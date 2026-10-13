@@ -1,0 +1,17 @@
+# Node
+node_modules/
+dist/
+
+# Rust
+target/
+
+# Tauri
+src-tauri/gen/
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 本地环境
+.env
+.env.*

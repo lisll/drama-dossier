@@ -1,0 +1,20 @@
+[package]
+name = "drama-dossier"
+version = "0.1.0"
+description = "短剧报审材料自动生成工具"
+authors = ["DramaDossier contributors"]
+license = "MIT"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+dossier-core = { path = "../crates/dossier-core" }
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = [] }
+rfd = "0.15"
+
+[lib]
+name = "drama_dossier_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]

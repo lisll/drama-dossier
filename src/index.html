@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:"
+    />
+    <title>剧备 DramaDossier</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="app-header">
+        <div class="brand">
+          <img src="./icon.svg" alt="" width="36" height="36" />
+          <div>
+            <h1>剧备 <span>DramaDossier</span></h1>
+            <p>从素材目录到结构化报审材料包</p>
+          </div>
+        </div>
+        <div class="path-row">
+          <input id="library-root" type="text" placeholder="选择或输入剧集素材根目录" />
+          <button id="browse-root" class="ghost">选择</button>
+          <button id="scan" class="primary">扫描剧目</button>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <aside class="panel drama-list-panel">
+          <section class="panel-header">
+            <h2>剧目</h2>
+            <span id="drama-count" class="badge">0</span>
+          </section>
+          <div id="drama-list" class="drama-list">
+            <div class="empty">先选择素材根目录，再点击「扫描剧目」。</div>
+          </div>
+        </aside>
+
+        <section class="detail">
+          <div id="detail-placeholder" class="empty large">
+            <h2>准备就绪</h2>
+            <p>
+              剧备按「一部剧一个子目录」扫描。请把分集视频放入子目录，并尽量命名为
+              <code>第01集.mp4</code>；封面可命名为 <code>封面.jpg</code>，简介可命名为
+              <code>简介.txt</code>。
+            </p>
+          </div>
+
+          <div id="detail-view" class="hidden">
+            <section class="detail-head">
+              <div>
+                <h2 id="drama-name"></h2>
+                <p id="drama-path"></p>
+              </div>
+              <button id="analyze" class="primary">探测并检查</button>
+            </section>
+
+            <div class="grid">
+              <section class="panel">
+                <section class="panel-header">
+                  <h3>检查结果</h3>
+                  <span id="ready-badge" class="badge">待检查</span>
+                </section>
+                <div id="checklist" class="checklist">
+                  <div class="empty">尚未探测分集规格。</div>
+                </div>
+              </section>
+
+              <section class="panel">
+                <section class="panel-header">
+                  <h3>分集</h3>
+                  <span id="episode-count" class="badge">0</span>
+                </section>
+                <div class="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>集号</th>
+                        <th>文件</th>
+                        <th>时长</th>
+                        <th>规格</th>
+                        <th>状态</th>
+                      </tr>
+                    </thead>
+                    <tbody id="episode-body">
+                      <tr>
+                        <td colspan="5" class="empty">尚未探测。</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+            </div>
+
+            <section class="panel package-panel">
+              <section class="panel-header">
+                <h3>生成报审包</h3>
+              </section>
+              <div class="form-grid">
+                <label>输出目录<input id="output-dir" type="text" placeholder="留空时生成到剧目目录/报审包" /></label>
+                <label>ffprobe 路径<input id="ffprobe-path" type="text" placeholder="留空时从 PATH 查找 ffprobe" /></label>
+                <label>出品 / 公司<input id="company-name" type="text" placeholder="使用者填写的真实信息" /></label>
+                <label>投资总额（万元）<input id="total-investment" type="number" min="0" step="0.01" /></label>
+                <label>演员成本占比（%）<input id="actor-ratio" type="number" min="0" max="100" step="0.01" /></label>
+                <label>联系方式<input id="contact" type="text" placeholder="仅写入本地报审包" /></label>
+              </div>
+              <div class="option-row">
+                <label><input id="copy-episodes" type="checkbox" /> 复制分集视频进报审包</label>
+                <label><input id="ai-generated" type="checkbox" /> 剧名/简介/封面使用了 AI 辅助生成</label>
+                <button id="browse-output" class="ghost">选择输出目录</button>
+                <button id="generate" class="success">生成材料包</button>
+              </div>
+              <div id="generate-result" class="result hidden"></div>
+              <p class="legal">
+                合规说明：剧备只整理使用者提供的真实材料，不伪造签名、印章或时间戳；报审包固定包含内容权属声明模板。
+              </p>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+    <div id="toast" class="toast hidden"></div>
+    <script src="./main.js"></script>
+  </body>
+</html>
