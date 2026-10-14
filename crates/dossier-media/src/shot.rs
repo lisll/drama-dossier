@@ -326,7 +326,7 @@ mod tests {
         ));
     }
 
-    /// 真跑一次：造一段「红 1 秒 + 蓝 1 秒」的硬切视频，切点必须落在 1 秒附近。
+    /// 真跑一次：造一段「黑 1 秒 + 白 1 秒」的硬切视频，切点必须落在 1 秒附近。
     #[test]
     fn real_detection_finds_a_hard_cut() {
         let runner = SystemRunner::new();
@@ -342,6 +342,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let clip = dir.join("cut.mp4");
+        // 用黑→白这种亮度直方图完全不重叠的对色：scene 分数按构造就是 1.0，
+        // 与 ffmpeg 版本无关（实测 6.1.1 = 1.000000）。红蓝这类有重叠的
+        // 配色只能得 0.4 左右，会让断言在不同版本上时好时坏。
         let output = runner
             .run(
                 &CommandSpec::new("ffmpeg")
@@ -353,11 +356,11 @@ mod tests {
                         "-f",
                         "lavfi",
                         "-i",
-                        "color=c=red:s=160x120:r=10:d=1",
+                        "color=c=black:s=160x120:r=10:d=1",
                         "-f",
                         "lavfi",
                         "-i",
-                        "color=c=blue:s=160x120:r=10:d=1",
+                        "color=c=white:s=160x120:r=10:d=1",
                         "-filter_complex",
                         "[0:v][1:v]concat=n=2:v=1:a=0[v]",
                         "-map",
