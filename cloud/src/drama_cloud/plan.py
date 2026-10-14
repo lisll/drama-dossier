@@ -94,6 +94,11 @@ class ProcessingPlan:
         for step in self.steps:
             if step.spec.capability:
                 caps.add(step.spec.capability)
+            # 参数相关的额外要求（例如擦除选了模型后端）也必须出现在计划里，
+            # 否则队列会把这个任务派给一台没有模型的 Worker。
+            dynamic = getattr(step.spec, "dynamic_capabilities", None)
+            if dynamic is not None:
+                caps.update(str(item) for item in dynamic(step.params))
         return sorted(caps)
 
     def fingerprint(self) -> str:
@@ -185,7 +190,19 @@ def build_plan(
                 f"步骤 {step.id}（{step.module}）需要能力 {spec.capability}，"
                 "当前 Worker 不支持；请改为具备该能力的 Worker 或调整配方",
             )
-        steps.append(PlannedStep(step.id, step.module, _normalize_params(step.module, step.params), spec))
+        normalized = _normalize_params(step.module, step.params)
+        dynamic = getattr(spec, "dynamic_capabilities", None)
+        if dynamic is not None:
+            needed = {str(item) for item in dynamic(normalized)}
+            missing_dynamic = sorted(needed - available_caps)
+            if missing_dynamic:
+                raise WorkError(
+                    ErrorClass.CAPABILITY_MISSING,
+                    f"步骤 {step.id}（{step.module}）按当前参数需要能力 "
+                    + ", ".join(missing_dynamic)
+                    + "，当前 Worker 不支持；请改用具备该能力的 Worker 或调整参数",
+                )
+        steps.append(PlannedStep(step.id, step.module, normalized, spec))
 
     _validate_input_references(steps, plan_inputs)
 

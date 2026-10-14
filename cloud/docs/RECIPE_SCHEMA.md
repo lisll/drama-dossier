@@ -111,7 +111,7 @@
 
 模块 `media.quality_gate` 的同名参数若显式给出，则**覆盖**这里的策略值（便于单任务微调）。
 
-## 8. 模块参数表（15 个）
+## 8. 模块参数表（21 个）
 
 注册表在 `src/drama_cloud/recipes/registry.py`，字面量写死，配方改不动它。
 
@@ -318,6 +318,100 @@
 | `min_duration_seconds` | float ≥0\|null | `null` | 同上 |
 | `duration_tolerance_seconds` | float 0..30 | `1.0` | 时长偏差容差（剪辑/重采样会带来零头） |
 
+### `video.render` · 合成渲染（Tier 2）
+
+把文字/角标/字幕合进画面，**不改变帧率与时长**（要改时长是时间线的事）。
+需要 `dossier-media` 且本机 `ffmpeg` 有 `drawtext` / `overlay` / `subtitles`，
+否则能力 `media.render.compose` 不会出现，任务在计划阶段被拒。
+
+| 参数 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `input_index` | int ≥0 | `0` | 用第几个输入素材 |
+| `texts` | string[] | `[]` | 叠加文字，每条一行 |
+| `font_size` | int 8..200 | `28` | 字号 |
+| `font_color` | string | `white` | 字色 |
+| `font_file` | string\|null | `null` | 字体文件；**中文必须显式给**（默认字体没有汉字） |
+| `logos` | string[] | `[]` | 图片叠加，`<路径>[,宽度]`，用于重制角标 |
+| `subtitles_input_index` | int ≥0\|null | `null` | 外挂字幕素材下标；与 `use_asr_subtitle` 二选一 |
+| `use_asr_subtitle` | bool | `false` | 用同一条管线里 `subtitle.asr` 产出的字幕（须排在它之后） |
+| `subtitle_style` | string\|null | `null` | 传给 `subtitles` 滤镜的样式串，如 `Fontsize=32,Outline=2` |
+| `output_name` | string | `rendered.mp4` | 产物文件名 |
+| `timeout_seconds` | float >0 | `1800` | 单步超时 |
+
+`texts` / `logos` / 字幕至少要给一个，否则只是重编码，参数校验直接拒绝。
+
+### `audio.separate` · 音源分离（Tier 2）
+
+Demucs 分离人声与伴奏。产物是**旁路音轨**（登记成 `stem`），不替换主视频输入。
+
+| 参数 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `input_index` | int ≥0 | `0` | 用第几个输入素材（音频，或带音轨的视频） |
+| `mode` | `two`/`four` | `two` | 两轨（vocals/no_vocals）或四轨 |
+| `model` | string | `htdemucs` | Demucs 模型名 |
+| `device` | `cpu`/`cuda` | `cpu` | 推理设备 |
+| `jobs` | int 1..16 | `1` | 并行作业数 |
+| `timeout_seconds` | float >0 | `3600` | 单步超时 |
+
+### `audio.timestretch` · 变速/变调（Tier 2）
+
+优先 Rubber Band（可保持音调），没有时退到 `ffmpeg atempo`（**会连带变调**）。
+要求保持音调却没装 rubberband 时**显式拒绝**，必须显式 `allow_pitch_shift=true` 才降级。
+
+| 参数 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `input_index` | int ≥0 | `0` | 用第几个输入素材 |
+| `speed` | float >0..8 | — | 速度倍率（必填） |
+| `pitch_semitones` | float −24..24 | `0.0` | 音调偏移（半音） |
+| `allow_pitch_shift` | bool | `false` | 接受「变速同时变调」的降级 |
+| `output_name` | string | `stretched.wav` | 产物文件名 |
+| `timeout_seconds` | float >0 | `1800` | 单步超时 |
+
+输入是音频文件时才替换主管线输入；视频素材的音轨变速只作为旁路产物（避免后续步骤拿到没有画面的输入）。
+
+### `subtitle.asr` · 语音识别转字幕（Tier 2）
+
+Whisper 转写为 SRT，产出角色 `subtitle_text`，可被 `subtitle.mux`（`source: {"kind":"planned"}`）
+或 `video.render`（`use_asr_subtitle`）直接消费。
+
+| 参数 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `input_index` | int ≥0 | `0` | 用第几个输入素材 |
+| `flavor` | `openai`/`cpp` | `openai` | whisper CLI 或 whisper.cpp |
+| `model` | string | `small` | 模型名/路径 |
+| `language` | string\|null | `zh` | 语言；`null` 交给工具自动判定 |
+| `threads` | int 1..128\|null | `null` | 线程数 |
+| `timeout_seconds` | float >0 | `3600` | 单步超时 |
+
+### `subtitle.ocr` · 区域 OCR 文本识别（Tier 2）
+
+按固定区域抽帧再识别（Tesseract），用于核对角标/标题写的是什么——补的是
+「DBNet 只说哪里有字、不说写的是什么」这个缺口。产物是 `ocr_report`（JSON）。
+
+| 参数 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `input_index` | int ≥0 | `0` | 用第几个输入素材 |
+| `region` | object | — | 绝对像素区域 `{x, y, width, height}`（原点左上角） |
+| `interval` | float >0..60 | `1.0` | 抽帧间隔（秒） |
+| `language` | string | `chi_sim+eng` | Tesseract 语言包 |
+| `confidence` | float 0..100 | `60.0` | 置信度门槛；低于它的行仍输出，但只计入 `low_confidence` |
+| `max_frames` | int 1..500 | `12` | 最多识别多少帧（角标是静态的，几帧就够） |
+| `timeout_seconds` | float >0 | `1800` | 单步超时 |
+
+### `timeline.shots` · 镜头切点检测（Tier 2）
+
+用 ffmpeg 的 `select=scene` 分数找**候选**切点，产物是 `shots`（登记成 `shot_list` 的 JSON）。
+它只做候选生成、不做语义判断——「要不要按这个切点成章」由编排层或人决定。
+需要 `dossier-media` 与本机 ffmpeg 的 `select` 滤镜（能力 `media.shot.detect`）。
+
+| 参数 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `input_index` | int ≥0 | `0` | 用第几个输入素材 |
+| `threshold` | float 0..1 | `0.35` | 场景分数阈值；越高越保守 |
+| `min_gap` | float 0..10 | `0.2` | 两个切点之间的最小间隔（秒），压掉同一秒内的重复检测 |
+| `output_name` | string | `shots.json` | 产物文件名 |
+| `timeout_seconds` | float >0 | `3600` | 单步超时 |
+
 ### 模块能力与角色一览
 
 | 模块 | 能力标签 | `requires` | `produces` | 类型 |
@@ -337,6 +431,12 @@
 | `video.inpaint` | `video_inpaint` | video | video | transcode |
 | `video.erase_verify` | `video_inpaint` | video | erase_verification | gate |
 | `media.quality_gate` | `ffprobe` | encoded | quality_report | transform |
+| `video.render` | `media.render.compose` | video | video | transform |
+| `audio.separate` | `media.audio.separate` | audio | stems | transform |
+| `audio.timestretch` | `media.audio.timestretch` / `media.audio.tempo_only` | audio | audio | transform |
+| `subtitle.asr` | `media.asr` | audio | subtitle_text | transform |
+| `subtitle.ocr` | `media.ocr` | video | ocr_report | transform |
+| `timeline.shots` | `media.shot.detect` | video | shots | plan |
 
 `kind` 只用于说明与检查点策略：只有 `media.encode` 物化文件，因此只有它的阶段产物可以被复用。
 

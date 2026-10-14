@@ -15,16 +15,26 @@ from ..base import StrictModel
 from ..errors import WorkError, ErrorClass, bad_param
 from ..recipes.registry import ModuleSpec, register
 from .ffmpeg import MediaContext, run_checked
+from .ffmpeg_caps import (
+    ffmpeg_available,
+    missing_encoders,
+    requires_all,
+    requires_encoders,
+    requires_filters,
+)
 
 # ---------- C3 字幕 ----------
 
 
 class SubtitleSource(StrictModel):
-    kind: Literal["external", "embedded"]
+    kind: Literal["external", "embedded", "planned"]
     #: kind=external 时：输入素材下标（字幕文件作为一份独立输入）。
     input_index: Optional[int] = Field(None, ge=0)
     #: kind=embedded 时：素材内字幕轨下标。
     stream_index: Optional[int] = Field(None, ge=0)
+    #: kind=planned 时：产出字幕的步骤模块名（默认 `subtitle.asr`）。
+    #: 这是「识别 → 上字幕」一条管线跑完的关键：字幕不在输入素材里，而是前序步骤刚生成的。
+    producer: str = "subtitle.asr"
 
     @model_validator(mode="after")
     def _check(self):
@@ -45,7 +55,26 @@ class SubtitleParams(StrictModel):
 
 def implement_subtitle(ctx: MediaContext, params: SubtitleParams) -> dict:
     source = params.source
-    if source.kind == "external":
+    if source.kind == "planned":
+        # 字幕来自同一条管线的前序步骤（ASR 刚产出的 SRT）。找不到就显式报错——
+        # 「静默当成没有字幕」会让整条任务在质量门禁之外悄悄少做一件事。
+        plan_key = "asr" if source.producer == "subtitle.asr" else source.producer
+        produced = ctx.plan.get(plan_key) or {}
+        path = produced.get("subtitle")
+        if not path or not Path(str(path)).is_file():
+            raise bad_param(
+                f"source.kind=planned 需要前序步骤 {source.producer} 的产出，"
+                f"但计划里没有可用的字幕文件（plan[{plan_key!r}].subtitle）"
+            )
+        plan = {
+            "mode": params.mode,
+            "kind": "planned",
+            "path": str(path),
+            "producer": source.producer,
+            "language": params.language,
+            "title": params.title,
+        }
+    elif source.kind == "external":
         index = source.input_index
         if index is None or index >= len(ctx.inputs):
             raise bad_param("外挂字幕的输入素材下标不存在")
@@ -172,6 +201,36 @@ def check_container(params: EncodeParams) -> None:
         )
 
 
+def ensure_encoders(
+    ctx: MediaContext, params: EncodeParams, subtitle_codec: Optional[str]
+) -> None:
+    """确认这次真正会用到的编码器都在。
+
+    为什么不在参数校验阶段做完：本机装了哪些编码器是**部署事实**，不是参数问题。
+    所以这里查一次 `ffmpeg -encoders`，缺了就以 `capability_missing` 失败并列出缺哪个、
+    属于什么用途——而不是让 ffmpeg 跑到一半报 "Unknown encoder"（那种报错的分类是
+    `target_unsupported`，会把「机器没装」误报成「你的参数不支持」，把排查引到错方向）。
+
+    `media.encode` 的能力探测只钉住默认的 `libx264`；h265/vp9/av1 与音频编码器是配方
+    选的，只能在拿到参数后才能确认，所以放在这里补。
+    """
+    needed = {VIDEO_ENCODERS[params.video_codec]: "视频"}
+    if params.audio_codec != "none" and ctx.probe.get("has_audio"):
+        audio = AUDIO_ENCODERS[params.audio_codec]
+        if audio:
+            needed[audio] = "音频"
+    if subtitle_codec:
+        needed[subtitle_codec] = "字幕"
+
+    missing = missing_encoders(ctx.settings, needed)
+    if missing:
+        detail = "、".join(f"{name}（{needed[name]}编码）" for name in missing)
+        raise WorkError(
+            ErrorClass.CAPABILITY_MISSING,
+            f"本机 ffmpeg 缺少编码器：{detail}；请在部署侧装齐 ffmpeg，或改用本机已有的编码器",
+        )
+
+
 def _segment_args(ctx: MediaContext, timeline: dict) -> List[str]:
     """把时间线编译成 filter_complex 的 trim/concat 段。"""
     segments = timeline.get("segments") or [{"input_index": 0, "start": 0.0, "end": None}]
@@ -207,11 +266,18 @@ def implement_encode(ctx: MediaContext, params: EncodeParams) -> dict:
     if timeline.get("pending_review"):
         raise bad_param("时间线尚未通过人工审核，拒绝编码")
 
+    subtitle = ctx.plan.get("subtitle")
+    soft_subtitle_codec = (
+        ("mov_text" if params.container == "mp4" else "srt")
+        if subtitle and subtitle.get("mode") == "soft"
+        else None
+    )
+    ensure_encoders(ctx, params, soft_subtitle_codec)
+
     filters, video_label, audio_label = _segment_args(ctx, timeline)
     video_filters = ctx.plan.get("video_filters") or []
     audio_filters = ctx.plan.get("audio_filters") or []
 
-    subtitle = ctx.plan.get("subtitle")
     if subtitle and subtitle.get("mode") == "burn":
         if subtitle["kind"] == "external":
             escaped = subtitle["path"].replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
@@ -249,8 +315,7 @@ def implement_encode(ctx: MediaContext, params: EncodeParams) -> dict:
         if subtitle["kind"] == "external":
             subtitle_input_index = len(ctx.inputs)
             args += ["-i", subtitle["path"]]
-        container = params.container
-        subtitle_codec = "mov_text" if container == "mp4" else "srt"
+        subtitle_codec = soft_subtitle_codec
 
     # C10：章节元数据文件也是输入，必须在输出选项之前声明。
     chapters = ctx.plan.get("chapters")
@@ -387,6 +452,8 @@ register(
         produces=frozenset({"subtitle_plan"}),
         params_model=SubtitleParams,
         implement=implement_subtitle,
+        # 烧录走 `subtitles` 滤镜；软字幕转封装要 `mov_text`（mp4）编码器。
+        capability_probe=requires_filters("subtitles"),
     )
 )
 register(
@@ -398,6 +465,7 @@ register(
         produces=frozenset({"metadata_policy"}),
         params_model=MetadataParams,
         implement=implement_metadata,
+        capability_probe=ffmpeg_available,
     )
 )
 register(
@@ -409,5 +477,12 @@ register(
         produces=frozenset({"encoded"}),
         params_model=EncodeParams,
         implement=implement_encode,
+        # 这一条只钉两件「无论配方怎么写都必须成立」的事：默认视频编码器在，以及拼时间线
+        # 用的基础滤镜在。h265/vp9/av1 与音频编码器由配方选，只在拿到参数后才能确认，
+        # 交给 `implement_encode` 里的 `ensure_encoders` 逐次核对。
+        capability_probe=requires_all(
+            requires_encoders("libx264"),
+            requires_filters("trim", "atrim", "setpts", "asetpts", "settb", "asettb", "concat"),
+        ),
     )
 )

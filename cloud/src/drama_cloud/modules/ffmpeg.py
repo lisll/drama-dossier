@@ -10,9 +10,10 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from ..config import Settings
 from ..errors import ErrorClass, WorkError
@@ -32,6 +33,10 @@ _PATTERNS = (
     ("does not support", ErrorClass.TARGET_UNSUPPORTED),
     ("invalid argument", ErrorClass.PARAM_OUT_OF_RANGE),
     ("no such filter", ErrorClass.PARAM_OUT_OF_RANGE),
+    # shell 的「命令找不到」：外部工具跑起来了，但它依赖的可执行文件不在。
+    # 这是能力缺失（不该重试），不是素材坏了。ffmpeg 自身不会打印这句话。
+    ("command not found", ErrorClass.CAPABILITY_MISSING),
+    ("executable file not found", ErrorClass.CAPABILITY_MISSING),
 )
 
 
@@ -67,6 +72,11 @@ class MediaContext:
     #: 当前是第几次尝试（从 1 开始）。质量类重试靠它逐级加力：
     #: 第 2 次加大 mask 膨胀/羽化，第 3 次可切换更强的修复后端。
     attempt: int = 1
+    #: 长任务进度回调：订阅方（Worker）把它接到任务进度上；`None` = 不订阅。
+    #:
+    #: 回调**在跟随进度文件的后台线程上执行**，因此实现方不能借用创建于别的线程的
+    #: SQLite 连接（sqlite3 默认 `check_same_thread=True`），必须自己开一条。
+    progress_hook: Optional[Callable[[dict], None]] = None
 
     @property
     def ffmpeg(self) -> str:
@@ -114,6 +124,107 @@ def run_checked(args: List[str], timeout: float = 3600.0, cwd: Optional[Path] = 
             classify(stderr),
             f"{Path(args[0]).name} 退出码 {result.returncode}：{_tail(stderr)}",
         )
+
+
+# ---------- 长任务进度跟随 ----------
+
+
+def read_progress_events(path: Path, offset: int) -> Tuple[List[dict], int]:
+    """读取从字节 `offset` 起新增的**完整**进度行，返回（事件, 新偏移）。
+
+    为什么按字节偏移而不是行号：进度文件是追加写的，长任务随时可能被杀，
+    **最后一行常常是半行**。半行不能解析，所以偏移只推进到最后一个换行符之后，
+    把半行留给下一次读；文件不存在或读不动时返回空列表（进度不是任务的产物，
+    拿不到不该让擦除失败）。
+    """
+    try:
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            chunk = handle.read()
+    except OSError:
+        return [], offset
+    if not chunk:
+        return [], offset
+    end = chunk.rfind(b"\n")
+    if end < 0:
+        return [], offset
+    events: List[dict] = []
+    for line in chunk[: end + 1].splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line.decode("utf-8", "replace"))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            events.append(payload)
+    return events, offset + end + 1
+
+
+def run_streaming(
+    args: List[str],
+    *,
+    progress_path: Optional[Path] = None,
+    on_progress: Optional[Callable[[dict], None]] = None,
+    timeout: float = 3600.0,
+    cwd: Optional[Path] = None,
+    poll: float = 0.2,
+) -> subprocess.CompletedProcess:
+    """跑子进程并**同时**跟随它的 JSONL 进度文件。
+
+    与 `run()` 的差别只有一点：`run()` 要等进程结束才能看到任何东西，长任务
+    （逐帧擦除）在界面上就是一个静止的 `RUNNING`。这里用后台线程按字节偏移
+    增量读进度文件，把每条事件交给 `on_progress`，进程结束前就能上报真实进度。
+
+    未订阅（`progress_path`/`on_progress` 为空）时退化为 `run()`，行为完全不变。
+    """
+    if progress_path is None or on_progress is None:
+        return run(args, timeout=timeout, cwd=cwd)
+
+    def deliver(event: dict) -> None:
+        try:
+            on_progress(event)
+        except Exception:  # 订阅方自己的问题（例如数据库忙）不该拖垮擦除
+            pass
+
+    try:
+        process = subprocess.Popen(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=str(cwd) if cwd else None,
+        )
+    except FileNotFoundError as error:
+        raise WorkError(ErrorClass.CAPABILITY_MISSING, f"找不到可执行文件：{args[0]}") from error
+
+    stop = threading.Event()
+    offset = 0
+
+    def follow() -> None:
+        nonlocal offset
+        while not stop.wait(poll):
+            events, offset = read_progress_events(progress_path, offset)
+            for event in events:
+                deliver(event)
+
+    thread = threading.Thread(target=follow, name="progress-follow", daemon=True)
+    thread.start()
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        raise WorkError(
+            ErrorClass.RESOURCE_CONTENTION, f"命令超时（{timeout:.0f}s）：{args[0]}"
+        ) from None
+    finally:
+        stop.set()
+        thread.join(timeout=5.0)
+    # 收尾再读一次：进程退出前写下的最后几条事件不能丢。
+    for event in read_progress_events(progress_path, offset)[0]:
+        deliver(event)
+    return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
 
 
 def probe_json(path: Path, settings: Settings) -> dict:

@@ -37,8 +37,9 @@ from pydantic import Field, model_validator
 from ..base import StrictModel
 from ..config import Settings
 from ..errors import ErrorClass, WorkError, bad_param, quality_retry, unsupported
-from ..recipes.registry import ModuleSpec, register
-from .ffmpeg import MediaContext, classify, run
+from ..recipes.registry import ModuleSpec, register, register_capability
+from ..toolchain import resolve_binary
+from .ffmpeg import MediaContext, classify, read_progress_events, run, run_streaming
 
 #: 工具输出的最大验收长度（错误信息只需要尾部）。
 _STDERR_TAIL = 800
@@ -170,8 +171,14 @@ class EraseVerifyParams(StrictModel):
 
 
 def repo_root() -> Path:
-    """仓库根目录（`cloud/src/drama_cloud/modules/inpaint.py` 往上四级）。"""
-    return Path(__file__).resolve().parents[4]
+    """仓库根目录。
+
+    委托给 `drama_cloud.toolchain`：三个 Rust 工具的查找顺序必须一致，
+    但**这个模块级的名字要留着**——单测通过替换 `module.repo_root` 来隔离真实仓库。
+    """
+    from ..toolchain import repo_root as _repo_root
+
+    return _repo_root()
 
 
 def resolve_tool(settings: Optional[Settings]) -> Path:
@@ -180,10 +187,8 @@ def resolve_tool(settings: Optional[Settings]) -> Path:
     查找顺序：部署配置 → PATH → 仓库内的 cargo 构建产物。找不到时明确按
     `capability_missing` 失败，而不是静默跳过擦除（那会交付一份「没擦干净」的成品）。
     """
-    candidates: List[Path] = []
     configured = getattr(settings, "inpaint_bin", None) if settings is not None else None
-    if configured:
-        candidates.append(Path(str(configured)))
+    candidates: List[Path] = [Path(str(item)) for item in (configured,) if item]
     found = shutil.which("dossier-inpaint")
     if found:
         candidates.append(Path(found))
@@ -200,9 +205,71 @@ def resolve_tool(settings: Optional[Settings]) -> Path:
     )
 
 
-#: 模型修复后端所需的能力标签。只有配置了模型 worker 的部署才该声明它；否则
-#: 需要模型的任务会被路由到真正具备 GPU/模型的 Worker 上。
+#: 模型修复后端所需的能力标签。以前它只能由部署方写 `DRAMA_CLOUD_CAPABILITIES`
+#: 手工声明（声明错了没人发现）；现在改为注册探测函数，见 `model_capability_available`。
 MODEL_CAPABILITY = "video_inpaint_model"
+
+#: `dossier-runtime check` 的超时（清单校验要读文件摘要，给足时间但不无限等）。
+_RUNTIME_CHECK_TIMEOUT = 120.0
+
+
+def runtime_bin(settings: Optional[Settings]) -> Optional[Path]:
+    """定位 `dossier-runtime`（用于核对运行时组件清单）。"""
+    configured = getattr(settings, "runtime_bin", None) if settings is not None else None
+    return resolve_binary(configured, "dossier-runtime")
+
+
+def runtime_manifest_check(settings: Optional[Settings]) -> Optional[bool]:
+    """按清单核对模型组件是否装齐。
+
+    返回 `None` 表示「没法核对」（没配清单），与 `False`（核对了、但不齐）是两种结论：
+    前者只能给出弱保证，后者必须让能力缺席。
+    """
+    manifest = getattr(settings, "runtime_manifest", None) if settings is not None else None
+    if not manifest:
+        return None
+    tool = runtime_bin(settings)
+    if tool is None:
+        return False
+    try:
+        result = run(
+            [str(tool), "check", "--manifest", str(manifest)],
+            timeout=_RUNTIME_CHECK_TIMEOUT,
+        )
+    except WorkError:
+        return False
+    return result.returncode == 0
+
+
+def model_capability_available(settings: Optional[Settings]) -> bool:
+    """`video_inpaint_model` 是否成立。
+
+    两级判定：
+    1. 必须配置了模型 worker（`DRAMA_CLOUD_INPAINT_WORKER`）——没配就不用谈模型；
+    2. 配了清单（`DRAMA_CLOUD_RUNTIME_MANIFEST`）时，还要 `dossier-runtime check`
+       通过（组件齐全、摘要对得上）。没配清单时只能给出弱保证：「配了 worker」。
+    这比「靠环境变量手工声明」强的地方在于：第 2 级是**真的去核对文件**，
+    文件被删、权重换了、装错版本都会被探测到。
+    """
+    if settings is None:
+        return False
+    program = getattr(settings, "inpaint_worker_program", None)
+    if not program:
+        return False
+    return runtime_manifest_check(settings) is not False
+
+
+#: 参数相关的额外能力要求：选了模型后端（检测或修复）就必须有 `video_inpaint_model`。
+#: 这是 Tier 1「模型端到端可用性」的关键一步——不做这层检查，配方完全可以在
+#: 一台没有模型的机器上通过计划校验，然后跑到一半才发现 worker 起不来。
+def required_inpaint_capabilities(params: dict) -> FrozenSet[str]:
+    caps = set()
+    if params.get("inpainter") == "worker" or params.get("detector") == "worker":
+        caps.add(MODEL_CAPABILITY)
+    return frozenset(caps)
+
+
+register_capability(MODEL_CAPABILITY, model_capability_available)
 
 #: `--help` 探测结果的缓存键是「路径 + 大小 + mtime」，同一份可执行文件只问一次。
 _TOOL_FLAGS: Dict[Tuple[str, int, int], FrozenSet[str]] = {}
@@ -334,6 +401,7 @@ def build_args(
     report_path: Path,
     tool: Path,
     worker: Optional[Dict[str, object]],
+    progress_path: Optional[Path] = None,
 ) -> List[str]:
     args: List[str] = [
         str(tool),
@@ -358,6 +426,8 @@ def build_args(
         "--ffmpeg", ctx.ffmpeg,
         "--ffprobe", ctx.ffprobe,
     ]
+    if progress_path is not None:
+        args += ["--progress-json", str(progress_path)]
     if "--verify-ssim-warn" in tool_flags(tool):
         # SSIM 真值代理：配方声明的阈值同时给工具自检与 video.erase_verify 裁决用。
         args += [
@@ -451,19 +521,31 @@ def implement_inpaint(ctx: MediaContext, params: InpaintParams) -> dict:
     tool = resolve_tool(ctx.settings)
     worker = worker_settings(ctx.settings)
     escalation = plan_escalation(params, ctx.attempt, worker)
-    if "--verify-ssim-warn" not in tool_flags(tool):
+    flags = tool_flags(tool)
+    if "--verify-ssim-warn" not in flags:
         escalation.notes.append(
             "已安装的 dossier-inpaint 不认识 --verify-ssim-warn，本次校验沿用旧指标"
             "（残留 / 闪烁 / 接缝 / 一致性）；如需 SSIM 请升级该工具"
+        )
+    # 进度流是可选能力：旧工具不认这个开关，硬加会让整条擦除失败。
+    follow_progress = "--progress-json" in flags
+    if not follow_progress:
+        escalation.notes.append(
+            "已安装的 dossier-inpaint 不认识 --progress-json，本次不产出逐帧进度"
+            "（任务进度仍按阶段上报）；如需实时进度请升级该工具"
         )
 
     source = Path(ctx.inputs[params.input_index])
     suffix = source.suffix or ".mp4"
     output = ctx.scratch(f"inpainted{suffix}")
     report_path = ctx.scratch("inpaint-report.json")
+    progress_path = ctx.scratch("inpaint.progress.jsonl")
     if output.exists():
         # 上一次尝试的产物不能被误当成本次结果（尤其是加力后仍有残留的情况）。
         output.unlink()
+    if progress_path.exists():
+        # 上一次尝试的进度同理：留着会让跟随者读到旧任务的事件。
+        progress_path.unlink()
 
     args = build_args(
         ctx,
@@ -474,8 +556,14 @@ def implement_inpaint(ctx: MediaContext, params: InpaintParams) -> dict:
         report_path=report_path,
         tool=tool,
         worker=worker,
+        progress_path=progress_path if follow_progress else None,
     )
-    result = run(args, timeout=params.timeout_seconds)
+    result = run_streaming(
+        args,
+        progress_path=progress_path if follow_progress else None,
+        on_progress=ctx.progress_hook if follow_progress else None,
+        timeout=params.timeout_seconds,
+    )
     stderr = result.stderr.decode("utf-8", "replace")
     if result.returncode not in (0, 2, 3):
         raise WorkError(
@@ -491,6 +579,11 @@ def implement_inpaint(ctx: MediaContext, params: InpaintParams) -> dict:
     report = read_report(report_path)
     verdict = report_verdict(report)
     summary = report_summary(report)
+    last_progress: Optional[dict] = None
+    if follow_progress:
+        events, _ = read_progress_events(progress_path, 0)
+        if events:
+            last_progress = events[-1]
 
     ctx.plan["inpaint"] = {
         "tool": str(tool),
@@ -504,6 +597,9 @@ def implement_inpaint(ctx: MediaContext, params: InpaintParams) -> dict:
         "report": report,
         "summary": summary,
         "verdict": verdict,
+        # 逐帧进度流的**末条**事件（含阶段与帧计数）。过程事件已实时上报给任务进度，
+        # 这里留一份终态是为了让处理日志能自答「这次擦除到底跑了多少帧」。
+        "progress": last_progress,
     }
 
     # 用擦除结果替换该路输入：后续步骤（画面处理 / 编码 / 门禁）看到的就是干净画面。
@@ -527,6 +623,35 @@ def implement_inpaint(ctx: MediaContext, params: InpaintParams) -> dict:
             "media": summary,
         }
     )
+    # 产物戳记（Tier 3）：工具默认写在 `<输出>.stamp.json`，里面是管线版本、工具版本、
+    # 参数与输入摘要。它是「这批产物是不是同一套流程出的」的唯一依据，所以必须
+    # 跟着产物一起存下来；旧工具不写戳记时明确记一条说明，而不是静默当它不存在。
+    stamp_path = Path(f"{output}.stamp.json")
+    if stamp_path.is_file():
+        # 管线名与版本**从戳记里读**，不在这里再写一份常量：版本号只有一个来源
+        # （Rust 侧 `dossier_core::pipeline_version`），否则两边会各自漂移。
+        stamp_media: dict = {"output": output.name}
+        try:
+            payload = json.loads(stamp_path.read_text(encoding="utf-8"))
+            stamp_media["pipeline"] = payload.get("pipeline")
+            stamp_media["pipeline_version"] = payload.get("pipelineVersion")
+            stamp_media["tool_version"] = (payload.get("tool") or {}).get("version")
+        except (OSError, ValueError):
+            stamp_media["unreadable"] = True
+        ctx.artifacts.append(
+            {
+                "kind": "artifact_stamp",
+                "path": stamp_path,
+                "name": stamp_path.name,
+                "media": stamp_media,
+            }
+        )
+        ctx.plan["inpaint"]["stamp"] = str(stamp_path)
+    else:
+        ctx.notes.append(
+            "本次擦除没有产出产物戳记（已安装的 dossier-inpaint 较旧，或不支持写法）；"
+            "升级该工具后可用 `drama-cloud artifacts check` 做跨产物一致性校验"
+        )
 
     def require_review(severity: str, reason: str) -> None:
         review = ctx.plan.setdefault("review", {"required": False, "severity": "info", "reasons": []})
@@ -739,6 +864,8 @@ register(
         # 没装/没构建 dossier-inpaint 的部署不会声明该能力，任务在计划阶段就被拒绝，
         # 而不是跑起来才发现工具缺失（见 docs/PROJECT_REVIEW.md C2）。
         capability_probe=capability_available,
+        # 选了模型后端时，还要有真的可用的模型（见 required_inpaint_capabilities）。
+        dynamic_capabilities=required_inpaint_capabilities,
     )
 )
 register(

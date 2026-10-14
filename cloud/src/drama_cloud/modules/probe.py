@@ -8,6 +8,7 @@ from __future__ import annotations
 from ..base import StrictModel
 from ..recipes.registry import ModuleSpec, register
 from .ffmpeg import MediaContext, probe_json, summarize
+from .ffmpeg_caps import ffprobe_available
 
 
 class ProbeParams(StrictModel):
@@ -38,5 +39,7 @@ register(
         params_model=ProbeParams,
         kind="plan",
         implement=implement_probe,
+        # 探测能力靠的是 ffprobe 这个程序本身，只要它在就成立。
+        capability_probe=ffprobe_available,
     )
 )

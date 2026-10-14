@@ -22,6 +22,7 @@ from ..base import StrictModel
 from ..errors import bad_param
 from ..recipes.registry import ModuleSpec, register
 from .ffmpeg import MediaContext, run_checked
+from .ffmpeg_caps import requires_filters
 
 DENOISE_PRESETS = {
     "off": None,
@@ -228,6 +229,8 @@ register(
         produces=frozenset({"video_filters"}),
         params_model=VideoQualityParams,
         implement=implement_video_quality,
+        # C4 真正用到的滤镜：缩放 + 亮度/对比度/饱和度 + 锐化 + 降噪。
+        capability_probe=requires_filters("scale", "eq", "unsharp", "hqdn3d"),
     )
 )
 register(
@@ -239,6 +242,7 @@ register(
         produces=frozenset({"video_filters"}),
         params_model=FpsConvertParams,
         implement=implement_fps_convert,
+        capability_probe=requires_filters("fps"),
     )
 )
 register(
@@ -250,6 +254,7 @@ register(
         produces=frozenset({"video_filters"}),
         params_model=DeflickerParams,
         implement=implement_deflicker,
+        capability_probe=requires_filters("deflicker"),
     )
 )
 register(
@@ -261,5 +266,7 @@ register(
         produces=frozenset({"frame_report"}),
         params_model=FrameInspectParams,
         implement=implement_frame_inspect,
+        # 抽检链是 `fps,signalstats,metadata=print`，三个滤镜缺一不可。
+        capability_probe=requires_filters("fps", "signalstats", "metadata"),
     )
 )

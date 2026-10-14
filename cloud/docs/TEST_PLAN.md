@@ -13,6 +13,10 @@
 | 单元 | `tests/test_recipes.py` `test_plan.py` `test_state_machine.py` `test_queue.py` `test_storage.py` | 无 ffmpeg | 快；校验规则、状态机、队列语义、签名 |
 | 模块 | `tests/test_modules.py` | 无 ffmpeg | 模块只写 `ctx.plan`，因此可直接断言「生成的滤镜链」 |
 | 模块（擦除） | `tests/test_inpaint_module.py` | 无 ffmpeg、无 GPU | 用「假工具脚本」替身驱动 `video.inpaint`/`video.erase_verify`：加力、判据方向、自动重试、转人工、warn 产出 |
+| 模块（Tier 2 后期） | `tests/test_late_stage.py` | 无模型；一条用例需要 ffmpeg + 已构建的 `dossier-media` | 假 `dossier-media` 驱动 `video.render`/`audio.separate`/`audio.timestretch`/`subtitle.asr`/`subtitle.ocr`/`timeline.shots`：参数拼装、产物回收、能力缺失时的显式拒绝；末条真跑一次镜头检测 |
+| 能力路由 | `tests/test_capability_routing.py` | 无 ffmpeg | 整机能力探测（`register_capability`）、动态能力要求（选了模型后端就得有 `video_inpaint_model`）、`artifacts check` 的错误码与异常路径 |
+| 能力探测（ffmpeg） | `tests/test_ffmpeg_caps.py` | 无 ffmpeg | 解析 `ffmpeg -filters`/`-encoders`：图例行、缺分隔线、探测失败、缺一个滤镜就不许声明能力 |
+| 进度流消费端 | `tests/test_progress_tail.py` | 无 ffmpeg | 按字节偏移增量读 JSONL、半行留给下一次、末条终态 |
 | 业务（复核） | `tests/test_review.py` | 无 ffmpeg | 人工复核队列生命周期、裁决约束、去重、任务投影与 API 端点/角色 |
 | 集成 | `tests/test_runner.py` | ffmpeg | 真跑 Worker：编码、门禁、检查点、取消、租约 |
 | 接口 | `tests/test_api.py` | ffmpeg（仅全链路用例） | FastAPI TestClient：认证、授权、限流、幂等 |

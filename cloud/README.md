@@ -71,7 +71,7 @@ cloud/
 │   ├── base.py          # StrictModel（extra="forbid"）
 │   ├── plan.py          # 配方 → ProcessingPlan（能力检查、输入角色、指纹）
 │   ├── recipes/         # C1/C2：配方 Schema、版本策略、模块白名单注册表
-│   ├── modules/         # C4–C12：15 个处理模块（含 inpaint）、擦除校验与质量门禁
+│   ├── modules/         # C4–C12 + Tier 2：21 个处理模块（含 inpaint）、擦除校验与质量门禁
 │   ├── tasks/           # state.py 状态机、queue.py 队列、service.py 业务、runner.py Worker、review.py 人工复核队列
 │   ├── api.py           # FastAPI 控制面
 │   ├── cli.py           # 命令行入口
@@ -79,7 +79,7 @@ cloud/
 │   └── web/             # Web 客户端（静态页）
 ├── recipes/             # 内置配方（输出预设 + 擦除，7 份）
 ├── docs/                # 交付物文档，见下表
-├── tests/               # 147 个测试（单元 / 模块 / 集成 / 接口 / 复核）
+├── tests/               # 215 个测试（单元 / 模块 / 集成 / 接口 / 复核）
 ├── demo.sh              # 一键端到端演示
 └── var/                 # 运行目录（数据库/存储/工作目录，可整体删除）
 ```
@@ -89,7 +89,7 @@ cloud/
 | 文档 | 内容 |
 | --- | --- |
 | `docs/ARCHITECTURE.md` | 逻辑/部署架构、模块职责、C1–C12 覆盖、与设计文档的差异、已知限制 |
-| `docs/RECIPE_SCHEMA.md` | 配方字段、15 个模块的参数表、校验规则、示例 |
+| `docs/RECIPE_SCHEMA.md` | 配方字段、21 个模块的参数表、校验规则、示例 |
 | `docs/recipe.schema.json` | 配方 JSON Schema 快照（运行时也可从 `/api/v1/recipes/schema.json` 取） |
 | `docs/PROCESSING_PIPELINE.md` | 计划构造、模块契约、一次性编码、检查点复用、门禁、产物登记、质量类重试 |
 | `docs/API_SPEC.md` | 端点总表与详情、错误码表、认证与幂等规则、调用示例 |

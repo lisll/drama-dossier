@@ -18,6 +18,7 @@ from ..base import StrictModel
 from ..errors import bad_param
 from ..recipes.registry import ModuleSpec, register
 from .ffmpeg import MediaContext, run_checked
+from .ffmpeg_caps import ffmpeg_available
 
 # ---------- C5 时间线 ----------
 
@@ -323,6 +324,7 @@ register(
         produces=frozenset({"timeline"}),
         params_model=TimelineParams,
         implement=implement_timeline,
+        capability_probe=ffmpeg_available,
     )
 )
 register(
@@ -334,6 +336,8 @@ register(
         produces=frozenset({"chapters"}),
         params_model=ChaptersParams,
         implement=implement_chapters,
+        # 分集切分用 `-c copy` 流拷贝，不需要额外滤镜，ffmpeg 在就成立。
+        capability_probe=ffmpeg_available,
     )
 )
 register(
@@ -346,5 +350,6 @@ register(
         produces=frozenset({"timeline"}),
         params_model=CommentaryParams,
         implement=implement_commentary,
+        capability_probe=ffmpeg_available,
     )
 )

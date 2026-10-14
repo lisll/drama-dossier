@@ -304,3 +304,143 @@ H2 的替代路径已存在：擦除/转码/对比等能力都有命令行入口
 - 复核状态**不阻断产物下载**（`approved` 之前也能取到文件）——生产环境应在下载端点校验；
 - 没有操作者身份体系，复核的 `actor` 就是令牌身份，没有双人复核约束；
 - 没有视频画面级的差分预览（复核者看的是指标 + 成品文件，不是并排对比工具）。
+
+## 8. 第四轮复核（按 Tier 1/2/3 补齐能力之后）
+
+第四轮的目标不再是「把某个链路跑通」，而是**按与 Grove Max 1.2.4 的纯技术对比结论，
+把三档缺口补上**。对比报告在仓库外（`Grove-Max-分析报告.md`），结论口径固定在本节 8.1，
+落地细节与用法见 `docs/RUNTIME.md`。
+
+### 8.1 三档缺口的定义（固定下来，避免口径漂移）
+
+| 档 | 定义（缺了会怎样） | 缺口项 | 落地位置 |
+| --- | --- | --- | --- |
+| **Tier 1** | 阻塞性缺口：缺了对应能力对用户不可用 | 运行时与模型交付体系；GPU / 加速组件 / 硬件编码 / 并行度协商；模型端到端可用性 | `crates/dossier-runtime` |
+| **Tier 2** | 能力空白：整个技术域不存在 | 音源分离、变速变调、ASR、OCR 识别、镜头边界/切点、图像合成渲染 | `crates/dossier-media` |
+| **Tier 3** | 工程完整性缺口 | 长任务进度流 + 可恢复执行；管线版本化与跨产物一致性校验；应用内更新 / 凭据存储 / 设备指纹 | `crates/dossier-core`（前两项）+ `crates/dossier-runtime`（第三项） |
+
+对比里还列出过「浏览器自动化 + 会话持久化」，属于 Tier 2 域但**明确不做**：它的用途是
+自动登录平台并上传，超出本项目「技术学习」的边界（见 §8.5）。
+
+### 8.2 本轮实现
+
+| 落地 | 内容 | 库侧单测 |
+| --- | --- | --- |
+| `crates/dossier-runtime` | 组件清单/校验/安装/回滚（`manifest` + `store`）、能力协商（`caps`：GPU 够格判定 + 硬件编码器三级判断与一帧实测 + 四档并行度）、工具探测（`probe`）、更新验签（`update`：openssl→node 验签链，fail closed）、凭据（`secret`）、指纹（`device`）、自检 CLI（`selfcheck`） | 97 |
+| `crates/dossier-media` | 合成渲染（`render`：drawtext/overlay/字幕烧录）、镜头切点（`shot`）、变速变调（`timestretch`）、音源分离（`separate`）、ASR（`asr`）、OCR 文本识别（`ocr`）、字幕读写（`srt`）、工具链盘点（`tools`）；**六个计划类型各自的 `execute` 执行入口**（见 §8.7） | 60 |
+| `crates/dossier-core` | 进度流（`progress`：JSONL 追加 + seq 单调 + 截断尾行丢弃）、检查点续跑（`checkpoint`：输入指纹 + 原子保存 + 失效产物回退为 Pending）、管线版本与产物一致性（`pipeline_version`：产物戳记 + 四类偏差）、`dossier-artifacts check` CLI | 68 + 3（集成） |
+
+云端侧同步接线（`cloud/src/drama_cloud/modules/`）：新增 `ffmpeg_caps.py`（解析
+`ffmpeg -filters` / `-encoders`，与 Rust `probe.rs` 保持同一套解析规则），并给全部
+**21 个**模块补上 `capability_probe`——此前的探测只覆盖 `video.inpaint` 一族与
+`ffprobe`，现在「缺滤镜/缺编码器」也会如实让能力缺席。
+
+Tier 2 的库能力随后也接进了注册表（`modules/late_stage.py` 六个模块 +
+`modules/media_cli.py` 的能力探测），否则「库里有、配方用不到」等于没做：
+`video.render`（文字/角标/字幕烧录）、`audio.separate`（Demucs，产物登记成 stem）、
+`audio.timestretch`（要保音调但没 rubberband 时**显式拒绝**，`allow_pitch_shift` 才降级）、
+`subtitle.asr`（Whisper → SRT，产物可被 `subtitle.mux` 用 `source: planned` 直接消费）、
+`subtitle.ocr`（区域抽帧 + Tesseract）。
+
+进度流（Tier 3 的第一项）本轮把「生产 → 消费」两端接完，而不是只停在库层：
+
+- **生产**：`dossier-inpaint --progress-json <路径>` 写两个阶段（`locate` 逐帧检测 /
+  `inpaint` 逐片段修复）；每修完一个片段追加一条，定位阶段每 1/10 采一条；分母用
+  「时长 × 帧率」的估计值并按 `max(估计, 已完成)` 向上修正；失败、以及三条「原样输出」
+  的早退路径都会写终态（详见 `docs/RUNTIME.md` §3.5）。
+- **消费**：云端 `run_streaming` 用后台线程按字节偏移跟随这个 JSONL（半行留给下一次），
+  `StepProgress` 把每条事件写进 `tasks.progress_json`，`drama-cloud task` 显示
+  `stage done/total`。
+
+### 8.3 复核发现与修复
+
+第四轮实施完、准备收口时做了交叉比对（「文档承诺 ↔ 代码事实 ↔ 测试覆盖」），
+前后两批共发现 5 个真实缺陷与 2 处过期。第一批：
+
+| 发现 | 判定 | 处置 |
+| --- | --- | --- |
+| 验签临时工作目录按「pid + 版本号」命名，同进程内两个并发验签用例会命中同一目录，先建后删互相踩（表现为随机 `NotFound`） | **真实缺陷（flaky 测试）** | 已修：工作目录名追加进程内单调序号；连跑 5 次 97 通过 |
+| `worker_capabilities` 把 `ffmpeg` / `ffprobe` 无条件写进能力集合——没装 ffmpeg 的机器也会声明「我会 ffmpeg」，只要求 `ffmpeg` 的步骤（如 `metadata.policy`）会被排进来再失败 | **真实缺陷**（与 C2 的能力路由原则矛盾） | 已修：`ffmpeg` / `ffprobe` 改为如实探测；部署侧确有其他手段时仍可用 `DRAMA_CLOUD_CAPABILITIES` 显式声明 |
+| `media.encode` 既没有能力探测、也没有编码前校验：配方选 h265/vp9/av1 或 mp3/opus 时，缺编码器要等 ffmpeg 跑到一半才报 `Unknown encoder`（分类还会被归成「参数不支持」，把排查引向错方向） | **真实缺口** | 已补双保险：能力探测钉住默认 `libx264` + 拼时间线用的基础滤镜；`ensure_encoders` 在编码前按**本次真正用到**的编码器（含音频、软字幕的 `mov_text`/`srt`）逐次核对，缺了以 `capability_missing` 列出缺哪个、属于什么用途 |
+| `ffmpeg_caps.py` 没有单测：图例行、缺分隔线的编码器清单、探测失败/非零退出这些「会误导路由」的输入全靠人工看 | 测试缺口 | 已补 `cloud/tests/test_ffmpeg_caps.py`：23 例（解析、缓存、失败即缺能力、能力路由、编码前预检、真实 ffmpeg 冒烟） |
+| 三处文档的云端测试数量停留在 147（README / cloud README / DEVELOPMENT） | 文档过期 | 已更新（当前 180） |
+
+接进度流时又交叉比对了一轮（「进度流接了没有？谁读？长任务还靠什么活着？」），
+再发现 2 个真实缺陷：
+
+| 发现 | 判定 | 处置 |
+| --- | --- | --- |
+| `Worker` 的心跳线程复用主线程创建的 SQLite 连接：sqlite3 默认 `check_same_thread=True`，跨线程用会抛 `ProgrammingError`，而心跳**故意吞掉**异常（心跳失败不该让 Worker 崩）→ 租约永远不会被续、长任务跑到租约到期就被判「Worker 失联」。实测确认：临时连接跨线程 `execute` 直接报 `SQLite objects created in a thread can only be used in that same thread` | **真实缺陷（长任务可靠性）**，且「没抛出来」骗过了所有既有测试 | 已修：心跳线程内懒建自己的连接（`Heartbeat._own_conn`），退出时关闭；新增回归测试**直接断言租约时间被推进**（把修复回退后该测试立刻失败，见 §8.4） |
+| Tier 3 的进度流只有「生产」没有「消费」：`dossier-inpaint` 侧能落 JSONL，但云端跑长任务时仍旧只写阶段名，界面上还是一个静止的 `RUNNING` | **能力未闭环**（比缺库更隐蔽：看起来做完了） | 已补：`run_streaming`（字节偏移跟随 + 半行丢弃）+ `StepProgress`（回调线程自建连接）+ CLI 进度显示；`--progress-json` 按 `--help` 探测，旧工具不认识就退回阶段级进度并写明 |
+
+### 8.4 第四轮最终验证
+
+| 检查 | 命令 | 结果 |
+| --- | --- | --- |
+| 格式 | `cargo fmt --all -- --check` | 通过 |
+| 静态检查 | `cargo clippy --offline -p dossier-core -p dossier-inpaint -p dossier-media -p dossier-runtime --all-targets -- -D warnings` | 通过 |
+| 核心单测 | `cargo test --offline -p dossier-core` | 68 通过 |
+| 擦除单测 | `cargo test --offline -p dossier-inpaint` | 94 + 5 通过（新增 3 例进度流：成功 / 无标识 / 失败终态） |
+| 后期单测 | `cargo test --offline -p dossier-media` | 60 通过（46 + 六个 `execute` 的执行分支 14） |
+| 运行时单测 | `cargo test --offline -p dossier-runtime` | 97 通过（连跑 5 次稳定） |
+| 云端测试 | `cd cloud && PYTHONPATH=src pytest -q` | 215 通过（180 + Tier 2 接线 20 + 能力路由/戳记 15） |
+| 模型 worker 测试 | `cd tools/model_worker && python -m unittest discover -s tests`（用装了 numpy/onnxruntime 的解释器） | 48 通过 |
+| 心跳续租回归（反向验证） | 把 `Heartbeat` 改回「复用主连接」后跑该用例 | **失败**（租约未推进），恢复修复后通过——证明这条测试真的钉住了缺陷 |
+| 擦除进度流实测（CLI） | `dossier-inpaint --progress-json …`（320x240@12fps 合成素材） | 7 条事件、seq 1–7、末条 `finished`，分母 72 = 实际帧数 |
+| 擦除进度流实测（云端，真实工具） | `video.inpaint` + `StepProgress` + 20ms 轮询 | 工具跑动期间抓到 `video.inpaint` 的 0/72 → 30/72 → 72/72，收尾事件写进处理日志 |
+| 后期执行入口实测（CLI） | `dossier-media speed --input tone.wav --output fast.wav --speed 1.5 --allow-pitch-shift --run` | 真的产出文件：2.00s 的 440Hz 单音 → **1.34s** |
+| 产物戳记端到端 | `dossier-inpaint`（320x240@12fps 合成素材）→ `dossier-artifacts check .` | 默认写出 `out.mp4.stamp.json`；`--no-stamp` 不写；校验输出「戳记 1 份…结论：一致」 |
+| 端到端演示（回归新模块未破坏旧链路） | `drama-cloud --home /tmp/ddcloud-demo demo` | 4 条配方全部 SUCCEEDED（门禁 9/9、9/9、10/10、9/9），幂等键验证通过 |
+| 镜头切点实测（真实工具 + 真实 ffmpeg） | `timeline.shots` 跑「黑→白」硬切素材（160x120@10fps） | 检出 ≥1 个候选切点并写出 `shots.json`；本机 `dossier-media` 确实声明 `media.shot.detect` |
+| 合成渲染实测（真实工具 + 真实 ffmpeg） | `video.render`（`texts=["第 1 集"]`）跑 320x240@10fps 合成素材 | 真的产出 `rendered.mp4`（27,600 字节）；本机 ffmpeg 有 `drawtext` 与 libass，故 `media.render.compose` / `media.render.subtitle_burn` 都声明为具备 |
+| 桌面命令层格式 | `rustfmt --edition 2021 --check src-tauri/src/*.rs` | 通过 |
+| 桌面壳编译 | `cargo check -p drama-dossier` | **无法执行**（缺 glib ≥ 2.70 / javascriptcoregtk-4.1，详见 §8.5） |
+
+### 8.5 仍然保持未实现 / 阻塞
+
+| 项 | 状态 | 原因 |
+| --- | --- | --- |
+| H1 云端 GPU 侧模型类处理 | 保持 `[ ]` | 本机 aarch64 无 GPU、无 torch 官方 wheel；Tier 1 的 GPU 判定分支用假探测结果测穿 |
+| H2 桌面客户端 | 保持 `[ ]` | glib 2.68 < 2.70、缺 `webkit2gtk-4.1`；本轮新增的两个 crate **没有接进 `src-tauri`**（新 IPC 命令无法在本机编译验证，所以不写不可验证的粘合代码） |
+| H3 macOS 签名与公证 | 保持 `[ ]` | 需 macOS 机器与开发者证书 |
+| H4 应用内更新通道 | 部分推进 | 「签名清单 + 验签 + 版本比较 + 组件级下载/校验/回滚」已实现并有单测；**发布通道（服务器、密钥托管）不在仓库内**，属明确不做 |
+| 浏览器自动化（自动登录/上传） | 不做 | 超出「技术学习」边界 |
+| 模型权重端到端推理 | 阻塞 | 权重体量大且不入库；`fetch_models.sh` + `manifest-gen` + `selfcheck` 可校验安装结果，但本机无法跑通推理 |
+
+### 8.6 本轮新增的残留局限
+
+- 同进程内对**同一路径**并发做原子写时，临时文件名（「目标名 + pid」）会互相覆盖；
+  当前设计是单写者（一个任务一个检查点/戳记），所以不影响使用，但要变成多写者需先改命名。
+- `dossier-runtime` 的凭据存储是「权限收紧的文件」，**不是** OS 钥匙串；
+  在能接入 keyring 的桌面上应替换实现（接口已在 `SecretStore` 收敛）。
+- 逐帧进度的「事后回看」：`tasks.progress_json` 是**单值**，会被后续阶段覆盖，
+  所以 done/total 只在运行期间可见；跑完之后要帧数请读 `inpaint_report.json`。
+  要保留全过程需要把进度改成「按阶段累积」的表（现在没做，因为收益只是回看）。
+- 进度分母是估计值（`时长 × 帧率` 按窗口截断）：素材不写时长时退化为「未知」，
+  此时分母等于已完成量、百分比恒为 100%。真实帧数上限修正只保证「不写出自相矛盾的
+  进度」，不保证第一次上报就准确。
+
+### 8.7 第五轮收口（Tier 1/2/3 的「最后一公里」）
+
+第四轮的库侧能力落地后，做了一次「文档承诺 ↔ 代码事实 ↔ 测试覆盖」的逐条对账，
+补的都是**接线**与**判定**，而不是新写一套实现。四处关键发现：
+
+| 发现 | 性质 | 处置 |
+| --- | --- | --- |
+| `docs/RUNTIME.md` §2.2 承诺 `--run` 会「真的执行」，但库层**没有执行入口**——只有 CLI 能跑，云端要么自己拼命令（等于第二套实现），要么接不上 | 文档与代码不符 + 能力未闭环 | 新增 `SeparatePlan::execute` / `AsrPlan::execute` / `TimeStretchPlan::execute` / `RegionFramePlan::execute` / `RecognizePlan::execute`（时间线类型的 `TimeStretchPlan` 亦在内），CLI 的 `--run` 与云端模块共用同一条路径；新增 14 个假 runner 单测 |
+| 产物戳记只有类型和规则、**没有生产端也没有消费端**：类型定义不算能力 | 能力未闭环 | `dossier-inpaint` 默认写 `<输出>.stamp.json`（`--no-stamp` / `--stamp-json`），新增 `dossier-artifacts check`（0/1/2 退出码）与云端 `artifacts check`（退出码原样透传）；戳记写失败**区分**「显式路径 → 失败」与「默认路径 → 告警」 |
+| `video_inpaint_model` 这类整机能力只能由部署方写 `DRAMA_CLOUD_CAPABILITIES` 声明，声明错了没人发现；`inpainter=worker` 仍能在无模型机器上通过计划校验 | 判定不可信（比缺库更隐蔽） | 能力改成**注册探测函数**（`register_capability`）：必须配了 worker，配了清单还要 `dossier-runtime check` 通过；参数相关的要求走 `ModuleSpec.dynamic_capabilities`，在**建任务时**拒绝 |
+| Tier 2 的「镜头切点」已有库实现（`dossier-media shots`）却**没有云端模块**：云端另有一套 ffmpeg 场景检测，结果只活在临时目录、不可审阅，`media.shot.detect` 这条能力标签也没人用 | 能力未接线 + 同一件事两份实现 | 新增 `timeline.shots`（`kind=plan`，`produces=shots`）：调库层 `shots --json`、产物登记成 `shot_list`、按 `media.shot.detect` 探测路由；本机实际跑通 |
+
+同轮还修掉两个**测试自身的缺陷**（都会让「绿灯」失去意义）：
+
+- `crates/dossier-media/src/timestretch.rs` 的三个执行用例共用同一个「进程号命名」的临时目录，
+  用例并行跑且上一次运行的文件会留下，于是「断言输出不存在」的用例被别的用例写下的文件带跑
+  （实测复现：`execute_fails_when_the_output_is_missing` panic）。改为**每次调用唯一路径**。
+- 云端 `tests/test_late_stage.py` 有四条用例的夹具写错了（假工具产出**空文件**、
+  「缺工具」场景实际回落到仓库里真实构建的工具），导致断言对象根本不是被测行为。
+  已改为「夹具真的产出非空文件」+ 显式掐断工具解析，并把「无帧」与「缺工具」拆成两条用例
+  （前者 `internal`，后者 `capability_missing`）。
+
+另外补了一条分类规则：`dossier-media` 因依赖命令缺失而以 **127** 退出时归
+`capability_missing`（从前会被归到别的类别并触发无效重试）。

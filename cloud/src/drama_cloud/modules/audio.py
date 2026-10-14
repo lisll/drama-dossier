@@ -16,6 +16,7 @@ from ..base import StrictModel
 from ..errors import WorkError, ErrorClass
 from ..recipes.registry import ModuleSpec, register
 from .ffmpeg import MediaContext, run
+from .ffmpeg_caps import requires_filters
 
 
 class EqBand(StrictModel):
@@ -147,5 +148,9 @@ register(
         produces=frozenset({"audio_filters"}),
         params_model=AudioQualityParams,
         implement=implement_audio_quality,
+        # C7 的音轨处理链：测量、均衡、压缩、响度归一化、声道布局。
+        capability_probe=requires_filters(
+            "loudnorm", "equalizer", "acompressor", "dynaudnorm", "aformat"
+        ),
     )
 )

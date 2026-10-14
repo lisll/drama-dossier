@@ -15,13 +15,15 @@ use std::sync::{Arc, Mutex};
 
 use clap::Parser;
 
+use dossier_core::checkpoint::{input_fingerprint, ArtifactRef};
+use dossier_core::pipeline_version::{pipeline_version, ArtifactStamp, ToolStamp, ERASE_PIPELINE};
 use dossier_inpaint::detect::{
     FixedRoiDetector, FixedRoisDetector, TextDetector, WorkerConfig, WorkerTextDetector,
 };
 use dossier_inpaint::frames::{FfmpegConfig, FfmpegFrameSink, FfmpegFrameSource};
 use dossier_inpaint::inpaint::{ColumnFillInpainter, Inpainter, WorkerInpainter};
 use dossier_inpaint::mask::MaskRect;
-use dossier_inpaint::pipeline::{run_pipeline, PipelineConfig};
+use dossier_inpaint::pipeline::{run_pipeline, PipelineConfig, ProgressStream};
 use dossier_inpaint::probe::probe_video;
 use dossier_inpaint::verify::{Verdict, VerifyConfig};
 use dossier_inpaint::worker::WorkerSession;
@@ -183,6 +185,20 @@ struct Args {
     /// 处理日志（结构化 JSON）输出路径；缺省写到 `<输出>.inpaint-report.json`
     #[arg(long)]
     report_json: Option<PathBuf>,
+    /// 产物戳记（管线版本 / 工具版本 / 参数与输入摘要）输出路径；
+    /// 缺省写到 `<输出>.stamp.json`。给定了这个路径时写入失败会让整次执行失败。
+    #[arg(long)]
+    stamp_json: Option<PathBuf>,
+    /// 不写产物戳记。默认**写**：没有戳记，事后就无法回答「这批产物是不是同一套流程出的」。
+    #[arg(long)]
+    no_stamp: bool,
+    /// 进度流输出路径（JSONL，覆盖写）。
+    ///
+    /// 擦除是逐帧长任务，只靠 stdout 看不到「跑到哪了」。给出这个路径后，管线会把
+    /// 「定位 / 修复」两个阶段与逐片段计数按 `dossier-core` 的进度格式追加写进去，
+    /// 桌面端与云端 tail 这个文件即可显示真实进度；进程被 kill 也只丢最后半行。
+    #[arg(long)]
+    progress_json: Option<PathBuf>,
 }
 
 fn parse_roi(value: &str) -> Result<MaskRect, String> {
@@ -298,6 +314,19 @@ fn run(args: &Args) -> Result<ExitCode, String> {
     if let (Some(start), Some(end)) = (start_frame, end_frame) {
         println!("处理窗口：帧 [{start}, {end})");
     }
+    let progress = args.progress_json.clone().map(|path| ProgressStream {
+        path,
+        task_id: args
+            .output
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "dossier-inpaint".to_string()),
+        pipeline: ERASE_PIPELINE.to_string(),
+        est_total_frames: estimate_window_frames(info.duration_sec, fps, start_frame, end_frame),
+    });
+    if let Some(progress) = &progress {
+        println!("进度流：{}", progress.path.display());
+    }
 
     let config = PipelineConfig {
         clip_frames: args.clip_frames,
@@ -313,6 +342,7 @@ fn run(args: &Args) -> Result<ExitCode, String> {
         temporal_smooth: args.temporal_smooth,
         start_frame,
         end_frame,
+        progress,
         ..Default::default()
     };
 
@@ -425,6 +455,27 @@ fn run(args: &Args) -> Result<ExitCode, String> {
     }
 
     println!("输出：{}", args.output.display());
+    if !args.no_stamp {
+        match write_stamp(
+            args,
+            &info,
+            fps,
+            start_frame,
+            end_frame,
+            &report_path,
+            lossless_intermediate,
+        ) {
+            Ok(path) => println!("产物戳记：{}", path.display()),
+            Err(message) if args.stamp_json.is_some() => {
+                return Err(format!("产物戳记写入失败：{message}"));
+            }
+            Err(message) => {
+                // 默认路径写不进去（例如输出目录只读）不该把已经跑完的擦除判成失败，
+                // 但必须让调用方看见——静默丢戳记会让「产物一致性校验」变成一句空话。
+                eprintln!("警告：产物戳记写入失败：{message}（本次产物没有版本戳记）");
+            }
+        }
+    }
     if args.keep_temp {
         println!("中间文件保留在：{}", temp_dir.display());
     } else {
@@ -459,6 +510,123 @@ fn print_verification(report: &dossier_inpaint::pipeline::PipelineReport) {
             "  - [{:?}] {}：{}",
             issue.severity, issue.code, issue.message
         );
+    }
+}
+
+/// 写产物戳记（`<输出>.stamp.json`）：回答「这份产物是哪套管线、哪个版本、哪组参数、
+/// 哪份输入跑出来的」。参数摘要覆盖所有会改变画面结果的开关——漏掉一个，
+/// 两次参数不同的跑批就会被判成「同一套参数」，戳记也就失去了意义。
+fn write_stamp(
+    args: &Args,
+    info: &dossier_inpaint::probe::VideoInfo,
+    fps: f64,
+    start_frame: Option<u64>,
+    end_frame: Option<u64>,
+    report_path: &std::path::Path,
+    lossless_intermediate: bool,
+) -> Result<PathBuf, String> {
+    let version = pipeline_version(ERASE_PIPELINE).ok_or_else(|| {
+        format!("管线 {ERASE_PIPELINE} 没有登记版本（内部错误：请检查 pipeline_version）")
+    })?;
+    let task_id = args
+        .output
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "dossier-inpaint".to_string());
+    let source = ArtifactRef::capture(&args.input)
+        .map_err(|error| format!("无法读取输入素材摘要：{error}"))?;
+    let regions: Vec<String> = args
+        .roi
+        .iter()
+        .map(|rect| format!("{},{},{},{}", rect.x, rect.y, rect.width, rect.height))
+        .collect();
+    let params = input_fingerprint(&[
+        ("detector", args.detector.as_str()),
+        ("inpainter", args.inpainter.as_str()),
+        ("roi", regions.join(";").as_str()),
+        ("start_frame", &start_frame.unwrap_or(0).to_string()),
+        (
+            "end_frame",
+            &end_frame.map(|e| e.to_string()).unwrap_or_default(),
+        ),
+        ("temporal_smooth", &args.temporal_smooth.to_string()),
+        ("region_pad", &args.region_pad.to_string()),
+        (
+            "region_group_area_ratio",
+            &args.region_group_area_ratio.to_string(),
+        ),
+        ("clip_frames", &args.clip_frames.to_string()),
+        ("probe_frames", &args.probe_frames.to_string()),
+        ("dilate", &args.dilate.to_string()),
+        ("feather", &args.feather.to_string()),
+        ("context", &args.context.to_string()),
+        ("min_score", &args.min_score.to_string()),
+        ("vcodec", args.vcodec.as_str()),
+        ("crf", &args.crf.to_string()),
+        ("preset", args.preset.as_str()),
+        ("tune", args.tune.as_deref().unwrap_or("")),
+        ("pix_fmt", args.pix_fmt.as_str()),
+        (
+            "intermediate",
+            if lossless_intermediate {
+                "lossless"
+            } else {
+                "delivery"
+            },
+        ),
+        ("fps", &fps.to_string()),
+        ("size", &format!("{}x{}", info.size.width, info.size.height)),
+        ("verify", if args.no_verify { "off" } else { "on" }),
+        (
+            "verify_thresholds",
+            &input_fingerprint(&[
+                (
+                    "residual_warn",
+                    &args.verify_residual_ratio_warn.to_string(),
+                ),
+                (
+                    "residual_fail",
+                    &args.verify_residual_ratio_fail.to_string(),
+                ),
+                ("flicker_warn", &args.verify_flicker_warn.to_string()),
+                ("flicker_fail", &args.verify_flicker_fail.to_string()),
+                ("seam_warn", &args.verify_seam_warn.to_string()),
+                ("seam_fail", &args.verify_seam_fail.to_string()),
+                ("psnr_warn", &args.verify_psnr_warn.to_string()),
+                ("psnr_fail", &args.verify_psnr_fail.to_string()),
+                ("ssim_warn", &args.verify_ssim_warn.to_string()),
+                ("ssim_fail", &args.verify_ssim_fail.to_string()),
+            ]),
+        ),
+    ]);
+    let program = std::env::current_exe()
+        .ok()
+        .map(|path| path.display().to_string());
+    let mut stamp = ArtifactStamp::new(ERASE_PIPELINE, version, task_id, params)
+        .with_tool(ToolStamp {
+            name: "dossier-inpaint".to_string(),
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            program,
+        })
+        .with_inputs(vec![source.sha256.clone()]);
+    stamp
+        .add_output(&args.output)
+        .map_err(|error| error.to_string())?;
+    if report_path.is_file() {
+        stamp
+            .add_output(report_path)
+            .map_err(|error| error.to_string())?;
+    }
+    // 戳记本身也要自洽（管线已登记、版本一致、有产物），否则写下去只会误导下游。
+    stamp.validate().map_err(|error| error.to_string())?;
+    match &args.stamp_json {
+        Some(path) => {
+            stamp.save(path).map_err(|error| error.to_string())?;
+            Ok(path.clone())
+        }
+        None => stamp
+            .save_next_to(&args.output)
+            .map_err(|error| error.to_string()),
     }
 }
 
@@ -507,6 +675,25 @@ fn frame_window(args: &Args, fps: f64) -> Result<(Option<u64>, Option<u64>), Str
         end = Some(base + (duration * fps).round().max(1.0) as u64);
     }
     Ok((start, end))
+}
+
+/// 修复阶段的帧数估计：`时长 × 帧率` 再按处理窗口截断。
+///
+/// 只是进度条的分母，不是「必须处理多少帧」的断言：真实帧数超过它时，管线会把分母
+/// 跟着实际进度一起抬高（见 `pipeline::inpaint_total`），所以估偏小不会让进度卡住。
+/// 素材没写时长时返回 0，表示「总量未知」。
+fn estimate_window_frames(
+    duration_sec: f64,
+    fps: f64,
+    start_frame: Option<u64>,
+    end_frame: Option<u64>,
+) -> u64 {
+    if !duration_sec.is_finite() || duration_sec <= 0.0 || !fps.is_finite() || fps <= 0.0 {
+        return 0;
+    }
+    let total = (duration_sec * fps).round() as u64;
+    let window_end = end_frame.map(|end| end.min(total)).unwrap_or(total);
+    window_end.saturating_sub(start_frame.unwrap_or(0))
 }
 
 /// 需要 worker 会话时启动一个常驻进程；否则返回 `None` 走一次性后端。
@@ -682,5 +869,40 @@ mod desktop_entry_tests {
         let help = Args::try_parse_from(["dossier-inpaint", "--help"]).expect_err("--help 应短路");
         assert!(!help.use_stderr(), "--help 不应写入 stderr");
         assert_eq!(super::parse_error_exit_code(&help), ExitCode::SUCCESS);
+    }
+
+    /// `--progress-json` 缺省为空：不写进度文件，也不该因此改动任何既有行为。
+    #[test]
+    fn progress_json_is_optional_and_parses_when_given() {
+        let args = parse(&request());
+        assert_eq!(args.progress_json, None);
+
+        let args = Args::try_parse_from([
+            "dossier-inpaint",
+            "--input",
+            "/tmp/in.mp4",
+            "--output",
+            "/tmp/out.mp4",
+            "--progress-json",
+            "/tmp/out.progress.jsonl",
+        ])
+        .expect("--progress-json 应被接受");
+        assert_eq!(
+            args.progress_json,
+            Some(PathBuf::from("/tmp/out.progress.jsonl"))
+        );
+    }
+
+    /// 进度分母的估计规则：按窗口截断、素材无时长时退化为「未知（0）」。
+    #[test]
+    fn frame_estimate_respects_the_processing_window() {
+        use super::estimate_window_frames;
+        assert_eq!(estimate_window_frames(10.0, 25.0, None, None), 250);
+        assert_eq!(estimate_window_frames(10.0, 25.0, Some(50), None), 200);
+        assert_eq!(estimate_window_frames(10.0, 25.0, Some(50), Some(100)), 50);
+        // 窗口末端超过素材总帧数时按总帧数截断，不虚报分母。
+        assert_eq!(estimate_window_frames(10.0, 25.0, None, Some(9999)), 250);
+        assert_eq!(estimate_window_frames(0.0, 25.0, None, None), 0);
+        assert_eq!(estimate_window_frames(10.0, 0.0, None, None), 0);
     }
 }

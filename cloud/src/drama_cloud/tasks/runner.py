@@ -55,11 +55,16 @@ class Heartbeat:
 
     def __init__(self, worker: "Worker", conn, task_id: str):
         self.worker = worker
-        self.conn = conn
+        # `conn` 只是签名兼容：心跳**不能**用主连接（见下方 `_own_conn` 的说明）。
         self.task_id = task_id
         self.stop_event = threading.Event()
         self.lost = False
         self._thread = threading.Thread(target=self._loop, name="heartbeat", daemon=True)
+        #: 心跳线程自己的连接。**不能**复用 Worker 的主连接：sqlite3 的连接默认
+        #: 只能被创建它的线程使用，跨线程用会抛 ProgrammingError——而这里必须吞掉
+        #: 异常（心跳失败不该让 Worker 崩），于是租约会被静默放任过期，
+        #: 长任务跑到一半就被判成「Worker 失联」。所以线程内自建连接，退出时关掉。
+        self._own_conn = None
 
     def __enter__(self) -> "Heartbeat":
         self._thread.start()
@@ -68,16 +73,75 @@ class Heartbeat:
     def __exit__(self, *exc) -> None:
         self.stop_event.set()
         self._thread.join(timeout=2.0)
+        if self._own_conn is not None:
+            try:
+                self._own_conn.close()
+            except Exception:
+                pass
+            self._own_conn = None
 
     def _loop(self) -> None:
         interval = max(1.0, float(self.worker.settings.heartbeat_seconds))
         while not self.stop_event.wait(interval):
             try:
-                if not self.worker.queue.heartbeat(self.conn, self.task_id, self.worker.worker_id):
+                if self._own_conn is None:
+                    self._own_conn = connect(self.worker.settings)
+                if not self.worker.queue.heartbeat(
+                    self._own_conn, self.task_id, self.worker.worker_id
+                ):
                     self.lost = True
                     return
             except Exception:  # 心跳失败不让 Worker 崩溃；由租约过期兜底
                 continue
+
+
+class StepProgress:
+    """把一个长步骤的进度事件写进任务进度（`tasks.progress_json`）。
+
+    为什么需要它：擦除这类逐帧步骤只靠「阶段开始 / 阶段结束」两条记录，界面上就是
+    一个静止的 `RUNNING`；工具已经按 JSONL 报出真实帧数，把它落到任务上才算长任务进度。
+
+    为什么在回调里开自己的连接：回调发生在跟随进度文件的后台线程上。SQLite 连接默认
+    只能被创建它的线程使用，借用主连接会抛 `ProgrammingError`——这正是心跳线程先前
+    静默失效的同一个坑。连接在回调线程内懒建（`threading.local`），步骤结束统一关闭。
+    """
+
+    def __init__(self, settings, task_id: str, stage: str, index: int, total: int,
+                 steps: Sequence[StepOutcome]):
+        self._settings = settings
+        self._task_id = task_id
+        self._stage = stage
+        self._index = index
+        self._total = total
+        self._steps = steps
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self._connections: List = []
+
+    def __call__(self, event: dict) -> None:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = connect(self._settings)
+            self._local.conn = conn
+            with self._lock:
+                self._connections.append(conn)
+        payload = {
+            "stage": self._stage,
+            "index": self._index,
+            "total": self._total,
+            "steps": [s.__dict__ for s in self._steps],
+            "progress": event,
+        }
+        set_progress(conn, self._task_id, payload)
+
+    def close(self) -> None:
+        with self._lock:
+            connections, self._connections = self._connections, []
+        for conn in connections:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 class Worker:
@@ -276,7 +340,17 @@ class Worker:
             if not reused:
                 spec = get_module(module)
                 params = spec.params_model.model_validate(step.get("params") or {})
-                spec.implement(context, params)
+                sink = StepProgress(
+                    self.settings, task["id"], module, index, len(plan_steps), outcomes
+                )
+                context.progress_hook = sink
+                try:
+                    spec.implement(context, params)
+                finally:
+                    # 订阅只在这个步骤内有效：下一个模块可能根本不产出进度，
+                    # 留着旧钩子会让它的进度写进上一个阶段的名字。
+                    context.progress_hook = None
+                    sink.close()
                 self._write_checkpoint(conn, task, step, context)
             outcomes.append(
                 StepOutcome(step["id"], module, "reused" if reused else "executed",

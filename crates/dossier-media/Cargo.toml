@@ -1,0 +1,18 @@
+[package]
+name = "dossier-media"
+version = "0.1.0"
+edition = "2021"
+description = "Media post-production adapters for drama-dossier (剧备): source separation, time-stretch/pitch, ASR, OCR text recognition, shot boundary detection and ffmpeg-based compositing/render."
+license = "MIT"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4", features = ["derive"] }
+dossier-runtime = { path = "../dossier-runtime" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[[bin]]
+name = "dossier-media"
+path = "src/main.rs"

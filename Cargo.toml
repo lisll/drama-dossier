@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/dossier-core", "crates/dossier-inpaint", "src-tauri"]
+members = [
+    "crates/dossier-core",
+    "crates/dossier-inpaint",
+    "crates/dossier-media",
+    "crates/dossier-runtime",
+    "src-tauri",
+]
 
 [workspace.package]
 version = "0.1.0"

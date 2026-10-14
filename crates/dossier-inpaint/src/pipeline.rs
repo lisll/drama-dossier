@@ -13,7 +13,9 @@
 //! 窗口外帧原样输出，既省算力也避免对无标识画面做无谓重编码。
 
 use std::io;
+use std::path::PathBuf;
 
+use dossier_core::progress::{ProgressError, ProgressEventKind, ProgressRecorder, TaskProgress};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -26,6 +28,45 @@ use crate::inpaint::{union_masks, Inpainter};
 use crate::mask::{feather, BinaryMask, FrameSize, MaskRect};
 use crate::patch::{crop_roi, paste_roi, ClipPatch};
 use crate::verify::{Verifier, VerifyConfig, VerifyReport};
+
+/// 进度流的阶段总数（`stage_index` 从 0 开始）：0 = 定位，1 = 修复。
+///
+/// 为什么只有两段：逐帧校验是**跟着修复一起做**的（每个片段修完立即度量），
+/// 封装与裁决在 `main.rs` 里、管线之外，所以不在这里虚报第三个阶段。
+pub const PROGRESS_STAGE_TOTAL: u32 = 2;
+
+/// 定位阶段在进度流里的序号与名字（0）。
+pub const LOCATE_STAGE: u32 = 0;
+/// 定位阶段的阶段名。
+pub const LOCATE_STAGE_NAME: &str = "locate";
+/// 修复阶段在进度流里的序号与名字（1）。
+pub const INPAINT_STAGE: u32 = 1;
+/// 修复阶段的阶段名。
+pub const INPAINT_STAGE_NAME: &str = "inpaint";
+
+/// 进度流落点与身份（Tier 3：长任务进度流）。
+///
+/// 擦除是逐帧长任务，跑到一半时使用者只能看到一个静止的 `RUNNING`。给一个文件路径后，
+/// 管线会把「定位 / 修复」两个阶段与逐片段进度按 `dossier-core::progress` 的 JSONL 格式
+/// 追加写进去：桌面端与云端 tail 这个文件就能显示真实进度，进程被杀也只丢最后半行。
+///
+/// **默认不写**（`None`）：不产生任何行为变化，也不需要额外的文件权限。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgressStream {
+    /// JSONL 输出路径；每次运行**覆盖**（同一次运行的进度只有一份）。
+    pub path: PathBuf,
+    /// 任务标识（云端是 task id，桌面端可以是输出文件名）。
+    pub task_id: String,
+    /// 管线标识，例如 `drama.logo.erase`。
+    pub pipeline: String,
+    /// 修复阶段的**帧数估计**（单位 = 帧），由调用方按 `时长 × 帧率` 与处理窗口算出。
+    ///
+    /// 为什么是估计：擦除按时间顺序流式读帧，开始前拿不到真实帧数（`nb_frames` 大量素材
+    /// 不写）。估计值只用来算百分比分母，**偏小不会让进度失真**——管线每次上报都用
+    /// `max(估计, 实际已完成)` 当分母，所以真实帧数超过估计时进度条继续正常增长，
+    /// 不会卡在 100% 也不会写出一条自相矛盾的进度（`0` 表示完全未知）。
+    pub est_total_frames: u64,
+}
 
 /// 可读取的帧源。
 pub trait FrameSource {
@@ -80,6 +121,8 @@ pub struct PipelineConfig {
     /// 默认 2.0：合并浪费的面积只有在「不超过各自独立处理之和的两倍」时才划算。
     /// `<= 1.0` 表示不分组（整个外接 ROI 一次送模型），等于旧行为。
     pub region_group_area_ratio: f64,
+    /// 进度流（`None` = 不写）。见 [`ProgressStream`]。
+    pub progress: Option<ProgressStream>,
 }
 
 impl Default for PipelineConfig {
@@ -99,6 +142,7 @@ impl Default for PipelineConfig {
             start_frame: None,
             end_frame: None,
             region_group_area_ratio: 2.0,
+            progress: None,
         }
     }
 }
@@ -218,6 +262,101 @@ pub enum PipelineError {
     Config(String),
     #[error("输出校验失败：{0}")]
     Verify(String),
+    #[error("进度流写入失败：{0}")]
+    Progress(#[from] ProgressError),
+}
+
+/// 写一条进度事件；没有配进度流时是空操作。
+#[allow(clippy::too_many_arguments)]
+fn record_progress(
+    recorder: &mut Option<ProgressRecorder>,
+    stream: Option<&ProgressStream>,
+    kind: ProgressEventKind,
+    stage_index: u32,
+    stage: &str,
+    unit_done: u64,
+    unit_total: u64,
+    message: &str,
+) -> Result<(), PipelineError> {
+    let (Some(recorder), Some(stream)) = (recorder.as_mut(), stream) else {
+        return Ok(());
+    };
+    let mut item = TaskProgress::new(
+        stream.task_id.clone(),
+        stream.pipeline.clone(),
+        stage,
+        stage_index,
+        PROGRESS_STAGE_TOTAL,
+    )
+    .with_units(unit_done, unit_total);
+    if !message.is_empty() {
+        item = item.with_message(message);
+    }
+    recorder.record(kind, &item)?;
+    Ok(())
+}
+
+/// 修复阶段的分母：估计值与实际已完成帧数取大，再用 1 兜底。
+///
+/// 这样「估计偏小」只会让分母随真实进度一起涨，绝不会写出 `unit_done > unit_total`
+/// 这类会被 `ProgressRecorder` 直接拒收的事件。
+fn inpaint_total(stream: Option<&ProgressStream>, done: u64) -> u64 {
+    let estimate = stream.map(|item| item.est_total_frames).unwrap_or(0);
+    estimate.max(done).max(1)
+}
+
+/// 没有可修复区域时的收尾：把进度流推到底，否则文件会永远停在「运行中」。
+///
+/// `done` 用真实写出的帧数（`copy_through` 也是逐帧输出，只是没改像素）。
+fn finish_without_inpaint(
+    recorder: &mut Option<ProgressRecorder>,
+    stream: Option<&ProgressStream>,
+    done: u64,
+    reason: &str,
+) -> Result<(), PipelineError> {
+    let total = inpaint_total(stream, done);
+    record_progress(
+        recorder,
+        stream,
+        ProgressEventKind::Progress,
+        INPAINT_STAGE,
+        INPAINT_STAGE_NAME,
+        done,
+        total,
+        reason,
+    )?;
+    record_progress(
+        recorder,
+        stream,
+        ProgressEventKind::Finished,
+        INPAINT_STAGE,
+        INPAINT_STAGE_NAME,
+        done,
+        total,
+        reason,
+    )
+}
+
+/// 每处理完一个片段上报一次。
+///
+/// 单位是「已输出帧数」而不是「已处理片段数」：片段长度会变（尾部残片、离开时间窗的
+/// 冲刷），按帧数上报才能和定位阶段、和最终报告里的 `framesOut` 对得上。
+fn clip_progress(
+    recorder: &mut Option<ProgressRecorder>,
+    stream: Option<&ProgressStream>,
+    report: &PipelineReport,
+) -> Result<(), PipelineError> {
+    let total = inpaint_total(stream, report.frames_out);
+    record_progress(
+        recorder,
+        stream,
+        ProgressEventKind::Progress,
+        INPAINT_STAGE,
+        INPAINT_STAGE_NAME,
+        report.frames_out,
+        total,
+        "片段修复完成",
+    )
 }
 
 /// 一个「裁剪—修复」作业：一组标识共用的 ROI 与其内部区域。
@@ -296,8 +435,12 @@ fn plan_roi_jobs(
 /// 执行完整管线。
 ///
 /// `reopen` 会在定位与修复两遍各调用一次，用于重新打开同一个视频源。
+///
+/// 配了 [`PipelineConfig::progress`] 时，全过程按 `dossier-core` 的 JSONL 进度格式落盘：
+/// `locate`（逐帧检测）与 `inpaint`（逐片段修复）两个阶段，每处理完一个片段追加一条，
+/// 进程被杀也只丢最后半行。
 pub fn run_pipeline<S, F>(
-    mut reopen: F,
+    reopen: F,
     sink: &mut dyn FrameSink,
     size: FrameSize,
     detector: &dyn TextDetector,
@@ -309,6 +452,51 @@ where
     S: FrameSource,
 {
     config.validate()?;
+    let stream = config.progress.as_ref();
+    // 覆盖写：一次运行对应一份进度。给了路径却建不出文件属于配置问题，显式失败。
+    let mut recorder = match stream {
+        Some(item) => Some(ProgressRecorder::create(&item.path)?),
+        None => None,
+    };
+
+    let result = run_pipeline_inner(
+        reopen,
+        sink,
+        size,
+        detector,
+        inpainter,
+        config,
+        &mut recorder,
+        stream,
+    );
+
+    // 失败也必须留下终态，否则 tailer 会一直以为任务在跑；但这条写入是尽力而为——
+    // 需要保留的错误是管线错误本身，不能被「进度文件写不进去」顶替掉。
+    if result.is_err() {
+        if let Some(active) = recorder.as_mut() {
+            if let Some(last) = active.last_event().map(|event| event.progress.clone()) {
+                let _ = active.record(ProgressEventKind::Failed, &last);
+            }
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_pipeline_inner<S, F>(
+    mut reopen: F,
+    sink: &mut dyn FrameSink,
+    size: FrameSize,
+    detector: &dyn TextDetector,
+    inpainter: &dyn Inpainter,
+    config: &PipelineConfig,
+    recorder: &mut Option<ProgressRecorder>,
+    stream: Option<&ProgressStream>,
+) -> Result<PipelineReport, PipelineError>
+where
+    F: FnMut() -> io::Result<S>,
+    S: FrameSource,
+{
     let mut report = PipelineReport::default();
 
     // ---- 第一遍：确定标识区域（显式区域优先） ----
@@ -319,7 +507,27 @@ where
         .filter(|rect| !rect.is_empty())
         .collect();
 
-    if regions.is_empty() {
+    // 定位阶段的单位是「采样的帧数」；显式给了区域就只剩一个单元（解析区域）。
+    let auto_locate = regions.is_empty();
+    let locate_units = if auto_locate {
+        config.probe_frames.max(1) as u64
+    } else {
+        1
+    };
+    record_progress(
+        recorder,
+        stream,
+        ProgressEventKind::Started,
+        LOCATE_STAGE,
+        LOCATE_STAGE_NAME,
+        0,
+        locate_units,
+        "定位标识区域",
+    )?;
+
+    if auto_locate {
+        // 每 1/10 阶段上报一次：逐帧检测是最慢的一段，只在首尾上报会看起来像卡死。
+        let step = (locate_units / 10).max(1);
         let mut source = reopen()?;
         let mut samples: Vec<Vec<TextBox>> = Vec::new();
         let mut index = 0_u64;
@@ -333,6 +541,18 @@ where
                 samples.push(filter_by_score(boxes, config.detect_min_score));
             }
             index += 1;
+            if index.is_multiple_of(step) {
+                record_progress(
+                    recorder,
+                    stream,
+                    ProgressEventKind::Progress,
+                    LOCATE_STAGE,
+                    LOCATE_STAGE_NAME,
+                    samples.len() as u64,
+                    locate_units,
+                    "逐帧检测标识",
+                )?;
+            }
         }
         drop(source);
         regions = stable_rois(&samples, &config.reliability)
@@ -342,9 +562,31 @@ where
             .collect();
     }
 
+    let locate_done_message = if auto_locate {
+        format!("聚合出 {} 个标识区域", regions.len())
+    } else {
+        "使用显式区域，跳过自动定位".to_string()
+    };
+    record_progress(
+        recorder,
+        stream,
+        ProgressEventKind::Progress,
+        LOCATE_STAGE,
+        LOCATE_STAGE_NAME,
+        locate_units,
+        locate_units,
+        &locate_done_message,
+    )?;
+
     if regions.is_empty() {
         // 没检测到标识：原样输出
         copy_through(reopen()?, sink, &mut report)?;
+        finish_without_inpaint(
+            recorder,
+            stream,
+            report.frames_out,
+            "未检测到标识，全部帧原样输出",
+        )?;
         return Ok(report);
     }
     report.regions = regions.clone();
@@ -357,6 +599,12 @@ where
         Some(roi) => roi,
         None => {
             copy_through(reopen()?, sink, &mut report)?;
+            finish_without_inpaint(
+                recorder,
+                stream,
+                report.frames_out,
+                "标识区域无法形成有效 ROI，全部帧原样输出",
+            )?;
             return Ok(report);
         }
     };
@@ -372,6 +620,12 @@ where
     );
     if jobs.is_empty() {
         copy_through(reopen()?, sink, &mut report)?;
+        finish_without_inpaint(
+            recorder,
+            stream,
+            report.frames_out,
+            "未形成有效修复作业，全部帧原样输出",
+        )?;
         return Ok(report);
     }
     report.roi_jobs = jobs.len() as u64;
@@ -384,6 +638,16 @@ where
     };
 
     // ---- 第二遍：逐帧掩码 + 逐片段修复 ----
+    record_progress(
+        recorder,
+        stream,
+        ProgressEventKind::Started,
+        INPAINT_STAGE,
+        INPAINT_STAGE_NAME,
+        0,
+        inpaint_total(stream, 0),
+        "逐片段修复",
+    )?;
     let mut source = reopen()?;
     let mut clip: Vec<FrameBuffer> = Vec::with_capacity(config.clip_frames);
     let mut coverage_sum = 0.0;
@@ -408,6 +672,7 @@ where
                     verifier.as_mut(),
                 )?;
                 clip.clear();
+                clip_progress(recorder, stream, &report)?;
             }
             if let Some(verifier) = verifier.as_mut() {
                 verifier.reset_temporal();
@@ -436,6 +701,7 @@ where
                 verifier.as_mut(),
             )?;
             clip.clear();
+            clip_progress(recorder, stream, &report)?;
         }
     }
     if !clip.is_empty() {
@@ -453,12 +719,23 @@ where
             &mut coverage_sum,
             verifier.as_mut(),
         )?;
+        clip_progress(recorder, stream, &report)?;
     }
 
     if report.inpainted_clips > 0 {
         report.mean_mask_coverage = coverage_sum / report.inpainted_clips as f64;
     }
     report.verification = verifier.map(|verifier| verifier.finish());
+    record_progress(
+        recorder,
+        stream,
+        ProgressEventKind::Finished,
+        INPAINT_STAGE,
+        INPAINT_STAGE_NAME,
+        report.frames_out,
+        inpaint_total(stream, report.frames_out),
+        "擦除完成",
+    )?;
     Ok(report)
 }
 
@@ -668,7 +945,7 @@ fn copy_through<S: FrameSource>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::detect::{DetectError, FixedRoiDetector, TextBox};
+    use crate::detect::{DetectError, FixedRoiDetector, FixedRoisDetector, TextBox};
     use crate::frames::{frame_bytes, FrameReader, CHANNELS};
     use crate::inpaint::{ColumnFillInpainter, InpaintError, Inpainter};
     use crate::verify::{Verdict, VerifyConfig};
@@ -1615,5 +1892,176 @@ mod tests {
         assert!(dest.get(10, 20), "作业原点应平移到并集坐标系");
         assert!(dest.get(17, 23), "作业右下角也应平移");
         assert!(!dest.get(0, 0), "作业之外不应被涂上");
+    }
+
+    fn progress_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "dossier-inpaint-progress-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn progress_stream(path: &std::path::Path, est_total_frames: u64) -> ProgressStream {
+        ProgressStream {
+            path: path.to_path_buf(),
+            task_id: "ep01".into(),
+            pipeline: "drama.logo.erase".into(),
+            est_total_frames,
+        }
+    }
+
+    /// 成功路径：两阶段、seq 连续、阶段不回退、逐片段计数单调，最后落到终态。
+    #[test]
+    fn progress_stream_records_two_stages_and_ends_terminal() {
+        let dir = progress_dir("ok");
+        let path = dir.join("progress.jsonl");
+        let size = FrameSize::new(64, 48);
+        let bar = MaskRect::new(8, 36, 48, 6);
+        let data = synthetic_video(size, 10, bar);
+        let detector = FixedRoiDetector::new(bar);
+        let config = PipelineConfig {
+            clip_frames: 4,
+            probe_frames: 5,
+            context_scale: 2.0,
+            mask_dilate: 1,
+            feather_radius: 1,
+            progress: Some(progress_stream(&path, 10)),
+            ..Default::default()
+        };
+        let (report, _) = run(&data, size, &detector, &config);
+        assert_eq!(report.frames_out, 10);
+
+        let log = dossier_core::progress::load_progress_log(&path).unwrap();
+        assert_eq!(log.skipped_lines, 0);
+        assert!(!log.truncated_tail);
+        assert!(log.is_terminal(), "跑完必须留下终态");
+        assert_eq!(log.events[0].kind, ProgressEventKind::Started);
+        assert_eq!(log.events[0].progress.stage, LOCATE_STAGE_NAME);
+        assert_eq!(log.events[0].progress.task_id, "ep01");
+        assert_eq!(log.events[0].progress.pipeline, "drama.logo.erase");
+
+        let mut stage = 0;
+        let mut done = 0;
+        for (index, event) in log.events.iter().enumerate() {
+            assert_eq!(event.seq, index as u64 + 1, "seq 必须连续递增");
+            assert!(event.progress.stage_index >= stage, "阶段序号不允许回退");
+            if event.progress.stage_index > stage {
+                stage = event.progress.stage_index;
+                done = 0;
+            }
+            if event.kind == ProgressEventKind::Progress {
+                assert!(event.progress.unit_done >= done, "阶段内计数不允许回退");
+                done = event.progress.unit_done;
+            }
+        }
+        assert_eq!(log.last().unwrap().kind, ProgressEventKind::Finished);
+        let last = log.current().unwrap();
+        assert_eq!(last.stage, INPAINT_STAGE_NAME);
+        assert_eq!(
+            last.unit_done, report.frames_out,
+            "末条进度要对得上真实帧数"
+        );
+        assert_eq!(last.unit_done, last.unit_total);
+
+        // 自动定位期间要有中间进度：只在阶段首尾各报一条，界面上与「卡死」无法区分。
+        let locate: Vec<_> = log
+            .events
+            .iter()
+            .filter(|event| event.progress.stage_index == LOCATE_STAGE)
+            .collect();
+        assert!(
+            locate.len() >= 3,
+            "定位阶段应逐帧上报，实得 {}",
+            locate.len()
+        );
+        assert!(locate
+            .last()
+            .unwrap()
+            .progress
+            .message
+            .contains("聚合出 1 个标识区域"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 没检测到标识（整条原样输出）也必须留下终态，否则进度文件永远停在「运行中」。
+    #[test]
+    fn progress_stream_is_terminal_when_nothing_is_detected() {
+        let dir = progress_dir("none");
+        let path = dir.join("progress.jsonl");
+        let size = FrameSize::new(64, 48);
+        let data = synthetic_video(size, 6, MaskRect::new(8, 36, 48, 6));
+        let config = PipelineConfig {
+            probe_frames: 3,
+            progress: Some(progress_stream(&path, 6)),
+            ..Default::default()
+        };
+        let (report, _) = run_with(
+            &data,
+            size,
+            &FixedRoisDetector::new(Vec::new()),
+            &ColumnFillInpainter { sample_rows: 4 },
+            &config,
+        );
+        assert!(report.roi.is_none(), "前提：这个检测器什么都不报");
+        assert_eq!(report.frames_out, 6);
+
+        let log = dossier_core::progress::load_progress_log(&path).unwrap();
+        assert!(log.is_terminal());
+        let last = log.current().unwrap();
+        assert_eq!(last.stage, INPAINT_STAGE_NAME, "收尾要落在第二个阶段上");
+        assert_eq!(last.unit_done, 6, "原样输出同样算作真实处理的帧数");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct FailingInpainter;
+
+    impl Inpainter for FailingInpainter {
+        fn inpaint(
+            &self,
+            _patch: &mut ClipPatch,
+            _mask: &BinaryMask,
+            _feather_radius: u32,
+        ) -> Result<(), InpaintError> {
+            Err(InpaintError::Backend("测试用失败".into()))
+        }
+    }
+
+    /// 失败必须留下 Failed 终态，否则 tailer 会一直以为任务还在跑。
+    #[test]
+    fn progress_stream_records_failed_terminal() {
+        let dir = progress_dir("failed");
+        let path = dir.join("progress.jsonl");
+        let size = FrameSize::new(64, 48);
+        let bar = MaskRect::new(8, 36, 48, 6);
+        let data = synthetic_video(size, 4, bar);
+        let detector = FixedRoiDetector::new(bar);
+        let config = PipelineConfig {
+            clip_frames: 2,
+            probe_frames: 2,
+            context_scale: 2.0,
+            mask_dilate: 1,
+            feather_radius: 1,
+            progress: Some(progress_stream(&path, 4)),
+            ..Default::default()
+        };
+        let mut sink: Vec<Vec<u8>> = Vec::new();
+        let error = run_pipeline(
+            || Ok(FrameReader::new(Cursor::new(data.clone()), size)),
+            &mut sink,
+            size,
+            &detector,
+            &FailingInpainter,
+            &config,
+        )
+        .expect_err("修复后端失败时管线必须报错");
+        assert!(matches!(error, PipelineError::Inpaint(_)));
+
+        let log = dossier_core::progress::load_progress_log(&path).unwrap();
+        assert!(log.is_terminal());
+        assert_eq!(log.last().unwrap().kind, ProgressEventKind::Failed);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -19,6 +19,7 @@ from .db import connect, init_db
 from .errors import WorkError
 from .recipes.schema import validate_recipe
 from .storage import LocalStorage
+from .toolchain import resolve_binary
 from .tasks import review as review_service
 from .tasks import service
 from .tasks.queue import TaskQueue
@@ -308,6 +309,24 @@ def _principal_from_token(conn, token: str) -> dict:
     return {"id": row["id"], "name": row["name"], "role": row["role"]}
 
 
+def _progress_text(progress: dict) -> str:
+    """任务进度摘要：带上了逐帧进度就显示「done/total（百分比）」，否则只有阶段名。
+
+    单位名不在这里猜：`progress.progress` 是工具报上来的原始事件，不同模块的单元不同
+    （擦除是帧、编码可能是秒），所以只显示两个计数与比例，不写「帧」这种具体单位。
+    """
+    stage = str((progress or {}).get("stage", "-"))
+    event = (progress or {}).get("progress")
+    if not isinstance(event, dict):
+        return stage
+    done = event.get("unitDone")
+    total = event.get("unitTotal")
+    if not isinstance(done, int) or not isinstance(total, int) or total <= 0:
+        return stage
+    percent = min(100, round(done * 100 / total))
+    return f"{stage} {done}/{total}（{percent}%）"
+
+
 def _wait_for_task(settings: Settings, task_id: str, timeout: float) -> int:
     deadline = time.time() + timeout
     last = None
@@ -318,8 +337,7 @@ def _wait_for_task(settings: Settings, task_id: str, timeout: float) -> int:
         finally:
             conn.close()
         if task["state"] != last:
-            stage = (task["progress"] or {}).get("stage", "-")
-            print(f"  [{task['state']}] {stage}")
+            print(f"  [{task['state']}] {_progress_text(task['progress'] or {})}")
             last = task["state"]
         if task["state"] in ("SUCCEEDED", "FAILED", "CANCELLED"):
             for artifact in task["artifacts"]:
@@ -351,7 +369,7 @@ def cmd_task(args) -> int:
     print(f"  状态      {task['state']}（尝试 {task['attempts']} 次）")
     print(f"  配方      {task['recipe_id']}@{task['recipe_version']} sha256={task['recipe_sha256'][:16]}…")
     print(f"  目标      {task['target']}")
-    print(f"  进度      {(task['progress'] or {}).get('stage', '-')}")
+    print(f"  进度      {_progress_text(task['progress'] or {})}")
     if task["error"]:
         print(f"  错误      {task['error']['class']}: {task['error']['message']}")
     for attempt in attempts:
@@ -499,6 +517,65 @@ def cmd_cleanup(args) -> int:
     return 0
 
 
+def cmd_artifacts_check(args) -> int:
+    """跨产物一致性校验（Tier 3 的消费端）。
+
+    把若干任务的**产物戳记**取出来交给 Rust 侧 `dossier-artifacts check`：它会回答
+    「这批产物是不是同一套管线、同一个工具版本、同一组参数、同一批输入出的」。
+    典型用法是审一批分集——一次跑批里混进了旧工具产出的分集，只看单个任务是看不出来的。
+
+    这里刻意**不重新实现**一致性规则（那是 `dossier_core::pipeline_version` 的职责），
+    只负责把文件凑齐、把结论如实带回：工具的退出码就是命令的退出码。
+    """
+    from .modules.ffmpeg import run
+
+    settings = _settings(args)
+    storage = LocalStorage(settings)
+    conn = connect(settings)
+    staging = settings.work_dir / "artifact-stamps"
+    staging.mkdir(parents=True, exist_ok=True)
+    collected: List[Path] = []
+    try:
+        for task_id in args.task_ids:
+            task = service.get_task(conn, task_id)
+            stamps = [a for a in service.list_artifacts(conn, task_id) if a["kind"] == "artifact_stamp"]
+            if not stamps:
+                print(f"任务 {task['id']} 没有产物戳记（擦除工具较旧，或该任务不含擦除步骤）")
+                continue
+            for artifact in stamps:
+                name = Path(str(artifact["storage_key"])).name
+                target = staging / f"{task_id}_{artifact['id']}_{name}"
+                target.write_bytes(storage.read_bytes(artifact["storage_key"]))
+                collected.append(target)
+    finally:
+        conn.close()
+
+    if not collected:
+        print("没有任何可校验的产物戳记", file=sys.stderr)
+        return 1
+
+    tool = resolve_binary(getattr(settings, "artifacts_bin", None), "dossier-artifacts")
+    if tool is None:
+        print(
+            "错误[capability_missing] 找不到 dossier-artifacts；请设置 DRAMA_CLOUD_ARTIFACTS_BIN，"
+            "或在仓库根目录执行 cargo build --release -p dossier-core --bin dossier-artifacts",
+            file=sys.stderr,
+        )
+        return 1
+
+    command = [str(tool), "check", *[str(path) for path in collected]]
+    if args.json:
+        command.append("--json")
+    result = run(command, timeout=300.0)
+    stdout = result.stdout.decode("utf-8", "replace")
+    stderr = result.stderr.decode("utf-8", "replace")
+    if stdout.strip():
+        print(stdout.rstrip())
+    if result.returncode != 0 and stderr.strip():
+        print(stderr.rstrip(), file=sys.stderr)
+    return int(result.returncode)
+
+
 def cmd_demo(args) -> int:
     """造素材 → 提交 → 跑 Worker → 校验产物（不需要起 HTTP 服务）。"""
     from .demo import run_demo
@@ -631,6 +708,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=float, default=3600.0)
     p.set_defaults(func=cmd_review_rerun)
 
+    p = sub.add_parser("artifacts", help="产物戳记与跨产物一致性检查")
+    artifacts_sub = p.add_subparsers(dest="artifacts_command")
+    q = artifacts_sub.add_parser("check", help="对若干任务的产物戳记做一致性校验")
+    q.add_argument("task_ids", nargs="+", help="要一起校验的任务 id（同批分集放在一次比对里）")
+    q.add_argument("--json", action="store_true", help="输出 JSON（便于脚本消费）")
+    q.set_defaults(func=cmd_artifacts_check)
+
     p = sub.add_parser("cleanup", help="清理过期产物并回收过期租约")
     p.set_defaults(func=cmd_cleanup)
 
@@ -653,6 +737,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     if getattr(args, "version", False) and not getattr(args, "command", None):
         return cmd_version(args)
     if not getattr(args, "command", None):
+        parser.print_help()
+        return 0
+    if not hasattr(args, "func"):
+        # 分组命令（如 `artifacts`）没给子命令时给出帮助，而不是抛 AttributeError。
         parser.print_help()
         return 0
     try:

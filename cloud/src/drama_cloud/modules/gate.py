@@ -15,6 +15,7 @@ from ..base import StrictModel
 from ..errors import ErrorClass, WorkError
 from ..recipes.registry import ModuleSpec, register
 from .ffmpeg import MediaContext, probe_json, summarize
+from .ffmpeg_caps import ffprobe_available
 from .timeline import timeline_duration
 
 
@@ -219,5 +220,6 @@ register(
         produces=frozenset({"quality_report"}),
         params_model=QualityGateParams,
         implement=implement_quality_gate,
+        capability_probe=ffprobe_available,
     )
 )

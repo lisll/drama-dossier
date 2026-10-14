@@ -41,6 +41,15 @@ class Settings:
     #: 同样只由部署方声明；配方只能选择「用哪个后端」，不能指定命令。
     inpaint_worker_program: Optional[str] = None
     inpaint_worker_args: Tuple[str, ...] = ()
+    #: 后期工具链（Rust 侧 `dossier-media`）路径；留空时按 PATH → 仓库 target/ 自动查找。
+    media_bin: Optional[str] = None
+    #: 产物戳记校验工具（Rust 侧 `dossier-artifacts`）路径；解析规则同上。
+    artifacts_bin: Optional[str] = None
+    #: 运行时组件工具（Rust 侧 `dossier-runtime`）路径；解析规则同上。
+    runtime_bin: Optional[str] = None
+    #: 运行时组件清单（Tier 1 的 `RuntimeManifest`）。给了它，能力路由就会去核对
+    #: 「模型/权重到底装齐了没有」，而不是只看 `inpaint_worker_program` 有没有配。
+    runtime_manifest: Optional[str] = None
 
     @property
     def db_path(self) -> Path:
@@ -81,6 +90,10 @@ def load_settings(**overrides) -> Settings:
         "ffprobe": os.environ.get("DRAMA_CLOUD_FFPROBE", "ffprobe"),
         "inpaint_bin": os.environ.get("DRAMA_CLOUD_INPAINT_BIN") or None,
         "inpaint_worker_program": os.environ.get("DRAMA_CLOUD_INPAINT_WORKER") or None,
+        "media_bin": os.environ.get("DRAMA_CLOUD_MEDIA_BIN") or None,
+        "artifacts_bin": os.environ.get("DRAMA_CLOUD_ARTIFACTS_BIN") or None,
+        "runtime_bin": os.environ.get("DRAMA_CLOUD_RUNTIME_BIN") or None,
+        "runtime_manifest": os.environ.get("DRAMA_CLOUD_RUNTIME_MANIFEST") or None,
         # shlex 而不是 split：worker 脚本路径可能带空格，配引号即可。
         "inpaint_worker_args": tuple(shlex.split(raw_worker_args)) if raw_worker_args else (),
         # 部署方额外声明的能力（如只有 GPU 机器才有的 `video_inpaint_model`）。

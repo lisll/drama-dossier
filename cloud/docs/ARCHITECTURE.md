@@ -33,13 +33,16 @@
             │ 读取计划快照（tasks.plan_json）       │ 读写对象
 ┌───────────▼───────────────────────┐   ┌───────────▼──────────────────────┐
 │ 处理管线（modules/）               │   │ 存储（storage.py）               │
-│   13 个白名单模块，见 §4           │   │  本地文件系统实现                │
+│   21 个白名单模块，见 §4           │   │  本地文件系统实现                │
 │   计划型模块只写 ctx.plan          │   │  · 对象键不透明，调用方不拼路径    │
 │   只有 media.encode 物化文件       │   │  · 上传/下载用短时 HMAC 令牌      │
 └───────────┬───────────────────────┘   └──────────────────────────────────┘
             │ 调用外部进程
 ┌───────────▼──────────────────────────────────────────────────────────────┐
 │ 媒体引擎：ffmpeg 4.2.4 / ffprobe（本机实测版本）                           │
+│ 后期能力：`dossier-media`（合成渲染/变速变调/音源分离/ASR/OCR/镜头切点）   │
+│ 擦除能力：`dossier-inpaint`（含 `--progress-json` 逐帧进度）                │
+│ 运行时核对：`dossier-runtime check`｜戳记核对：`dossier-artifacts check`    │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -102,7 +105,7 @@ config ── errors ── db ── storage
 | `api.py` | HTTP 边界：认证、授权、限流、错误码映射 | 不实现业务规则 |
 | `cli.py` | 命令行薄封装 | 不实现业务规则 |
 
-## 4. 处理模块白名单（15 个）
+## 4. 处理模块白名单（21 个）
 
 注册表是**代码里的字面量**，配方改不动它；配方只能引用已注册的名字。
 `import drama_cloud.modules` 即完成注册，`registry.ensure_modules_loaded()` 保证 CLI/API/Worker
@@ -125,6 +128,18 @@ config ── errors ── db ── storage
 | `video.erase_verify` | `video_inpaint` | video | erase_verification | C12 |
 | `media.encode` | `h264_encode` | video | encoded | C6 |
 | `media.quality_gate` | `ffprobe` | encoded | quality_report | §10 门禁 |
+| `video.render` | `media.render.compose` | video | video | Tier 2 合成渲染 |
+| `audio.separate` | `media.audio.separate` | audio | stems | Tier 2 音源分离 |
+| `audio.timestretch` | `media.audio.timestretch` / `media.audio.tempo_only` | audio | audio | Tier 2 变速变调 |
+| `subtitle.asr` | `media.asr` | audio | subtitle_text | Tier 2 语音识别 |
+| `subtitle.ocr` | `media.ocr` | video | ocr_report | Tier 2 区域识别 |
+| `timeline.shots` | `media.shot.detect` | video | shots | Tier 2 镜头切点 |
+
+后六个模块（Tier 2 后期能力）的能力标签来自 **`dossier-media probe --json`**
+（`modules/media_cli.py`，结果按「工具路径 + 大小 + mtime」缓存），不靠环境变量声明：
+哪台机器装了 rubberband / demucs / whisper / tesseract，由工具自己说了算。
+可执行文件的查找顺序由 `toolchain.py` 统一规定（部署配置 → PATH → 仓库 `target/release|debug`），
+三个 Rust 工具（`dossier-inpaint` / `dossier-media` / `dossier-artifacts`）走同一条规则。
 
 **依赖闭包校验**：每一步的 `requires` 必须已被输入素材（video/audio/metadata）或前序步骤满足，
 否则配方在**发布时**就被拒绝——不会跑到一半才报错。
@@ -135,8 +150,30 @@ config ── errors ── db ── storage
 **能力可以被探测**（`ModuleSpec.capability_probe`，见 `docs/PROJECT_REVIEW.md` C2）：
 `video.inpaint` 只有在**本机真的找得到 `dossier-inpaint` 可执行文件**时才声明
 `video_inpaint`，否则不兼容的任务在计划阶段就被路由到别的 Worker，而不是领了任务再失败。
-模型修复后端另用 `video_inpaint_model` 标签，只有配了模型 worker 的部署才声明它
-（可用 `DRAMA_CLOUD_CAPABILITIES` 环境变量补充声明）。
+模型修复后端另用 `video_inpaint_model` 标签。它**不是**手工声明，而是一条注册进
+`registry.register_capability` 的**探测函数**（`modules/inpaint.py::model_capability_available`）：
+必须配了模型 worker（`DRAMA_CLOUD_INPAINT_WORKER`）；配了运行时清单
+（`DRAMA_CLOUD_RUNTIME_MANIFEST`）时还要 `dossier-runtime check --manifest` 通过——
+清单里少一个权重、摘要对不上，能力就如实缺席。`DRAMA_CLOUD_CAPABILITIES` 仍可补充声明，
+但它不再是模型能力的唯一真相。
+
+**「选哪个后端」也是能力**（`ModuleSpec.dynamic_capabilities`）：`video.inpaint` 的参数里
+`inpainter=worker` 或 `detector=worker` 会额外要求 `video_inpaint_model`，这条在
+**计划阶段**就检查（`plan.build_plan`）：缺了就 `capability_missing` 拒绝建任务，
+而不是派给一台没有模型的 Worker、跑到一半才发现起不来。
+
+**全部 21 个模块都有探测**（`modules/ffmpeg_caps.py` + `modules/media_cli.py`）：`ffmpeg` / `ffprobe` 按
+`which` 语义探测（以前是无条件写死的，没装 ffmpeg 的机器也会声明「我会 ffmpeg」）；
+依赖滤镜的模块按 `ffmpeg -filters` 判断（如 `video.quality` 需要
+`scale/eq/unsharp/hqdn3d`），`h264_encode` 则要求 `libx264` **加上**拼时间线用的基础滤镜
+（`trim/atrim/setpts/asetpts/settb/asettb/concat`）。
+解析规则与 Rust 侧 `crates/dossier-runtime/src/probe.rs` **刻意保持镜像**，
+避免同一台机器给出两个答案；探测失败（程序不在、非零退出、超时）一律**按缺能力处理**。
+
+配方真正选用的编码器（h265/vp9/av1、mp3/opus、软字幕的 `mov_text`/`srt`）无法在
+能力标签里穷举，所以在 `media.encode` 里做**编码前预检**（`ensure_encoders`）：
+缺哪个就以 `capability_missing` 列出「编码器名 + 用途」，而不是等 ffmpeg 跑到一半
+报 `Unknown encoder`（那会被归类成「参数不支持」，把排查方向带偏）。
 
 **参数按能力拼**：控制面与外部工具是两个会各自发布的产物。`resolve_tool` 只保证「工具在」，
 所以拼参数前还会读一次工具的 `--help`（结果按「路径 + 大小 + mtime」缓存，只问一次），
@@ -153,6 +190,8 @@ config ── errors ── db ── storage
 | 队列用数据库而不是 Redis | 本机无 Redis；文档本身也要求「关键任务状态仍以数据库为准」，避免两套真相 |
 | 检查点只做阶段级 | 文档明确「不尝试恢复任意 FFmpeg 进程的内部状态」；只有产出文件的阶段才允许复用 |
 | 取消是协作式的 | 在阶段边界检查 `cancel_requested`，不用信号打断 ffmpeg，避免留下半个文件 |
+| 长任务进度流两端都要接 | 只有生产端（工具写 JSONL）或只有消费端（界面读）都不算能力：`run_streaming` 按字节偏移增量读并丢弃半行，回调线程自建 SQLite 连接写进度 |
+| 产物一致性规则只写一份 | 擦除产出 `<输出>.stamp.json`，由 Rust 侧 `dossier-artifacts check` 汇总判定；云端 `artifacts check` 只搬运戳记并**透传退出码**，不重写第二套规则 |
 
 ## 6. C1–C12 覆盖情况
 
@@ -168,8 +207,9 @@ config ── errors ── db ── storage
 | C8 | 元数据 | `modules/encode.py` `metadata.policy`（keep/strip/edit + 定位字段清理） | 完成 |
 | C9 | 帧级（细化后） | `frame.fps_convert` / `frame.deflicker` / `frame.inspect` | 部分：**插帧未实现**（需 GPU + 模型），配方写不存在的模块会被白名单拒绝 |
 | C10 | 分集重组 | `modules/timeline.py` `chapters.reorg` + `split_chapters` | 完成 |
-| C11 | 解说重剪（需人工审核） | `modules/timeline.py` `commentary.rebuild` | 部分：脚本↔转写匹配与候选时间线完成；**本机未内置 ASR**，转写需作为参数提供 |
-| C12 | 硬字幕/角标擦除 + 确认流 | `modules/inpaint.py` `video.inpaint` / `video.erase_verify`、`tasks/review.py`、Rust `crates/dossier-inpaint` | 完成：擦除、四项指标自动校验、质量类自动重试（加力/换后端）、人工复核队列与 mask 修正重跑；**模型后端（DBNet/E2FGVI）只是接线**，需 GPU + 权重 |
+| C11 | 解说重剪（需人工审核） | `modules/timeline.py` `commentary.rebuild` + `modules/late_stage.py` `subtitle.asr` | 部分：脚本↔转写匹配与候选时间线完成；**ASR 已接线**（Whisper → SRT，产物可被 `subtitle.mux` 直接使用），但本机没有 whisper 与权重，真实转写未跑通，也可继续由参数直接提供转写 |
+| C12 | 硬字幕/角标擦除 + 确认流 | `modules/inpaint.py` `video.inpaint` / `video.erase_verify`、`tasks/review.py`、Rust `crates/dossier-inpaint` | 完成：擦除、四项指标自动校验、质量类自动重试（加力/换后端）、人工复核队列与 mask 修正重跑、产物戳记与跨产物一致性校验（`dossier-artifacts check`）；**模型后端（DBNet/E2FGVI）只是接线**，需 GPU + 权重 |
+| Tier 2 | 后期能力（渲染/分离/变速/ASR/OCR/镜头切点） | `modules/late_stage.py` + Rust `crates/dossier-media` | 完成接线：模块可被配方引用，能力按 `dossier-media probe` 如实缺席；**本机没有 demucs/whisper/tesseract/rubberband**，真实推理未跑通（用假工具测穿参数与产物链路）。`timeline.shots` 与 `video.render` 在本机**真的跑通**（ffmpeg 有 `select` 与 libass） |
 
 ## 7. 与设计文档的差异
 
@@ -199,5 +239,11 @@ config ── errors ── db ── storage
 2. **单机存储**：`storage.py` 用本地磁盘，没有分片上传、没有副本，也没有多机共享。
 3. **无 TLS**：`serve` 默认监听 `127.0.0.1` 的明文 HTTP。对外暴露必须放到反向代理后面并启用 TLS（设计文档 §10 的硬要求）。
 4. **限流是单进程内存**：多实例部署要换成集中式计数器。
-5. **无 ASR**：C11 需要外部提供转写时间戳。
+5. **ASR 已接线但本机跑不通**：`subtitle.asr`（Whisper → SRT）已实现并有假工具测试，
+   但本机没有 whisper 与模型权重，能力标签会如实缺席——C11 的转写目前仍可由参数直接提供。
+   同理，`audio.separate`（demucs）、`subtitle.ocr`（tesseract）、`audio.timestretch` 的
+   「变速不变调」（rubberband）、`video.render`（需 `libass`/`drawtext`）都只在有对应外部
+   程序的机器上才声明能力。
 6. **时间线不含音频**：`_segment_args` 对每个片段同时做 `[i:a]`，所以多片段剪辑要求素材带音轨。
+7. **桌面壳未接新能力**：`src-tauri` 因 glib 版本编译不过，本轮新增的模块与命令
+   （`video.render` / `subtitle.asr` / … 与 `artifacts check`）只在 CLI 与 API 可用。

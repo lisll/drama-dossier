@@ -513,3 +513,95 @@ def test_gpu_only_model_capability_comes_from_the_deployment(settings):
     assert "video_inpaint_model" not in worker_capabilities(settings)
     gpu = dataclasses.replace(settings, capabilities=("video_inpaint_model",))
     assert "video_inpaint_model" in worker_capabilities(gpu)
+
+
+# ---------- 长任务进度流（Tier 3） ----------
+
+#: 认识 `--progress-json` 的假工具：跑的时候先写两条进度、睡一下、再写终结条，
+#: 这样「边跑边上报」而不是「跑完才读最后一行」是可被观测的。
+PROGRESS_TOOL = r"""#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "--help" ]; then
+  echo "  --input --output --report-json --progress-json --dilate"
+  exit 0
+fi
+progress=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) input="$2"; shift 2;;
+    --output) output="$2"; shift 2;;
+    --report-json) report="$2"; shift 2;;
+    --progress-json) progress="$2"; shift 2;;
+    *) shift;;
+  esac
+done
+emit() { printf '%s\n' "$1" >> "$progress"; }
+emit '{"seq":1,"kind":"started","taskId":"t","pipeline":"drama.logo.erase","stage":"locate","stageIndex":0,"stageTotal":2,"unitDone":0,"unitTotal":2}'
+emit '{"seq":2,"kind":"progress","taskId":"t","pipeline":"drama.logo.erase","stage":"inpaint","stageIndex":1,"stageTotal":2,"unitDone":1,"unitTotal":2}'
+sleep 0.3
+emit '{"seq":3,"kind":"finished","taskId":"t","pipeline":"drama.logo.erase","stage":"inpaint","stageIndex":1,"stageTotal":2,"unitDone":2,"unitTotal":2}'
+cp "$input" "$output"
+cat > "$report" <<JSON
+{"framesIn": 2, "framesOut": 2, "regions": [{"x": 0, "y": 0, "width": 8, "height": 8}],
+ "clips": 1, "inpaintedClips": 1, "roiJobs": 1, "inpaintBatches": 1, "meanMaskCoverage": 0.1,
+ "verification": {"applicable": true, "verdict": "pass", "issues": [], "notes": []}}
+JSON
+exit 0
+"""
+
+
+def make_progress_tool(directory: Path) -> Path:
+    script = directory / "progress-inpaint"
+    script.write_text(PROGRESS_TOOL, encoding="utf-8")
+    script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return script
+
+
+def test_build_args_only_passes_progress_json_when_asked(context):
+    """进度流是可选开关：不给路径就不该出现在命令行里（旧工具不认识它）。"""
+    params = InpaintParams.model_validate({"regions": [{"x": 0, "y": 0, "width": 8, "height": 8}]})
+    escalation = plan_escalation(params, 1, None)
+    common = dict(
+        source=context.primary,
+        output=context.work_dir / "out.mp4",
+        report_path=context.work_dir / "report.json",
+        tool=Path("/bin/true"),
+        worker=None,
+    )
+    assert "--progress-json" not in build_args(context, params, escalation, **common)
+    args = build_args(
+        context, params, escalation, progress_path=context.work_dir / "progress.jsonl", **common
+    )
+    index = args.index("--progress-json")
+    assert args[index + 1].endswith("progress.jsonl")
+
+
+def test_implement_inpaint_streams_progress_into_the_hook(context, settings, tmp_path):
+    """工具报出的每一条进度都要实时交给订阅方，并把末条留在处理日志里。"""
+    tool = make_progress_tool(tmp_path)
+    context.settings = dataclasses.replace(settings, inpaint_bin=str(tool))
+    seen: list = []
+    context.progress_hook = seen.append
+    params = InpaintParams.model_validate({"regions": [{"x": 0, "y": 0, "width": 8, "height": 8}]})
+
+    implement_inpaint(context, params)
+
+    assert [event["seq"] for event in seen] == [1, 2, 3]
+    assert seen[-1]["kind"] == "finished"
+    assert context.plan["inpaint"]["progress"]["unitDone"] == 2
+
+
+def test_missing_progress_support_is_announced_not_fatal(context, settings, tmp_path):
+    """旧工具不认 `--progress-json` 时只记一条说明，擦除照常完成。"""
+    # 用 warn 结论：本条只用来看「缺进度能力」的处置，不要被自动重试的裁决带跑。
+    tool = make_fake_tool(tmp_path, mode="warn")
+    context.settings = dataclasses.replace(settings, inpaint_bin=str(tool))
+    seen: list = []
+    context.progress_hook = seen.append
+    params = InpaintParams.model_validate({"regions": [{"x": 0, "y": 0, "width": 8, "height": 8}]})
+
+    implement_inpaint(context, params)
+
+    assert seen == [], "工具没报进度时不该凭空造事件"
+    assert context.plan["inpaint"]["progress"] is None
+    assert any("--progress-json" in note for note in context.notes)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -11,7 +12,7 @@ from drama_cloud.errors import ErrorClass, WorkError
 from drama_cloud.tasks import service
 from drama_cloud.recipes.registry import get_module
 from drama_cloud.tasks.queue import TaskQueue
-from drama_cloud.tasks.runner import Worker
+from drama_cloud.tasks.runner import Heartbeat, Worker
 from drama_cloud.tasks.state import TaskState
 
 from .conftest import requires_ffmpeg
@@ -65,6 +66,33 @@ def test_end_to_end_success(conn, settings, storage, project, tiny_video):
 
     # 成功后工作目录被清理。
     assert not (settings.work_dir / task["id"]).exists()
+
+
+def test_heartbeat_renews_the_lease_from_its_own_thread(conn, settings, storage, project,
+                                                        tiny_video):
+    """心跳线程必须真的推进租约时间。
+
+    跨线程复用主连接时 sqlite3 会抛 `ProgrammingError`，而心跳**故意**吞掉异常
+    （心跳失败不该让 Worker 崩），于是「线程没崩」完全不能说明续租成功了——
+    只有租约时间被推进才算数。
+    """
+    project_id, _, _ = project
+    task = prepare(conn, settings, storage, project_id, tiny_video)
+    worker = Worker(settings, worker_id="wrk_beat")
+    claimed = worker.queue.claim(conn, worker.worker_id, worker.capabilities)
+    assert claimed is not None
+    before = conn.execute(
+        "SELECT lease_expires_at FROM tasks WHERE id = ?", (task["id"],)
+    ).fetchone()["lease_expires_at"]
+
+    with Heartbeat(worker, conn, task["id"]) as beat:
+        time.sleep(1.5)
+        assert beat.lost is False
+
+    after = conn.execute(
+        "SELECT lease_expires_at FROM tasks WHERE id = ?", (task["id"],)
+    ).fetchone()["lease_expires_at"]
+    assert after > before, "心跳没有推进租约（心跳线程多半在跨线程用主连接）"
 
 
 def test_subtitle_burn_end_to_end(conn, settings, storage, project, tiny_video, tiny_subtitle):

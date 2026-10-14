@@ -127,7 +127,32 @@ DramaDossier 是一个本地优先的桌面应用，用于把散落在磁盘上�
 │   │       ├── transcode.rs     # 转码建议与批量规范化脚本
 │   │       ├── platforms.rs     # 平台材料要求知识库（示例档案）
 │   │       ├── draft.rs         # 剪映草稿导出 / 导入
-│   │       └── types.rs         # 共享领域模型
+│   │       ├── progress.rs      # 长任务进度流（JSONL，可续写）
+│   │       ├── checkpoint.rs    # 检查点与断点续跑
+│   │       ├── pipeline_version.rs  # 管线版本与产物一致性校验
+│   │       ├── types.rs         # 共享领域模型
+│   │       └── bin/dossier-artifacts.rs  # `check`：跨产物戳记一致性校验（退出码 0/1/2）
+│   ├── dossier-runtime/         # 运行时能力管理（Tier 1）
+│   │   └── src/
+│   │       ├── command.rs       # 可注入的命令执行器（含 FakeRunner）
+│   │       ├── probe.rs         # 工具版本 / ffmpeg 滤镜与编码器 / GPU 探测
+│   │       ├── caps.rs          # 决策：GPU 够格、硬件编码器、并行度
+│   │       ├── manifest.rs      # 运行时组件清单
+│   │       ├── store.rs         # 校验 / 安装 / 状态 / 回滚
+│   │       ├── update.rs        # 更新通道：签名清单 + 验签 + 版本比较
+│   │       ├── secret.rs        # 本地凭据存储（0600 + 原子写）
+│   │       ├── device.rs        # 设备指纹（只输出摘要）
+│   │       └── main.rs          # probe / selfcheck / install / rollback / update
+│   ├── dossier-media/           # 后期能力适配（Tier 2）
+│   │   └── src/
+│   │       ├── tools.rs         # 工具链盘点与能力标签
+│   │       ├── render.rs        # 合成渲染（文字 / 图片 / 字幕烧录）
+│   │       ├── shot.rs          # 镜头切点检测
+│   │       ├── timestretch.rs   # 变速变调（Rubber Band 优先）
+│   │       ├── separate.rs      # 音源分离（Demucs）
+│   │       ├── asr.rs           # 语音识别（Whisper）
+│   │       ├── ocr.rs           # OCR 文本识别（Tesseract）
+│   │       └── srt.rs           # 字幕读写
 │   └── dossier-inpaint/         # 字幕 / 角标擦除管线（学习用原型）
 │       └── src/
 │           ├── probe.rs         # ffprobe 解析
@@ -163,12 +188,13 @@ DramaDossier 是一个本地优先的桌面应用，用于把散落在磁盘上�
 │   ├── recipes/                 # 内置配方（7 份，含 drama-logo-erase 擦除配方）
 │   ├── docs/                    # 架构、配方、管线、API、数据库、打包、测试、擦除确认流
 │   │   └── INPAINT_REVIEW_FLOW.md  # 确认流：自动校验 + 分支A 重试 + 分支B 人工复核
-│   └── tests/                   # 147 个测试
+│   └── tests/                   # 215 个测试
 ├── docs/
 │   ├── BUILD.md                 # 构建与发布说明
 │   ├── DEVELOPMENT.md           # 开发规范与模块边界
 │   ├── MATERIAL_SPEC.md         # 素材与报审包数据规格
 │   ├── PROJECT_REVIEW.md        # 全项目复盘、缺口清单与验证记录
+│   ├── RUNTIME.md               # Tier 1/2/3：运行时、后期与长任务能力层
 │   ├── SUBTITLE_REMOVAL.md      # 硬字幕擦除原理、协议与实测
 │   └── WATERMARK_REMOVAL.md     # 角标 / 水印擦除参数、编码策略与实测
 └── .github/workflows/           # CI 和桌面包构建
@@ -367,6 +393,10 @@ cargo run -p dossier-inpaint -- \
   --input in.mp4 --output out.mp4 \
   --detector worker --inpainter worker \
   --worker-program python3 --worker-args tools/model_worker/worker.py
+
+# 跨产物一致性：擦除默认写 <输出>.stamp.json，一批分集用同一条命令一起核对
+cargo run -p dossier-core --bin dossier-artifacts -- check ./out/*.stamp.json
+# 退出码 0=一致 / 1=不一致 / 2=读不出来；云端对应 `drama-cloud artifacts check <task_id...>`
 ```
 
 原理、交换机协议、实测数据与已知局限见 [docs/SUBTITLE_REMOVAL.md](docs/SUBTITLE_REMOVAL.md)
@@ -402,7 +432,7 @@ python3.9 -m venv .venv && ./.venv/bin/pip install -e cloud[dev]
 ./cloud/demo.sh                               # 一键端到端演示
 ```
 
-文档在 `cloud/docs/`：架构、配方规范（含 15 个模块参数表）、处理管线、API 规范、
+文档在 `cloud/docs/`：架构、配方规范（含 21 个模块参数表）、处理管线、API 规范、
 数据库 Schema、打包指南、测试计划、擦除确认流。
 
 ## 数据流
@@ -706,6 +736,12 @@ DramaDossier 只做真实材料的整理、格式化和完整性提示：
 - [x] 云端制作系统原型（C1–C11 配方、持久化队列、质量门禁、Web 客户端）
 - [x] 云端擦除确认流（C12：擦除 + 自动校验 + 分支A 重试 + 分支B 人工复核）
 - [x] 云端人工复核队列（Web 面板 + `drama-cloud review-*`，失败路径保留候选产物供放行）
+- [x] 运行时能力管理（`dossier-runtime`：组件清单/校验/安装/回滚、GPU 与硬件编码与并行度协商、更新验签、凭据、设备指纹、`selfcheck`）
+- [x] 后期能力适配（`dossier-media`：合成渲染、镜头切点、变速变调、音源分离、ASR、OCR 文本识别）
+- [x] 长任务工程完整性（`dossier-core`：进度流 / 检查点续跑 / 管线版本与产物一致性；见 `docs/RUNTIME.md`）
+- [x] 云端能力探测补全（`ffmpeg -filters/-encoders` 解析 + 21 个模块的能力标签如实缺席）
+- [x] Tier 2 后期能力接线（`video.render` / `audio.separate` / `audio.timestretch` / `subtitle.asr` / `subtitle.ocr` / `timeline.shots`）
+- [x] 产物戳记与跨产物一致性（`dossier-inpaint` 写 `.stamp.json`，`dossier-artifacts check` 校验，云端 `artifacts check` 透传退出码）
 - [ ] 云端：GPU 侧模型类处理（光流插帧、模型修复）
 - [ ] 云端：桌面客户端（Tauri 2，需 glib ≥ 2.70）
 - [x] 擦除管线：第二遍只在 ROI 内检测（约 10x 提速）
@@ -714,7 +750,7 @@ DramaDossier 只做真实材料的整理、格式化和完整性提示：
 - [x] 擦除管线：worker 常驻以消除每帧进程启动开销（`--persistent-worker`，实测约 7×）
 - [x] 报审包差异对比（`dossier-core::diff`）
 - [ ] macOS 签名与公证示例
-- [ ] 应用内更新通道
+- [ ] 应用内更新通道（签名清单 + 验签 + 版本比较已实现；发布通道与自动替换未做）
 
 ## 常见问题
 

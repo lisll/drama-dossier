@@ -91,11 +91,17 @@ node --check src/main.js
 `cargo test --workspace` 会失败。只想验证核心与擦除管线时可以按 crate 跑：
 
 ```bash
-cargo test -p dossier-core       # 含 transcode / diff / platforms / draft 单测
-cargo test -p dossier-inpaint    # 含 erase 命令拼装与 CLI 交叉校验
-cargo clippy -p dossier-inpaint --all-targets -- -D warnings
+cargo test --offline -p dossier-core -p dossier-inpaint -p dossier-media -p dossier-runtime
+                                 # core=报审链路+进度/检查点/管线版本；inpaint=擦除；
+                                 # media=渲染/切点/变速/分离/ASR/OCR；runtime=清单/能力/更新/凭据
+cargo clippy --offline -p dossier-core -p dossier-inpaint -p dossier-media -p dossier-runtime \
+    --all-targets -- -D warnings
 cd tools/model_worker && python3 -m unittest discover -s tests -v
 ```
+
+`--offline` 是必须的：本机构建环境访问不到 crates.io，所有依赖都已经在本地 vendor 里；
+新增第三方 crate 目前**装不上**，能用的是工作区里已有的（clap / serde / thiserror / chrono / sha2 等）
+与 crate 之间的 `path` 依赖。
 
 擦除管线的一键体验脚本（造测试素材 → 跑链路）：`tools/prototype_demo.sh`。
 
@@ -106,7 +112,7 @@ cd tools/model_worker && python3 -m unittest discover -s tests -v
 ```bash
 python3.9 -m venv .venv && ./.venv/bin/pip install -e cloud[dev]
 
-# 测试（147 个：单元 / 模块 / 集成 / 接口）
+# 测试（215 个：单元 / 模块 / 集成 / 接口）
 cd cloud && PYTHONPATH=src ../.venv/bin/python -m pytest tests/ -q
 
 # 端到端演示：造素材 → 4 条配方 → 门禁 → 取产物

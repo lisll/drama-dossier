@@ -16,3 +16,5 @@ pub mod pipeline;
 pub mod probe;
 pub mod verify;
 pub mod worker;
+
+pub use pipeline::ProgressStream;
