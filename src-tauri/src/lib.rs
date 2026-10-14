@@ -136,6 +136,9 @@ fn analyze_drama(
 }
 
 #[tauri::command]
+// 参数名即前端 IPC 协议字段（camelCase 映射），合并成结构体会破坏现有调用方；
+// 与 dossier-inpaint/src/pipeline.rs 的既有做法一致，这里显式豁免参数数量检查。
+#[allow(clippy::too_many_arguments)]
 fn generate_package(
     root: String,
     name: String,
