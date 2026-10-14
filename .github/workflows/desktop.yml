@@ -3,7 +3,7 @@ name: Desktop build
 on:
   push:
     branches:
-      - main
+      - master
     tags:
       - "app-v*"
   pull_request:
