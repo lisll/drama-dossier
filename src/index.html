@@ -23,6 +23,9 @@
         <span id="current-drama" class="drama-chip hidden"></span>
       </header>
 
+      <!-- 运行环境横幅：全局首屏，未就绪时显示（含一键配置入口），就绪后隐藏 -->
+      <div id="env-banner" class="env-banner hidden"></div>
+
       <main class="workspace">
         <nav class="sidenav" id="sidenav">
           <button class="nav-item active" data-module="library">剧目库</button>
@@ -110,8 +113,6 @@
 
           <!-- ============ 模块二：生成报审包 ============ -->
           <section id="module-generate" class="module hidden">
-            <div id="env-banner" class="env-banner hidden"></div>
-
             <div id="generate-context" class="drama-context empty">尚未选择剧目——请先到「剧目库」扫描并点选一部剧。</div>
 
             <section class="panel package-panel">
@@ -120,7 +121,6 @@
               </section>
               <div class="form-grid">
                 <label>输出目录<input id="output-dir" type="text" placeholder="留空时生成到剧目目录/报审包" /></label>
-                <label>ffprobe 路径<input id="ffprobe-path" type="text" placeholder="留空时从 PATH 查找 ffprobe" /></label>
                 <label>出品 / 公司<input id="company-name" type="text" placeholder="使用者填写的真实信息" /></label>
                 <label>投资总额（万元）<input id="total-investment" type="number" min="0" step="0.01" /></label>
                 <label>演员成本占比（%）<input id="actor-ratio" type="number" min="0" max="100" step="0.01" /></label>
@@ -320,7 +320,7 @@
                 <button id="reset-settings" class="ghost">恢复默认</button>
               </div>
               <p class="settings-note">
-                保存时一并记录「生成报审包」里的 ffprobe 路径与输出目录；设置只写入本机配置文件，不上传。
+                保存时一并记录「本机环境」里的 ffprobe 路径与「生成报审包」的输出目录；设置只写入本机配置文件，不上传。
                 <br />
                 配置文件：<span id="settings-path">—</span>
               </p>
@@ -329,10 +329,21 @@
             <section class="panel">
               <section class="panel-header">
                 <h3>本机环境</h3>
-                <button id="runtime-recheck" class="ghost">重新检测</button>
+                <div class="actions">
+                  <button id="runtime-install" class="primary">一键配置运行环境</button>
+                  <button id="runtime-recheck" class="ghost">重新检测</button>
+                </div>
               </section>
               <div id="runtime-list" class="runtime-list">
                 <div class="empty">尚未检测。</div>
+              </div>
+              <div class="form-grid">
+                <label
+                  >ffprobe 路径（高级，留空自动查找）<input
+                    id="ffprobe-path"
+                    type="text"
+                    placeholder="一键配置后自动填写"
+                /></label>
               </div>
             </section>
 

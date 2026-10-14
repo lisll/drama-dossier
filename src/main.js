@@ -19,6 +19,8 @@ const state = {
 };
 let renamePlan = null;
 let bitrateItems = null;
+// 最近一次从配置文件读到的设置：保存时用它带回 ffmpegPath（界面上没有对应输入框）。
+let loadedSettings = null;
 
 const $ = (selector) => document.querySelector(selector);
 const esc = (value) =>
@@ -99,6 +101,7 @@ async function loadSettings() {
   try {
     const payload = await call("load_app_settings");
     const settings = payload.settings ?? {};
+    loadedSettings = settings;
     $("#settings-path").textContent = payload.path;
     fillRules(settings.rules);
     if (settings.ffprobePath) $("#ffprobe-path").value = settings.ffprobePath;
@@ -121,6 +124,8 @@ async function saveSettings() {
     const path = await call("save_app_settings", {
       settings: {
         rules,
+        // ffmpegPath 由「一键配置运行环境」写入，界面无输入框，保存时原样带回避免丢失。
+        ffmpegPath: loadedSettings?.ffmpegPath ?? null,
         ffprobePath: $("#ffprobe-path").value.trim() || null,
         outputDir: $("#output-dir").value.trim() || null,
       },
@@ -203,9 +208,6 @@ function switchModule(name) {
   document.querySelectorAll(".module").forEach((node) => {
     node.classList.toggle("hidden", node.id !== `module-${name}`);
   });
-  if (name === "generate" || name === "settings") {
-    checkRuntime();
-  }
 }
 
 function renderContexts() {
@@ -839,7 +841,7 @@ async function executeTranscode() {
   }
 }
 
-// ============ 运行环境（生成页横幅 + 设置-本机环境） ============
+// ============ 运行环境（全局横幅 + 设置-本机环境） ============
 
 async function checkRuntime(force = false) {
   if (state.runtime && !force) {
@@ -861,21 +863,42 @@ async function checkRuntime(force = false) {
 
 function renderEnvBanner(status) {
   const tools = [status.ffmpeg, status.ffprobe];
-  const missing = tools.filter((tool) => !tool.found);
+  const missing = tools.filter((tool) => !tool.found || !tool.ok);
   const node = $("#env-banner");
-  node.classList.remove("hidden", "ok", "warn", "error");
   if (!missing.length) {
-    node.classList.add("ok");
-    node.innerHTML = `运行环境就绪：ffmpeg <code>${esc(
-      status.ffmpeg.displayVersion ?? status.ffmpeg.version ?? "",
-    )}</code> · ffprobe <code>${esc(
-      status.ffprobe.displayVersion ?? status.ffprobe.version ?? "",
-    )}</code>`;
-  } else {
-    node.classList.add("error");
-    node.innerHTML = `运行环境未就绪：缺少 ${esc(
-      missing.map((tool) => tool.name).join("、"),
-    )}。请安装 ffmpeg（含 ffprobe）并确保在 PATH 中，或在「生成报审包」里填写 ffprobe 路径。`;
+    // 就绪后不占版面；完整探测结果在「设置 → 本机环境」。
+    node.classList.add("hidden");
+    node.innerHTML = "";
+    return;
+  }
+  node.classList.remove("hidden", "ok", "warn", "error");
+  node.classList.add("error");
+  node.innerHTML = `运行环境未就绪：缺少 ${esc(
+    missing.map((tool) => tool.name).join("、"),
+  )}。点击「一键配置运行环境」自动下载安装（约 25 MB，需要网络）；也可以在「设置 → 本机环境」手动指定路径。<button id="env-install" class="ghost">一键配置运行环境</button>`;
+}
+
+// 一键配置运行环境：后台自动下载安装 ffmpeg/ffprobe 并写回设置，无需手动配置。
+// evermeet.cx 单连接限流，全剧下载可能需要几分钟，期间按钮保持禁用。
+async function runtimeInstall() {
+  const buttons = [$("#env-install"), $("#runtime-install")].filter(Boolean);
+  for (const button of buttons) {
+    button.disabled = true;
+    button.textContent = "正在配置…（下载安装中，请稍候）";
+  }
+  try {
+    const report = await call("install_runtime");
+    toast(report.note);
+  } catch (error) {
+    toast(String(error), true);
+  } finally {
+    for (const button of buttons) {
+      button.disabled = false;
+      button.textContent = "一键配置运行环境";
+    }
+    // 无论成败都刷新：成功后回填自动写入的路径并重测，失败时也展示最新状态。
+    await loadSettings();
+    await checkRuntime(true);
   }
 }
 
@@ -916,6 +939,13 @@ $("#bitrate-probe").addEventListener("click", probeBitrate);
 $("#bitrate-fix").addEventListener("click", fixBitrate);
 $("#exec-run").addEventListener("click", executeTranscode);
 $("#runtime-recheck").addEventListener("click", () => checkRuntime(true));
+$("#runtime-install").addEventListener("click", runtimeInstall);
+// 横幅里的安装按钮随 innerHTML 重建，用事件委托绑定。
+$("#env-banner").addEventListener("click", (event) => {
+  if (event.target instanceof Element && event.target.id === "env-install") {
+    runtimeInstall();
+  }
+});
 $("#browse-erase-input").addEventListener("click", async () => {
   try {
     const file = await call("pick_video");

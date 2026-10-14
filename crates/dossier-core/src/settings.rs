@@ -19,6 +19,8 @@ pub struct AppSettings {
     pub rules: Option<ChecklistRules>,
     /// ffprobe 可执行文件路径；`None` 表示从 `PATH` 查找。
     pub ffprobe_path: Option<PathBuf>,
+    /// ffmpeg 可执行文件路径；`None` 表示从 `PATH` 查找（一键安装的运行环境写在这里）。
+    pub ffmpeg_path: Option<PathBuf>,
     /// 默认输出目录；`None` 表示生成到「剧目目录/报审包」。
     pub output_dir: Option<PathBuf>,
 }
@@ -123,6 +125,7 @@ mod tests {
                 prefer_portrait: false,
             }),
             ffprobe_path: Some(PathBuf::from("/opt/ffmpeg/bin/ffprobe")),
+            ffmpeg_path: Some(PathBuf::from("/opt/ffmpeg/bin/ffmpeg")),
             output_dir: Some(PathBuf::from("/tmp/报审输出")),
         };
         save_settings(&path, &settings).unwrap();

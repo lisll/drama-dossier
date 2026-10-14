@@ -13,13 +13,14 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dossier_core::{
-    bitrate_report, nudge_frames, plan_recut_segments, plan_rename, probe_episode, BitrateItem,
-    EpisodeFile, FfprobeConfig, ProbedEpisode,
+    bitrate_report, load_settings, nudge_frames, plan_recut_segments, plan_rename, probe_episode,
+    save_settings, BitrateItem, EpisodeFile, FfprobeConfig, ProbedEpisode,
 };
 use dossier_media::shot::{detect_shots, ShotDetectConfig};
-use dossier_runtime::probe::{probe_ffprobe, probe_tool};
-use dossier_runtime::{probe_ffmpeg, CommandRunner, CommandSpec, SystemRunner, ToolReport};
+use dossier_runtime::probe::probe_tool;
+use dossier_runtime::{CommandRunner, CommandSpec, SystemRunner, ToolReport};
 use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Manager};
 
 use crate::dossier::{load_drama, probe_all};
 
@@ -29,10 +30,63 @@ pub const DEFAULT_MIN_BITRATE_KBPS: u64 = 4000;
 const FFMPEG_TIMEOUT_SECS: u64 = 600;
 
 // ---------------------------------------------------------------------------
+// 运行环境解析与一键安装
+// ---------------------------------------------------------------------------
+
+/// 应用数据目录下的运行环境安装位置（一键安装的 ffmpeg/ffprobe 放这里）。
+fn app_bin_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|dir| dir.join("bin"))
+        .map_err(|error| format!("无法定位应用数据目录：{error}。请检查系统权限。"))
+}
+
+/// 读取当前设置（缺失/损坏回退默认，与 `load_app_settings` 同语义）。
+fn read_settings(app: &AppHandle) -> Result<dossier_core::AppSettings, String> {
+    let path = crate::settings_path(app)?;
+    Ok(load_settings(&path).settings)
+}
+
+/// ffmpeg 解析顺序：设置里显式路径 → 一键安装目录 → `PATH`。
+fn resolve_ffmpeg(app: &AppHandle) -> Result<PathBuf, String> {
+    if let Some(path) = read_settings(app)?.ffmpeg_path {
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    if let Ok(bin) = app_bin_dir(app) {
+        let candidate = bin.join("ffmpeg");
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    Ok(PathBuf::from("ffmpeg"))
+}
+
+/// ffprobe 解析顺序：界面显式提示（填了就用，错误让它自然暴露）→ 设置 → 一键安装目录 → `PATH`。
+fn resolve_ffprobe(app: &AppHandle, hint: Option<&str>) -> Result<PathBuf, String> {
+    if let Some(hint) = hint.map(str::trim).filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(hint));
+    }
+    if let Some(path) = read_settings(app)?.ffprobe_path {
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    if let Ok(bin) = app_bin_dir(app) {
+        let candidate = bin.join("ffprobe");
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    Ok(PathBuf::from("ffprobe"))
+}
+
+// ---------------------------------------------------------------------------
 // 本机环境
 // ---------------------------------------------------------------------------
 
-/// 本机环境探测结果，供「生成页横幅」与「设置-本机环境」共用。
+/// 本机环境探测结果，供「全局横幅」与「设置-本机环境」共用。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeStatus {
@@ -42,19 +96,19 @@ pub struct RuntimeStatus {
 }
 
 #[tauri::command]
-pub fn runtime_status(ffprobe_path: Option<String>) -> RuntimeStatus {
+pub fn runtime_status(
+    app: AppHandle,
+    ffprobe_path: Option<String>,
+) -> Result<RuntimeStatus, String> {
+    let ffmpeg = resolve_ffmpeg(&app)?;
+    let ffprobe = resolve_ffprobe(&app, ffprobe_path.as_deref())?;
     let runner = SystemRunner::new();
-    RuntimeStatus {
-        ffmpeg: probe_ffmpeg(&runner, None),
-        ffprobe: probe_ffprobe(&runner, ffprobe_path.as_deref().map(Path::new)),
+    Ok(RuntimeStatus {
         // 只探解释器版本（秒级）；torch/onnxruntime 导入太慢，留给擦除页自查。
-        python: probe_tool(
-            &runner,
-            "python",
-            Path::new("python3"),
-            &["--version"],
-        ),
-    }
+        ffmpeg: probe_tool(&runner, "ffmpeg", &ffmpeg, &["-hide_banner", "-version"]),
+        ffprobe: probe_tool(&runner, "ffprobe", &ffprobe, &["-hide_banner", "-version"]),
+        python: probe_tool(&runner, "python", Path::new("python3"), &["--version"]),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -135,13 +189,15 @@ pub fn apply_rename(
 /// 码率探测结果（附阈值判断）。
 #[tauri::command]
 pub fn probe_bitrate(
+    app: AppHandle,
     root: String,
     name: String,
     min_kbps: Option<u64>,
     ffprobe_path: Option<String>,
 ) -> Result<Vec<BitrateItem>, String> {
     let drama = load_drama(&root, &name)?;
-    let episodes = probe_all(&drama, ffprobe_path);
+    let ffprobe = resolve_ffprobe(&app, ffprobe_path.as_deref())?;
+    let episodes = probe_all(&drama, Some(ffprobe.display().to_string()));
     if episodes.is_empty() {
         return Err("没有任何成功探测规格的分集；请先确认素材可读且 ffprobe 可用。".into());
     }
@@ -174,8 +230,8 @@ pub struct FailedItem {
 }
 
 /// 跑一条 ffmpeg 命令；失败时把 stderr 首行带回给界面。
-fn run_ffmpeg(args: &[&str]) -> Result<(), String> {
-    let mut spec = CommandSpec::new("ffmpeg");
+fn run_ffmpeg(program: &Path, args: &[&str]) -> Result<(), String> {
+    let mut spec = CommandSpec::new(program.display().to_string());
     for arg in args {
         spec = spec.arg(*arg);
     }
@@ -183,7 +239,7 @@ fn run_ffmpeg(args: &[&str]) -> Result<(), String> {
     let runner = SystemRunner::new();
     let output = runner
         .run(&spec)
-        .map_err(|error| format!("ffmpeg 启动失败（确认 PATH 里有 ffmpeg）：{error}"))?;
+        .map_err(|error| format!("ffmpeg 启动失败（{}）：{error}", program.display()))?;
     if output.success() {
         return Ok(());
     }
@@ -197,35 +253,38 @@ fn run_ffmpeg(args: &[&str]) -> Result<(), String> {
 }
 
 /// 重编码一条视频到目标码率：先写 `*.fixing.mp4` 临时文件，成功后原子替换原文件。
-fn reencode_to_bitrate(input: &Path, min_bps: u64) -> Result<(), String> {
+fn reencode_to_bitrate(ffmpeg: &Path, input: &Path, min_bps: u64) -> Result<(), String> {
     let target_kbps = (min_bps / 1000).max(1);
     let maxrate_kbps = target_kbps + target_kbps / 4;
     let bufsize_kbps = target_kbps * 2;
     let tmp = input.with_extension("fixing.mp4");
     let tmp_str = tmp.display().to_string();
     let input_str = input.display().to_string();
-    let result = run_ffmpeg(&[
-        "-y",
-        "-i",
-        &input_str,
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-b:v",
-        &format!("{target_kbps}k"),
-        "-maxrate",
-        &format!("{maxrate_kbps}k"),
-        "-bufsize",
-        &format!("{bufsize_kbps}k"),
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-movflags",
-        "+faststart",
-        &tmp_str,
-    ]);
+    let result = run_ffmpeg(
+        ffmpeg,
+        &[
+            "-y",
+            "-i",
+            &input_str,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-b:v",
+            &format!("{target_kbps}k"),
+            "-maxrate",
+            &format!("{maxrate_kbps}k"),
+            "-bufsize",
+            &format!("{bufsize_kbps}k"),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            &tmp_str,
+        ],
+    );
     match result {
         Ok(()) => {
             std::fs::rename(&tmp, input).map_err(|error| {
@@ -241,13 +300,16 @@ fn reencode_to_bitrate(input: &Path, min_bps: u64) -> Result<(), String> {
 }
 
 fn fix_bitrate_blocking(
+    app: &AppHandle,
     root: String,
     name: String,
     min_kbps: Option<u64>,
     ffprobe_path: Option<String>,
 ) -> Result<FixBitrateReport, String> {
+    let ffmpeg = resolve_ffmpeg(app)?;
+    let ffprobe = resolve_ffprobe(app, ffprobe_path.as_deref())?;
     let drama = load_drama(&root, &name)?;
-    let episodes = probe_all(&drama, ffprobe_path.clone());
+    let episodes = probe_all(&drama, Some(ffprobe.display().to_string()));
     if episodes.is_empty() {
         return Err("没有任何成功探测规格的分集；请先确认素材可读且 ffprobe 可用。".into());
     }
@@ -264,7 +326,7 @@ fn fix_bitrate_blocking(
         }
         let from_kbps = item.bitrate_bps.unwrap_or(0) / 1000;
         let path = PathBuf::from(&item.path);
-        match reencode_to_bitrate(&path, min_bps) {
+        match reencode_to_bitrate(&ffmpeg, &path, min_bps) {
             Ok(()) => {
                 // 修完回探一次，把实际码率报给界面。
                 let re_probed = probe_episode(
@@ -275,7 +337,7 @@ fn fix_bitrate_blocking(
                         episode_number: None,
                     },
                     &FfprobeConfig {
-                        bin: ffprobe_path.as_deref().map(PathBuf::from),
+                        bin: Some(ffprobe.clone()),
                     },
                 );
                 fixed.push(FixedItem {
@@ -300,13 +362,14 @@ fn fix_bitrate_blocking(
 
 #[tauri::command]
 pub async fn fix_bitrate(
+    app: AppHandle,
     root: String,
     name: String,
     min_kbps: Option<u64>,
     ffprobe_path: Option<String>,
 ) -> Result<FixBitrateReport, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        fix_bitrate_blocking(root, name, min_kbps, ffprobe_path)
+        fix_bitrate_blocking(&app, root, name, min_kbps, ffprobe_path)
     })
     .await
     .map_err(|error| format!("码率修复任务失败：{error}"))?
@@ -371,6 +434,7 @@ fn seed_for(file_name: &str) -> u64 {
 
 /// 智能微调：每集从开头裁掉 1~3 帧（帧率未知时按 30fps 折算），输出同名新文件。
 fn transcode_nudge_blocking(
+    ffmpeg: &Path,
     drama_name: &str,
     episodes: &[ProbedEpisode],
     output_dir: &Path,
@@ -393,7 +457,7 @@ fn transcode_nudge_blocking(
         ];
         args.extend(encode_output_args(&output));
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        run_ffmpeg(&arg_refs).map_err(|error| {
+        run_ffmpeg(ffmpeg, &arg_refs).map_err(|error| {
             let _ = std::fs::remove_file(&output);
             format!("{}：{error}", episode.file.file_name)
         })?;
@@ -449,6 +513,7 @@ fn spans_for_segment(
 /// 分集重组：全剧拼成一条时间线，在场景切点附近重新分集；切不到精确关键帧，
 /// 因此每个片段统一重编码（保证切点帧级精确）。输出名保持「第NN集」以便再次扫描。
 fn transcode_recut_blocking(
+    ffmpeg: &Path,
     episodes: &[ProbedEpisode],
     target_count: usize,
     output_dir: &Path,
@@ -460,9 +525,10 @@ fn transcode_recut_blocking(
     let mut boundaries: Vec<f64> = Vec::new();
     let mut file_starts: Vec<f64> = Vec::with_capacity(episodes.len());
     let mut offset = 0.0;
+    let ffmpeg_str = ffmpeg.display().to_string();
     for episode in episodes {
         file_starts.push(offset);
-        let report = detect_shots("ffmpeg", &episode.file.path, &ShotDetectConfig::default())
+        let report = detect_shots(&ffmpeg_str, &episode.file.path, &ShotDetectConfig::default())
             .map_err(|error| format!("{} 场景检测失败：{error}", episode.file.file_name))?;
         boundaries.extend(report.boundaries.iter().map(|b| offset + b.time_sec));
         offset += episode.spec.duration_sec;
@@ -495,7 +561,7 @@ fn transcode_recut_blocking(
             ];
             args.extend(encode_output_args(&output));
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            run_ffmpeg(&arg_refs).map_err(|error| {
+            run_ffmpeg(ffmpeg, &arg_refs).map_err(|error| {
                 let _ = std::fs::remove_file(&output);
                 format!("第 {} 集：{error}", index + 1)
             })?;
@@ -515,7 +581,7 @@ fn transcode_recut_blocking(
                 ];
                 args.extend(encode_output_args(&part));
                 let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                if let Err(error) = run_ffmpeg(&arg_refs) {
+                if let Err(error) = run_ffmpeg(ffmpeg, &arg_refs) {
                     for part in &part_paths {
                         let _ = std::fs::remove_file(part);
                     }
@@ -539,18 +605,21 @@ fn transcode_recut_blocking(
             }
             let list_str = list_path.display().to_string();
             let output_str = output.display().to_string();
-            let concat_result = run_ffmpeg(&[
-                "-y",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                &list_str,
-                "-c",
-                "copy",
-                &output_str,
-            ]);
+            let concat_result = run_ffmpeg(
+                ffmpeg,
+                &[
+                    "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    &list_str,
+                    "-c",
+                    "copy",
+                    &output_str,
+                ],
+            );
             for part in &part_paths {
                 let _ = std::fs::remove_file(part);
             }
@@ -589,13 +658,16 @@ fn transcode_recut_blocking(
 }
 
 fn transcode_blocking(
+    app: &AppHandle,
     root: String,
     name: String,
     request: TranscodeRequest,
     ffprobe_path: Option<String>,
 ) -> Result<TranscodeRunReport, String> {
+    let ffmpeg = resolve_ffmpeg(app)?;
+    let ffprobe = resolve_ffprobe(app, ffprobe_path.as_deref())?;
     let drama = load_drama(&root, &name)?;
-    let episodes = probe_all(&drama, ffprobe_path);
+    let episodes = probe_all(&drama, Some(ffprobe.display().to_string()));
     if episodes.is_empty() {
         return Err("没有任何成功探测规格的分集；请先确认素材可读且 ffprobe 可用。".into());
     }
@@ -606,7 +678,7 @@ fn transcode_blocking(
                 .output_dir
                 .map(PathBuf::from)
                 .unwrap_or_else(|| drama.dir.join("微调输出"));
-            transcode_nudge_blocking(&drama.name, &episodes, &output_dir)
+            transcode_nudge_blocking(&ffmpeg, &drama.name, &episodes, &output_dir)
         }
         "recut" => {
             let target = request
@@ -617,7 +689,7 @@ fn transcode_blocking(
                 .output_dir
                 .map(PathBuf::from)
                 .unwrap_or_else(|| drama.dir.join("重组输出"));
-            transcode_recut_blocking(&episodes, target, &output_dir)
+            transcode_recut_blocking(&ffmpeg, &episodes, target, &output_dir)
         }
         other => Err(format!("未知转码模式：{other}（支持 nudge / recut）")),
     }
@@ -625,16 +697,195 @@ fn transcode_blocking(
 
 #[tauri::command]
 pub async fn transcode_execute(
+    app: AppHandle,
     root: String,
     name: String,
     request: TranscodeRequest,
     ffprobe_path: Option<String>,
 ) -> Result<TranscodeRunReport, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        transcode_blocking(root, name, request, ffprobe_path)
+        transcode_blocking(&app, root, name, request, ffprobe_path)
     })
     .await
     .map_err(|error| format!("转码任务失败：{error}"))?
+}
+
+// ---------------------------------------------------------------------------
+// 一键安装运行环境
+// ---------------------------------------------------------------------------
+
+/// macOS 静态 ffmpeg 发行源：evermeet.cx。版本钉死保证可复现；
+/// 该站单连接限流（HTTP 429 / 带宽限速），因此**顺序**下载并交给 curl 重试。
+/// 注意：该站只提供 Intel（x86_64）构建（官方明确不提供 ARM 原生版），
+/// 在 Apple Silicon 上经 Rosetta 2 运行；Rosetta 缺失时自检会拦截并提示安装。
+#[cfg(target_os = "macos")]
+const EVERMEET_FFMPEG_URL: &str = "https://evermeet.cx/ffmpeg/ffmpeg-9.0.2.zip";
+#[cfg(target_os = "macos")]
+const EVERMEET_FFPROBE_URL: &str = "https://evermeet.cx/ffmpeg/ffprobe-9.0.2.zip";
+
+/// 一键安装结果。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallRuntimeReport {
+    pub ffmpeg_path: String,
+    pub ffprobe_path: String,
+    pub skipped_existing: Vec<String>,
+    pub note: String,
+}
+
+/// 用系统 curl 下载（macOS 自带，支持重试与断点续传）。
+fn download_file(url: &str, target: &Path) -> Result<(), String> {
+    let spec = CommandSpec::new("/usr/bin/curl")
+        .arg("-fL")
+        .arg("-sS")
+        .arg("--retry")
+        .arg("4")
+        .arg("--retry-delay")
+        .arg("10")
+        .arg("--retry-all-errors")
+        .arg("--max-time")
+        .arg("1800")
+        .arg("-o")
+        .arg(target.display().to_string())
+        .arg(url);
+    let runner = SystemRunner::new();
+    let output = runner
+        .run(&spec)
+        .map_err(|error| format!("curl 启动失败：{error}"))?;
+    if output.success() {
+        return Ok(());
+    }
+    let detail = output.combined();
+    let first = detail
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("（无输出）");
+    Err(format!("下载失败（{}）：{first}", output.code_label()))
+}
+
+/// 安装单个工具：下载 zip → 解压到临时目录 → 授权 → 移到目标位置。
+/// 返回 `Ok(true)` 表示目标已存在、本次跳过。
+#[cfg(target_os = "macos")]
+fn install_one(bin_dir: &Path, name: &str, url: &str) -> Result<bool, String> {
+    let target = bin_dir.join(name);
+    if target.is_file() {
+        return Ok(true);
+    }
+    let zip_path = bin_dir.join(format!("{name}.download.zip"));
+    let staging = bin_dir.join(format!("{name}.staging"));
+    let _ = std::fs::remove_dir_all(&staging);
+    let result = (|| -> Result<(), String> {
+        download_file(url, &zip_path)?;
+        std::fs::create_dir_all(&staging).map_err(|error| format!("创建解压目录失败：{error}"))?;
+        let spec = CommandSpec::new("/usr/bin/unzip")
+            .arg("-o")
+            .arg("-q")
+            .arg(zip_path.display().to_string())
+            .arg("-d")
+            .arg(staging.display().to_string());
+        let runner = SystemRunner::new();
+        let output = runner
+            .run(&spec)
+            .map_err(|error| format!("unzip 启动失败：{error}"))?;
+        if !output.success() {
+            let detail = output.combined();
+            let first = detail
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or("（无输出）");
+            return Err(format!("解压失败（{}）：{first}", output.code_label()));
+        }
+        let extracted = staging.join(name);
+        if !extracted.is_file() {
+            return Err(format!("压缩包里没有找到 {name} 可执行文件"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&extracted, std::fs::Permissions::from_mode(0o755))
+                .map_err(|error| format!("设置可执行权限失败：{error}"))?;
+        }
+        std::fs::rename(&extracted, &target)
+            .map_err(|error| format!("安装 {name} 失败：{error}"))?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&staging);
+    let _ = std::fs::remove_file(&zip_path);
+    result.map(|_| false)
+}
+
+#[cfg(target_os = "macos")]
+fn install_runtime_blocking(app: &AppHandle) -> Result<InstallRuntimeReport, String> {
+    let bin_dir = app_bin_dir(app)?;
+    std::fs::create_dir_all(&bin_dir).map_err(|error| format!("创建运行环境目录失败：{error}"))?;
+
+    let mut skipped_existing = Vec::new();
+    if install_one(&bin_dir, "ffmpeg", EVERMEET_FFMPEG_URL)? {
+        skipped_existing.push("ffmpeg".into());
+    }
+    if install_one(&bin_dir, "ffprobe", EVERMEET_FFPROBE_URL)? {
+        skipped_existing.push("ffprobe".into());
+    }
+
+    let ffmpeg_path = bin_dir.join("ffmpeg");
+    let ffprobe_path = bin_dir.join("ffprobe");
+
+    // 安装后自检，把「下载成功但跑不起来」拦在报告给用户之前。
+    {
+        let runner = SystemRunner::new();
+        let report = probe_tool(&runner, "ffmpeg", &ffmpeg_path, &["-hide_banner", "-version"]);
+        if !report.ok {
+            if report.detail.contains("Bad CPU type") {
+                return Err("安装完成但自检失败：CPU 架构不匹配（下载的是 Intel 版，需要 Rosetta 2）。请先在终端执行「softwareupdate --install-rosetta --agree-to-license」安装 Rosetta，再重新点击一键配置。".into());
+            }
+            return Err(format!("安装完成但自检失败：{}", report.detail));
+        }
+    }
+
+    // 写回设置：只在用户没有显式配置（或配置失效）时写入，避免覆盖手工配置。
+    let settings_path = crate::settings_path(app)?;
+    let mut settings = load_settings(&settings_path).settings;
+    let needs_ffmpeg = settings
+        .ffmpeg_path
+        .as_ref()
+        .map(|path| !path.is_file())
+        .unwrap_or(true);
+    let needs_ffprobe = settings
+        .ffprobe_path
+        .as_ref()
+        .map(|path| !path.is_file())
+        .unwrap_or(true);
+    if needs_ffmpeg {
+        settings.ffmpeg_path = Some(ffmpeg_path.clone());
+    }
+    if needs_ffprobe {
+        settings.ffprobe_path = Some(ffprobe_path.clone());
+    }
+    if needs_ffmpeg || needs_ffprobe {
+        save_settings(&settings_path, &settings)
+            .map_err(|error| format!("写入设置失败：{error}"))?;
+    }
+
+    Ok(InstallRuntimeReport {
+        ffmpeg_path: ffmpeg_path.display().to_string(),
+        ffprobe_path: ffprobe_path.display().to_string(),
+        skipped_existing,
+        note: format!("运行环境已就绪（安装目录：{}）", bin_dir.display()),
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn install_runtime_blocking(_app: &AppHandle) -> Result<InstallRuntimeReport, String> {
+    Err("运行环境自动安装目前仅支持 macOS；请手动安装 ffmpeg（含 ffprobe）。")
+}
+
+#[tauri::command]
+pub async fn install_runtime(app: AppHandle) -> Result<InstallRuntimeReport, String> {
+    tauri::async_runtime::spawn_blocking(move || install_runtime_blocking(&app))
+        .await
+        .map_err(|error| format!("运行环境安装任务失败：{error}"))?
 }
 
 #[cfg(test)]

@@ -38,7 +38,7 @@ struct SettingsPayload {
 }
 
 /// 设置文件位置：应用配置目录下的 `settings.json`。
-fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_config_dir()
         .map(|dir| dir.join("settings.json"))
@@ -203,7 +203,8 @@ pub fn run() {
             toolbox::apply_rename,
             toolbox::probe_bitrate,
             toolbox::fix_bitrate,
-            toolbox::transcode_execute
+            toolbox::transcode_execute,
+            toolbox::install_runtime
         ])
         .run(tauri::generate_context!())
         .expect("failed to run DramaDossier");
