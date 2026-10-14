@@ -1,0 +1,26 @@
+name: windows diagnose
+
+on:
+  push:
+    branches: [ci/windows-diagnose]
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: environment facts
+        shell: pwsh
+        run: |
+          "HOME=[$env:HOME]"
+          "USERPROFILE=[$env:USERPROFILE]"
+          "XDG_DATA_HOME=[$env:XDG_DATA_HOME]"
+          "APPDATA=[$env:APPDATA]"
+          foreach ($t in @('ffmpeg','ffprobe','sh','openssl','node','python3','py')) {
+            $c = Get-Command $t -ErrorAction SilentlyContinue
+            if ($c) { "$t -> $($c.Source)" } else { "$t -> <missing>" }
+          }
+      - name: test without fail fast
+        run: cargo test --workspace --all-features --no-fail-fast
