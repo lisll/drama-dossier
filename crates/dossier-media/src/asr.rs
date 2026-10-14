@@ -109,7 +109,10 @@ impl AsrPlan {
         // 所以在计划阶段就先确认。
         if self.flavor == WhisperFlavor::WhisperCpp {
             let path = Path::new(&self.model);
-            if path.is_absolute() && !path.is_file() {
+            // 判「带根」而不是「绝对」：Windows 上 `\models\x.bin` 这种从别处粘过来的写法
+            // 有根但**不是**绝对路径（绝对路径要盘符或 UNC），只判 `is_absolute()` 会漏掉它，
+            // 于是错误拖到跑了几分钟之后才暴露。带根的路径解析位置是确定的，可以直接校验。
+            if path.has_root() && !path.is_file() {
                 return Err(AsrError::ModelMissing(path.to_path_buf()));
             }
         }
