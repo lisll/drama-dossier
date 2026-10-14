@@ -406,9 +406,21 @@ Encoders:
     }
 
     /// 真机冒烟：把真实环境的能力标签打出来，确认调用链能跑通。
+    ///
+    /// 缺 ffmpeg 的环境直接跳过：CI runner 就是这种环境，清单全空，打印出来没有意义
+    /// （与本仓库其余真机用例的跳过约定一致）。
     #[test]
     fn real_environment_capability_smoke_test() {
         let runner = dossier_runtime::SystemRunner::new();
+        let ffmpeg_present = runner
+            .run(&CommandSpec::new("ffmpeg").arg("-version"))
+            .map(|output| output.success())
+            .unwrap_or(false);
+        if !ffmpeg_present {
+            eprintln!("跳过：本机没有可用的 ffmpeg");
+            return;
+        }
+
         let report = probe_media_tools(&runner, &MediaToolConfig::default());
         eprintln!(
             "本机后期能力：{}；缺失 {} 项；限制 {} 条",
@@ -424,11 +436,11 @@ Encoders:
                 tool.tool.display_version()
             );
         }
+        // ffmpeg 在，就一定有 atempo 这条降级能力——它只依赖 ffmpeg 本身，
+        // 与 drawtext / libx264 这些「某一份构建才有」的条目无关。
         assert!(
-            runner
-                .run(&CommandSpec::new("ffmpeg").arg("-version"))
-                .is_ok(),
-            "本机应当装有 ffmpeg（否则这条冒烟测试没有意义）"
+            report.supports(tags::TEMPO_ONLY),
+            "有 ffmpeg 却没有 atempo 标签：{report:?}"
         );
     }
 }

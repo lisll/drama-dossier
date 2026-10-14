@@ -1460,17 +1460,43 @@ mod tests {
         );
         assert!(report.video.parallelism.effective >= 1);
         assert!(report.video.parallelism.effective <= report.video.parallelism.maximum);
-        // 本机确定装了 ffmpeg 4.2.4，顺便验证真实解析。
-        assert!(report.ffmpeg.usable());
-        assert!(report.ffmpeg.encoders.video.contains("libx264"));
-        assert!(report.ffmpeg.filters.video.contains("drawtext"));
-        assert!(report.ffmpeg.filters.video.contains("overlay"));
 
-        let h264 = report
-            .video
-            .encoders
-            .get("h264")
-            .expect("本机应当有可用的 h264 编码路径");
+        // 下面的断言都要读真实解析结果：没有 ffmpeg 的机器（CI runner 就是）直接跳过，
+        // 与本仓库其余真机用例（`stamp_cli.rs` / `render.rs`）的跳过约定一致。
+        if !report.ffmpeg.usable() {
+            eprintln!("跳过：本机没有可用的 ffmpeg");
+            return;
+        }
+        assert!(report
+            .capability_tags()
+            .contains(&"media.ffmpeg".to_string()));
+
+        // 解析确实跑通了：ffmpeg 可用就必须给出非空的编码器/滤镜清单。
+        // 只断言「有清单」，不断言清单里是 libx264 / drawtext 这些具体条目——
+        // 那是某一份 ffmpeg 构建的内容，不是探测链路的不变式。
+        assert!(
+            !report.ffmpeg.encoders.video.is_empty(),
+            "ffmpeg 可用却没解析出编码器：{:?}",
+            report.ffmpeg.list_error
+        );
+        assert!(
+            !report.ffmpeg.filters.video.is_empty(),
+            "ffmpeg 可用却没解析出滤镜：{:?}",
+            report.ffmpeg.list_error
+        );
+
+        let h264 = report.video.encoders.get("h264").unwrap_or_else(|| {
+            panic!(
+                "有可用的 ffmpeg 却没有 h264 选型结论：{:?}",
+                report.video.encoder_errors
+            )
+        });
+        // 选型结果必须来自这台机器真实的编码器清单。
+        assert!(
+            report.ffmpeg.encoders.supports(&h264.selected),
+            "选中的编码器 {} 不在本机清单里",
+            h264.selected
+        );
         if h264.hardware {
             let verification = h264
                 .candidate(&h264.selected)
@@ -1485,9 +1511,6 @@ mod tests {
             // 软件回退必须给出理由。
             assert!(!h264.reason.is_empty());
         }
-        assert!(report
-            .capability_tags()
-            .contains(&"media.ffmpeg".to_string()));
     }
 
     #[test]
