@@ -136,7 +136,10 @@ fn plain_file_name(value: &str) -> Result<&str, String> {
     let path = Path::new(value);
     if value.is_empty()
         || path.components().count() != 1
-        || path.parent().map(|p| !p.as_os_str().is_empty()).unwrap_or(false)
+        || path
+            .parent()
+            .map(|p| !p.as_os_str().is_empty())
+            .unwrap_or(false)
     {
         return Err(format!("非法文件名（不允许包含路径）：{value}"));
     }
@@ -288,12 +291,10 @@ fn reencode_to_bitrate(ffmpeg: &Path, input: &Path, min_bps: u64) -> Result<(), 
         ],
     );
     match result {
-        Ok(()) => {
-            std::fs::rename(&tmp, input).map_err(|error| {
-                let _ = std::fs::remove_file(&tmp);
-                format!("替换原文件失败：{error}")
-            })
-        }
+        Ok(()) => std::fs::rename(&tmp, input).map_err(|error| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("替换原文件失败：{error}")
+        }),
         Err(error) => {
             let _ = std::fs::remove_file(&tmp);
             Err(error)
@@ -345,7 +346,9 @@ fn fix_bitrate_blocking(
                 fixed.push(FixedItem {
                     file_name: item.file_name.clone(),
                     from_kbps,
-                    to_kbps: re_probed.ok().and_then(|probed| probed.spec.bitrate_bps)
+                    to_kbps: re_probed
+                        .ok()
+                        .and_then(|probed| probed.spec.bitrate_bps)
                         .map(|bps| bps / 1000),
                 });
             }
@@ -473,9 +476,7 @@ fn transcode_nudge_blocking(
         mode: "nudge".into(),
         output_dir: output_dir.display().to_string(),
         items,
-        note: format!(
-            "《{drama_name}》每集开头已微调 1~3 帧，输出到新目录，原素材未改动。"
-        ),
+        note: format!("《{drama_name}》每集开头已微调 1~3 帧，输出到新目录，原素材未改动。"),
     })
 }
 
@@ -530,8 +531,12 @@ fn transcode_recut_blocking(
     let ffmpeg_str = ffmpeg.display().to_string();
     for episode in episodes {
         file_starts.push(offset);
-        let report = detect_shots(&ffmpeg_str, &episode.file.path, &ShotDetectConfig::default())
-            .map_err(|error| format!("{} 场景检测失败：{error}", episode.file.file_name))?;
+        let report = detect_shots(
+            &ffmpeg_str,
+            &episode.file.path,
+            &ShotDetectConfig::default(),
+        )
+        .map_err(|error| format!("{} 场景检测失败：{error}", episode.file.file_name))?;
         boundaries.extend(report.boundaries.iter().map(|b| offset + b.time_sec));
         offset += episode.spec.duration_sec;
     }
@@ -588,7 +593,11 @@ fn transcode_recut_blocking(
                         let _ = std::fs::remove_file(part);
                     }
                     let _ = std::fs::remove_file(&output);
-                    return Err(format!("第 {} 集（{}）：{error}", index + 1, span.file_name));
+                    return Err(format!(
+                        "第 {} 集（{}）：{error}",
+                        index + 1,
+                        span.file_name
+                    ));
                 }
                 part_paths.push(part);
             }
@@ -860,7 +869,12 @@ fn install_runtime_blocking(app: &AppHandle) -> Result<InstallRuntimeReport, Str
     // 安装后自检，把「下载成功但跑不起来」拦在报告给用户之前。
     {
         let runner = SystemRunner::new();
-        let report = probe_tool(&runner, "ffmpeg", &ffmpeg_path, &["-hide_banner", "-version"]);
+        let report = probe_tool(
+            &runner,
+            "ffmpeg",
+            &ffmpeg_path,
+            &["-hide_banner", "-version"],
+        );
         if !report.ok {
             if report.detail.contains("Bad CPU type") {
                 return Err("安装完成但自检失败：CPU 架构不匹配（下载的是 Intel 版，需要 Rosetta 2）。请先在终端执行「softwareupdate --install-rosetta --agree-to-license」安装 Rosetta，再重新点击一键配置。".into());
@@ -950,7 +964,10 @@ mod tests {
     #[test]
     fn spans_map_global_segment_back_to_local_files() {
         // 两集各 60 秒，全局 [50, 130] 跨两集。
-        let episodes = vec![probe_at("/a/第01集.mp4", 60.0), probe_at("/a/第02集.mp4", 60.0)];
+        let episodes = vec![
+            probe_at("/a/第01集.mp4", 60.0),
+            probe_at("/a/第02集.mp4", 60.0),
+        ];
         let spans = spans_for_segment(&episodes, &[0.0, 60.0], (50.0, 130.0));
         assert_eq!(spans.len(), 2);
         assert!((spans[0].local_start - 50.0).abs() < 1e-9);

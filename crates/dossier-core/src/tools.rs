@@ -30,7 +30,11 @@ pub struct RenamePlan {
 }
 
 /// 目标名规则：`{剧名} - 第{NN}集.{原扩展名}`；集号至少两位（`第01集`）。
-pub fn episode_target_name(drama_name: &str, episode_number: u32, file_name: &str) -> Option<String> {
+pub fn episode_target_name(
+    drama_name: &str,
+    episode_number: u32,
+    file_name: &str,
+) -> Option<String> {
     let ext = Path::new(file_name).extension()?.to_str()?;
     if ext.is_empty() {
         return None;
