@@ -142,6 +142,7 @@ DramaDossier 是一个本地优先的桌面应用，用于把散落在磁盘上�
 │   │       ├── update.rs        # 更新通道：签名清单 + 验签 + 版本比较
 │   │       ├── secret.rs        # 本地凭据存储（0600 + 原子写）
 │   │       ├── device.rs        # 设备指纹（只输出摘要）
+│   │       ├── paths.rs         # 平台数据目录（XDG / HOME / Windows %APPDATA%）
 │   │       └── main.rs          # probe / selfcheck / install / rollback / update
 │   ├── dossier-media/           # 后期能力适配（Tier 2）
 │   │   └── src/

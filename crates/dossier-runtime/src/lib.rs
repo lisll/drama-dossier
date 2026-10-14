@@ -11,7 +11,8 @@
 //! - [`store`]：组件安装 / 校验 / 回滚；
 //! - [`update`]：更新通道清单 + Ed25519 签名校验；
 //! - [`secret`]：本地凭据存储（文件权限 + 原子写，明确不是 OS 级密钥库）；
-//! - [`device`]：设备指纹（仅稳定标识的哈希，不外发）。
+//! - [`device`]：设备指纹（仅稳定标识的哈希，不外发）；
+//! - [`paths`]：平台数据目录解析（XDG / HOME / Windows `%APPDATA%`）。
 //!
 //! 合规边界：本 crate 只做本地能力管理与校验，不下载并执行未校验的可执行文件，
 //! 也不向任何服务上报设备信息。
@@ -21,6 +22,7 @@ pub mod command;
 pub mod device;
 pub mod digest;
 pub mod manifest;
+pub mod paths;
 pub mod probe;
 pub mod secret;
 pub mod store;
@@ -40,6 +42,7 @@ pub use manifest::{
     Component, ComponentFile, ComponentSource, ManifestError, ModelInfo, RuntimeManifest,
     RuntimeRoles, MANIFEST_SCHEMA_VERSION,
 };
+pub use paths::default_data_root;
 pub use probe::{
     probe_ffmpeg, probe_ffmpeg_capabilities, probe_gpu, probe_python, EncoderList,
     FfmpegCapabilities, FilterList, GpuDevice, GpuReport, PythonReport, ToolReport,

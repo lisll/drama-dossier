@@ -24,6 +24,7 @@ use dossier_runtime::caps::{probe_environment, ParallelismPreset, ProbeConfig};
 use dossier_runtime::command::SystemRunner;
 use dossier_runtime::device::compute_device_fingerprint;
 use dossier_runtime::manifest::{RuntimeManifest, RuntimeRoles};
+use dossier_runtime::paths::default_data_root;
 use dossier_runtime::secret::{mask, SecretStore};
 use dossier_runtime::store::{
     generate_component, Archiver, Downloader, GenerateOptions, RuntimeStore, StoreConfig,
@@ -815,17 +816,12 @@ fn store_config(root: Option<PathBuf>) -> Result<StoreConfig, String> {
 }
 
 fn default_runtime_root() -> Result<PathBuf, String> {
-    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(xdg).join("dossier").join("runtime"));
-    }
-    let home = std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .ok_or("无法确定运行时目录：既没有 XDG_DATA_HOME 也没有 HOME；请用 --root 指定")?;
-    Ok(PathBuf::from(home)
-        .join(".local")
-        .join("share")
-        .join("dossier")
-        .join("runtime"))
+    default_data_root()
+        .map(|root| root.join("dossier").join("runtime"))
+        .ok_or_else(|| {
+            "无法确定运行时目录：既没有 XDG_DATA_HOME / HOME，也没有 APPDATA；请用 --root 指定"
+                .to_string()
+        })
 }
 
 fn secret_store(root: Option<PathBuf>) -> Result<SecretStore, String> {

@@ -38,7 +38,7 @@ pub enum SecretError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("无法确定凭据目录：既没有 XDG_DATA_HOME 也没有 HOME")]
+    #[error("无法确定凭据目录：既没有 XDG_DATA_HOME / HOME，也没有 APPDATA")]
     NoHome,
     #[error("凭据文件权限过宽（{path}，mode {mode:o}）：同机其它用户可能读到内容")]
     InsecurePermissions { path: PathBuf, mode: u32 },
@@ -66,25 +66,16 @@ impl SecretStore {
         Self { root: root.into() }
     }
 
-    /// 默认位置：`$XDG_DATA_HOME/dossier/secrets`，退回 `$HOME/.local/share/dossier/secrets`。
+    /// 默认位置：`$XDG_DATA_HOME/dossier/secrets`，退回 `$HOME/.local/share/dossier/secrets`，
+    /// Windows 上退回 `%APPDATA%\dossier\secrets`（解析规则见 [`crate::paths`]）。
     ///
     /// 不放在仓库目录里——凭据绝不能进版本库。
     pub fn with_default_root() -> Result<Self, SecretError> {
-        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
-            return Ok(Self::new(
-                PathBuf::from(xdg).join("dossier").join("secrets"),
-            ));
-        }
-        let home = std::env::var_os("HOME")
-            .filter(|v| !v.is_empty())
-            .ok_or(SecretError::NoHome)?;
-        Ok(Self::new(
-            PathBuf::from(home)
-                .join(".local")
-                .join("share")
-                .join("dossier")
-                .join("secrets"),
-        ))
+        let root = crate::paths::default_data_root()
+            .ok_or(SecretError::NoHome)?
+            .join("dossier")
+            .join("secrets");
+        Ok(Self::new(root))
     }
 
     pub fn root(&self) -> &Path {
@@ -487,8 +478,9 @@ mod tests {
     }
 
     #[test]
-    fn default_root_uses_xdg_or_home() {
-        // 不改环境，只验证两种来源都能给出一个绝对路径且不以点开头。
+    fn default_root_uses_the_platform_data_dir() {
+        // 不改环境，只验证本机能给出一个绝对路径。各来源的优先级由
+        // `paths::tests` 覆盖（那里注入环境，不依赖真实机器）。
         let store = SecretStore::with_default_root().unwrap();
         assert!(store.root().is_absolute());
         assert!(store.root().ends_with("secrets"));
