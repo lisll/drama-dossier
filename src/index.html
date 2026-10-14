@@ -20,11 +20,21 @@
             <p>从素材目录到结构化报审材料包</p>
           </div>
         </div>
-        <span id="current-drama" class="drama-chip hidden"></span>
+        <div class="header-status">
+          <button id="env-chip" class="env-chip" type="button" title="查看本机环境检测结果">
+            正在检测本机环境…
+          </button>
+          <span id="current-drama" class="drama-chip hidden"></span>
+        </div>
       </header>
 
       <!-- 运行环境横幅：全局首屏，未就绪时显示（含一键配置入口），就绪后隐藏 -->
       <div id="env-banner" class="env-banner hidden"></div>
+
+      <div id="progress" class="progress hidden" role="status" aria-live="polite">
+        <div class="progress-track"><span id="progress-fill"></span></div>
+        <p id="progress-label" class="progress-label">正在处理…</p>
+      </div>
 
       <main class="workspace">
         <nav class="sidenav" id="sidenav">
@@ -45,7 +55,7 @@
               <div class="path-row">
                 <input id="library-root" type="text" placeholder="选择或输入剧集素材根目录" />
                 <button id="browse-root" class="ghost">选择</button>
-                <button id="scan" class="primary">扫描剧目</button>
+                <button id="scan" data-long-task class="primary">扫描剧目</button>
               </div>
               <div id="drama-list" class="drama-list">
                 <div class="empty">先选择素材根目录，再点击「扫描剧目」。</div>
@@ -68,7 +78,7 @@
                     <h2 id="drama-name"></h2>
                     <p id="drama-path"></p>
                   </div>
-                  <button id="analyze" class="primary">探测并检查</button>
+                  <button id="analyze" data-long-task class="primary">探测并检查</button>
                 </section>
 
                 <div class="grid">
@@ -119,8 +129,11 @@
               <section class="panel-header">
                 <h3>生成报审包</h3>
               </section>
+              <p class="hint">
+                「本次运行覆盖」只在这一次生效；长期默认值请到「设置」里改，留空即用默认。
+              </p>
               <div class="form-grid">
-                <label>输出目录<input id="output-dir" type="text" placeholder="留空时生成到剧目目录/报审包" /></label>
+                <label>输出目录（本次覆盖）<input id="output-dir" type="text" placeholder="留空时生成到剧目目录/报审包" /></label>
                 <label>出品 / 公司<input id="company-name" type="text" placeholder="使用者填写的真实信息" /></label>
                 <label>投资总额（万元）<input id="total-investment" type="number" min="0" step="0.01" /></label>
                 <label>演员成本占比（%）<input id="actor-ratio" type="number" min="0" max="100" step="0.01" /></label>
@@ -130,7 +143,7 @@
                 <label><input id="copy-episodes" type="checkbox" /> 复制分集视频进报审包</label>
                 <label><input id="ai-generated" type="checkbox" /> 剧名/简介/封面使用了 AI 辅助生成</label>
                 <button id="browse-output" class="ghost">选择输出目录</button>
-                <button id="generate" class="success">生成材料包</button>
+                <button id="generate" data-long-task class="success">生成材料包</button>
               </div>
               <div id="generate-result" class="result hidden"></div>
               <p class="legal">
@@ -143,6 +156,16 @@
           <section id="module-toolbox" class="module hidden">
             <div id="toolbox-context" class="drama-context empty">尚未选择剧目——请先到「剧目库」扫描并点选一部剧。</div>
 
+            <section class="panel guidance">
+              <h3>该用哪个工具？</h3>
+              <ol>
+                <li><strong>只想先看看要改什么</strong>：用「视频转码 → 转码建议」，它只出建议，不动文件。</li>
+                <li><strong>只是码率不达标</strong>：用「码率修复」，会就地重编码不达标的分集（<em>替换原文件</em>）。</li>
+                <li><strong>要改时长、顺序或分集数</strong>：用「视频转码 → 执行转码」，结果写到新目录。</li>
+                <li><strong>文件名不统一</strong>：先做「批量改名」，再跑上面的检查（集号解析依赖文件名）。</li>
+              </ol>
+            </section>
+
             <div class="tool-grid">
               <details class="panel tool-card" id="tool-rename">
                 <summary>批量改名</summary>
@@ -151,8 +174,8 @@
                   目标名冲突或重复时整体拒绝，不会改到一半。
                 </p>
                 <div class="option-row">
-                  <button id="rename-plan" class="primary">预览改名计划</button>
-                  <button id="rename-apply" class="success" disabled>应用改名</button>
+                  <button id="rename-plan" data-long-task class="primary">预览改名计划</button>
+                  <button id="rename-apply" data-long-task class="success" disabled>应用改名</button>
                 </div>
                 <div id="rename-result" class="result hidden"></div>
               </details>
@@ -167,8 +190,15 @@
                   <label>码率安全线（Mbps）<input id="bitrate-min" type="number" min="0.1" step="0.1" value="4" /></label>
                 </div>
                 <div class="option-row">
-                  <button id="bitrate-probe" class="primary">检测码率</button>
-                  <button id="bitrate-fix" class="success" disabled>修复不达标分集</button>
+                  <button id="bitrate-probe" data-long-task class="primary">检测码率</button>
+                  <button id="bitrate-fix" data-long-task class="danger" disabled>修复不达标分集</button>
+                </div>
+                <div id="bitrate-confirm" class="confirm hidden" role="alertdialog" aria-live="assertive">
+                  <p id="bitrate-confirm-text"></p>
+                  <div class="option-row">
+                    <button id="bitrate-confirm-yes" data-long-task class="danger">确认：重编码并替换原文件</button>
+                    <button id="bitrate-confirm-no" class="ghost">取消</button>
+                  </div>
                 </div>
                 <div id="bitrate-result" class="result hidden"></div>
               </details>
@@ -186,7 +216,7 @@
                     <label>最大高（0 表示不限）<input id="transcode-height" type="number" min="0" step="2" value="1920" /></label>
                   </div>
                   <div class="option-row">
-                    <button id="transcode-plan" class="primary">生成转码建议</button>
+                    <button id="transcode-plan" data-long-task class="primary">生成转码建议</button>
                   </div>
                   <div id="transcode-result" class="result hidden"></div>
                 </section>
@@ -206,7 +236,7 @@
                     <label>输出目录<input id="exec-output" type="text" placeholder="留空时写到剧目目录/微调输出 或 /重组输出" /></label>
                   </div>
                   <div class="option-row">
-                    <button id="exec-run" class="success">执行转码</button>
+                    <button id="exec-run" data-long-task class="success">执行转码</button>
                   </div>
                   <div id="exec-result" class="result hidden"></div>
                 </section>
@@ -234,7 +264,7 @@
                   <label>平台档案<select id="platform-select"></select></label>
                 </div>
                 <div class="option-row">
-                  <button id="platform-run" class="primary">对照当前剧目</button>
+                  <button id="platform-run" data-long-task class="primary">对照当前剧目</button>
                 </div>
                 <div id="platform-result" class="result hidden"></div>
               </details>
@@ -247,8 +277,8 @@
                 </div>
                 <div class="option-row">
                   <button id="draft-pick" class="ghost">选择草稿目录</button>
-                  <button id="draft-export" class="primary">导出草稿</button>
-                  <button id="draft-import" class="ghost">读回草稿</button>
+                  <button id="draft-export" data-long-task class="primary">导出草稿</button>
+                  <button id="draft-import" data-long-task class="ghost">读回草稿</button>
                 </div>
                 <div id="draft-result" class="result hidden"></div>
               </details>
@@ -288,7 +318,7 @@
                   <button id="browse-erase-input" class="ghost">选择输入视频</button>
                   <button id="erase-status" class="ghost">检测工具状态</button>
                   <button id="erase-plan" class="primary">预览命令</button>
-                  <button id="erase-run" class="success">执行擦除</button>
+                  <button id="erase-run" data-long-task class="success">执行擦除</button>
                 </div>
                 <div id="erase-result" class="result hidden"></div>
                 <p class="legal">
@@ -304,8 +334,11 @@
             <section class="panel">
               <section class="panel-header">
                 <h3>检查规则与路径</h3>
-                <span class="badge">可覆盖默认阈值</span>
+                <span id="settings-dirty" class="badge dirty hidden">有改动未保存</span>
               </section>
+              <p class="hint">
+                这里的值保存后才会生效（探测与生成都读已保存的设置）；「生成报审包」里的输出目录只是本次运行的临时覆盖。
+              </p>
               <div class="form-grid">
                 <label>最少集数<input id="rule-min-episodes" type="number" min="1" step="1" /></label>
                 <label>单集时长下限（秒）<input id="rule-min-duration" type="number" min="1" step="1" /></label>
@@ -315,12 +348,17 @@
                   <input id="rule-prefer-portrait" type="checkbox" /> 横屏分集给出警告
                 </label>
               </div>
+              <div class="form-grid">
+                <label>默认输出目录<input id="settings-output" type="text" placeholder="留空时生成到剧目目录/报审包" /></label>
+              </div>
               <div class="option-row">
                 <button id="save-settings" class="primary">保存设置</button>
                 <button id="reset-settings" class="ghost">恢复默认</button>
               </div>
               <p class="settings-note">
-                保存时一并记录「本机环境」里的 ffprobe 路径与「生成报审包」的输出目录；设置只写入本机配置文件，不上传。
+                设置只写入本机配置文件，不上传；素材根目录会随扫描自动记住。
+                <br />
+                ffprobe 路径在「本机环境」里填写，留空则由应用按「设置 → 安装目录 → PATH」依次查找。
                 <br />
                 配置文件：<span id="settings-path">—</span>
               </p>
@@ -362,7 +400,7 @@
         </div>
       </main>
     </div>
-    <div id="toast" class="toast hidden"></div>
+    <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
     <script src="./main.js"></script>
   </body>
 </html>

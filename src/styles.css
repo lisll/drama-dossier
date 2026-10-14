@@ -666,3 +666,167 @@ code {
   word-break: break-all;
   font-size: 12px;
 }
+
+/* ---------------------------------------------------------------------------
+   环境状态、长任务进度与结果语义色
+   （本轮为「C 端可用性」补的组件：状态前置、任务可见、失败不再穿成功色）
+   --------------------------------------------------------------------------- */
+
+.header-status {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.env-chip {
+  border-radius: 999px;
+  padding: 0 14px;
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--panel);
+  color: var(--muted);
+}
+
+.env-chip.ok {
+  color: #b7f5d8;
+  border-color: rgba(37, 197, 137, 0.4);
+  background: rgba(37, 197, 137, 0.14);
+}
+
+.env-chip.warn {
+  color: #ffe9c2;
+  border-color: rgba(240, 182, 77, 0.4);
+  background: rgba(240, 182, 77, 0.14);
+}
+
+.env-chip.error {
+  color: #ffd6da;
+  border-color: rgba(255, 91, 107, 0.45);
+  background: rgba(255, 91, 107, 0.14);
+}
+
+.progress {
+  display: grid;
+  gap: 6px;
+  padding: 12px 24px 0;
+}
+
+.progress-track {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.progress-track > span {
+  display: block;
+  width: 0;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #647eff, #2ed694);
+  transition: width 0.25s ease;
+}
+
+.progress.indeterminate .progress-track > span {
+  width: 34%;
+  animation: progress-slide 1.4s ease-in-out infinite;
+}
+
+@keyframes progress-slide {
+  0% {
+    margin-left: -34%;
+  }
+  100% {
+    margin-left: 100%;
+  }
+}
+
+.progress-label {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.field-error {
+  margin: 4px 0 0;
+  color: var(--danger);
+  font-size: 12px;
+}
+
+input[aria-invalid="true"] {
+  border-color: rgba(255, 91, 107, 0.7);
+}
+
+.result.warn {
+  background: rgba(240, 182, 77, 0.12);
+  border-color: rgba(240, 182, 77, 0.3);
+  color: #ffe9c2;
+}
+
+.result.error {
+  background: rgba(255, 91, 107, 0.12);
+  border-color: rgba(255, 91, 107, 0.32);
+  color: #ffd6da;
+}
+
+.result-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.result-actions button {
+  min-height: 30px;
+  font-size: 12px;
+}
+
+.danger {
+  background: linear-gradient(135deg, #ff6b7a, #d63a4c);
+}
+
+.confirm {
+  margin-top: 12px;
+  padding: 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 91, 107, 0.45);
+  background: rgba(255, 91, 107, 0.1);
+  font-size: 13px;
+}
+
+.confirm p {
+  margin: 0;
+  line-height: 1.7;
+}
+
+.guidance {
+  margin-bottom: 16px;
+}
+
+.guidance h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+}
+
+.guidance ol {
+  margin: 0;
+  padding-left: 20px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.8;
+}
+
+.guidance strong {
+  color: var(--text);
+}
+
+.guidance em {
+  color: var(--warn);
+  font-style: normal;
+}
+
+.badge.dirty {
+  color: #ffe9c2;
+  background: rgba(240, 182, 77, 0.16);
+}

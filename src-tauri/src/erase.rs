@@ -10,10 +10,13 @@
 
 use std::path::{Path, PathBuf};
 
+use dossier_core::same_path;
 use dossier_inpaint::erase::{
     build_plan, resolve_tool, run_plan, ErasePlan, EraseRequest, EraseRun,
 };
 use serde::Serialize;
+
+use crate::paths::normalize;
 
 /// 擦除工具的可用状态，供界面在启动时展示。
 #[derive(Debug, Serialize)]
@@ -73,9 +76,21 @@ pub fn erase_status(tool_path: Option<String>) -> EraseStatus {
     }
 }
 
+/// 输入与输出指向同一个文件时会边读边写、直接毁掉源素材；预览与执行前都先拦住。
+fn ensure_distinct_io(request: &EraseRequest) -> Result<(), String> {
+    if same_path(&normalize(&request.input), &normalize(&request.output)) {
+        return Err(format!(
+            "输出视频不能是输入视频本身（{}）：那会覆盖原素材。请换一个输出路径。",
+            request.input.display()
+        ));
+    }
+    Ok(())
+}
+
 /// 只拼装命令，不执行——界面据此展示「将要运行什么」。
 #[tauri::command]
 pub fn plan_erase(request: EraseRequest, tool_path: Option<String>) -> Result<ErasePlan, String> {
+    ensure_distinct_io(&request)?;
     let tool = locate(tool_path.as_deref())?;
     build_plan(&request, &tool)
 }
@@ -90,6 +105,7 @@ pub fn run_erase(
     if !request.input.is_file() {
         return Err(format!("输入视频不存在：{}", request.input.display()));
     }
+    ensure_distinct_io(&request)?;
     if let Some(parent) = request.output.parent() {
         if !parent.as_os_str().is_empty() && !parent.is_dir() {
             return Err(format!("输出目录不存在：{}", parent.display()));

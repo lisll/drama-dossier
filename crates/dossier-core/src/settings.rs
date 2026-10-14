@@ -23,6 +23,8 @@ pub struct AppSettings {
     pub ffmpeg_path: Option<PathBuf>,
     /// 默认输出目录；`None` 表示生成到「剧目目录/报审包」。
     pub output_dir: Option<PathBuf>,
+    /// 上次使用的素材根目录；`None` 表示还没有扫描过，界面需要重新选择。
+    pub library_root: Option<PathBuf>,
 }
 
 impl AppSettings {
@@ -127,6 +129,7 @@ mod tests {
             ffprobe_path: Some(PathBuf::from("/opt/ffmpeg/bin/ffprobe")),
             ffmpeg_path: Some(PathBuf::from("/opt/ffmpeg/bin/ffmpeg")),
             output_dir: Some(PathBuf::from("/tmp/报审输出")),
+            library_root: Some(PathBuf::from("/tmp/素材库")),
         };
         save_settings(&path, &settings).unwrap();
 
@@ -142,6 +145,10 @@ mod tests {
         assert_eq!(
             loaded.settings.output_dir,
             Some(PathBuf::from("/tmp/报审输出"))
+        );
+        assert_eq!(
+            loaded.settings.library_root,
+            Some(PathBuf::from("/tmp/素材库"))
         );
         std::fs::remove_dir_all(&dir).ok();
     }

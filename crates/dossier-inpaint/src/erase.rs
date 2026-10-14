@@ -96,6 +96,10 @@ impl EraseRequest {
         if self.output.as_os_str().is_empty() {
             return Err("请指定输出视频路径。".into());
         }
+        // 输出指向输入本身时，管线会边读边写同一个文件，直接毁掉源素材。
+        if dossier_core::same_path(&self.input, &self.output) {
+            return Err("输出视频不能与输入视频相同：那会覆盖原素材。请换一个输出路径。".into());
+        }
         match self.detector.as_str() {
             "fixed" => {
                 if self.regions.is_empty() {
@@ -418,6 +422,19 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn rejects_output_pointing_at_input() {
+        let mut req = request();
+        req.output = req.input.clone();
+        let err = req.validate().unwrap_err();
+        assert!(err.contains("不能与输入视频相同"), "{err}");
+
+        // 结尾分隔符/`.` 之类的写法差异也要认出来。
+        let mut variant = request();
+        variant.output = PathBuf::from("/tmp/./in.mp4");
+        assert!(variant.validate().is_err());
     }
 
     #[test]

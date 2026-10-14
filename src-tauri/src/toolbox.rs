@@ -13,8 +13,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dossier_core::{
-    bitrate_report, load_settings, nudge_frames, plan_recut_segments, plan_rename, probe_episode,
-    save_settings, BitrateItem, EpisodeFile, FfprobeConfig, ProbedEpisode,
+    bitrate_report, load_settings, nudge_frames, output_dir_hits_sources, plan_recut_segments,
+    plan_rename, probe_episode, save_settings, BitrateItem, EpisodeFile, FfprobeConfig,
+    ProbedEpisode,
 };
 use dossier_media::shot::{detect_shots, ShotDetectConfig};
 use dossier_runtime::probe::probe_tool;
@@ -23,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
 use crate::dossier::{load_drama, probe_all};
+use crate::paths::normalize;
 
 /// 码率安全线默认值（与竞品一致的 4 Mbps）。
 pub const DEFAULT_MIN_BITRATE_KBPS: u64 = 4000;
@@ -672,26 +674,49 @@ fn transcode_blocking(
         return Err("没有任何成功探测规格的分集；请先确认素材可读且 ffprobe 可用。".into());
     }
 
-    match request.mode.as_str() {
-        "nudge" => {
-            let output_dir = request
-                .output_dir
-                .map(PathBuf::from)
-                .unwrap_or_else(|| drama.dir.join("微调输出"));
-            transcode_nudge_blocking(&ffmpeg, &drama.name, &episodes, &output_dir)
-        }
+    let mode = request.mode.as_str();
+    if !matches!(mode, "nudge" | "recut") {
+        return Err(format!("未知转码模式：{mode}（支持 nudge / recut）"));
+    }
+    let subdir = match mode {
+        "recut" => "重组输出",
+        _ => "微调输出",
+    };
+    let output_dir = request
+        .output_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(|| drama.dir.join(subdir));
+    reject_source_dir(&output_dir, &episodes)?;
+
+    match mode {
         "recut" => {
             let target = request
                 .target_count
                 .unwrap_or(episodes.len())
                 .clamp(1, episodes.len().max(1) * 10);
-            let output_dir = request
-                .output_dir
-                .map(PathBuf::from)
-                .unwrap_or_else(|| drama.dir.join("重组输出"));
             transcode_recut_blocking(&ffmpeg, &episodes, target, &output_dir)
         }
-        other => Err(format!("未知转码模式：{other}（支持 nudge / recut）")),
+        _ => transcode_nudge_blocking(&ffmpeg, &drama.name, &episodes, &output_dir),
+    }
+}
+
+/// 拒绝把输出写回素材目录。
+///
+/// `智能微调` 输出的是同名文件、`分集重组` 固定输出 `第NN集.mp4`，两者都带 `-y`；
+/// 一旦输出目录就是素材目录，ffmpeg 会直接覆盖原素材。这里在**动手之前**拦住，
+/// 并把「哪个文件会被覆盖」如实告诉使用者。
+fn reject_source_dir(output_dir: &Path, episodes: &[ProbedEpisode]) -> Result<(), String> {
+    let normalized_dir = normalize(output_dir);
+    let sources: Vec<PathBuf> = episodes
+        .iter()
+        .map(|episode| normalize(&episode.file.path))
+        .collect();
+    match output_dir_hits_sources(&normalized_dir, &sources) {
+        Some(hit) => Err(format!(
+            "输出目录就是素材目录，继续会覆盖原素材（例如 {}）。请换一个输出目录，留空则默认写到剧目目录下的子目录。",
+            hit.display()
+        )),
+        None => Ok(()),
     }
 }
 

@@ -4,7 +4,7 @@
 //! 真正执行（重命名、调 ffmpeg）在桌面入口 `src-tauri/src/toolbox.rs` 里，
 //! 因此这里的每一条规则都能脱离 GUI 单测。
 
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -160,6 +160,47 @@ pub fn nudge_frames(seed: u64) -> u32 {
     (seed % 3 + 1) as u32
 }
 
+/// 路径归一化成分：忽略结尾分隔符、当前目录成分（`.`）与平台大小写差异。
+///
+/// 不做软链接解析，也不展开 `..`——本函数不碰文件系统，只做纯文本比较，
+/// 因此可以在任何平台上单测。执行层在真正写盘前还会用 `canonicalize` 复查一次。
+fn path_parts(path: &Path) -> Vec<String> {
+    path.components()
+        .filter(|component| !matches!(component, Component::CurDir))
+        .map(|component| {
+            let text = component.as_os_str().to_string_lossy().to_string();
+            if cfg!(windows) {
+                text.to_lowercase()
+            } else {
+                text
+            }
+        })
+        .collect()
+}
+
+/// 两个路径是否指向同一位置（按 [`path_parts`] 的规则比较）。
+pub fn same_path(left: &Path, right: &Path) -> bool {
+    path_parts(left) == path_parts(right)
+}
+
+/// 输出目录是否就是某个素材文件所在的目录。
+///
+/// 命中时返回该素材路径：把输出写回素材目录会直接覆盖原文件，
+/// 所以要拒绝执行，并把「哪个文件会被覆盖」如实告诉使用者。
+pub fn output_dir_hits_sources<'a>(
+    output_dir: &Path,
+    source_files: &'a [PathBuf],
+) -> Option<&'a Path> {
+    source_files
+        .iter()
+        .find(|file| {
+            file.parent()
+                .map(|parent| same_path(parent, output_dir))
+                .unwrap_or(false)
+        })
+        .map(PathBuf::as_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +293,46 @@ mod tests {
         // 目标段数多到超过可用时长时，应少切而不是产生碎片。
         let segments = plan_recut_segments(&[2.0], 3.0, 50, 1.0);
         assert!(segments.iter().all(|(start, end)| end - start >= 1.0));
+    }
+
+    #[test]
+    fn same_path_ignores_trailing_separator_and_current_dir() {
+        assert!(same_path(Path::new("/tmp/剧/"), Path::new("/tmp/剧")));
+        assert!(same_path(Path::new("/tmp/./剧"), Path::new("/tmp/剧")));
+        assert!(!same_path(
+            Path::new("/tmp/剧"),
+            Path::new("/tmp/剧/微调输出")
+        ));
+        // 文字相同但层级不同 → 不能算同一路径。
+        assert!(!same_path(Path::new("/tmp/a/b"), Path::new("/tmp/a")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn same_path_folds_case_on_windows() {
+        assert!(same_path(
+            Path::new(r"C:\剧集\示例剧"),
+            Path::new(r"c:\剧集\示例剧\")
+        ));
+    }
+
+    #[test]
+    fn output_dir_hits_sources_only_for_source_directory() {
+        let sources = vec![
+            PathBuf::from("/tmp/剧/第01集.mp4"),
+            PathBuf::from("/tmp/剧/第02集.mp4"),
+        ];
+        assert_eq!(
+            output_dir_hits_sources(Path::new("/tmp/剧"), &sources),
+            Some(Path::new("/tmp/剧/第01集.mp4"))
+        );
+        // 素材目录的子目录是默认输出位置，必须放行。
+        assert_eq!(
+            output_dir_hits_sources(Path::new("/tmp/剧/微调输出"), &sources),
+            None
+        );
+        assert!(output_dir_hits_sources(Path::new("/tmp/剧/"), &sources).is_some());
+        assert_eq!(output_dir_hits_sources(Path::new("/tmp/剧"), &[]), None);
     }
 
     #[test]
