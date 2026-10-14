@@ -109,7 +109,9 @@ pub fn plan_recut_segments(
     target_count: usize,
     min_segment_sec: f64,
 ) -> Vec<(f64, f64)> {
-    if !(total_sec > 0.0) {
+    // 用 partial_cmp 而不是 `!(total_sec > 0.0)`：NaN 时要照旧拒绝
+    // （`<=` 写法会放行 NaN，产生 (0, NaN) 的垃圾分段）。
+    if total_sec.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
         return vec![];
     }
     let target_count = target_count.max(1);
@@ -132,7 +134,9 @@ pub fn plan_recut_segments(
         // 剩余时长不够切时放弃这一刀（剩余部分并入最后一段）。
         let lower = cuts.last().copied().unwrap_or(0.0) + min_segment_sec;
         let upper = total_sec - (target_count - k) as f64 * min_segment_sec;
-        if !(upper > lower) {
+        // 同上：NaN 或区间不可用都要跳过这一刀，partial_cmp 与原 `!(upper > lower)`
+        // 在 NaN 上行为一致（拒绝），`<=` 写法则会放行。
+        if upper.partial_cmp(&lower) != Some(std::cmp::Ordering::Greater) {
             continue;
         }
         let chosen = sorted

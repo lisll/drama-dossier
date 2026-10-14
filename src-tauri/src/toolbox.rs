@@ -14,8 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use dossier_core::{
     bitrate_report, load_settings, nudge_frames, output_dir_hits_sources, plan_recut_segments,
-    plan_rename, probe_episode, save_settings, BitrateItem, EpisodeFile, FfprobeConfig,
-    ProbedEpisode,
+    plan_rename, probe_episode, BitrateItem, EpisodeFile, FfprobeConfig, ProbedEpisode,
 };
 use dossier_media::shot::{detect_shots, ShotDetectConfig};
 use dossier_runtime::probe::probe_tool;
@@ -541,7 +540,8 @@ fn transcode_recut_blocking(
         offset += episode.spec.duration_sec;
     }
     let total = offset;
-    if !(total > 0.0) {
+    // 用 partial_cmp 保持 NaN 拒绝语义（`<=` 写法会放行 NaN，让重组段变成垃圾值）。
+    if total.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
         return Err("全剧总时长为 0，无法重组。".into());
     }
 
@@ -768,6 +768,9 @@ pub struct InstallRuntimeReport {
 }
 
 /// 用系统 curl 下载（macOS 自带，支持重试与断点续传）。
+// 只被上面 macOS 专属的 install_one 调用；不按平台门控会在 Linux/Windows
+// 上成为死代码，被 CI 的 -D warnings 拦下。
+#[cfg(target_os = "macos")]
 fn download_file(url: &str, target: &Path) -> Result<(), String> {
     let spec = CommandSpec::new("/usr/bin/curl")
         .arg("-fL")
@@ -903,7 +906,9 @@ fn install_runtime_blocking(app: &AppHandle) -> Result<InstallRuntimeReport, Str
         settings.ffprobe_path = Some(ffprobe_path.clone());
     }
     if needs_ffmpeg || needs_ffprobe {
-        save_settings(&settings_path, &settings)
+        // 全限定调用而不是顶部导入：这行只在 macOS 分支编译，导入在
+        // Linux/Windows 上会成为未使用项，被 CI 的 -D warnings 拦下。
+        dossier_core::save_settings(&settings_path, &settings)
             .map_err(|error| format!("写入设置失败：{error}"))?;
     }
 
@@ -917,7 +922,7 @@ fn install_runtime_blocking(app: &AppHandle) -> Result<InstallRuntimeReport, Str
 
 #[cfg(not(target_os = "macos"))]
 fn install_runtime_blocking(_app: &AppHandle) -> Result<InstallRuntimeReport, String> {
-    Err("运行环境自动安装目前仅支持 macOS；请手动安装 ffmpeg（含 ffprobe）。")
+    Err("运行环境自动安装目前仅支持 macOS；请手动安装 ffmpeg（含 ffprobe）。".to_string())
 }
 
 #[tauri::command]
