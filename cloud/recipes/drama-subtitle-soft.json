@@ -1,0 +1,55 @@
+{
+  "schema_version": "1.0",
+  "recipe_id": "drama.subtitle.soft",
+  "version": 1,
+  "status": "published",
+  "target": {
+    "platform_profile": "generic-h264-mkv",
+    "container": "mkv",
+    "video_codec": "h264",
+    "audio_codec": "aac"
+  },
+  "compatibility": {
+    "min_worker_version": "1.0.0",
+    "required_capabilities": ["h264_encode", "subtitles"]
+  },
+  "preset": { "mode": "subtitle" },
+  "pipeline": [
+    { "id": "probe", "module": "media.probe", "params": {} },
+    { "id": "timeline", "module": "timeline.user_edits", "params": { "segments": [] } },
+    {
+      "id": "subtitle",
+      "module": "subtitle.mux",
+      "params": {
+        "source": { "kind": "external", "input_index": 1 },
+        "mode": "soft",
+        "language": "chi",
+        "title": "中文"
+      }
+    },
+    {
+      "id": "metadata",
+      "module": "metadata.policy",
+      "params": { "mode": "keep", "strip_location": true }
+    },
+    {
+      "id": "encode",
+      "module": "media.encode",
+      "params": {
+        "video_codec": "h264",
+        "audio_codec": "aac",
+        "container": "mkv",
+        "crf": 20,
+        "preset": "medium"
+      }
+    },
+    { "id": "gate", "module": "media.quality_gate", "params": {} }
+  ],
+  "quality_policy": {
+    "require_decodable_output": true,
+    "check_audio_video_sync": true,
+    "validate_target_profile": true,
+    "max_av_sync_ms": 200.0,
+    "min_duration_seconds": 0.5
+  }
+}

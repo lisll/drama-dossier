@@ -1,0 +1,41 @@
+{
+  "schema_version": "1.0",
+  "recipe_id": "drama.no_edit.generic",
+  "version": 1,
+  "status": "published",
+  "target": {
+    "platform_profile": "generic-h264-mp4",
+    "container": "mp4",
+    "video_codec": "h264",
+    "audio_codec": "aac"
+  },
+  "compatibility": {
+    "min_worker_version": "1.0.0",
+    "required_capabilities": ["h264_encode"]
+  },
+  "preset": { "mode": "no_edit" },
+  "pipeline": [
+    { "id": "probe", "module": "media.probe", "params": {} },
+    {
+      "id": "encode",
+      "module": "media.encode",
+      "params": {
+        "video_codec": "h264",
+        "audio_codec": "aac",
+        "container": "mp4",
+        "crf": 21,
+        "preset": "medium",
+        "pix_fmt": "yuv420p",
+        "gop_seconds": 2.0
+      }
+    },
+    { "id": "gate", "module": "media.quality_gate", "params": { "duration_tolerance_seconds": 1.0 } }
+  ],
+  "quality_policy": {
+    "require_decodable_output": true,
+    "check_audio_video_sync": true,
+    "validate_target_profile": true,
+    "max_av_sync_ms": 200.0,
+    "min_duration_seconds": 0.5
+  }
+}

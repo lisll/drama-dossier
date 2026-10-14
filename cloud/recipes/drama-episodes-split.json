@@ -1,0 +1,59 @@
+{
+  "schema_version": "1.0",
+  "recipe_id": "drama.episodes.split",
+  "version": 1,
+  "status": "published",
+  "target": {
+    "platform_profile": "vertical-1080x1920",
+    "container": "mp4",
+    "video_codec": "h264",
+    "audio_codec": "aac",
+    "width": 1080,
+    "height": 1920
+  },
+  "compatibility": {
+    "min_worker_version": "1.0.0",
+    "required_capabilities": ["h264_encode", "video_filters"]
+  },
+  "preset": { "mode": "full_edit" },
+  "pipeline": [
+    { "id": "probe", "module": "media.probe", "params": {} },
+    { "id": "timeline", "module": "timeline.user_edits", "params": { "segments": [] } },
+    {
+      "id": "video",
+      "module": "video.quality",
+      "params": { "scale": { "width": 1080, "height": 1920, "mode": "pad" } }
+    },
+    {
+      "id": "chapters",
+      "module": "chapters.reorg",
+      "params": {
+        "mode": "episodes",
+        "episode_seconds": 3.0,
+        "min_segment_seconds": 1.0,
+        "split": true,
+        "titles": ["第 1 集", "第 2 集", "第 3 集", "第 4 集"]
+      }
+    },
+    {
+      "id": "encode",
+      "module": "media.encode",
+      "params": {
+        "video_codec": "h264",
+        "audio_codec": "aac",
+        "container": "mp4",
+        "crf": 24,
+        "preset": "medium",
+        "pix_fmt": "yuv420p"
+      }
+    },
+    { "id": "gate", "module": "media.quality_gate", "params": { "duration_tolerance_seconds": 1.5 } }
+  ],
+  "quality_policy": {
+    "require_decodable_output": true,
+    "check_audio_video_sync": true,
+    "validate_target_profile": true,
+    "max_av_sync_ms": 200.0,
+    "min_duration_seconds": 0.5
+  }
+}

@@ -1,0 +1,53 @@
+{
+  "schema_version": "1.0",
+  "recipe_id": "drama.commentary.rebuild",
+  "version": 1,
+  "status": "draft",
+  "target": {
+    "platform_profile": "generic-h264-mp4",
+    "container": "mp4",
+    "video_codec": "h264",
+    "audio_codec": "aac"
+  },
+  "compatibility": {
+    "min_worker_version": "1.0.0",
+    "required_capabilities": ["h264_encode"]
+  },
+  "preset": { "mode": "full_edit" },
+  "pipeline": [
+    { "id": "probe", "module": "media.probe", "params": {} },
+    {
+      "id": "commentary",
+      "module": "commentary.rebuild",
+      "params": {
+        "commentary_input_index": 0,
+        "approve": false,
+        "match_threshold": 0.45,
+        "script": ["补一句", "再补一句"],
+        "transcript": [
+          { "start": 0.0, "end": 2.0, "text": "补一句" },
+          { "start": 3.0, "end": 5.0, "text": "再补一句" }
+        ]
+      }
+    },
+    {
+      "id": "encode",
+      "module": "media.encode",
+      "params": {
+        "video_codec": "h264",
+        "audio_codec": "aac",
+        "container": "mp4",
+        "crf": 23,
+        "preset": "medium"
+      }
+    },
+    { "id": "gate", "module": "media.quality_gate", "params": {} }
+  ],
+  "quality_policy": {
+    "require_decodable_output": true,
+    "check_audio_video_sync": true,
+    "validate_target_profile": true,
+    "max_av_sync_ms": 200.0,
+    "min_duration_seconds": 0.5
+  }
+}

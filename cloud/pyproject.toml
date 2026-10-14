@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "drama-cloud"
+version = "0.1.0"
+description = "云端短剧视频制作与多平台适配系统（控制面 + 媒体 Worker）"
+requires-python = ">=3.9"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2.5",
+    "jsonschema>=4.20",
+    "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "httpx>=0.27"]
+
+[project.scripts]
+drama-cloud = "drama_cloud.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+drama_cloud = ["web/*.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

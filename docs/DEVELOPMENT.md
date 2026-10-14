@@ -9,6 +9,7 @@
 | `tools/model_worker` | 模型侧 worker：DBNet 检测、E2FGVI 修复 | 不决定「改哪些像素」；不碰整帧回贴 |
 | `src-tauri` | 桌面窗口、IPC 命令、文件夹选择、打包 | 不把业务规则写在命令层 |
 | `src` | 桌面 WebView UI | 不绕过 Rust 命令访问文件系统 |
+| `cloud/` | 云端制作系统（学习原型）：配方、任务队列、媒体处理模块、控制面 API 与 Web 客户端 | 不引入 GPU 依赖；不在配方里执行任意命令（模块走白名单）；桌面壳方案见 `cloud/docs/PACKAGING_GUIDE.md` |
 
 `dossier-inpaint` 与报审材料链路相互独立，是命令行运行的学习原型，接入方式与
 交换机协议见 [SUBTITLE_REMOVAL.md](SUBTITLE_REMOVAL.md)；
@@ -70,3 +71,29 @@ cd tools/model_worker && python3 -m unittest discover -s tests -v
 ```
 
 擦除管线的一键体验脚本（造测试素材 → 跑链路）：`tools/prototype_demo.sh`。
+
+## 云端制作系统（`cloud/`）
+
+与桌面报审链路相互独立，Python 3.9 + FastAPI，运行目录 `cloud/var/`（可整体删除）。
+
+```bash
+python3.9 -m venv .venv && ./.venv/bin/pip install -e cloud[dev]
+
+# 测试（117 个：单元 / 模块 / 集成 / 接口）
+cd cloud && PYTHONPATH=src ../.venv/bin/python -m pytest tests/ -q
+
+# 端到端演示：造素材 → 4 条配方 → 门禁 → 取产物
+./cloud/demo.sh
+./cloud/demo.sh --http     # 另外演示 API + Web 客户端
+```
+
+模块边界与约定：
+
+- `plan.py` 只做「配方 → 可执行计划」，不碰磁盘；
+- `modules/*` 只往 `ctx.plan` 里追加内容，**只有 `media.encode` 物化文件**；
+- 状态迁移只能经 `tasks/state.py` 的 `transition()`，API 层不直接写 `tasks.state`；
+- 配方模块名是白名单字面量，参数模型 `extra="forbid"`，不存在「配方里塞命令」的路径；
+- 新增模块必须同时给出：注册项（`requires`/`produces`/`capability`）、参数模型与单元测试。
+
+文档索引：`cloud/docs/ARCHITECTURE.md`、`RECIPE_SCHEMA.md`、`PROCESSING_PIPELINE.md`、
+`API_SPEC.md`、`DATABASE_SCHEMA.md`、`PACKAGING_GUIDE.md`、`TEST_PLAN.md`。

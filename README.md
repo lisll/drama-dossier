@@ -21,6 +21,7 @@ DramaDossier 是一个本地优先的桌面应用，用于把散落在磁盘上�
 - [技术栈](#技术栈)
 - [核心模块](#核心模块)
 - [字幕与角标擦除实验](#字幕与角标擦除实验)
+- [云端制作系统（学习原型）](#云端制作系统学习原型)
 - [数据流](#数据流)
 - [快速开始](#快速开始)
 - [素材目录规范](#素材目录规范)
@@ -141,6 +142,11 @@ DramaDossier 是一个本地优先的桌面应用，用于把散落在磁盘上�
 │       ├── dbnet.py             # DBNet ONNX 推理与后处理
 │       ├── inpaint_backends.py  # E2FGVI 适配层与基线
 │       └── fetch_models.sh      # 模型获取（权重不入库）
+├── cloud/                       # 云端制作系统（学习原型，Python）
+│   ├── src/drama_cloud/         # API / CLI / Worker / 配方 / 处理模块
+│   ├── recipes/                 # 内置配方（6 份）
+│   ├── docs/                    # 架构、配方、管线、API、数据库、打包、测试
+│   └── tests/                   # 117 个测试
 ├── docs/
 │   ├── BUILD.md                 # 构建与发布说明
 │   ├── DEVELOPMENT.md           # 开发规范与模块边界
@@ -317,6 +323,35 @@ cargo run -p dossier-inpaint -- \
 
 原理、交换机协议、实测数据与已知局限见 [docs/SUBTITLE_REMOVAL.md](docs/SUBTITLE_REMOVAL.md)
 与 [docs/WATERMARK_REMOVAL.md](docs/WATERMARK_REMOVAL.md)。
+
+## 云端制作系统（学习原型）
+
+与桌面报审链路**相互独立**：`cloud/`（Python + FastAPI）实现设计文档里的
+「云端短剧视频制作与多平台适配系统」，覆盖 C1–C11 功能映射与阶段 1/2。
+**仅用于技术学习与自有素材**。
+
+- **能力**：配方发布/版本/灰度/回滚（C1/C2）、三档模式 no_edit / subtitle / full_edit（C3）、
+  画面与音频处理（C4/C7）、帧率与去闪烁（C9）、时间线（C5）、编码与元数据（C6/C8）、
+  分集重组（C10）、解说候选时间线（C11）、质量门禁；
+- **可靠性**：持久化队列 + 租约/心跳/失联回收、阶段检查点复用、协作式取消、
+  指数退避重试、产物保留期清理；
+- **客户端**：API 自带的 Web 客户端（本机 gio 2.68 < Tauri 2 要求的 2.70，装不了桌面壳；
+  方案见 `cloud/docs/PACKAGING_GUIDE.md`）；
+- **与文档的差异**：SQLite 代替 PostgreSQL、SQLite 队列代替 Celery + Redis、
+  本地文件系统代替 S3 兼容对象存储——差异集中在 `cloud/docs/ARCHITECTURE.md` §7，
+  替换点分别落在 `db.py` 与 `storage.py`。
+
+```bash
+python3.9 -m venv .venv && ./.venv/bin/pip install -e cloud[dev]
+./.venv/bin/drama-cloud initdb --admin demo   # 管理员令牌打印在最后一行
+./.venv/bin/drama-cloud seed
+./.venv/bin/drama-cloud serve                 # http://127.0.0.1:8000
+./.venv/bin/drama-cloud run-worker            # 另一个终端
+./cloud/demo.sh                               # 一键端到端演示
+```
+
+文档在 `cloud/docs/`：架构、配方规范（含 13 个模块参数表）、处理管线、API 规范、
+数据库 Schema、打包指南、测试计划。
 
 ## 数据流
 
@@ -616,6 +651,9 @@ DramaDossier 只做真实材料的整理、格式化和完整性提示：
 - [x] 检查规则自定义配置
 - [x] 硬字幕擦除原型（DBNet 检测 + 时序修复管线）
 - [x] 角标 / 水印擦除原型（E2FGVI 光流引导 + 无损中间态与两段式编码）
+- [x] 云端制作系统原型（C1–C11 配方、持久化队列、质量门禁、Web 客户端）
+- [ ] 云端：GPU 侧模型类处理（光流插帧、模型修复）
+- [ ] 云端：桌面客户端（Tauri 2，需 glib ≥ 2.70）
 - [ ] 擦除管线：第二遍只在 ROI 内检测（约 10x 提速）
 - [ ] 擦除管线：worker 常驻以消除每帧进程启动开销
 - [ ] 报审包差异对比
