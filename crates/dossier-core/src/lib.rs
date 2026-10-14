@@ -13,10 +13,14 @@ pub mod checklist;
 pub mod package;
 pub mod probe;
 pub mod scanner;
+pub mod settings;
 pub mod types;
 
 pub use checklist::{run_checks, ChecklistReport, ChecklistRules};
 pub use package::{generate_report_package, CostSheetForm, PackageOptions, PackageResult};
 pub use probe::{probe_episode, probe_episodes, FfprobeConfig};
-pub use scanner::{scan_drama_dir, scan_library};
+pub use scanner::{
+    scan_drama_dir, scan_library, validate_drama_dir, validate_drama_name, validate_library_root,
+};
+pub use settings::{load_settings, save_settings, AppSettings, LoadedSettings};
 pub use types::{CheckStatus, Drama, EpisodeFile, EpisodeSpec, ProbedEpisode};

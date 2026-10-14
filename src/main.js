@@ -1,4 +1,14 @@
 const { invoke } = window.__TAURI__?.core ?? {};
+
+// 与 dossier-core 的 ChecklistRules::default() 保持一致。
+const DEFAULT_RULES = {
+  minEpisodes: 4,
+  minDurationSec: 31,
+  maxDurationSec: 480,
+  maxBitrateBps: 8_000_000,
+  preferPortrait: true,
+};
+
 const state = {
   root: "",
   dramas: [],
@@ -35,6 +45,87 @@ function formatBytes(bytes) {
   const units = ["B", "KB", "MB", "GB", "TB"];
   const exponent = Math.min(Math.floor(Math.log2(bytes) / 10), units.length - 1);
   return `${(bytes / 1024 ** exponent).toFixed(exponent ? 1 : 0)} ${units[exponent]}`;
+}
+
+function rulesFromForm() {
+  const raw = (id) => {
+    const value = $(id).value.trim();
+    return value === "" ? null : Number(value);
+  };
+  const episodes = raw("#rule-min-episodes") ?? DEFAULT_RULES.minEpisodes;
+  const minDuration = raw("#rule-min-duration") ?? DEFAULT_RULES.minDurationSec;
+  const maxDuration = raw("#rule-max-duration") ?? DEFAULT_RULES.maxDurationSec;
+  const maxBitrateMbps = raw("#rule-max-bitrate");
+  const rules = {
+    minEpisodes: episodes,
+    minDurationSec: minDuration,
+    maxDurationSec: maxDuration,
+    maxBitrateBps:
+      maxBitrateMbps === null
+        ? DEFAULT_RULES.maxBitrateBps
+        : Math.round(maxBitrateMbps * 1e6),
+    preferPortrait: $("#rule-prefer-portrait").checked,
+  };
+
+  if (!Number.isInteger(rules.minEpisodes) || rules.minEpisodes <= 0) {
+    throw new Error("最少集数必须是大于 0 的整数。");
+  }
+  if (!(rules.minDurationSec > 0)) {
+    throw new Error("单集时长下限必须是大于 0 的秒数。");
+  }
+  if (!(rules.maxDurationSec > rules.minDurationSec)) {
+    throw new Error("单集时长上限必须大于下限。");
+  }
+  if (!(rules.maxBitrateBps > 0)) {
+    throw new Error("码率上限必须大于 0。");
+  }
+  return rules;
+}
+
+function fillRules(rules) {
+  const merged = { ...DEFAULT_RULES, ...(rules ?? {}) };
+  $("#rule-min-episodes").value = merged.minEpisodes;
+  $("#rule-min-duration").value = merged.minDurationSec;
+  $("#rule-max-duration").value = merged.maxDurationSec;
+  $("#rule-max-bitrate").value = Number((merged.maxBitrateBps / 1e6).toFixed(3));
+  $("#rule-prefer-portrait").checked = merged.preferPortrait !== false;
+}
+
+async function loadSettings() {
+  try {
+    const payload = await call("load_app_settings");
+    const settings = payload.settings ?? {};
+    $("#settings-path").textContent = payload.path;
+    fillRules(settings.rules);
+    if (settings.ffprobePath) $("#ffprobe-path").value = settings.ffprobePath;
+    if (settings.outputDir) $("#output-dir").value = settings.outputDir;
+    if (payload.warning) toast(payload.warning, true);
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+async function saveSettings() {
+  let rules;
+  try {
+    rules = rulesFromForm();
+  } catch (error) {
+    toast(String(error), true);
+    return;
+  }
+  try {
+    const path = await call("save_app_settings", {
+      settings: {
+        rules,
+        ffprobePath: $("#ffprobe-path").value.trim() || null,
+        outputDir: $("#output-dir").value.trim() || null,
+      },
+    });
+    $("#settings-path").textContent = path;
+    toast("设置已保存到本机配置文件");
+  } catch (error) {
+    toast(String(error), true);
+  }
 }
 
 function currentRoot() {
@@ -150,6 +241,7 @@ async function analyze() {
       root: state.root,
       name: drama.name,
       ffprobePath: $("#ffprobe-path").value.trim() || null,
+      rules: rulesFromForm(),
     });
     renderChecklist(state.analysis.checklist);
     renderEpisodes(state.analysis.probes);
@@ -172,6 +264,7 @@ async function generate() {
       copyEpisodes: $("#copy-episodes").checked,
       aiGenerated: $("#ai-generated").checked,
       ffprobePath: $("#ffprobe-path").value.trim() || null,
+      rules: rulesFromForm(),
       costSheet: {
         companyName: $("#company-name").value.trim(),
         totalInvestmentWan: investment === "" ? null : Number(investment),
@@ -206,6 +299,17 @@ $("#browse-output").addEventListener("click", () => browse("#output-dir"));
 $("#scan").addEventListener("click", scan);
 $("#analyze").addEventListener("click", analyze);
 $("#generate").addEventListener("click", generate);
+$("#save-settings").addEventListener("click", saveSettings);
+$("#reset-settings").addEventListener("click", () => {
+  fillRules(DEFAULT_RULES);
+  $("#ffprobe-path").value = "";
+  $("#output-dir").value = "";
+  toast("已恢复默认阈值；点击「保存设置」后写入配置文件");
+});
 $("#library-root").addEventListener("keydown", (event) => {
   if (event.key === "Enter") scan();
 });
+
+if (invoke) {
+  loadSettings();
+}

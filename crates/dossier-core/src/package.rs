@@ -173,6 +173,7 @@ pub fn generate_report_package(
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Manifest {
     schema: String,
     drama_name: String,
@@ -344,6 +345,63 @@ mod tests {
             .join("05_权属声明")
             .join("内容权属声明.txt")
             .is_file());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn manifest_uses_documented_camel_case_schema() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        let base = std::env::temp_dir().join(format!("dossier-manifest-{unique}"));
+        let d = base.join("剧A");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("剧名.txt"), "剧A").unwrap();
+
+        let r = generate_report_package(
+            "剧A",
+            &d,
+            None,
+            None,
+            &[],
+            &PackageOptions {
+                output_dir: Some(d.join("out")),
+                copy_episodes: false,
+                cost_sheet: None,
+                ai_generated: false,
+            },
+        )
+        .unwrap();
+
+        let raw = std::fs::read(r.package_dir.join("manifest.json")).unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        let obj = manifest.as_object().unwrap();
+        for key in [
+            "schema",
+            "dramaName",
+            "generatedAt",
+            "aiGenerated",
+            "copyEpisodes",
+            "files",
+        ] {
+            assert!(obj.contains_key(key), "manifest 缺少字段 {key}");
+        }
+        for key in [
+            "drama_name",
+            "generated_at",
+            "ai_generated",
+            "copy_episodes",
+        ] {
+            assert!(
+                !obj.contains_key(key),
+                "manifest 残留 snake_case 字段 {key}"
+            );
+        }
+        let first = manifest["files"].as_array().unwrap().first().unwrap();
+        assert!(first.get("path").is_some());
+        assert!(first.get("sizeBytes").is_some());
+        assert!(first.get("sha256").is_some());
         std::fs::remove_dir_all(&base).ok();
     }
 }

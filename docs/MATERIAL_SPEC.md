@@ -17,7 +17,7 @@
 
 ## v1 检查规则
 
-默认值可在未来版本中开放为设置：
+下表是内置默认值；都可在界面的「检查规则与路径设置」中覆盖，并随设置保存到本机配置文件（应用配置目录下的 `settings.json`）：
 
 | 项目 | 默认规则 | 级别 |
 |---|---:|---|
@@ -54,7 +54,7 @@
 
 ## manifest.json
 
-字段：
+字段（camelCase，`schema` 与 `sha256` 保持不变）：
 
 ```json
 {
@@ -62,14 +62,18 @@
   "dramaName": "示例短剧",
   "generatedAt": "2026-10-13T20:00:00Z",
   "aiGenerated": false,
+  "copyEpisodes": false,
   "files": [
     {
       "path": "01_剧集信息/剧名.txt",
+      "sizeBytes": 128,
       "sha256": "..."
     }
   ]
 }
 ```
+
+`files` 只列出写入报审包的文件（不含 `manifest.json` 自身）；`sha256` 为小写十六进制。
 
 `manifest.json` 是本地完整性清单，不是官方审核回执，也不能替代任何公章、签名或可信时间戳。
 

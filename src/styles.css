@@ -417,6 +417,57 @@ code {
   font-size: 12px;
 }
 
+.settings-panel {
+  margin-top: 16px;
+}
+
+.settings-panel summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--text);
+  list-style: none;
+}
+
+.settings-panel summary::-webkit-details-marker {
+  display: none;
+}
+
+.settings-panel summary::after {
+  content: "▾";
+  float: right;
+  color: var(--muted);
+}
+
+.settings-panel[open] summary {
+  margin-bottom: 14px;
+}
+
+.settings-panel[open] summary::after {
+  content: "▴";
+}
+
+.settings-panel .checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+}
+
+.settings-panel .checkbox-label input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  min-height: 0;
+  accent-color: var(--primary);
+}
+
+.settings-note {
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.7;
+  word-break: break-all;
+}
+
 @media (max-width: 1080px) {
   .app-header,
   .detail-head {

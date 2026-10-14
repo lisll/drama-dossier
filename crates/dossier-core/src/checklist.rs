@@ -34,6 +34,28 @@ impl Default for ChecklistRules {
     }
 }
 
+impl ChecklistRules {
+    /// 校验阈值是否自洽，返回可直接展示的中文错误。
+    pub fn validate(&self) -> Result<(), String> {
+        if self.min_episodes == 0 {
+            return Err("最少集数必须大于 0。".into());
+        }
+        if !self.min_duration_sec.is_finite() || self.min_duration_sec <= 0.0 {
+            return Err("单集时长下限必须是大于 0 的秒数。".into());
+        }
+        if !self.max_duration_sec.is_finite() || self.max_duration_sec <= self.min_duration_sec {
+            return Err(format!(
+                "单集时长上限（{:.0}s）必须大于下限（{:.0}s）。",
+                self.max_duration_sec, self.min_duration_sec
+            ));
+        }
+        if self.max_bitrate_bps == 0 {
+            return Err("码率上限必须大于 0。".into());
+        }
+        Ok(())
+    }
+}
+
 /// 一条检查结果。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -268,5 +290,35 @@ mod tests {
             .items
             .iter()
             .any(|i| i.id.ends_with("bitrate") && i.status == CheckStatus::Warn));
+    }
+
+    #[test]
+    fn rejects_inconsistent_rules() {
+        assert!(ChecklistRules::default().validate().is_ok());
+        assert!(ChecklistRules {
+            min_episodes: 0,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(ChecklistRules {
+            min_duration_sec: 0.0,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(ChecklistRules {
+            min_duration_sec: 300.0,
+            max_duration_sec: 120.0,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(ChecklistRules {
+            max_bitrate_bps: 0,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
     }
 }

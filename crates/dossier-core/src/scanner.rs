@@ -10,6 +10,7 @@ const TEXT_EXTS: &[&str] = &["txt", "md"];
 
 /// 扫描素材根目录，返回按名称排序的剧目列表。
 pub fn scan_library(root: &Path) -> std::io::Result<Vec<Drama>> {
+    validate_library_root(root)?;
     let mut dramas = Vec::new();
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
@@ -109,6 +110,68 @@ pub fn scan_drama_dir(name: &str, dir: &Path) -> Drama {
     }
 }
 
+/// 校验素材根目录是否可用，错误信息可直接展示给用户。
+pub fn validate_library_root(root: &Path) -> std::io::Result<()> {
+    let meta = std::fs::metadata(root).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "素材根目录不存在或无法访问：{}。请重新选择包含剧目子目录的文件夹。",
+                root.display()
+            ),
+        )
+    })?;
+    if !meta.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            format!(
+                "素材根目录不是文件夹：{}。请选择包含剧目子目录的文件夹。",
+                root.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// 校验剧目名称是单一目录名：拒绝路径分隔符、绝对路径与 `..`。
+pub fn validate_drama_name(name: &str) -> std::io::Result<()> {
+    let mut components = Path::new(name).components();
+    let is_single = matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    );
+    if !is_single {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("剧目名称不合法：{name}。只能使用单个子目录名，不能包含路径分隔符。"),
+        ));
+    }
+    Ok(())
+}
+
+/// 校验单个剧目录是否可用，错误信息可直接展示给用户。
+pub fn validate_drama_dir(dir: &Path) -> std::io::Result<()> {
+    let meta = std::fs::metadata(dir).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "剧目目录不存在或无法访问：{}。请重新扫描素材根目录。",
+                dir.display()
+            ),
+        )
+    })?;
+    if !meta.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            format!(
+                "剧目路径不是文件夹：{}。请重新扫描素材根目录。",
+                dir.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// 从文件名解析集号。支持 `第12集/话/回`、`E12`、独立数字段（`xxx_12`）。
 pub fn parse_episode_number(file_name: &str) -> Option<u32> {
     let s = file_name;
@@ -196,5 +259,31 @@ mod tests {
         assert!(drama.cover.is_some());
         assert!(drama.synopsis.is_some());
         std::fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn validates_paths_with_actionable_errors() {
+        let base = std::env::temp_dir().join(format!("dossier-validate-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::create_dir_all(base.join("剧A")).unwrap();
+        let file = base.join("素材.txt");
+        std::fs::write(&file, b"x").unwrap();
+
+        assert!(validate_library_root(&base).is_ok());
+        assert!(validate_library_root(&file).is_err());
+        assert!(validate_library_root(&base.join("缺失")).is_err());
+
+        assert!(validate_drama_dir(&base.join("剧A")).is_ok());
+        assert!(validate_drama_dir(&base.join("缺失")).is_err());
+        assert!(validate_drama_dir(&file).is_err());
+
+        assert!(validate_drama_name("剧A").is_ok());
+        assert!(validate_drama_name("剧 A").is_ok());
+        assert!(validate_drama_name("").is_err());
+        assert!(validate_drama_name("..").is_err());
+        assert!(validate_drama_name("a/b").is_err());
+        assert!(validate_drama_name("./剧A").is_err());
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }

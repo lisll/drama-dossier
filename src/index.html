@@ -117,6 +117,28 @@
                 合规说明：剧备只整理使用者提供的真实材料，不伪造签名、印章或时间戳；报审包固定包含内容权属声明模板。
               </p>
             </section>
+
+            <details class="panel settings-panel">
+              <summary>检查规则与路径设置（可覆盖默认阈值）</summary>
+              <div class="form-grid">
+                <label>最少集数<input id="rule-min-episodes" type="number" min="1" step="1" /></label>
+                <label>单集时长下限（秒）<input id="rule-min-duration" type="number" min="1" step="1" /></label>
+                <label>单集时长上限（秒）<input id="rule-max-duration" type="number" min="1" step="1" /></label>
+                <label>码率上限（Mbps）<input id="rule-max-bitrate" type="number" min="0.1" step="0.1" /></label>
+                <label class="checkbox-label">
+                  <input id="rule-prefer-portrait" type="checkbox" /> 横屏分集给出警告
+                </label>
+              </div>
+              <div class="option-row">
+                <button id="save-settings" class="primary">保存设置</button>
+                <button id="reset-settings" class="ghost">恢复默认</button>
+              </div>
+              <p class="settings-note">
+                保存时一并记录上方「生成报审包」里的 ffprobe 路径与输出目录；设置只写入本机配置文件，不上传。
+                <br />
+                配置文件：<span id="settings-path">—</span>
+              </p>
+            </details>
           </div>
         </section>
       </main>
