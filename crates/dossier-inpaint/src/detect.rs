@@ -6,11 +6,13 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::mask::{FrameSize, MaskRect};
+use crate::worker::WorkerSession;
 
 /// 检测到的一行文本（画面像素坐标）。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -59,6 +61,44 @@ pub enum DetectError {
 pub trait TextDetector {
     /// 返回该帧的文本行框；无字幕时返回空列表。
     fn detect(&self, frame: &[u8], size: FrameSize) -> Result<Vec<TextBox>, DetectError>;
+
+    /// 检测是否由画面内容驱动。
+    ///
+    /// 「固定 ROI」这类后端无论画面内容如何都返回同一个框，因此不能用来
+    /// 判断修复后是否还有残留文本；`verify` 模块会据此跳过残留检查。
+    fn is_content_based(&self) -> bool {
+        true
+    }
+
+    /// 是否希望只在 ROI 裁剪图上检测。
+    ///
+    /// 内容驱动的模型（DBNet）在 640×64 的 ROI 上比整帧 1080p 便宜近一个数量级，
+    /// 而且位置已经确定，没有理由每帧再扫全图。只有真正按内容检测的后端应返回
+    /// `true`：判定为 `true` 时管线会用 ROI 尺寸调用 [`TextDetector::detect`]，
+    /// 并把返回的框从裁剪坐标平移回整帧坐标。
+    ///
+    /// 默认 `false`（整帧检测），避免依赖画面绝对坐标的后端（如固定区域）被误裁。
+    fn prefer_roi_detection(&self) -> bool {
+        false
+    }
+}
+
+/// 把 ROI 裁剪坐标下的检测框平移回整帧坐标；完全落在画面外时返回 `None`。
+pub fn offset_box(box_: &TextBox, dx: u32, dy: u32, frame: FrameSize) -> Option<TextBox> {
+    let rect = MaskRect::new(
+        box_.x.saturating_add(dx),
+        box_.y.saturating_add(dy),
+        box_.width,
+        box_.height,
+    )
+    .clip(frame)?;
+    Some(TextBox::new(
+        rect.x,
+        rect.y,
+        rect.width,
+        rect.height,
+        box_.score,
+    ))
 }
 
 /// 固定 ROI 检测器：把使用者给定的区域当作每帧的字幕区域。
@@ -77,6 +117,10 @@ impl FixedRoiDetector {
 }
 
 impl TextDetector for FixedRoiDetector {
+    fn is_content_based(&self) -> bool {
+        false
+    }
+
     fn detect(&self, _frame: &[u8], size: FrameSize) -> Result<Vec<TextBox>, DetectError> {
         Ok(match self.rect.clip(size) {
             Some(rect) if !rect.is_empty() => {
@@ -84,6 +128,41 @@ impl TextDetector for FixedRoiDetector {
             }
             _ => Vec::new(),
         })
+    }
+}
+
+/// 多区域固定检测器：把若干个使用者给定的区域当作每帧的标识区域。
+///
+/// 与 [`FixedRoiDetector`] 的关系是「一个区域 vs 多个区域」；短剧里常见
+/// 「底部硬字幕 + 右上角台标」两个互不相邻的标识，各自需要有独立的掩码。
+#[derive(Debug, Clone)]
+pub struct FixedRoisDetector {
+    rects: Vec<MaskRect>,
+}
+
+impl FixedRoisDetector {
+    pub fn new(rects: Vec<MaskRect>) -> Self {
+        Self { rects }
+    }
+
+    pub fn rects(&self) -> &[MaskRect] {
+        &self.rects
+    }
+}
+
+impl TextDetector for FixedRoisDetector {
+    fn is_content_based(&self) -> bool {
+        false
+    }
+
+    fn detect(&self, _frame: &[u8], size: FrameSize) -> Result<Vec<TextBox>, DetectError> {
+        Ok(self
+            .rects
+            .iter()
+            .filter_map(|rect| rect.clip(size))
+            .filter(|rect| !rect.is_empty())
+            .map(|rect| TextBox::new(rect.x, rect.y, rect.width, rect.height, 1.0))
+            .collect())
     }
 }
 
@@ -108,6 +187,8 @@ pub struct WorkerConfig {
 pub struct WorkerTextDetector {
     pub config: WorkerConfig,
     pub work_dir: PathBuf,
+    /// 可选的常驻 worker 会话；`None` 时每次检测单独起进程。
+    session: Option<Arc<Mutex<WorkerSession>>>,
 }
 
 impl WorkerTextDetector {
@@ -115,7 +196,44 @@ impl WorkerTextDetector {
         Self {
             config,
             work_dir: work_dir.into(),
+            session: None,
         }
+    }
+
+    /// 复用外部传入的常驻 worker（与修复后端共享同一个进程）。
+    pub fn with_session(mut self, session: Arc<Mutex<WorkerSession>>) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    /// 把 `work_dir` 里的请求交给后端：常驻会话优先，否则一次性起进程。
+    fn invoke_backend(&self) -> Result<(), DetectError> {
+        if let Some(session) = &self.session {
+            let mut guard = session
+                .lock()
+                .map_err(|_| DetectError::Backend("常驻 worker 会话已中毒".into()))?;
+            return guard
+                .run(&self.work_dir)
+                .map_err(|error| DetectError::Backend(error.to_string()));
+        }
+        let output = Command::new(&self.config.program)
+            .args(&self.config.args)
+            .arg(&self.work_dir)
+            .output()
+            .map_err(|error| {
+                DetectError::Backend(format!(
+                    "无法启动检测后端 {}：{error}",
+                    self.config.program.display()
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(DetectError::Backend(format!(
+                "检测后端退出码 {:?}：{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -126,6 +244,10 @@ struct BoxesFile {
 }
 
 impl TextDetector for WorkerTextDetector {
+    fn prefer_roi_detection(&self) -> bool {
+        true
+    }
+
     fn detect(&self, frame: &[u8], size: FrameSize) -> Result<Vec<TextBox>, DetectError> {
         let expected = crate::frames::frame_bytes(size);
         if frame.len() < expected {
@@ -153,23 +275,7 @@ impl TextDetector for WorkerTextDetector {
                 .map_err(|error| DetectError::Backend(format!("请求序列化失败：{error}")))?,
         )?;
 
-        let output = Command::new(&self.config.program)
-            .args(&self.config.args)
-            .arg(&self.work_dir)
-            .output()
-            .map_err(|error| {
-                DetectError::Backend(format!(
-                    "无法启动检测后端 {}：{error}",
-                    self.config.program.display()
-                ))
-            })?;
-        if !output.status.success() {
-            return Err(DetectError::Backend(format!(
-                "检测后端退出码 {:?}：{}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
+        self.invoke_backend()?;
 
         let path = self.work_dir.join("boxes.json");
         let raw = std::fs::read(&path).map_err(|error| {
@@ -248,12 +354,16 @@ impl Default for Reliability {
     }
 }
 
-/// 跨帧聚合检测结果，返回稳定的字幕 ROI。
+/// 跨帧聚合检测结果，返回**每一个**稳定区域（按面积从大到小）。
+///
+/// 与 [`stable_roi`] 的区别：短剧里常见「底部字幕 + 角落角标」两个互不相邻的
+/// 标识，这里把它们作为独立区域返回，管线就能只在各自区域内生成掩码，
+/// 而不会把两个区域之间的正常画面也划进掩码坐标空间。
 ///
 /// 逐帧检测的偶发误检（例如画面里一闪而过的文字）会因出现帧数不足被丢弃。
-pub fn stable_roi(samples: &[Vec<TextBox>], reliability: &Reliability) -> Option<MaskRect> {
+pub fn stable_rois(samples: &[Vec<TextBox>], reliability: &Reliability) -> Vec<MaskRect> {
     if samples.is_empty() || reliability.min_frames == 0 {
-        return None;
+        return Vec::new();
     }
     // (累计外接矩形, 出现的帧数)
     let mut clusters: Vec<(MaskRect, usize)> = Vec::new();
@@ -278,12 +388,105 @@ pub fn stable_roi(samples: &[Vec<TextBox>], reliability: &Reliability) -> Option
         .filter(|(_, count)| *count >= reliability.min_frames)
         .map(|(rect, _)| rect)
         .collect();
-    union_rects(&stable)
+    let mut merged = merge_overlapping(&stable, reliability.iou_threshold);
+    merged.sort_by_key(|rect| std::cmp::Reverse(rect.area()));
+    merged
+}
+
+/// 跨帧聚合检测结果，返回包含全部稳定区域的外接 ROI。
+pub fn stable_roi(samples: &[Vec<TextBox>], reliability: &Reliability) -> Option<MaskRect> {
+    union_rects(&stable_rois(samples, reliability))
+}
+
+/// 只保留中心点落在任一区域内的检测框。
+///
+/// 用于把逐帧检测限制在稳定的标识区域内：短剧画面里偶发的背景文字
+/// （衣服印花、招牌等）会被这一步过滤掉，不进入掩码。
+pub fn filter_by_regions(
+    boxes: &[TextBox],
+    regions: &[MaskRect],
+    pad: u32,
+    frame: FrameSize,
+) -> Vec<TextBox> {
+    if regions.is_empty() {
+        return boxes.to_vec();
+    }
+    boxes
+        .iter()
+        .copied()
+        .filter(|box_| {
+            let center_x = box_.x + box_.width / 2;
+            let center_y = box_.y + box_.height / 2;
+            regions.iter().any(|region| {
+                region.expand(pad, frame).is_some_and(|expanded| {
+                    center_x >= expanded.x
+                        && center_x < expanded.right()
+                        && center_y >= expanded.y
+                        && center_y < expanded.bottom()
+                })
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stable_rois_separates_subtitle_and_corner_logo() {
+        let subtitle = MaskRect::new(120, 300, 400, 40);
+        let logo = MaskRect::new(560, 30, 60, 40);
+        let to_box = |rect: MaskRect| TextBox::new(rect.x, rect.y, rect.width, rect.height, 0.9);
+        let samples: Vec<Vec<TextBox>> = (0..5)
+            .map(|_| vec![to_box(subtitle), to_box(logo)])
+            .collect();
+
+        let regions = stable_rois(&samples, &Reliability::default());
+        assert_eq!(regions.len(), 2, "两个字幕区域不应被并成一个：{regions:?}");
+        assert_eq!(regions[0], subtitle, "面积大的区域应排在前面");
+        assert_eq!(regions[1], logo);
+
+        // 外接 ROI 仍是两者的并集，保证单次裁剪能覆盖全部区域
+        assert_eq!(
+            stable_roi(&samples, &Reliability::default()),
+            Some(subtitle.union(&logo).unwrap())
+        );
+    }
+
+    #[test]
+    fn stable_rois_drops_transient_boxes() {
+        let stable = MaskRect::new(0, 0, 100, 20);
+        let transient = MaskRect::new(200, 100, 40, 15);
+        let to_box = |rect: MaskRect| TextBox::new(rect.x, rect.y, rect.width, rect.height, 0.9);
+        let mut samples = vec![vec![to_box(stable), to_box(transient)]];
+        samples.extend((0..4).map(|_| vec![to_box(stable)]));
+
+        let regions = stable_rois(&samples, &Reliability::default());
+        assert_eq!(regions, vec![stable], "只出现一帧的框应被丢弃");
+    }
+
+    #[test]
+    fn filter_by_regions_keeps_only_centers_inside() {
+        let frame = FrameSize::new(640, 360);
+        let regions = [MaskRect::new(120, 300, 400, 40)];
+        let inside = TextBox::new(200, 310, 100, 20, 0.9);
+        let outside = TextBox::new(200, 100, 100, 20, 0.9);
+        let kept = filter_by_regions(&[inside, outside], &regions, 0, frame);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].rect(), inside.rect());
+
+        // 空区域列表不过滤
+        assert_eq!(
+            filter_by_regions(&[inside, outside], &[], 0, frame).len(),
+            2
+        );
+
+        // 外扩量足够时，边界附近的框也会被保留
+        let edge = TextBox::new(80, 300, 40, 20, 0.9);
+        assert!(filter_by_regions(&[edge], &regions, 0, frame).is_empty());
+        assert_eq!(filter_by_regions(&[edge], &regions, 20, frame).len(), 1);
+    }
 
     #[test]
     fn detect_error_is_not_io_coupled() {
@@ -303,6 +506,49 @@ mod tests {
         // 完全在画面外时返回空，而不是报错
         let outside = FixedRoiDetector::new(MaskRect::new(700, 400, 10, 10));
         assert!(outside.detect(&[], size).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fixed_rois_detector_returns_each_region() {
+        let size = FrameSize::new(640, 360);
+        let subtitle = MaskRect::new(120, 300, 400, 40);
+        let logo = MaskRect::new(560, 20, 60, 40);
+        let detector =
+            FixedRoisDetector::new(vec![subtitle, logo, MaskRect::new(700, 400, 10, 10)]);
+
+        let boxes = detector.detect(&[], size).unwrap();
+        assert_eq!(boxes.len(), 2, "完全在画面外的区域应被忽略");
+        assert_eq!(boxes[0].rect(), subtitle);
+        assert_eq!(boxes[1].rect(), logo);
+        assert!(!detector.is_content_based());
+    }
+
+    #[test]
+    fn offset_box_translates_and_clips() {
+        let frame = FrameSize::new(100, 50);
+        let cropped = TextBox::new(5, 3, 20, 10, 0.8);
+        let moved = offset_box(&cropped, 40, 20, frame).unwrap();
+        assert_eq!(moved.rect(), MaskRect::new(45, 23, 20, 10));
+        assert_eq!(moved.score, 0.8);
+
+        // 平移后越界：先裁到画面内，完全在画面外则丢弃
+        let clipped = offset_box(&cropped, 90, 20, frame).unwrap();
+        assert_eq!(clipped.rect(), MaskRect::new(95, 23, 5, 10));
+        assert!(offset_box(&cropped, 200, 0, frame).is_none());
+    }
+
+    #[test]
+    fn default_detectors_keep_full_frame_detection() {
+        let detector = FixedRoisDetector::new(vec![MaskRect::new(0, 0, 10, 10)]);
+        assert!(!detector.prefer_roi_detection());
+        let worker = WorkerTextDetector::new(
+            WorkerConfig {
+                program: "true".into(),
+                args: Vec::new(),
+            },
+            std::env::temp_dir(),
+        );
+        assert!(worker.prefer_roi_detection());
     }
 
     #[test]

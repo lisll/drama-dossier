@@ -7,9 +7,12 @@
 //! 不提供 DRM 绕过能力，也不处理他人作品的版权标识。
 
 pub mod detect;
+pub mod erase;
 pub mod frames;
 pub mod inpaint;
 pub mod mask;
 pub mod patch;
 pub mod pipeline;
 pub mod probe;
+pub mod verify;
+pub mod worker;

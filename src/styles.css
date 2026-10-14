@@ -486,3 +486,82 @@ code {
     grid-template-columns: 1fr;
   }
 }
+
+/* 「报审配套工具」与「擦除实验」两个折叠面板：沿用设置面板的 summary 外观。 */
+.toolbox-panel,
+.erase-panel {
+  margin-top: 16px;
+}
+
+.toolbox-panel summary,
+.erase-panel summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--text);
+  list-style: none;
+}
+
+.toolbox-panel summary::-webkit-details-marker,
+.erase-panel summary::-webkit-details-marker {
+  display: none;
+}
+
+.toolbox-panel summary::after,
+.erase-panel summary::after {
+  content: "▾";
+  float: right;
+  color: var(--muted);
+}
+
+.toolbox-panel[open] summary,
+.erase-panel[open] summary {
+  margin-bottom: 14px;
+}
+
+.toolbox-panel[open] summary::after,
+.erase-panel[open] summary::after {
+  content: "▴";
+}
+
+.form-grid select {
+  width: 100%;
+}
+
+.tool-block {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.tool-block h4 {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+
+.hint {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.result table {
+  width: 100%;
+  margin-top: 8px;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.result th,
+.result td {
+  padding: 4px 6px;
+  text-align: left;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.result pre,
+.result code {
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: 12px;
+}

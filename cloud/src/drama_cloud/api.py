@@ -24,7 +24,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, Literal, Optional, Tuple
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -40,6 +40,7 @@ from .plan import ENGINE_VERSION, WORKER_VERSION
 from .recipes.registry import registered_modules
 from .recipes.schema import recipe_json_schema
 from .storage import LocalStorage
+from .tasks import review as review_service
 from .tasks import service
 from .tasks.queue import TaskQueue
 
@@ -50,6 +51,7 @@ _STATUS_BY_CLASS = {
     ErrorClass.INPUT_CORRUPT: 422,
     ErrorClass.TARGET_UNSUPPORTED: 422,
     ErrorClass.QUALITY_GATE_FAILED: 422,
+    ErrorClass.QUALITY_RETRYABLE: 409,
     ErrorClass.CAPABILITY_MISSING: 503,
     ErrorClass.TRANSIENT_IO: 503,
     ErrorClass.STORAGE_UNAVAILABLE: 503,
@@ -81,6 +83,21 @@ class TaskRequest(StrictModel):
     priority: int = Field(100, ge=0, le=10000)
     project_id: Optional[str] = None
     idempotency_key: Optional[str] = None
+
+
+class ReviewDecisionRequest(StrictModel):
+    """人工复核裁决：`approve` 放行 / `reject` 判定不可用（通常随后重跑）。"""
+
+    decision: Literal["approve", "reject"]
+    note: str = ""
+
+
+class ReviewRerunRequest(StrictModel):
+    """按修正后的参数重跑：`user_params` 形态与创建任务一致（按步骤 id 覆盖已有参数）。"""
+
+    user_params: Optional[dict] = None
+    note: str = ""
+    priority: int = Field(100, ge=0, le=10000)
 
 
 class RecipePublishRequest(StrictModel):
@@ -244,6 +261,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "modules": sorted(registered_modules()),
             "queue_depth": queue.depth(conn),
             "tasks_by_state": queue.stats(conn),
+            "reviews_pending": len(review_service.list_reviews(conn, status="pending", limit=1000)),
             "storage": {
                 "root": str(settings.storage_dir),
                 "objects_bytes": _dir_size(settings.storage_dir),
@@ -526,6 +544,66 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             filename=Path(artifact["storage_key"]).name,
             media_type="application/octet-stream",
             headers={"X-Artifact-SHA256": artifact["sha256"]},
+        )
+
+    # ---------- 人工复核队列（确认流分支B） ----------
+
+    @app.get("/api/v1/reviews")
+    def list_reviews_endpoint(
+        status: Optional[str] = Query(None),
+        task_id: Optional[str] = Query(None),
+        limit: int = Query(100, ge=1, le=500),
+        principal: Principal = Depends(require_role("viewer")),
+        conn=Depends(get_conn),
+    ):
+        return {"reviews": review_service.list_reviews(
+            conn, status=status, task_id=task_id, limit=limit
+        )}
+
+    @app.get("/api/v1/reviews/{review_id}")
+    def get_review_endpoint(
+        review_id: str,
+        principal: Principal = Depends(require_role("viewer")),
+        conn=Depends(get_conn),
+    ):
+        return review_service.get_review(conn, review_id)
+
+    @app.post("/api/v1/reviews/{review_id}/claim")
+    def claim_review_endpoint(
+        review_id: str,
+        principal: Principal = Depends(require_role("operator")),
+        conn=Depends(get_conn),
+    ):
+        return review_service.claim(conn, review_id, actor=principal.user_id)
+
+    @app.post("/api/v1/reviews/{review_id}/decision")
+    def decide_review_endpoint(
+        review_id: str,
+        payload: ReviewDecisionRequest,
+        principal: Principal = Depends(require_role("operator")),
+        conn=Depends(get_conn),
+    ):
+        """标记通过 / 标记失败。只改复核记录与审计，不改任务状态。"""
+        return review_service.decide(
+            conn, review_id, payload.decision, note=payload.note, actor=principal.user_id
+        )
+
+    @app.post("/api/v1/reviews/{review_id}/rerun", status_code=201)
+    def rerun_review_endpoint(
+        review_id: str,
+        payload: ReviewRerunRequest,
+        principal: Principal = Depends(require_role("operator")),
+        conn=Depends(get_conn),
+    ):
+        """修正 mask / 参数后重跑：创建一个新任务，本复核记录转 superseded。"""
+        return review_service.rerun(
+            conn,
+            settings,
+            review_id,
+            user_params=payload.user_params,
+            note=payload.note,
+            actor=principal.user_id,
+            priority=payload.priority,
         )
 
     # ---------- 审计 ----------

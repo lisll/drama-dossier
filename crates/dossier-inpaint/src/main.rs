@@ -11,15 +11,20 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 
 use clap::Parser;
 
-use dossier_inpaint::detect::{FixedRoiDetector, TextDetector, WorkerConfig, WorkerTextDetector};
+use dossier_inpaint::detect::{
+    FixedRoiDetector, FixedRoisDetector, TextDetector, WorkerConfig, WorkerTextDetector,
+};
 use dossier_inpaint::frames::{FfmpegConfig, FfmpegFrameSink, FfmpegFrameSource};
 use dossier_inpaint::inpaint::{ColumnFillInpainter, Inpainter, WorkerInpainter};
 use dossier_inpaint::mask::MaskRect;
 use dossier_inpaint::pipeline::{run_pipeline, PipelineConfig};
 use dossier_inpaint::probe::probe_video;
+use dossier_inpaint::verify::{Verdict, VerifyConfig};
+use dossier_inpaint::worker::WorkerSession;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -34,9 +39,36 @@ struct Args {
     /// 输出视频（音轨从输入素材直接复制）
     #[arg(long)]
     output: PathBuf,
-    /// 固定区域（字幕或角标），格式 x,y,w,h；配合 --detector fixed
+    /// 固定区域（字幕或角标），格式 x,y,w,h；可重复给出以支持多个标识。
+    ///
+    /// 给出后管线会跳过定位阶段，直接在这些区域内生成掩码；
+    /// 配合 `--detector worker` 时还可以只在这些区域内采纳模型检测框。
     #[arg(long, value_parser = parse_roi, allow_hyphen_values = true)]
-    roi: Option<MaskRect>,
+    roi: Vec<MaskRect>,
+    /// 只处理从该时间点（秒）开始的画面；之前的帧原样输出
+    #[arg(long, allow_hyphen_values = true)]
+    start: Option<f64>,
+    /// 处理时长（秒）；与 `--start` 配合限定时间窗
+    #[arg(long, allow_hyphen_values = true)]
+    duration: Option<f64>,
+    /// 只处理从该帧开始的画面（优先于 `--start`）
+    #[arg(long)]
+    start_frame: Option<u64>,
+    /// 只处理到该帧之前（不含该帧；优先于 `--duration`）
+    #[arg(long)]
+    end_frame: Option<u64>,
+    /// 掩码时序平滑半径（帧）：相邻帧掩码取并集，抑制漏检导致的闪烁
+    #[arg(long, default_value_t = 1)]
+    temporal_smooth: u32,
+    /// 检测框必须落在区域内的判定外扩量（像素）
+    #[arg(long, default_value_t = 8)]
+    region_pad: u32,
+    /// 区域分组阈值：合并后的外扩 ROI 面积最多是「各自独立处理面积之和」的多少倍。
+    ///
+    /// 两处标识离得远时，外接 ROI 会框进大片无关画面；此时按阈值拆成多个
+    /// 裁剪作业分别送模型，速度与上下文都会更好。`<= 1.0` 表示不分组。
+    #[arg(long, default_value_t = 2.0, allow_hyphen_values = true)]
+    region_group_area_ratio: f64,
     /// 检测后端：fixed（需 --roi）或 worker（DBNet Python worker）
     #[arg(long, default_value = "fixed")]
     detector: String,
@@ -47,8 +79,15 @@ struct Args {
     #[arg(long)]
     worker_program: Option<String>,
     /// worker 参数，可重复或用逗号分隔（如 tools/model_worker/worker.py）
-    #[arg(long, value_delimiter = ',')]
+    ///
+    /// `allow_hyphen_values`：worker 自己的开关（如 `--serve`、`--e2fgvi-repo`）也以
+    /// 连字符开头，必须能作为一个值传进来，否则会被当成本工具的未知参数。
+    #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
     worker_args: Vec<String>,
+    /// 常驻 worker：整个视频只启动一次后端进程，把解释器启动与模型加载
+    /// 摊到所有帧/片段上（逐帧检测时收益最明显）。
+    #[arg(long)]
+    persistent_worker: bool,
     /// ffmpeg 可执行文件路径；缺省从 PATH 查找
     #[arg(long)]
     ffmpeg: Option<PathBuf>,
@@ -105,6 +144,45 @@ struct Args {
     /// 保留中间文件（临时视频与 worker 交换目录）
     #[arg(long)]
     keep_temp: bool,
+    /// 关闭擦除结果自动校验（默认开启）。
+    ///
+    /// 校验会在输出帧上重跑检测并计算残留 / 闪烁 / 接缝 / 一致性指标，
+    /// 结论写入处理日志（`--report-json`），并按结论设置退出码。
+    #[arg(long)]
+    no_verify: bool,
+    /// 残留文本像素占比 警告阈值（0–1）
+    #[arg(long, default_value_t = VerifyConfig::default().residual_ratio_warn)]
+    verify_residual_ratio_warn: f64,
+    /// 残留文本像素占比 失败阈值（0–1）
+    #[arg(long, default_value_t = VerifyConfig::default().residual_ratio_fail)]
+    verify_residual_ratio_fail: f64,
+    /// 闪烁指数 均值警告阈值
+    #[arg(long, default_value_t = VerifyConfig::default().flicker_index_warn)]
+    verify_flicker_warn: f64,
+    /// 闪烁指数 峰值失败阈值
+    #[arg(long, default_value_t = VerifyConfig::default().flicker_index_fail)]
+    verify_flicker_fail: f64,
+    /// 接缝分数 均值警告阈值
+    #[arg(long, default_value_t = VerifyConfig::default().seam_score_warn)]
+    verify_seam_warn: f64,
+    /// 接缝分数 峰值失败阈值
+    #[arg(long, default_value_t = VerifyConfig::default().seam_score_fail)]
+    verify_seam_fail: f64,
+    /// 掩码内一致性 PSNR 均值警告阈值（dB）
+    #[arg(long, default_value_t = VerifyConfig::default().psnr_warn_db)]
+    verify_psnr_warn: f64,
+    /// 掩码内一致性 PSNR 最低失败阈值（dB）
+    #[arg(long, default_value_t = VerifyConfig::default().psnr_fail_db)]
+    verify_psnr_fail: f64,
+    /// 掩码内结构相似度（SSIM）均值 警告阈值
+    #[arg(long, default_value_t = VerifyConfig::default().ssim_warn)]
+    verify_ssim_warn: f64,
+    /// 掩码内结构相似度（SSIM）最低 失败阈值
+    #[arg(long, default_value_t = VerifyConfig::default().ssim_fail)]
+    verify_ssim_fail: f64,
+    /// 处理日志（结构化 JSON）输出路径；缺省写到 `<输出>.inpaint-report.json`
+    #[arg(long)]
+    report_json: Option<PathBuf>,
 }
 
 fn parse_roi(value: &str) -> Result<MaskRect, String> {
@@ -123,10 +201,24 @@ fn parse_roi(value: &str) -> Result<MaskRect, String> {
     Ok(rect)
 }
 
+/// 参数解析失败时的退出码：clap 默认用法错误退出码是 2，会与本工具的
+/// 「自动校验失败」（2）撞码，让上游把「参数写错」误判成「画面没擦干净」。
+/// 这里统一映射成 1（执行错误），保证 0 / 2 / 3 的确认流语义唯一；
+/// `--help` / `--version` 不是错误，仍为 0。
+fn parse_error_exit_code(error: &clap::Error) -> ExitCode {
+    ExitCode::from(if error.use_stderr() { 1 } else { 0 })
+}
+
 fn main() -> ExitCode {
-    let args = Args::parse();
+    let args = match Args::try_parse() {
+        Ok(args) => args,
+        Err(error) => {
+            let _ = error.print();
+            return parse_error_exit_code(&error);
+        }
+    };
     match run(&args) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(message) => {
             eprintln!("错误：{message}");
             ExitCode::FAILURE
@@ -134,7 +226,34 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(args: &Args) -> Result<(), String> {
+/// 确认流退出码：`0` 自动确认通过，`3` 需要人工抽查，`2` 自动校验失败
+/// （应触发自动重试或转人工复核），`1` 为执行错误。
+fn verdict_exit_code(verdict: Option<Verdict>) -> ExitCode {
+    match verdict {
+        Some(Verdict::Fail) => ExitCode::from(2),
+        Some(Verdict::Warn) => ExitCode::from(3),
+        _ => ExitCode::SUCCESS,
+    }
+}
+
+fn verify_config_from_args(args: &Args) -> VerifyConfig {
+    let defaults = VerifyConfig::default();
+    VerifyConfig {
+        residual_ratio_warn: args.verify_residual_ratio_warn,
+        residual_ratio_fail: args.verify_residual_ratio_fail,
+        flicker_index_warn: args.verify_flicker_warn,
+        flicker_index_fail: args.verify_flicker_fail,
+        seam_score_warn: args.verify_seam_warn,
+        seam_score_fail: args.verify_seam_fail,
+        psnr_warn_db: args.verify_psnr_warn,
+        psnr_fail_db: args.verify_psnr_fail,
+        ssim_warn: args.verify_ssim_warn,
+        ssim_fail: args.verify_ssim_fail,
+        ..defaults
+    }
+}
+
+fn run(args: &Args) -> Result<ExitCode, String> {
     let lossless_intermediate = match args.intermediate.as_str() {
         "delivery" => false,
         "lossless" => true,
@@ -172,8 +291,13 @@ fn run(args: &Args) -> Result<(), String> {
     }
     std::fs::create_dir_all(&temp_dir).map_err(|error| format!("无法创建临时目录：{error}"))?;
 
-    let detector = build_detector(args, &temp_dir)?;
-    let inpainter = build_inpainter(args, &temp_dir)?;
+    let session = start_worker_session(args)?;
+    let detector = build_detector(args, &temp_dir, session.clone())?;
+    let inpainter = build_inpainter(args, &temp_dir, session)?;
+    let (start_frame, end_frame) = frame_window(args, fps)?;
+    if let (Some(start), Some(end)) = (start_frame, end_frame) {
+        println!("处理窗口：帧 [{start}, {end})");
+    }
 
     let config = PipelineConfig {
         clip_frames: args.clip_frames,
@@ -182,6 +306,13 @@ fn run(args: &Args) -> Result<(), String> {
         mask_dilate: args.dilate,
         feather_radius: args.feather,
         context_scale: args.context,
+        verify: (!args.no_verify).then(|| verify_config_from_args(args)),
+        regions: args.roi.clone(),
+        region_pad: args.region_pad,
+        region_group_area_ratio: args.region_group_area_ratio,
+        temporal_smooth: args.temporal_smooth,
+        start_frame,
+        end_frame,
         ..Default::default()
     };
 
@@ -224,10 +355,24 @@ fn run(args: &Args) -> Result<(), String> {
 
     match report.roi {
         Some(roi) => println!(
-            "字幕区域：{}x{} @ ({}, {})",
-            roi.width, roi.height, roi.x, roi.y
+            "标识区域：{} 个，外接 ROI {}x{} @ ({}, {})",
+            report.regions.len(),
+            roi.width,
+            roi.height,
+            roi.x,
+            roi.y
         ),
-        None => println!("未检测到字幕；输出为原样重编码"),
+        None => println!("未检测到标识；输出为原样重编码"),
+    }
+    for (index, region) in report.regions.iter().enumerate() {
+        println!(
+            "  区域 {}：{}x{} @ ({}, {})",
+            index + 1,
+            region.width,
+            region.height,
+            region.x,
+            region.y
+        );
     }
     println!(
         "帧数：{} → {}，片段：{}（其中修复 {}），掩码平均覆盖：{:.2}%",
@@ -237,6 +382,19 @@ fn run(args: &Args) -> Result<(), String> {
         report.inpainted_clips,
         report.mean_mask_coverage * 100.0
     );
+    println!(
+        "区域分组：{} 组，提交修复后端 {} 次",
+        report.roi_jobs, report.inpaint_batches
+    );
+
+    print_verification(&report);
+
+    let report_path = args
+        .report_json
+        .clone()
+        .unwrap_or_else(|| args.output.with_extension("inpaint-report.json"));
+    write_report(&report_path, &report)?;
+    println!("处理日志：{}", report_path.display());
 
     let mux_label = if lossless_intermediate {
         "交付编码"
@@ -272,7 +430,46 @@ fn run(args: &Args) -> Result<(), String> {
     } else {
         std::fs::remove_dir_all(&temp_dir).ok();
     }
-    Ok(())
+    Ok(verdict_exit_code(
+        report.verification.as_ref().map(|report| report.verdict),
+    ))
+}
+
+/// 打印校验结论；失败时把发现逐条列出，便于直接定位重试参数。
+fn print_verification(report: &dossier_inpaint::pipeline::PipelineReport) {
+    let Some(verification) = &report.verification else {
+        println!("自动校验：未启用");
+        return;
+    };
+    if !verification.applicable {
+        println!("自动校验：未执行（没有需要校验的掩码区域）");
+        return;
+    }
+    println!(
+        "自动校验：{:?}，残留峰值 {:.2}%，闪烁峰值 {:.2}，接缝峰值 {:.2}，一致性均值 {:.1} dB，SSIM 均值 {:.3}",
+        verification.verdict,
+        verification.residual.max_ratio * 100.0,
+        verification.flicker.max_index,
+        verification.seam.max_score,
+        verification.consistency.mean_psnr_db,
+        verification.ssim.mean_ssim
+    );
+    for issue in &verification.issues {
+        println!(
+            "  - [{:?}] {}：{}",
+            issue.severity, issue.code, issue.message
+        );
+    }
+}
+
+/// 落盘处理日志（结构化 JSON，供自动重试与人工复核读取）。
+fn write_report(
+    path: &std::path::Path,
+    report: &dossier_inpaint::pipeline::PipelineReport,
+) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(report)
+        .map_err(|error| format!("处理日志序列化失败：{error}"))?;
+    std::fs::write(path, json).map_err(|error| format!("处理日志写入失败：{error}"))
 }
 
 /// 交付编码参数：`--intermediate delivery` 时用于中间态，`lossless` 时用于最后一步。
@@ -292,32 +489,83 @@ fn delivery_encoder_args(args: &Args) -> Vec<String> {
     encoder_args
 }
 
+/// 把 `--start/--duration`（秒）与 `--start-frame/--end-frame`（帧）统一成帧窗口。
+fn frame_window(args: &Args, fps: f64) -> Result<(Option<u64>, Option<u64>), String> {
+    let mut start = args.start_frame;
+    let mut end = args.end_frame;
+    if let Some(seconds) = args.start {
+        if !seconds.is_finite() || seconds < 0.0 {
+            return Err("--start 必须是非负秒数".into());
+        }
+        start = Some((seconds * fps).round() as u64);
+    }
+    if let Some(duration) = args.duration {
+        if !duration.is_finite() || duration <= 0.0 {
+            return Err("--duration 必须是大于 0 的秒数".into());
+        }
+        let base = start.unwrap_or(0);
+        end = Some(base + (duration * fps).round().max(1.0) as u64);
+    }
+    Ok((start, end))
+}
+
+/// 需要 worker 会话时启动一个常驻进程；否则返回 `None` 走一次性后端。
+///
+/// 检测与修复共享同一个进程，因此 DBNet 与修复模型的权重只加载一次。
+fn start_worker_session(args: &Args) -> Result<Option<Arc<Mutex<WorkerSession>>>, String> {
+    let needs_worker = args.detector == "worker" || args.inpainter == "worker";
+    if !(args.persistent_worker && needs_worker) {
+        return Ok(None);
+    }
+    let config = worker_config(args)?;
+    let session = WorkerSession::spawn(&config).map_err(|error| error.to_string())?;
+    println!("常驻 worker：pid {}", session.pid());
+    Ok(Some(Arc::new(Mutex::new(session))))
+}
+
 fn build_detector(
     args: &Args,
     temp_dir: &std::path::Path,
+    session: Option<Arc<Mutex<WorkerSession>>>,
 ) -> Result<Box<dyn TextDetector>, String> {
     match args.detector.as_str() {
         "fixed" => {
-            let roi = args
-                .roi
-                .ok_or_else(|| "--detector fixed 需要用 --roi x,y,w,h 指定字幕区域".to_string())?;
-            Ok(Box::new(FixedRoiDetector::new(roi)))
+            if args.roi.is_empty() {
+                return Err("--detector fixed 需要用 --roi x,y,w,h 指定标识区域".to_string());
+            }
+            if args.roi.len() == 1 {
+                Ok(Box::new(FixedRoiDetector::new(args.roi[0])))
+            } else {
+                Ok(Box::new(FixedRoisDetector::new(args.roi.clone())))
+            }
         }
-        "worker" => Ok(Box::new(WorkerTextDetector::new(
-            worker_config(args)?,
-            temp_dir.join("detect"),
-        ))),
+        "worker" => {
+            let mut detector =
+                WorkerTextDetector::new(worker_config(args)?, temp_dir.join("detect"));
+            if let Some(session) = session {
+                detector = detector.with_session(session);
+            }
+            Ok(Box::new(detector))
+        }
         other => Err(format!("未知检测后端 {other}；可选 fixed 或 worker")),
     }
 }
 
-fn build_inpainter(args: &Args, temp_dir: &std::path::Path) -> Result<Box<dyn Inpainter>, String> {
+fn build_inpainter(
+    args: &Args,
+    temp_dir: &std::path::Path,
+    session: Option<Arc<Mutex<WorkerSession>>>,
+) -> Result<Box<dyn Inpainter>, String> {
     match args.inpainter.as_str() {
         "column" => Ok(Box::new(ColumnFillInpainter { sample_rows: 4 })),
-        "worker" => Ok(Box::new(WorkerInpainter::new(
-            worker_config(args)?,
-            temp_dir.join("inpaint"),
-        ))),
+        "worker" => {
+            let mut inpainter =
+                WorkerInpainter::new(worker_config(args)?, temp_dir.join("inpaint"));
+            if let Some(session) = session {
+                inpainter = inpainter.with_session(session);
+            }
+            Ok(Box::new(inpainter))
+        }
         other => Err(format!("未知修复后端 {other}；可选 column 或 worker")),
     }
 }
@@ -330,4 +578,109 @@ fn worker_config(args: &Args) -> Result<WorkerConfig, String> {
         program: PathBuf::from(program),
         args: args.worker_args.clone(),
     })
+}
+
+#[cfg(test)]
+mod desktop_entry_tests {
+    //! 桌面端（`erase::build_plan`）拼出来的参数必须被 CLI 自己接受。
+    //!
+    //! 两套入口各写各的参数名很容易漂移，这里用 clap 反向解析守住契约：
+    //! 一旦桌面端少写/写错一个开关，这个测试就会失败。
+
+    use super::Args;
+    use clap::Parser;
+    use dossier_inpaint::erase::{build_plan, EraseRegion, EraseRequest};
+    use std::path::PathBuf;
+    use std::process::ExitCode;
+
+    fn request() -> EraseRequest {
+        EraseRequest {
+            input: PathBuf::from("/tmp/in.mp4"),
+            output: PathBuf::from("/tmp/out.mp4"),
+            regions: vec![
+                EraseRegion {
+                    x: 120,
+                    y: 300,
+                    width: 400,
+                    height: 40,
+                },
+                EraseRegion {
+                    x: 900,
+                    y: 30,
+                    width: 120,
+                    height: 60,
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn parse(request: &EraseRequest) -> Args {
+        let plan = build_plan(request, std::path::Path::new("/bin/dossier-inpaint")).unwrap();
+        let mut argv = vec![plan.program.display().to_string()];
+        argv.extend(plan.args.iter().cloned());
+        Args::try_parse_from(argv).expect("桌面端参数必须能被 CLI 解析")
+    }
+
+    #[test]
+    fn desktop_plan_matches_the_cli_parser() {
+        let request = request();
+        let args = parse(&request);
+        assert_eq!(args.input, PathBuf::from("/tmp/in.mp4"));
+        assert_eq!(args.output, PathBuf::from("/tmp/out.mp4"));
+        assert_eq!(args.roi.len(), 2);
+        assert_eq!(args.roi[0].x, 120);
+        assert_eq!(args.roi[1].width, 120);
+        assert_eq!(args.detector, "fixed");
+        assert_eq!(args.inpainter, "column");
+        assert_eq!(args.dilate, request.dilate);
+        assert_eq!(args.feather, request.feather);
+        assert!(!args.persistent_worker);
+        assert_eq!(
+            args.report_json,
+            Some(PathBuf::from("/tmp/out.mp4.inpaint-report.json"))
+        );
+        assert_eq!(args.worker_program, None);
+    }
+
+    #[test]
+    fn desktop_worker_plan_matches_the_cli_parser() {
+        let mut request = request();
+        request.detector = "worker".into();
+        request.inpainter = "worker".into();
+        request.persistent_worker = true;
+        request.start = Some(12.5);
+        request.duration = Some(8.0);
+        request.worker_program = Some("python3".into());
+        request.worker_args = vec!["tools/model_worker/worker.py".into(), "--serve".into()];
+
+        let args = parse(&request);
+        assert_eq!(args.detector, "worker");
+        assert_eq!(args.inpainter, "worker");
+        assert!(args.persistent_worker);
+        assert_eq!(args.worker_program.as_deref(), Some("python3"));
+        assert_eq!(args.worker_args.len(), 2);
+        assert_eq!(args.start, Some(12.5));
+        assert_eq!(args.duration, Some(8.0));
+    }
+
+    #[test]
+    fn clap_usage_errors_never_look_like_a_failed_verification() {
+        // 确认流里 2 = 校验失败、3 = 需人工抽查，都代表「跑完了但画面有问题」。
+        // 参数写错属于执行错误（1），不能撞上这两个码，否则上游会把「命令拼错」
+        // 当成「没擦干净」而去重试或转人工。
+        let error = Args::try_parse_from(["dossier-inpaint", "--no-such-flag"])
+            .expect_err("未知参数应报错");
+        assert!(error.use_stderr(), "未知参数属于用法错误，应写入 stderr");
+        assert_eq!(error.exit_code(), 2, "先确认 clap 默认确实是 2（撞码来源）");
+        assert_eq!(
+            super::parse_error_exit_code(&error),
+            ExitCode::from(1),
+            "用法错误必须映射成执行错误码 1"
+        );
+        // --help / --version 不是错误：走 stdout 且应为 0。
+        let help = Args::try_parse_from(["dossier-inpaint", "--help"]).expect_err("--help 应短路");
+        assert!(!help.use_stderr(), "--help 不应写入 stderr");
+        assert_eq!(super::parse_error_exit_code(&help), ExitCode::SUCCESS);
+    }
 }

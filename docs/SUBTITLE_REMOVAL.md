@@ -60,7 +60,9 @@
 | `crates/dossier-inpaint/src/patch.rs` | ROI 裁剪与回贴 |
 | `crates/dossier-inpaint/src/detect.rs` | 检测后端：`FixedRoiDetector` / `WorkerTextDetector`、跨帧 `stable_roi` |
 | `crates/dossier-inpaint/src/inpaint.rs` | 修复后端：`ColumnFillInpainter`（基线）/ `WorkerInpainter` |
-| `crates/dossier-inpaint/src/pipeline.rs` | 两遍管线与片段调度 |
+| `crates/dossier-inpaint/src/worker.rs` | 常驻 worker 会话（`--persistent-worker`，stdio 行协议） |
+| `crates/dossier-inpaint/src/verify.rs` | 擦除结果自动校验（残留 / 闪烁 / 接缝 / 一致性 / SSIM） |
+| `crates/dossier-inpaint/src/pipeline.rs` | 两遍管线、区域分组与片段调度 |
 | `crates/dossier-inpaint/src/main.rs` | CLI |
 | `tools/model_worker/worker.py` | worker 入口（读请求 → 跑模型 → 写产物） |
 | `tools/model_worker/dbnet.py` | DBNet ONNX 推理与概率图后处理 |
@@ -88,6 +90,31 @@ cargo run -p dossier-inpaint -- \
   --worker-program python3 \
   --worker-args tools/model_worker/worker.py,--e2fgvi-repo,/path/to/E2FGVI,--e2fgvi-ckpt,/path/to/e2fgvi_ckpt.pth \
   --clip-frames 30 --probe-frames 60 --dilate 4 --feather 2 --context 1.6
+
+# 多个标识（例如底部字幕 + 右上角台标）一起擦：--roi 可重复给出
+cargo run -p dossier-inpaint -- \
+  --input in.mp4 --output out.mp4 \
+  --roi 120,300,400,40 --roi 900,30,120,60 --detector fixed --inpainter column
+
+# 两处标识离得远时：让管线按面积阈值拆成多个裁剪作业，各自独立送模型
+cargo run -p dossier-inpaint -- \
+  --input in.mp4 --output out.mp4 \
+  --roi 120,300,400,40 --roi 900,30,120,60 --detector fixed --inpainter column \
+  --region-group-area-ratio 2.0
+
+# 常驻 worker：整段视频只启动一次 Python 解释器 + 模型（逐帧检测时提速最明显）
+cargo run -p dossier-inpaint -- \
+  --input in.mp4 --output out.mp4 \
+  --detector worker --inpainter worker \
+  --worker-program python3 --worker-args tools/model_worker/worker.py,--serve \
+  --persistent-worker
+
+# 只处理「有标识的那一段」：时间窗外的帧原样输出（退出码见下）
+cargo run -p dossier-inpaint -- \
+  --input in.mp4 --output out.mp4 \
+  --detector worker --inpainter worker \
+  --worker-program python3 --worker-args tools/model_worker/worker.py \
+  --start 12.5 --duration 8.0 --report-json out.report.json
 ```
 
 常用参数：
@@ -96,12 +123,22 @@ cargo run -p dossier-inpaint -- \
 | --- | --- | --- |
 | `--detector` | `fixed` | `fixed`（需 `--roi x,y,w,h`）或 `worker` |
 | `--inpainter` | `column` | `column`（本地基线）或 `worker` |
+| `--persistent-worker` | 关 | 整个视频只启动一次 worker 进程（`--serve`），摊掉解释器/模型加载开销 |
+| `--region-group-area-ratio` | `2.0` | 多标识的区域分组阈值：合并后外扩 ROI 面积 ≤ 各自独立面积和 × 该倍数；`<= 1.0` 表示不分组 |
 | `--clip-frames` | `30` | 每个片段的帧数；E2FGVI 建议 ≥ 10（`num_ref` 默认 10） |
 | `--probe-frames` | `60` | 定位阶段抽检帧数 |
 | `--dilate` | `4` | 掩码膨胀半径，覆盖描边与抗锯齿 |
 | `--feather` | `2` | 回贴羽化半径，避免边界硬切 |
 | `--context` | `1.6` | ROI 相对检测框的外扩比例，给模型留上下文 |
 | `--min-score` | `0.5` | 检测置信度下限 |
+| `--roi` | 无 | 固定区域 `x,y,w,h`，**可重复**给出以支持多个标识 |
+| `--start` / `--duration` | 无 | 只处理该时间窗（秒）；窗外帧原样输出 |
+| `--start-frame` / `--end-frame` | 无 | 时间窗的精确帧号版本（优先于秒） |
+| `--temporal-smooth` | `1` | 掩码时序平滑半径（帧）；`0` 关闭 |
+| `--region-pad` | `8` | 检测框必须落在区域内的判定外扩量（像素） |
+| `--no-verify` | 关 | 关闭擦除结果自动校验 |
+| `--verify-residual-ratio-fail` 等 | 见 `--help` | 自动校验阈值（残留 / 闪烁 / 接缝 / 一致性 / SSIM） |
+| `--report-json` | `<输出>.inpaint-report.json` | 处理日志（结构化 JSON）输出路径 |
 | `--keep-temp` | 关 | 保留中间视频与 worker 交换目录，便于排查 |
 | `--fps` | 自动 | 素材帧率不可信时手动指定（管线按固定帧率处理） |
 | `--intermediate` | `delivery` | `delivery` 直接出片；`lossless` 先落 FFV1 无损母版再单独交付编码 |
@@ -142,6 +179,23 @@ cargo run -p dossier-inpaint -- \
 约定：颜色通道统一 **BGR**（对齐 ffmpeg `bgr24`）；坐标是整帧像素坐标且必须落在画面内；
 硬字幕在片段内位置固定，因此 T 个时刻共用同一张掩码。
 
+**常驻模式**（worker 以 `--serve` 启动，Rust 侧用 `--persistent-worker` 启用）
+
+进程只启动一次，之后在 stdin/stdout 上跑行协议；像素仍然走上面的目录交换，
+所以单次请求的内存占用与一次性模式完全一致：
+
+```text
+Rust → worker:  {"workDir":"/tmp/…/exchange-1","mode":"detect"}\n
+worker → Rust:  {"ok":true}\n
+（worker 处理完后写 boxes.json / out/frame_*.raw）…
+Rust → worker:  {"workDir":"/tmp/…/exchange-2"}\n
+```
+
+失败时回 `{"ok":false,"kind":"backend"|"protocol","error":"…"}`；
+worker 进程意外退出会让 Rust 侧报错并带上退出状态，而不是静默产出坏帧。
+反过来的约定是：**worker 的 stdout 只能出现协议行**——`worker.py` 用
+`os.dup2(2, 1)` 把库的打印改道到 stderr，正是为了守住这条。
+
 ## 几条关键不变量
 
 1. **只改掩码覆盖的像素。**
@@ -155,6 +209,41 @@ cargo run -p dossier-inpaint -- \
 3. **跨帧聚合。** 单帧偶发误检不应扩大掩码，`stable_roi` 用多帧一致性过滤。
 4. **帧数守恒。** 输出帧数与输入一致；`out/` 缺帧或尺寸不符时 Rust 侧直接报错，而不是静默输出坏帧。
 5. **音轨不重新编码。** 视频重编码后与原素材用 `-c copy` 重新封装音轨。
+
+## 擦除结果自动校验（确认流）
+
+「擦完就出片」是不够的：必须判断**标识是否真的清除干净**、**画面有没有伪影/闪烁**。
+`dossier-inpaint` 在输出帧上做四项可离线复算的检查（`src/verify.rs`），结论写入处理日志：
+
+| 指标 | 度量 | 失败阈值（默认） |
+| --- | --- | --- |
+| 残留 `residual` | 对输出帧重跑同一检测器，掩码内仍被判为文本的像素占比 | 任取一帧 > 10% |
+| 闪烁 `flicker` | 掩码内亮度帧间差 ÷ 掩码外参考带帧间差 | 超阈值帧占比 > 10% 或均值 > 3.0 |
+| 接缝 `seam` | 掩码边界内外亮度梯度 ÷ 参考带梯度（边界梯度低于 3 亮度级时不计） | 同上 |
+| 一致性 `consistency` | 掩码内亮度相对「前 8 帧中位数」的 PSNR（无干净参考时的真值代理） | 低于阈值帧占比 > 10% 或均值 < 24 dB |
+| 结构相似度 `ssim` | 同一组「当前帧 vs 历史中位数」的全局 SSIM；PSNR 看不见的「抹平/糊块」由它兜底 | 低于阈值帧占比 > 10% 或均值 < 0.55 |
+
+判定与退出码（便于自动化串到「自动重试 / 人工复核」分支）：
+
+| 结论 | 退出码 | 含义 |
+| --- | --- | --- |
+| `pass` | `0` | 自动确认通过，输出可直接使用 |
+| `warn` | `3` | 触发警告阈值，建议人工抽查 |
+| `fail` | `2` | 自动校验失败：应调整 `--dilate/--feather/--context` 或换更强模型重跑 |
+| 执行错误 | `1` | 管线本身失败（解码、worker、编码等），**也包括命令行参数写错** |
+
+> 参数解析失败必须走 `1`：clap 默认的用法错误退出码也是 2，会和「自动校验失败」撞码，
+> 让上游把「命令拼错」当成「画面没擦干净」。`crates/dossier-inpaint/src/main.rs` 里有一个
+> 单测（`clap_usage_errors_never_look_like_a_failed_verification`）钉住这条约定。
+
+两点边界要说清楚：
+
+- `--detector fixed` 不是内容驱动的检测器，无论画面如何都会返回同一个框，
+  因此**残留检查会被显式跳过**（报告里 `residual.checked = false` 并给出说明），
+  其余三项指标仍然有效。要自动判断残留，请用 `--detector worker`（DBNet）。
+- 单帧尖峰可能来自检测/度量的偶发抖动，所以闪烁与接缝的失败判定要求
+  「超阈值帧占比 > `failFrameRatio`（默认 0.1）」或「均值本身超阈值」，
+  避免一帧噪声就把整段判失败。
 
 ## 环境与算力现实（实测）
 
@@ -178,9 +267,10 @@ cargo run -p dossier-inpaint -- \
 
 由此得到两条重要结论：
 
-- **第二次遍历应只在 ROI 上检测。** ROI（如 439×111，约 41 ms）比全帧 1080p（约 389 ms）
-  便宜近 10 倍，而且位置已经确定，没有理由每帧再扫全图。
-  当前实现为了简单仍在第二遍检测整帧，这是首要的优化点。
+- **第二次遍历只在 ROI 上检测（已实现）。** 内容驱动后端把 `prefer_roi_detection()`
+  置为 `true` 后，管线和自动校验都改为把 ROI 裁剪图交给模型，检测框平移回整帧坐标
+  （`detect::offset_box`）。ROI（如 439×111，约 41 ms）比全帧 1080p（约 389 ms）
+  便宜近 10 倍；`--detector fixed` 这类依赖绝对坐标的后端仍走整帧，语义不变。
 - **每次调用都起一个新进程代价很高。** 一次 75 帧、640×360 的完整运行实测约 61 s，
   其中绝大部分是 ~98 次 worker 进程启动（0.6 s × 98 ≈ 59 s），而不是模型本身。
   按 1080p 补番 45 分钟估算，逐帧起进程会让单集耗时达到数小时量级。
@@ -193,24 +283,40 @@ cargo run -p dossier-inpaint -- \
   所以掩码之外的像素虽然**逐字节未被管线改写**，但重编码后仍会与原始像素有差异
   （实测与「纯重编码基准」同级：锐利边缘上约 80–90 个像素差 >24，最大约 85）。
   若要进一步逼近无损，可以只重编码受影响的区域再拼接，或改用无损中间格式。
-- **E2FGVI 路径未在本机端到端验证。** 适配层的张量变换、补边裁回、「只在洞内合成」
-  都用假模型离线单测，但权重本身在此环境跑不起来。
+- **E2FGVI / LaMa / ProPainter 均未在本机端到端验证。** 适配层的张量变换、补边裁回、
+  「只在洞内合成」都用假模型离线单测，但权重本身在此环境（aarch64、无 GPU）跑不起来。
+  `--inpaint-engine lama` 是单帧模型逐帧调用（无时序约束，快但易闪）；
+  `propainter` 通过外部适配层接入，需要模型仓库里提供 `dossier_backend.py::build_inpainter`。
+- **worker 进程启动开销已可摊掉。** `--persistent-worker` 让整段视频只启动一次 worker
+  （配合 `worker.py --serve`），实测 20 帧样例从 8.08 s 降到 1.14 s（约 7×）；
+  剩下的是模型本身的推理耗时。
 - **薄 ROI 对时序模型不友好。** 字幕条常只有 40–60 px 高，而 E2FGVI 在较大空间尺度上
   训练；实践中应把 ROI 高度留足（`--context` 调大），不要只框住文字本身。
-- **一条 ROI 只能覆盖一个位置。** 字幕位置跳动、多行不同位置的字幕目前会合并成一个
-  大 ROI，代价是修复范围变大。
+- **多个标识默认仍共用一次裁剪。** 多区域已支持（`--roi` 可重复；检测驱动时会把互不相邻的
+  稳定区域聚类成多个区域）。喂给模型的上下文默认是这些区域的**外接 ROI**；不过现在可以用
+  `--region-group-area-ratio`（默认 2.0）把离得远的标识拆成多个裁剪作业、各自独立送模型。
+  该阈值是「合并后的外扩 ROI 面积 ≤ 各自独立处理面积之和 × 倍数」；`<= 1.0` 等价于旧行为
+  （始终合并），两处标识离得越远、拆开的收益越大。
+- **逐帧掩码只在本地基线后端生效。** `Inpainter::inpaint_frames` 支持逐帧掩码，
+  列填充后端已按帧使用；worker 协议目前仍是单 `mask.pgm`（等于逐帧掩码的并集），
+  改成逐帧掩码需要扩展协议。
 - **硬字幕与镜头运动同时存在时**，逐片段修复在片段边界可能出现时序不一致。
 
 ## 后续工作（按收益排序）
 
-1. **第二遍只在 ROI 内检测**，把检测代价降到约 1/10。
-2. **减少 worker 进程启动开销**：改成一次运行常驻一个 worker，或让单次调用批量处理多帧。
+1. **~~第二遍只在 ROI 内检测~~（已实现）**：`TextDetector::prefer_roi_detection`
+   让 DBNet worker 只吃 ROI 裁剪图，检测框由 `offset_box` 平移回整帧坐标。
+   注意：像素级检测代价降了约 10×，但当前端到端耗时仍被 worker 进程启动主导，
+   所以实测总时长没有等比例下降。
+2. **~~减少 worker 进程启动开销~~（已实现）**：`--persistent-worker` + `worker.py --serve`
+   让整段视频只启动一次 worker；像素仍走目录交换，单请求内存不变。
 3. **掩码细化**：现在用「矩形外接 + 膨胀」，可换成 DBNet 收缩轮廓 + unclip，
    贴合斜体/描边字幕，减少无谓修复面积。
 4. **区域化重编码**，消除掩码外的重编码差异。
 5. **在 GPU 机器上验证 E2FGVI**，并比较不同 `clip_frames` / `num_ref` 的时序稳定性。
-6. **质量评估**：构造「有字幕 / 无字幕」成对素材，用 PSNR/SSIM 在字幕区域内量化修复质量，
-   而不是只靠肉眼。
+6. **~~质量评估~~（已实现基础版）**：`verify.rs` 提供残留/闪烁/接缝/一致性/SSIM 五项指标与
+   `pass/warn/fail` 判定，并落盘为处理日志。仍缺的是「与无字幕参考帧做真值 PSNR/SSIM」：
+   当前一致性与 SSIM 都用**时序中位数**当参考代理，有干净母版时应当换成真值比较。
 
 ## 实测记录（可复现）
 

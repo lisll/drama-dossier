@@ -12,7 +12,8 @@
 users ──┬─ projects ──┬─ assets                 （输入素材）
         │             └─ tasks ──┬─ task_attempts      （每次尝试）
         │                        ├─ task_checkpoints   （阶段检查点）
-        │                        └─ artifacts         （产物）
+        │                        ├─ artifacts         （产物）
+        │                        └─ review_queue      （人工复核队列，确认流分支B）
         └─ audit_events
 recipes ── recipe_versions     （配方与不可变版本）
 ```
@@ -28,6 +29,7 @@ recipes ── recipe_versions     （配方与不可变版本）
 | `task_attempts` | 每次执行的尝试记录 | 每次抢占 |
 | `task_checkpoints` | 阶段完成情况与产物指纹 | 每步一次 |
 | `artifacts` | 产物登记与保留期 | 每次登记 |
+| `review_queue` | 擦除确认流的人工复核队列 | 每次需要人工确认 |
 | `audit_events` | 关键操作审计 | 每次关键操作 |
 
 主键统一用带前缀的不透明 id（`usr_` / `prj_` / `ast_` / `tsk_` / `art_` / `up_`），
@@ -195,6 +197,31 @@ recipes ── recipe_versions     （配方与不可变版本）
 | `created_at` | TEXT | NOT NULL | |
 
 索引：`idx_artifacts_task (task_id)`。
+
+### `review_queue`（人工复核队列）
+
+擦除确认流（`docs/INPAINT_REVIEW_FLOW.md`）的落库形态：自动校验失败且自动重试用尽时，
+或结论为 `warn` 时，登记一条待复核记录。
+
+| 列 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `id` | TEXT | PK | `rev_…` |
+| `task_id` | TEXT | NOT NULL, FK → tasks | 关联任务 |
+| `artifact_id` | TEXT | NULL | 待放行产物；自动校验失败时为空（无成品可放行） |
+| `reason` | TEXT | NOT NULL | `auto_verify_failed` / `auto_verify_warn` |
+| `severity` | TEXT | NOT NULL, CHECK ∈ (`info`,`warn`,`high`) | 严重度 |
+| `status` | TEXT | NOT NULL, CHECK ∈ (`pending`,`approved`,`rejected`,`superseded`) | 复核状态 |
+| `detail_json` | TEXT | NULL | 擦除参数、指标摘要、逐项判据、修正建议 |
+| `claimed_by` | TEXT | NULL | 认领人（避免并发处理同一条） |
+| `created_at` | TEXT | NOT NULL | |
+| `decided_by` | TEXT | NULL | 裁决人 |
+| `decided_at` | TEXT | NULL | 裁决时间 |
+| `decision_note` | TEXT | NULL | 备注；重跑时记录新任务 id |
+
+索引：`idx_review_status (status, created_at)`、`idx_review_task (task_id)`。
+
+规则：同一个 `(task_id, reason)` 只保留一条 `pending` 记录；复核是**记录 + 审计**，
+不改写原任务的状态、尝试记录与参数——「修正后重跑」产生的是新任务。
 
 ### `audit_events`
 

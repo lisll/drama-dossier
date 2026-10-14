@@ -225,10 +225,13 @@ def _validate_input_references(steps: Sequence[PlannedStep], inputs: Sequence[Pl
                         f"步骤 {step.id} 引用的输入 #{index} 角色为 {inputs[index].role}，"
                         "不是 subtitle",
                     )
-        if step.module in ("timeline.user_edits", "commentary.rebuild"):
+        if step.module in ("timeline.user_edits", "commentary.rebuild", "video.inpaint"):
             indexes = []
             if step.module == "timeline.user_edits":
                 indexes = [s.get("input_index", 0) for s in params.get("segments") or []]
+            elif step.module == "video.inpaint":
+                # 擦除会把该路输入替换成擦除结果，下标必须真实存在。
+                indexes = [params.get("input_index", 0)]
             else:
                 indexes = [params.get("commentary_input_index", 0)]
             for index in indexes:

@@ -9,6 +9,9 @@ use dossier_core::{
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
+mod dossier;
+mod erase;
+
 #[derive(Debug, Serialize)]
 struct ProbeOutcome {
     file_name: String,
@@ -180,7 +183,17 @@ pub fn run() {
             load_app_settings,
             save_app_settings,
             analyze_drama,
-            generate_package
+            generate_package,
+            erase::pick_video,
+            erase::erase_status,
+            erase::plan_erase,
+            erase::run_erase,
+            dossier::transcode_advice,
+            dossier::diff_report_packages,
+            dossier::platform_profiles,
+            dossier::platform_review,
+            dossier::export_draft,
+            dossier::import_draft
         ])
         .run(tauri::generate_context!())
         .expect("failed to run DramaDossier");

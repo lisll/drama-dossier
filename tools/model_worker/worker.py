@@ -19,15 +19,22 @@ Rust 侧 `dossier-inpaint` 负责，因此这里不做任何「贴回去」的�
 
 `auto` 会用真实模型，缺失依赖时降级到基线并在 stderr 打印告警；
 显式指定 `dbnet` / `e2fgvi` 时依赖缺失即报错退出，不做静默降级。
+
+常驻模式（`--serve`）：
+    进程一次启动，之后从 stdin 逐行读 `{"workDir": "...", "mode": ...}`，
+    每处理完一个请求就在 stdout 回一行 JSON。这样可以把「解释器启动 + 模型加载」
+    摊到整个视频上，而不是每帧/每片段重来一次。像素数据仍然走目录交换，
+    因此单次请求的内存与一次性模式完全一致。
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import traceback
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -58,6 +65,74 @@ def default_dbnet_model() -> Optional[str]:
 
 def warn(message: str) -> None:
     print(f"[worker] 警告：{message}", file=sys.stderr)
+
+
+# 常驻模式下把「解释器启动 + 权重加载」复用起来；一次性模式下缓存只命中一次，
+# 语义与原来完全一致，因此两条路径共用同一份代码。
+_ENGINE_CACHE: Dict[str, object] = {}
+
+
+def cached_dbnet(args: argparse.Namespace):
+    """按权重路径缓存 DBNet 会话；返回 None 表示应退回调试后端。"""
+    engine = args.detect_engine
+    model_path = args.dbnet_model or default_dbnet_model()
+    if not model_path:
+        message = "未找到 DBNet 权重（可用 --dbnet-model 指定）"
+        if engine == "dbnet":
+            raise ProtocolError(message)
+        warn(f"{message}，改用 bright-rows 调试后端")
+        return None
+    key = f"dbnet|{model_path}|{args.threads}"
+    cached = _ENGINE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        import dbnet as dbnet_module
+
+        dbnet = dbnet_module.DbnetOnnx(model_path, threads=args.threads)
+    except Exception as error:  # 缺 onnxruntime 或模型损坏
+        if engine == "dbnet":
+            raise
+        warn(f"DBNet 不可用，改用 bright-rows 调试后端：{error}")
+        return None
+    _ENGINE_CACHE[key] = dbnet
+    return dbnet
+
+
+def cached_inpainter(args: argparse.Namespace):
+    """按仓库/权重/设备缓存时序修复模型；返回 None 表示应退回 column 基线。"""
+    engine = args.inpaint_engine
+    if not args.e2fgvi_ckpt:
+        message = "未提供 --e2fgvi-ckpt，跳过模型修复"
+        if engine == "e2fgvi":
+            raise ProtocolError(message)
+        warn(f"{message}，改用 column 基线")
+        return None
+    key = (
+        f"{engine}|{args.e2fgvi_repo}|{args.e2fgvi_ckpt}|{args.device}|{args.e2fgvi_num_ref}"
+    )
+    # key 用原始 engine（auto/e2fgvi 分开缓存），构造用解析后的引擎名
+    cached = _ENGINE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    resolved = "e2fgvi" if engine == "auto" else engine
+    builder = inpaint_backends.BACKEND_BUILDERS.get(resolved)
+    if builder is None:
+        raise ProtocolError(f"未知修复引擎 {engine!r}")
+    try:
+        inpainter = builder(
+            repo_path=args.e2fgvi_repo,
+            checkpoint_path=args.e2fgvi_ckpt,
+            device=args.device,
+            num_ref=args.e2fgvi_num_ref,
+        )
+    except Exception as error:
+        if engine != "auto":
+            raise
+        warn(f"模型后端不可用，改用 column 基线：{error}")
+        return None
+    _ENGINE_CACHE[key] = inpainter
+    return inpainter
 
 
 def load_raw_frame(path: Path, width: int, height: int) -> np.ndarray:
@@ -190,23 +265,7 @@ def run_detect(args: argparse.Namespace, work_dir: Path, request: Request) -> in
     frame = load_raw_frame(work_dir / request.frame_file, request.width, request.height)
 
     engine = args.detect_engine
-    dbnet = None
-    if engine in ("auto", "dbnet"):
-        model_path = args.dbnet_model or default_dbnet_model()
-        if model_path:
-            try:
-                import dbnet as dbnet_module
-
-                dbnet = dbnet_module.DbnetOnnx(model_path, threads=args.threads)
-            except Exception as error:  # 缺 onnxruntime 或模型损坏
-                if engine == "dbnet":
-                    raise
-                warn(f"DBNet 不可用，改用 bright-rows 调试后端：{error}")
-        else:
-            message = "未找到 DBNet 权重（可用 --dbnet-model 指定）"
-            if engine == "dbnet":
-                raise ProtocolError(message)
-            warn(f"{message}，改用 bright-rows 调试后端")
+    dbnet = cached_dbnet(args) if engine in ("auto", "dbnet") else None
 
     if dbnet is None:
         boxes = detect_bright_rows(frame, args.detect_min_score)
@@ -249,25 +308,10 @@ def run_inpaint(args: argparse.Namespace, work_dir: Path, request: Request) -> i
     engine = args.inpaint_engine
     restored: Optional[List[np.ndarray]] = None
 
-    if engine in ("auto", "e2fgvi"):
-        if args.e2fgvi_ckpt:
-            try:
-                inpainter = inpaint_backends.build_torch_e2fgvi(
-                    repo_path=args.e2fgvi_repo,
-                    checkpoint_path=args.e2fgvi_ckpt,
-                    device=args.device,
-                    num_ref=args.e2fgvi_num_ref,
-                )
-                restored = inpainter.inpaint(frames, mask)
-            except Exception as error:
-                if engine == "e2fgvi":
-                    raise
-                warn(f"E2FGVI 不可用，改用 column 基线：{error}")
-        else:
-            message = "未提供 --e2fgvi-ckpt，跳过 E2FGVI"
-            if engine == "e2fgvi":
-                raise ProtocolError(message)
-            warn(f"{message}，改用 column 基线")
+    if engine in ("auto", "e2fgvi", "lama", "propainter"):
+        inpainter = cached_inpainter(args)
+        if inpainter is not None:
+            restored = inpainter.inpaint(frames, mask)
 
     if restored is None:
         restored = inpaint_backends.column_fill(frames, mask, sample_rows=args.sample_rows)
@@ -293,9 +337,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="dossier-inpaint 模型 worker（DBNet 检测 + E2FGVI 修复）"
     )
-    parser.add_argument("work_dir", help="交换目录，必须包含 request.json")
+    parser.add_argument("work_dir", nargs="?", help="交换目录，必须包含 request.json（--serve 时可省略）")
     parser.add_argument("--mode", choices=[DETECT_MODE, INPAINT_MODE], default=None,
                         help="覆盖 request.json 里的 mode（调试用）")
+    parser.add_argument("--serve", action="store_true",
+                        help="常驻模式：从 stdin 逐行读请求，处理完在 stdout 回结果，进程不退出")
 
     detect = parser.add_argument_group("检测")
     detect.add_argument("--detect-engine", choices=["auto", "dbnet", "bright-rows"], default="auto")
@@ -307,9 +353,14 @@ def build_parser() -> argparse.ArgumentParser:
     detect.add_argument("--detect-min-score", type=float, default=0.5)
 
     inpaint = parser.add_argument_group("修复")
-    inpaint.add_argument("--inpaint-engine", choices=["auto", "e2fgvi", "column"], default="auto")
-    inpaint.add_argument("--e2fgvi-repo", default=None, help="E2FGVI 官方仓库路径")
-    inpaint.add_argument("--e2fgvi-ckpt", default=None, help="E2FGVI 权重路径")
+    inpaint.add_argument(
+        "--inpaint-engine",
+        choices=["auto", "e2fgvi", "lama", "propainter", "column"],
+        default="auto",
+        help="lama 为单帧修复、propainter 为视频修复；二者都需要各自权重与依赖",
+    )
+    inpaint.add_argument("--e2fgvi-repo", default=None, help="模型仓库路径（E2FGVI / ProPainter / LaMa）")
+    inpaint.add_argument("--e2fgvi-ckpt", default=None, help="模型权重路径")
     inpaint.add_argument("--e2fgvi-num-ref", type=int, default=10)
     inpaint.add_argument("--sample-rows", type=int, default=4, help="column 基线的采样行数")
     inpaint.add_argument("--device", default="cpu")
@@ -318,19 +369,75 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def dispatch(args: argparse.Namespace, work_dir: Path) -> int:
+    """处理一个交换目录；一次性模式与常驻模式共用这条路径。"""
+    request = Request.load(work_dir)
+    mode = args.mode or request.mode
+    if mode == DETECT_MODE:
+        return run_detect(args, work_dir, request)
+    return run_inpaint(args, work_dir, request)
+
+
+def serve(args: argparse.Namespace) -> int:
+    """常驻模式：stdin/stdout 行协议，进程不随请求退出。
+
+    协议 stdout 用 `dup` 出来的独立 fd，模型/库往 `sys.stdout` 打印的内容被改道到
+    stderr，避免污染协议流（`os.dup2(2, 1)` 之后连 C 扩展的 stdout 也一起改道）。
+    """
+    import os
+
+    protocol = os.fdopen(os.dup(1), "w", encoding="utf-8", buffering=1)
+    os.dup2(2, 1)
+    sys.stdout = sys.stderr
+
+    def reply(payload: Dict[str, object]) -> None:
+        protocol.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        protocol.flush()
+
+    reply({"ready": True, "pid": os.getpid()})
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            message = json.loads(line)
+            work_dir = Path(message["workDir"]).resolve()
+            if not work_dir.is_dir():
+                raise ProtocolError(f"{work_dir} 不是目录")
+            code = dispatch(args, work_dir)
+            if code == 0:
+                reply({"ok": True, "workDir": str(work_dir)})
+            else:
+                reply({
+                    "ok": False,
+                    "kind": "protocol" if code == EXIT_PROTOCOL else "backend",
+                    "error": f"退出码 {code}",
+                    "workDir": str(work_dir),
+                })
+        except ProtocolError as error:
+            reply({"ok": False, "kind": "protocol", "error": str(error)})
+        except Exception as error:  # 模型/依赖/IO 故障
+            if "WORKER_DEBUG" in os.environ:
+                traceback.print_exc()
+            reply({"ok": False, "kind": "backend", "error": str(error)})
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.serve:
+        return serve(args)
+
+    if not args.work_dir:
+        print("[worker] 错误：缺少 work_dir（非 --serve 模式必须给出交换目录）", file=sys.stderr)
+        return EXIT_PROTOCOL
     work_dir = Path(args.work_dir).resolve()
     if not work_dir.is_dir():
         print(f"[worker] 错误：{work_dir} 不是目录", file=sys.stderr)
         return EXIT_PROTOCOL
 
     try:
-        request = Request.load(work_dir)
-        mode = args.mode or request.mode
-        if mode == DETECT_MODE:
-            return run_detect(args, work_dir, request)
-        return run_inpaint(args, work_dir, request)
+        return dispatch(args, work_dir)
     except ProtocolError as error:
         print(f"[worker] 协议错误：{error}", file=sys.stderr)
         return EXIT_PROTOCOL

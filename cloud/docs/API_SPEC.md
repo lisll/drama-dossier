@@ -51,6 +51,7 @@
 | `input_corrupt` | 422 | 素材损坏或缺少视频轨 |
 | `target_unsupported` | 422 | 容器/编码组合不支持 |
 | `quality_gate_failed` | 422 | 门禁未通过（结果确定，重试无意义） |
+| `quality_retryable` | 409 | 擦除确认流未通过（可重试：会换参数重跑，用尽后转人工复核） |
 | `capability_missing` | 503 | 集群缺能力/缺可执行文件 |
 | `transient_io` | 503 | 临时 IO 失败 |
 | `storage_unavailable` | 503 | 存储不可用（如素材对象缺失） |
@@ -95,6 +96,11 @@
 | POST | `/api/v1/recipes/{recipe_id}/versions/{version}/status` | admin | 改配方版本状态 |
 | GET | `/api/v1/artifacts/{artifact_id}` | viewer | 产物元信息 + 下载链接 |
 | GET | `/api/v1/artifacts/{artifact_id}/download` | 下载令牌 / Bearer | 下载产物字节 |
+| GET | `/api/v1/reviews` | viewer | 列出人工复核记录（可按 `status` / `task_id` 过滤） |
+| GET | `/api/v1/reviews/{review_id}` | viewer | 复核记录详情 |
+| POST | `/api/v1/reviews/{review_id}/claim` | operator | 认领复核记录 |
+| POST | `/api/v1/reviews/{review_id}/decision` | operator | 标记通过 / 标记失败 |
+| POST | `/api/v1/reviews/{review_id}/rerun` | operator | 修正 mask/参数后重跑（新建任务） |
 | GET | `/api/v1/audit` | admin | 审计事件 |
 | GET | `/` `/static/*` | 无 | Web 客户端静态页 |
 
@@ -129,6 +135,10 @@
   "home": "/…/cloud/var"
 }
 ```
+
+`capabilities` 是**本机实际具备**的能力，不是模块清单的简单投影：需要外部依赖的能力只有
+依赖真的存在时才出现（例如没装 `dossier-inpaint` 时不会出现 `video_inpaint`；
+模型修复能力 `video_inpaint_model` 只在配了模型 worker 时出现）。
 
 ### POST `/api/v1/uploads` → 201
 
@@ -344,11 +354,13 @@ admin 专属，`limit` 1..1000（默认 100），按 id 倒序：
 ```
 
 已记录的审计动作：`user.create`、`recipe.publish`、`recipe.status`、`recipe.rollback`、
-`task.create`、`task.cancel`、`task.retry`、`asset.register`。
+`task.create`、`task.cancel`、`task.retry`、`asset.register`、
+`review.enqueue`、`review.claim`、`review.approve`、`review.reject`、`review.rerun`。
 
 ### GET `/` 与 `/static/*`
 
-Web 客户端（令牌登录 → 直传素材 → 选配方建任务 → 轮询状态 → 下载产物），
+Web 客户端（令牌登录 → 直传素材 → 选配方建任务 → 轮询状态 → 下载产物 →
+**人工复核队列**：列表 / 详情 / 标记通过 / 标记失败 / 修正后重跑），
 静态文件来自 `src/drama_cloud/web/`。
 
 ## 5. 典型调用序列

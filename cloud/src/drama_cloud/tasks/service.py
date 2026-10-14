@@ -544,11 +544,19 @@ def get_task(conn, task_id: str, include_plan: bool = False) -> dict:
         "finished_at": row["finished_at"],
         "lease": {"owner": row["lease_owner"], "expires_at": row["lease_expires_at"]},
         "artifacts": list_artifacts(conn, task_id),
+        # 人工复核投影（确认流分支B）：没有记录时为 None。延迟导入避免 service ↔ review 循环。
+        "review": _review_summary(conn, task_id),
     }
     if include_plan:
         detail["plan"] = json_load(row["plan_json"], {}) or {}
         detail["recipe"] = json_load(row["recipe_snapshot_json"], {}) or {}
     return detail
+
+
+def _review_summary(conn, task_id: str):
+    from . import review
+
+    return review.review_summary(conn, task_id)
 
 
 def list_tasks(conn, state: Optional[str] = None, limit: int = 50) -> List[dict]:

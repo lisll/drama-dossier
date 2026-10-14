@@ -127,6 +127,26 @@
     <h2>6 · 产物</h2>
     <div id="artifacts" class="muted">查询任务后显示</div>
   </section>
+
+  <section>
+    <h2>7 · 人工复核队列（擦除确认流）</h2>
+    <p class="muted">
+      自动校验失败或仅到警告区间的任务会排在这里。自动重试已用尽时，最后一遍擦除结果会
+      作为<b>候选产物</b>保留下来：确认可接受就「标记通过」放行，不可接受就「标记失败」，
+      需要改参数就「修正后重跑」。放行是人的决定，不是系统的默认结论。
+    </p>
+    <div class="row">
+      <select id="reviewStatus">
+        <option value="pending">待处理</option>
+        <option value="approved">已通过</option>
+        <option value="rejected">已判定失败</option>
+        <option value="superseded">已重跑取代</option>
+      </select>
+      <button id="reviewsRefresh" class="ghost">刷新队列</button>
+    </div>
+    <div id="reviews" class="muted" style="margin-top:12px">连接后显示</div>
+    <div id="reviewDetail" style="margin-top:12px"></div>
+  </section>
 </main>
 
 <footer>
@@ -171,7 +191,7 @@ async function connect() {
     $("whoami").innerHTML = "";
     $("whoami").append("当前身份：", document.createTextNode(me.name + " / " + me.role));
     document.querySelector("#who").textContent = me.name + " · " + me.role;
-    await refreshStatus(); await loadRecipes(); await loadAssets();
+    await refreshStatus(); await loadRecipes(); await loadAssets(); await loadReviews();
   } catch (error) {
     $("whoami").innerHTML = '<span class="err">' + error.message + "</span>";
   }
@@ -375,6 +395,123 @@ async function loadTasks() {
   }
   $("tasks").innerHTML = ""; $("tasks").appendChild(table);
 }
+
+// ---------- 人工复核队列（确认流分支B） ----------
+
+function reviewRow(item) {
+  const tr = document.createElement("tr");
+  const metrics = (item.detail && item.detail.inpaint && item.detail.inpaint.summary) || {};
+  const parts = [];
+  if (metrics.residual_max_ratio != null) parts.push("残留 " + (metrics.residual_max_ratio * 100).toFixed(2) + "%");
+  if (metrics.flicker_max_index != null) parts.push("闪烁 " + metrics.flicker_max_index.toFixed(2));
+  if (metrics.seam_max_score != null) parts.push("接缝 " + metrics.seam_max_score.toFixed(2));
+  if (metrics.ssim_min != null) parts.push("SSIM " + Number(metrics.ssim_min).toFixed(3));
+
+  const cells = [
+    item.severity, item.reason,
+    item.artifact_id ? "候选产物 " + item.artifact_id : "无产物",
+    parts.join(" · ") || "—",
+  ];
+  for (const value of cells) {
+    const td = document.createElement("td");
+    td.textContent = value;
+    tr.appendChild(td);
+  }
+  const actions = document.createElement("td");
+  actions.style.whiteSpace = "nowrap";
+
+  const detailBtn = document.createElement("button");
+  detailBtn.className = "ghost";
+  detailBtn.textContent = "详情";
+  detailBtn.onclick = () => showReview(item.id);
+
+  const approveBtn = document.createElement("button");
+  approveBtn.textContent = "标记通过";
+  approveBtn.disabled = !item.artifact_id;
+  approveBtn.onclick = () => decideReview(item.id, "approve");
+
+  const rejectBtn = document.createElement("button");
+  rejectBtn.className = "ghost";
+  rejectBtn.textContent = "标记失败";
+  rejectBtn.onclick = () => decideReview(item.id, "reject");
+
+  const rerunBtn = document.createElement("button");
+  rerunBtn.className = "ghost";
+  rerunBtn.textContent = "修正后重跑";
+  rerunBtn.onclick = () => rerunReview(item.id);
+
+  actions.append(detailBtn, approveBtn, rejectBtn, rerunBtn);
+  tr.appendChild(actions);
+  return tr;
+}
+
+async function loadReviews() {
+  if (!state.token) { return; }
+  const status = $("reviewStatus").value;
+  const data = await api("/api/v1/reviews?status=" + encodeURIComponent(status) + "&limit=20");
+  const box = $("reviews");
+  box.innerHTML = "";
+  if (!data.reviews.length) {
+    box.textContent = "没有复核记录（status=" + status + "）";
+    return;
+  }
+  const table = document.createElement("table");
+  table.innerHTML = "<tr><th>级别</th><th>原因</th><th>产物</th><th>指标</th><th>动作</th></tr>";
+  for (const item of data.reviews) table.appendChild(reviewRow(item));
+  box.appendChild(table);
+}
+
+async function showReview(id) {
+  const data = await api("/api/v1/reviews/" + encodeURIComponent(id));
+  show("reviewDetail", pre(data));
+}
+
+async function decideReview(id, decision) {
+  const note = window.prompt(decision === "approve" ? "放行说明（会写进审计）" : "判定失败的原因", "");
+  if (note === null) return;
+  try {
+    const data = await api("/api/v1/reviews/" + encodeURIComponent(id) + "/decision", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: decision, note: note }),
+    });
+    show("reviewDetail", pre(data));
+    await loadReviews();
+  } catch (error) {
+    $("reviewDetail").innerHTML = '<span class="err">' + error.message + "</span>";
+  }
+}
+
+async function rerunReview(id) {
+  const raw = window.prompt(
+    '修正 video.inpaint 参数（JSON，例如 {"dilate": 8, "feather": 4}）',
+    '{"dilate": 8}'
+  );
+  if (raw === null) return;
+  let params;
+  try {
+    params = JSON.parse(raw);
+  } catch (e) {
+    $("reviewDetail").innerHTML = '<span class="err">参数不是合法 JSON</span>';
+    return;
+  }
+  try {
+    const data = await api("/api/v1/reviews/" + encodeURIComponent(id) + "/rerun", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_params: { erase: params }, note: "人工修正 mask 后重跑" }),
+    });
+    show("reviewDetail", pre(data));
+    await loadReviews();
+  } catch (error) {
+    $("reviewDetail").innerHTML = '<span class="err">' + error.message + "</span>";
+  }
+}
+
+$("reviewsRefresh").onclick = () => loadReviews().catch((error) => {
+  $("reviews").innerHTML = '<span class="err">' + error.message + "</span>";
+});
+$("reviewStatus").onchange = () => loadReviews().catch(() => {});
 
 // ---------- 启动 ----------
 

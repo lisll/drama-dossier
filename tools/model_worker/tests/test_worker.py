@@ -11,6 +11,7 @@ E2FGVI 权重无法在 CI/开发机上获取，因此这里用一个「假模型
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -553,3 +554,270 @@ class WorkerEndToEndTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TensorCodecTests(unittest.TestCase):
+    """张量编码（tanh / unit）必须与权重训练时一致，否则输出会偏色。"""
+
+    def test_unit_codec_round_trip(self) -> None:
+        frames = np.random.default_rng(11).integers(0, 256, (2, 5, 6, 3), dtype=np.uint8)
+        tensor = backends.to_model_tensor(frames, codec="unit")
+        self.assertAlmostEqual(float(tensor.min()), 0.0, places=6)
+        self.assertAlmostEqual(float(tensor.max()), 1.0, places=6)
+        restored = backends.from_model_tensor(tensor, frame_count=2, codec="unit")
+        self.assertTrue(np.array_equal(frames, restored))
+
+    def test_tanh_and_unit_differ(self) -> None:
+        frames = np.full((1, 2, 2, 3), 128, dtype=np.uint8)
+        tanh = backends.to_model_tensor(frames, codec="tanh")
+        unit = backends.to_model_tensor(frames, codec="unit")
+        self.assertLess(float(tanh.mean()), 0.02)
+        self.assertAlmostEqual(float(unit.mean()), 128 / 255, places=5)
+
+    def test_unknown_codec_is_rejected(self) -> None:
+        frames = np.zeros((1, 2, 2, 3), dtype=np.uint8)
+        with self.assertRaises(backends.InpaintError):
+            backends.to_model_tensor(frames, codec="sigmoid")
+        with self.assertRaises(backends.InpaintError):
+            backends.VideoModelInpainter(lambda f, m: f, codec="sigmoid")
+
+
+class FrameWiseInpainterTests(unittest.TestCase):
+    """LaMa 一类单帧模型：逐帧调用，但仍只在洞内取模型结果。"""
+
+    class UnitModel:
+        def __init__(self) -> None:
+            self.batches = []
+
+        def __call__(self, image, mask):
+            self.batches.append(image.shape)
+            return np.ones_like(image)  # 全白（unit 编码下就是 255）
+
+    def test_calls_model_once_per_frame_with_single_frame_batches(self) -> None:
+        model = self.UnitModel()
+        inpainter = backends.FrameWiseInpainter(model, multiple=8)
+        frames = [np.full((8, 8, 3), 20, dtype=np.uint8) for _ in range(3)]
+        mask = np.zeros((8, 8), dtype=bool)
+        mask[2:4, 2:4] = True
+
+        out = inpainter.inpaint(frames, mask)
+        self.assertEqual([shape[2] for shape in model.batches], [1, 1, 1])
+        self.assertEqual(len(out), 3)
+        for frame in out:
+            self.assertEqual(frame[2, 2].tolist(), [255, 255, 255], "洞内应取模型输出")
+            self.assertEqual(frame[0, 0].tolist(), [20, 20, 20], "洞外应保持原样")
+
+    def test_default_codec_is_unit(self) -> None:
+        inpainter = backends.FrameWiseInpainter(self.UnitModel())
+        self.assertEqual(inpainter.codec, "unit")
+
+
+class BackendRegistryTests(unittest.TestCase):
+    def test_registry_covers_cli_choices(self) -> None:
+        parser = worker.build_parser()
+        choice_action = next(
+            action
+            for action in parser._actions
+            if "--inpaint-engine" in getattr(action, "option_strings", [])
+        )
+        for name in choice_action.choices:
+            # auto 走默认模型；column 是 numpy 基线，不属于模型注册表
+            if name in ("auto", "column"):
+                continue
+            self.assertIn(name, backends.BACKEND_BUILDERS, f"{name} 缺少构造函数")
+        self.assertIn("column", choice_action.choices, "基线后端必须可选")
+
+    def test_external_backend_needs_repo_path(self) -> None:
+        with self.assertRaises(backends.InpaintError):
+            backends.build_external_backend("propainter", repo_path=None, checkpoint_path="x")
+
+    def test_external_backend_needs_adapter_module(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(backends.InpaintError):
+                backends.build_external_backend(
+                    "propainter", repo_path=tmp, checkpoint_path="x"
+                )
+
+    def test_external_backend_loads_adapter_module(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "dossier_backend.py").write_text(
+                "class Backend:\n"
+                "    def inpaint(self, frames, mask):\n"
+                "        return list(frames)\n"
+                "\n"
+                "def build_inpainter(repo_path, checkpoint_path, device, num_ref):\n"
+                "    return Backend()\n",
+                encoding="utf-8",
+            )
+            inpainter = backends.build_external_backend(
+                "propainter", repo_path=tmp, checkpoint_path="x"
+            )
+            self.assertTrue(hasattr(inpainter, "inpaint"))
+
+    def test_external_backend_rejects_adapter_without_inpaint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "dossier_backend.py").write_text(
+                "def build_inpainter(repo_path, checkpoint_path, device, num_ref):\n"
+                "    return object()\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(backends.InpaintError):
+                backends.build_external_backend(
+                    "propainter", repo_path=tmp, checkpoint_path="x"
+                )
+
+    def test_propainter_builder_delegates_to_external_adapter(self) -> None:
+        with self.assertRaises(backends.InpaintError):
+            backends.build_torch_propainter(repo_path="/nonexistent", checkpoint_path="x")
+
+
+class ServeModeTests(unittest.TestCase):
+    """常驻模式：一个进程处理多个请求，且不污染协议输出。"""
+
+    def _spawn_serve(self, *extra):
+        return subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(worker.__file__)),
+                "--serve",
+                "--detect-engine",
+                "bright-rows",
+                "--inpaint-engine",
+                "column",
+                *extra,
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+
+    @staticmethod
+    def _read_reply(process):
+        line = process.stdout.readline()
+        if not line:
+            raise AssertionError("常驻 worker 提前退出了")
+        return json.loads(line)
+
+    def _make_detect_dir(self, root: Path) -> None:
+        make_work_dir(root)
+        frame = np.full((48, 64, 3), 30, dtype=np.uint8)
+        frame[30:38, 8:56] = 250  # 一条「高亮字幕带」
+        (root / "in" / "frame.raw").write_bytes(frame.tobytes())
+        write_request(
+            root,
+            {
+                "mode": "detect",
+                "width": 64,
+                "height": 48,
+                "frameFile": "in/frame.raw",
+                "outputFile": "boxes.json",
+            },
+        )
+
+    def _make_inpaint_dir(self, root: Path) -> None:
+        make_work_dir(root)
+        (root / "out").mkdir(exist_ok=True)
+        frame = np.full((16, 16, 3), 40, dtype=np.uint8)
+        (root / "in" / "frame_0000.raw").write_bytes(frame.tobytes())
+        mask = np.zeros((16, 16), dtype=bool)
+        mask[6:10, :] = True
+        (root / "mask.pgm").write_bytes(p5(mask))
+        write_request(
+            root,
+            {
+                "mode": "inpaint",
+                "width": 16,
+                "height": 16,
+                "frameCount": 1,
+                "inputDir": "in",
+                "outputDir": "out",
+                "maskFile": "mask.pgm",
+            },
+        )
+
+    def test_serves_multiple_requests_from_one_process(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            detect_dir = Path(tmp) / "detect"
+            inpaint_dir = Path(tmp) / "inpaint"
+            detect_dir.mkdir()
+            inpaint_dir.mkdir()
+            self._make_detect_dir(detect_dir)
+            self._make_inpaint_dir(inpaint_dir)
+
+            process = self._spawn_serve()
+            try:
+                hello = self._read_reply(process)
+                self.assertTrue(hello.get("ready"))
+                pid = hello["pid"]
+
+                for work_dir in (detect_dir, inpaint_dir, detect_dir):
+                    process.stdin.write(json.dumps({"workDir": str(work_dir)}) + "\n")
+                    process.stdin.flush()
+                    reply = self._read_reply(process)
+                    self.assertTrue(reply.get("ok"), reply)
+                    self.assertEqual(hello["pid"], pid, "必须复用同一个进程")
+
+                boxes = json.loads((detect_dir / "boxes.json").read_text(encoding="utf-8"))
+                self.assertTrue(boxes["boxes"], "第二个请求也应写出检测结果")
+            finally:
+                process.stdin.close()
+                process.wait(timeout=10)
+
+    def test_bad_request_is_reported_without_killing_the_process(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            good = Path(tmp) / "detect"
+            good.mkdir()
+            self._make_detect_dir(good)
+
+            process = self._spawn_serve()
+            try:
+                self._read_reply(process)
+                process.stdin.write(json.dumps({"workDir": str(Path(tmp) / "missing")}) + "\n")
+                process.stdin.flush()
+                reply = self._read_reply(process)
+                self.assertFalse(reply["ok"])
+                self.assertEqual(reply["kind"], "protocol")
+
+                process.stdin.write(json.dumps({"workDir": str(good)}) + "\n")
+                process.stdin.flush()
+                self.assertTrue(self._read_reply(process)["ok"], "坏请求之后应能继续服务")
+            finally:
+                process.stdin.close()
+                process.wait(timeout=10)
+
+    def test_backend_error_is_reported_as_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "broken"
+            root.mkdir()
+            make_work_dir(root)
+            write_request(
+                root,
+                {
+                    "mode": "inpaint",
+                    "width": 8,
+                    "height": 8,
+                    "frameCount": 1,
+                    "inputDir": "in",
+                    "outputDir": "in/frame_0000.raw/out",  # 无法创建目录 → 后端错误
+                    "maskFile": "mask.pgm",
+                },
+            )
+            frame = np.full((8, 8, 3), 40, dtype=np.uint8)
+            (root / "in" / "frame_0000.raw").write_bytes(frame.tobytes())
+            mask = np.zeros((8, 8), dtype=bool)
+            mask[4, :] = True
+            (root / "mask.pgm").write_bytes(p5(mask))
+
+            process = self._spawn_serve()
+            try:
+                self._read_reply(process)
+                process.stdin.write(json.dumps({"workDir": str(root)}) + "\n")
+                process.stdin.flush()
+                reply = self._read_reply(process)
+                self.assertFalse(reply["ok"])
+                self.assertEqual(reply["kind"], "backend")
+            finally:
+                process.stdin.close()
+                process.wait(timeout=10)

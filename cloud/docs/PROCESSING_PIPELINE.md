@@ -86,6 +86,8 @@ Worker 装载输入（`_stage_inputs`）：
 | `encoded` | `media.encode` 产出的文件路径 |
 | `artifacts` | 额外要登记的产物（如字幕文件、报告） |
 | `notes` | 人类可读的执行说明，写进 `run_report.json` |
+| `user_params` | 本次任务的参数覆盖（按步骤 id），复核重跑时用于修正 mask |
+| `attempt` | 当前是第几次尝试（从 1 开始）；质量类重试靠它逐级加力 |
 
 `ctx.plan` 的分区约定（各模块只写自己的键，互不覆盖）：
 
@@ -102,6 +104,9 @@ Worker 装载输入（`_stage_inputs`）：
 | `encode` | `media.encode` | 门禁（校验编码器/容器） |
 | `target_resolution` | `video.quality` | 门禁（校验分辨率） |
 | `quality_report` | `media.quality_gate` | 产物登记、任务结果 |
+| `inpaint` | `video.inpaint` | `video.erase_verify`、复核队列、处理日志 |
+| `erase_verify` | `video.erase_verify` | 复核队列、任务结果 |
+| `review` | `video.inpaint` / `video.erase_verify` | 产物登记后入人工复核队列；失败路径登记 `inpaint_candidate` 候选产物供人工判定 |
 | `scene_candidates` | `timeline.user_edits` | 人工审核 |
 | `frame_report` | `frame.inspect` | 报告 |
 
@@ -202,6 +207,7 @@ def implement_video_quality(ctx, params: VideoQualityParams) -> dict:
 | `target_unsupported` | 否 | 容器/编码组合不支持、编码器不存在 |
 | `capability_missing` | 否 | Worker 缺能力、缺可执行文件 |
 | `quality_gate_failed` | 否 | 门禁不通过（重跑结论相同） |
+| `quality_retryable` | 是 | 擦除确认流未通过；重试会换参数（加力/换后端），用尽后转人工复核 |
 | `cancelled` | 否 | 用户取消 |
 | `internal` | 否 | 未预期异常（带堆栈） |
 
@@ -211,6 +217,19 @@ def implement_video_quality(ctx, params: VideoQualityParams) -> dict:
 
 失败时 Worker 先写 `task_attempts.finished_at / error_class / error_message`；
 决定重试时**保留工作目录**供检查点复用，不再重试时清理。
+
+### 9.1 质量类重试（擦除确认流）
+
+`quality_retryable` 是唯一「重试会换参数」的失败分类，因此有两条额外规则：
+
+1. **固定短等待**：用 `QUALITY_RETRY_DELAY_SECONDS = 1.0` 而不是指数退避——
+   重跑的目的是换参数，不是在等外部故障恢复；
+2. **丢弃检查点**：进入质量类重试时清空该任务的 `task_checkpoints`。上游画面会变，
+   上一轮 `media.encode` 的产物不再可信，绝不能按「阶段复用」直接拿来交付。
+
+用尽 3 次后转入人工复核队列（`review_queue`，原因 `auto_verify_failed`），而不是直接判死；
+`warn` 结论则在产物正常产出的同时登记 `auto_verify_warn` 记录。
+细节见 `docs/INPAINT_REVIEW_FLOW.md`。
 
 ## 10. 租约、心跳与失联回收
 

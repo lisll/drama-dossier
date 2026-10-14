@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from . import audio, encode, filters, gate, probe, timeline  # noqa: F401  导入即注册
+from . import audio, encode, filters, gate, inpaint, probe, timeline  # noqa: F401  导入即注册
 from .ffmpeg import MediaContext, probe_json, run_checked, summarize
 
 __all__ = [

@@ -24,7 +24,7 @@ from typing import List, Optional, Sequence
 
 from ..config import Settings
 from ..db import json_dump, json_load, now_iso, transaction
-from ..errors import ErrorClass, backoff_delay
+from ..errors import QUALITY_RETRY_DELAY_SECONDS, ErrorClass, backoff_delay
 from .state import CLAIMABLE_STATES, TaskState, failure_target, transition
 
 #: 一次 claim 事务里最多检查多少个候选任务（用于按能力过滤）。
@@ -75,7 +75,13 @@ class TaskQueue:
         """按失败分类决定：重排队（指数退避）还是直接失败。"""
         target = failure_target(error_class, attempt, max_attempts)
         if target is TaskState.RETRY_WAITING:
-            delay = backoff_delay(attempt)
+            # 质量类重试是「换参数再算一遍」，不是等外部故障恢复，所以用固定短等待；
+            # 走指数退避只会让自动重试变慢，没有任何收益。
+            delay = (
+                QUALITY_RETRY_DELAY_SECONDS
+                if error_class is ErrorClass.QUALITY_RETRYABLE
+                else backoff_delay(attempt)
+            )
             return transition(
                 conn,
                 task_id,

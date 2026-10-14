@@ -26,6 +26,10 @@ class ErrorClass(str, enum.Enum):
     CAPABILITY_MISSING = "capability_missing"
     # 质量门禁未通过：结果确定，重跑不会有不同结论，所以不可重试。
     QUALITY_GATE_FAILED = "quality_gate_failed"
+    # 擦除确认流未通过（残留/闪烁/接缝/一致性超阈值）。与门禁不同，这里的失败**可以**
+    # 靠调整参数改善（加大 mask 膨胀、换更强修复后端），因此允许有限次数的自动重试；
+    # 次数用尽后按「转人工复核」处理，而不是直接判死。
+    QUALITY_RETRYABLE = "quality_retryable"
     CANCELLED = "cancelled"
     INTERNAL = "internal"
 
@@ -43,8 +47,13 @@ _RETRYABLE = frozenset(
         ErrorClass.WORKER_LOST,
         ErrorClass.STORAGE_UNAVAILABLE,
         ErrorClass.RESOURCE_CONTENTION,
+        ErrorClass.QUALITY_RETRYABLE,
     }
 )
+
+#: 质量类重试的固定等待（秒）。它重跑是为了换参数，不是为了等外部故障恢复，
+#: 所以不走指数退避——等久了只会让「自动重试」变慢。
+QUALITY_RETRY_DELAY_SECONDS = 1.0
 
 #: 指数退避基数（秒）与上限，供调度器计算下次可执行时间。
 BACKOFF_BASE_SECONDS = 5.0
@@ -86,3 +95,8 @@ def unsupported(message: str) -> WorkError:
 
 def corrupt_input(message: str) -> WorkError:
     return WorkError(ErrorClass.INPUT_CORRUPT, message)
+
+
+def quality_retry(message: str) -> WorkError:
+    """擦除确认流未通过：交给调度器按「调参数重跑 → 转人工复核」处理。"""
+    return WorkError(ErrorClass.QUALITY_RETRYABLE, message)

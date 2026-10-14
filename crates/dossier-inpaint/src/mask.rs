@@ -148,6 +148,11 @@ impl BinaryMask {
         &self.data
     }
 
+    /// 可变访问底层掩码数据，便于批量合并（`0` = 保留，非 `0` = 修复）。
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+
     pub fn size(&self) -> FrameSize {
         FrameSize::new(self.width, self.height)
     }

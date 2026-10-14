@@ -118,6 +118,103 @@
               </p>
             </section>
 
+            <details class="panel toolbox-panel">
+              <summary>报审配套工具（转码建议 / 改稿对比 / 平台档案 / 剪映草稿）</summary>
+
+              <section class="tool-block">
+                <h4>转码建议与批量规范化</h4>
+                <p class="hint">对照目标规格逐集给出「是否需要转码 + 原因 + ffmpeg 命令」。只产出建议，不会自动转码。</p>
+                <div class="form-grid">
+                  <label>目标容器<input id="transcode-container" type="text" value="mp4" /></label>
+                  <label>码率上限（Mbps）<input id="transcode-bitrate" type="number" min="0.1" step="0.1" value="8" /></label>
+                  <label>最大宽（0 表示不限）<input id="transcode-width" type="number" min="0" step="2" value="1080" /></label>
+                  <label>最大高（0 表示不限）<input id="transcode-height" type="number" min="0" step="2" value="1920" /></label>
+                </div>
+                <div class="option-row">
+                  <button id="transcode-plan" class="primary">生成转码建议</button>
+                </div>
+                <div id="transcode-result" class="result hidden"></div>
+              </section>
+
+              <section class="tool-block">
+                <h4>报审包差异对比</h4>
+                <p class="hint">读两份报审包的 manifest.json，列出新增 / 移除 / 修改的文件（不读取素材内容）。</p>
+                <div class="form-grid">
+                  <label>改稿前报审包目录<input id="diff-left" type="text" placeholder="含 manifest.json 的目录" /></label>
+                  <label>改稿后报审包目录<input id="diff-right" type="text" placeholder="含 manifest.json 的目录" /></label>
+                </div>
+                <div class="option-row">
+                  <button id="diff-left-pick" class="ghost">选择目录</button>
+                  <button id="diff-right-pick" class="ghost">选择目录</button>
+                  <button id="diff-run" class="primary">对比清单</button>
+                </div>
+                <div id="diff-result" class="result hidden"></div>
+              </section>
+
+              <section class="tool-block">
+                <h4>平台材料要求（示例档案）</h4>
+                <p class="hint">内置档案是学习示例，不是任何平台的官方规范；接入真实业务前请替换为平台方最新规范。</p>
+                <div class="form-grid">
+                  <label>平台档案<select id="platform-select"></select></label>
+                </div>
+                <div class="option-row">
+                  <button id="platform-run" class="primary">对照当前剧目</button>
+                </div>
+                <div id="platform-result" class="result hidden"></div>
+              </section>
+
+              <section class="tool-block">
+                <h4>剪映草稿</h4>
+                <p class="hint">导出分集顺序与时长到剪映草稿目录，或把草稿时间线读回来核对。草稿格式随剪映版本变化。</p>
+                <div class="form-grid">
+                  <label>草稿目录（读回时选择）<input id="draft-dir" type="text" placeholder="导出时留空写到剧目目录" /></label>
+                </div>
+                <div class="option-row">
+                  <button id="draft-pick" class="ghost">选择草稿目录</button>
+                  <button id="draft-export" class="primary">导出草稿</button>
+                  <button id="draft-import" class="ghost">读回草稿</button>
+                </div>
+                <div id="draft-result" class="result hidden"></div>
+              </section>
+            </details>
+
+            <details class="panel erase-panel">
+              <summary>字幕 / 角标擦除（实验功能，仅限自有素材）</summary>
+              <div class="form-grid">
+                <label>输入视频<input id="erase-input" type="text" placeholder="仅限自有素材" /></label>
+                <label>输出视频<input id="erase-output" type="text" placeholder="例如 /path/out.mp4" /></label>
+                <label>区域（x,y,w,h）<input id="erase-regions" type="text" placeholder="120,300,400,40；多个用分号分隔" /></label>
+                <label>检测后端<select id="erase-detector">
+                  <option value="fixed">fixed（按上面的区域）</option>
+                  <option value="worker">worker（DBNet 模型检测）</option>
+                </select></label>
+                <label>修复后端<select id="erase-inpainter">
+                  <option value="column">column（本地基线，无需模型）</option>
+                  <option value="worker">worker（时序模型）</option>
+                </select></label>
+                <label>掩码膨胀（px）<input id="erase-dilate" type="number" min="0" max="64" step="1" value="4" /></label>
+                <label>羽化（px）<input id="erase-feather" type="number" min="0" max="64" step="1" value="2" /></label>
+                <label>ROI 外扩比例<input id="erase-context" type="number" min="1" max="8" step="0.1" value="1.6" /></label>
+                <label>起始秒（可选）<input id="erase-start" type="number" min="0" step="0.1" /></label>
+                <label>时长秒（可选）<input id="erase-duration" type="number" min="0.1" step="0.1" /></label>
+                <label>worker 程序<input id="erase-worker-program" type="text" placeholder="如 python3" /></label>
+                <label>worker 参数<input id="erase-worker-args" type="text" placeholder="逗号分隔，如 tools/model_worker/worker.py,--serve" /></label>
+                <label>工具路径<input id="erase-tool-path" type="text" placeholder="留空时从 PATH / 仓库 target 查找" /></label>
+              </div>
+              <div class="option-row">
+                <label><input id="erase-persistent" type="checkbox" /> 常驻 worker（--persistent-worker）</label>
+                <button id="browse-erase-input" class="ghost">选择输入视频</button>
+                <button id="erase-status" class="ghost">检测工具状态</button>
+                <button id="erase-plan" class="primary">预览命令</button>
+                <button id="erase-run" class="success">执行擦除</button>
+              </div>
+              <div id="erase-result" class="result hidden"></div>
+              <p class="legal">
+                只处理自有素材的硬字幕与角标；擦除结果按确认流自动校验（退出码 0 通过 / 3 需人工抽查 / 2 校验失败）。
+                本功能不提供 DRM 绕过能力，也不处理他人作品的版权标识。
+              </p>
+            </details>
+
             <details class="panel settings-panel">
               <summary>检查规则与路径设置（可覆盖默认阈值）</summary>
               <div class="form-grid">

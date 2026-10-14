@@ -97,11 +97,12 @@ config ── errors ── db ── storage
 | `tasks/state.py` | 状态机与迁移校验 | 不写业务字段 |
 | `tasks/queue.py` | 抢占、租约、心跳、退避、失联回收 | 不执行任务 |
 | `tasks/service.py` | 配方版本、任务、产物、审计的业务规则 | 不跑 ffmpeg |
-| `tasks/runner.py` | 执行与检查点 | 不改变业务规则 |
+| `tasks/runner.py` | 执行、检查点、质量类重试与复核入队 | 不改变业务规则 |
+| `tasks/review.py` | 人工复核队列（认领/裁决/修正重跑） | 不跑 ffmpeg |
 | `api.py` | HTTP 边界：认证、授权、限流、错误码映射 | 不实现业务规则 |
 | `cli.py` | 命令行薄封装 | 不实现业务规则 |
 
-## 4. 处理模块白名单（13 个）
+## 4. 处理模块白名单（15 个）
 
 注册表是**代码里的字面量**，配方改不动它；配方只能引用已注册的名字。
 `import drama_cloud.modules` 即完成注册，`registry.ensure_modules_loaded()` 保证 CLI/API/Worker
@@ -120,6 +121,8 @@ config ── errors ── db ── storage
 | `audio.quality` | `audio_filters` | audio | audio_filters | C7 |
 | `subtitle.mux` | `subtitles` | video | subtitle_plan | C3 |
 | `metadata.policy` | `ffmpeg` | metadata | metadata_policy | C8 |
+| `video.inpaint` | `video_inpaint` | video | video | C12 |
+| `video.erase_verify` | `video_inpaint` | video | erase_verification | C12 |
 | `media.encode` | `h264_encode` | video | encoded | C6 |
 | `media.quality_gate` | `ffprobe` | encoded | quality_report | §10 门禁 |
 
@@ -128,6 +131,17 @@ config ── errors ── db ── storage
 
 **能力检查分两层**：配方级 `compatibility.required_capabilities` 一次性快速失败；
 模块级 `capability` 逐步检查，让「这个 Worker 到底能不能跑」在创建任务时就有答案。
+
+**能力可以被探测**（`ModuleSpec.capability_probe`，见 `docs/PROJECT_REVIEW.md` C2）：
+`video.inpaint` 只有在**本机真的找得到 `dossier-inpaint` 可执行文件**时才声明
+`video_inpaint`，否则不兼容的任务在计划阶段就被路由到别的 Worker，而不是领了任务再失败。
+模型修复后端另用 `video_inpaint_model` 标签，只有配了模型 worker 的部署才声明它
+（可用 `DRAMA_CLOUD_CAPABILITIES` 环境变量补充声明）。
+
+**参数按能力拼**：控制面与外部工具是两个会各自发布的产物。`resolve_tool` 只保证「工具在」，
+所以拼参数前还会读一次工具的 `--help`（结果按「路径 + 大小 + mtime」缓存，只问一次），
+不认识的开关就不传，并把降级写进处理日志（`modules/inpaint.py::tool_flags`）。
+这样「工具还是旧版」只会少一个校验维度，不会让整条擦除流程解析失败。
 
 ## 5. 关键设计决策
 
@@ -140,7 +154,7 @@ config ── errors ── db ── storage
 | 检查点只做阶段级 | 文档明确「不尝试恢复任意 FFmpeg 进程的内部状态」；只有产出文件的阶段才允许复用 |
 | 取消是协作式的 | 在阶段边界检查 `cancel_requested`，不用信号打断 ffmpeg，避免留下半个文件 |
 
-## 6. C1–C11 覆盖情况
+## 6. C1–C12 覆盖情况
 
 | 编号 | 功能 | 实现位置 | 状态 |
 | --- | --- | --- | --- |
@@ -155,6 +169,7 @@ config ── errors ── db ── storage
 | C9 | 帧级（细化后） | `frame.fps_convert` / `frame.deflicker` / `frame.inspect` | 部分：**插帧未实现**（需 GPU + 模型），配方写不存在的模块会被白名单拒绝 |
 | C10 | 分集重组 | `modules/timeline.py` `chapters.reorg` + `split_chapters` | 完成 |
 | C11 | 解说重剪（需人工审核） | `modules/timeline.py` `commentary.rebuild` | 部分：脚本↔转写匹配与候选时间线完成；**本机未内置 ASR**，转写需作为参数提供 |
+| C12 | 硬字幕/角标擦除 + 确认流 | `modules/inpaint.py` `video.inpaint` / `video.erase_verify`、`tasks/review.py`、Rust `crates/dossier-inpaint` | 完成：擦除、四项指标自动校验、质量类自动重试（加力/换后端）、人工复核队列与 mask 修正重跑；**模型后端（DBNet/E2FGVI）只是接线**，需 GPU + 权重 |
 
 ## 7. 与设计文档的差异
 
@@ -179,7 +194,8 @@ config ── errors ── db ── storage
 
 ## 9. 已知限制
 
-1. **无 GPU**：光流插帧、模型类修复（E2FGVI 一类）不在本原型范围内，也没有对应的注册模块。
+1. **无 GPU**：光流插帧没有对应模块；`video.inpaint` 的 `inpainter=worker` / `detector=worker`
+   只完成了接线，本机没有 onnxruntime 与模型权重，模型路径无法端到端验证（`column` 基线可跑通）。
 2. **单机存储**：`storage.py` 用本地磁盘，没有分片上传、没有副本，也没有多机共享。
 3. **无 TLS**：`serve` 默认监听 `127.0.0.1` 的明文 HTTP。对外暴露必须放到反向代理后面并启用 TLS（设计文档 §10 的硬要求）。
 4. **限流是单进程内存**：多实例部署要换成集中式计数器。

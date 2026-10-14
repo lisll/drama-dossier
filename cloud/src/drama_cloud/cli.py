@@ -19,6 +19,7 @@ from .db import connect, init_db
 from .errors import WorkError
 from .recipes.schema import validate_recipe
 from .storage import LocalStorage
+from .tasks import review as review_service
 from .tasks import service
 from .tasks.queue import TaskQueue
 
@@ -381,6 +382,87 @@ def cmd_tasks(args) -> int:
     return 0
 
 
+# ---------- 人工复核队列（确认流分支B） ----------
+
+
+def cmd_reviews(args) -> int:
+    settings = _settings(args)
+    conn = connect(settings)
+    try:
+        rows = review_service.list_reviews(conn, status=args.status, task_id=args.task,
+                                          limit=args.limit)
+    finally:
+        conn.close()
+    if args.json:
+        _print(rows)
+        return 0
+    if not rows:
+        print("没有复核记录" + (f"（status={args.status}）" if args.status else ""))
+        return 0
+    for row in rows:
+        detail = row.get("detail") or {}
+        summary = (detail.get("inpaint") or {}).get("summary") or {}
+        extra = ""
+        if summary:
+            extra = (f"  残留峰值 {(summary.get('residual_max_ratio') or 0.0) * 100:.2f}%"
+                     f"  闪烁 {summary.get('flicker_max_index') or 0.0:.2f}"
+                     f"  接缝 {summary.get('seam_max_score') or 0.0:.2f}")
+        print(f"{row['status']:<11}{row['severity']:<6}{row['id']:<26}{row['reason']:<20}"
+              f"task={row['task_id']}")
+        if extra:
+            print(f"           {extra.strip()}")
+    return 0
+
+
+def cmd_review(args) -> int:
+    settings = _settings(args)
+    conn = connect(settings)
+    try:
+        item = review_service.get_review(conn, args.review_id)
+    finally:
+        conn.close()
+    _print(item)
+    return 0
+
+
+def cmd_review_decide(args, decision: str) -> int:
+    settings = _settings(args)
+    conn = connect(settings)
+    try:
+        item = review_service.decide(
+            conn, args.review_id, decision, note=args.note or "", actor=args.actor
+        )
+    finally:
+        conn.close()
+    print(f"复核 {item['id']} → {item['status']}（{item['reason']}）")
+    return 0
+
+
+def cmd_review_rerun(args) -> int:
+    settings = _settings(args)
+    conn = connect(settings)
+    try:
+        params = json.loads(args.param) if args.param else None
+        result = review_service.rerun(
+            conn,
+            settings,
+            args.review_id,
+            user_params=params,
+            note=args.note or "",
+            actor=args.actor,
+            priority=args.priority,
+        )
+    finally:
+        conn.close()
+    task = result["task"]
+    print(f"已按修正后的参数重跑：新任务 {task['id']}（{task['state']}），"
+          f"原复核记录 → {result['review']['status']}")
+    print(f"  查看参数：drama-cloud task {task['id']} --plan")
+    if args.wait:
+        return _wait_for_task(settings, task["id"], timeout=args.timeout)
+    return 0
+
+
 def cmd_status(args) -> int:
     from .modules.ffmpeg import ffmpeg_version
 
@@ -513,6 +595,41 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("status", help="环境与队列概览")
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("reviews", help="列出人工复核队列")
+    p.add_argument("--status", default="pending",
+                   choices=["pending", "approved", "rejected", "superseded"])
+    p.add_argument("--task", default=None, help="只看某个任务的复核记录")
+    p.add_argument("--limit", type=int, default=100)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_reviews)
+
+    p = sub.add_parser("review", help="查看单条复核记录")
+    p.add_argument("review_id")
+    p.set_defaults(func=cmd_review)
+
+    p = sub.add_parser("review-approve", help="人工复核：标记通过（放行产物）")
+    p.add_argument("review_id")
+    p.add_argument("--note", default="")
+    p.add_argument("--actor", default="cli")
+    p.set_defaults(func=lambda args: cmd_review_decide(args, "approve"))
+
+    p = sub.add_parser("review-reject", help="人工复核：标记失败")
+    p.add_argument("review_id")
+    p.add_argument("--note", default="")
+    p.add_argument("--actor", default="cli")
+    p.set_defaults(func=lambda args: cmd_review_decide(args, "reject"))
+
+    p = sub.add_parser("review-rerun", help="人工复核：修正 mask/参数后重跑（新建任务）")
+    p.add_argument("review_id")
+    p.add_argument("--param", default=None,
+                   help='参数覆盖 JSON，形如 {"logo_erase":{"dilate":6}}')
+    p.add_argument("--note", default="")
+    p.add_argument("--actor", default="cli")
+    p.add_argument("--priority", type=int, default=100)
+    p.add_argument("--wait", action="store_true", help="等待重跑任务结束")
+    p.add_argument("--timeout", type=float, default=3600.0)
+    p.set_defaults(func=cmd_review_rerun)
 
     p = sub.add_parser("cleanup", help="清理过期产物并回收过期租约")
     p.set_defaults(func=cmd_cleanup)

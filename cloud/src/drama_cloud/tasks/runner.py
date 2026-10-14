@@ -30,7 +30,7 @@ from ..errors import ErrorClass, MAX_ATTEMPTS, WorkError
 from ..plan import ENGINE_VERSION, WORKER_VERSION, PlanInput
 from ..recipes.registry import ensure_modules_loaded, get_module, registered_modules
 from ..storage import LocalStorage
-from . import service
+from . import review, service
 from .queue import TaskQueue, set_progress
 from .state import TaskState, transition
 
@@ -144,7 +144,7 @@ class Worker:
             task = self._load_task(conn, task_id)
             self._prepare_workdir(work_dir)
             plan_inputs, paths = self._stage_inputs(conn, work_dir, task)
-            context = self._build_context(work_dir, plan_inputs, paths, task)
+            context = self._build_context(work_dir, plan_inputs, paths, task, attempt)
             with Heartbeat(self, conn, task_id) as beat:
                 steps = self._run_steps(conn, task, context, beat)
                 if beat.lost or not self._owns(conn, task_id):
@@ -175,10 +175,12 @@ class Worker:
             self._record_attempt_error(conn, task_id, attempt, ErrorClass.WORKER_LOST, str(lost))
             return
         except WorkError as error:
-            self._fail(conn, task_id, attempt, error.error_class, error.message, steps, work_dir)
+            self._fail(conn, task_id, attempt, error.error_class, error.message, steps,
+                       work_dir, context)
         except Exception as error:  # 未预期异常按 Internal 处理，但要留下堆栈
             detail = f"{type(error).__name__}: {error}\n{traceback.format_exc(limit=6)}"
-            self._fail(conn, task_id, attempt, ErrorClass.INTERNAL, detail, steps, work_dir)
+            self._fail(conn, task_id, attempt, ErrorClass.INTERNAL, detail, steps, work_dir,
+                       context)
 
     # ---------- 各阶段 ----------
 
@@ -193,6 +195,7 @@ class Worker:
             "input_asset_ids": json_load(row["input_asset_ids"], []) or [],
             "attempts": int(row["attempts"]),
             "state": row["state"],
+            "user_params": json_load(row["user_params_json"], {}) or {},
         }
 
     def _prepare_workdir(self, work_dir: Path) -> None:
@@ -217,7 +220,14 @@ class Worker:
             paths.append(target)
         return inputs, paths
 
-    def _build_context(self, work_dir: Path, inputs: Sequence[PlanInput], paths: Sequence[Path], task: dict):
+    def _build_context(
+        self,
+        work_dir: Path,
+        inputs: Sequence[PlanInput],
+        paths: Sequence[Path],
+        task: dict,
+        attempt: int = 1,
+    ):
         from ..modules.ffmpeg import MediaContext
 
         device = next((i for i, item in enumerate(inputs) if item.role == "video"), None)
@@ -229,6 +239,8 @@ class Worker:
             primary=paths[device],
             inputs=list(paths),
             plan={"quality_policy": task["plan"].get("quality_policy") or {}},
+            user_params=task.get("user_params") or {},
+            attempt=max(1, int(attempt)),
         )
 
     def _run_steps(self, conn, task: dict, context, beat: Heartbeat) -> List[StepOutcome]:
@@ -390,14 +402,14 @@ class Worker:
                         )
                     )
 
-            registered.append(
-                service.register_artifact(
-                    conn, self.storage, task["id"], "output", context.encoded,
-                    media=report.get("media") or {},
-                    quality=report,
-                    retain_days=self.settings.artifact_retention_days,
-                )
+            output_artifact = service.register_artifact(
+                conn, self.storage, task["id"], "output", context.encoded,
+                media=report.get("media") or {},
+                quality=report,
+                retain_days=self.settings.artifact_retention_days,
             )
+            registered.append(output_artifact)
+            self._enqueue_review(conn, task, context, artifact_id=output_artifact["id"])
 
         for entry in context.artifacts:
             path = entry.get("path")
@@ -494,7 +506,7 @@ class Worker:
         self._cleanup(context.work_dir, keep=False)
 
     def _fail(self, conn, task_id: str, attempt: int, error_class: ErrorClass,
-              detail: str, steps: List[StepOutcome], work_dir: Path) -> None:
+              detail: str, steps: List[StepOutcome], work_dir: Path, context=None) -> None:
         self._record_attempt_error(conn, task_id, attempt, error_class, detail)
         current = conn.execute("SELECT state FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if current is None:
@@ -511,14 +523,123 @@ class Worker:
         target = self.queue.schedule_retry(
             conn, task_id, error_class, attempt, detail, max_attempts=max_attempts
         )
+        if target == str(TaskState.RETRY_WAITING) and error_class is ErrorClass.QUALITY_RETRYABLE:
+            # 分支A：质量类重试不是「原地重跑」，而是换参数（加大 mask / 换更强后端）重算。
+            # 既然上游画面会变，任何已完成的编码检查点都不再可信，必须整体重做。
+            conn.execute("DELETE FROM task_checkpoints WHERE task_id = ?", (task_id,))
         set_progress(conn, task_id, {
             "stage": "retry_waiting" if target == str(TaskState.RETRY_WAITING) else "failed",
             "steps": [s.__dict__ for s in steps],
             "error_class": str(error_class),
+            "attempts": attempt,
         })
         if target != str(TaskState.RETRY_WAITING):
+            # 分支B：自动重试已用尽的质量类失败转人工复核队列（其他失败照旧直接判死）。
+            if error_class is ErrorClass.QUALITY_RETRYABLE:
+                self._enqueue_exhausted_review(conn, task_id, attempt, detail, steps, context)
             # 不再重试时清理工作目录；重试则保留，供阶段级复用。
             self._cleanup(work_dir, keep=False)
+
+    # ---------- 人工复核队列 ----------
+
+    def _review_detail(self, context, steps: List[StepOutcome]) -> dict:
+        """给复核者的上下文：擦除参数、指标摘要、以及原样保留的步骤结果。"""
+        detail: dict = {"steps": [s.__dict__ for s in steps]}
+        if context is None:
+            return detail
+        section = (getattr(context, "plan", {}) or {}).get("inpaint") or {}
+        if section:
+            detail["inpaint"] = {
+                "regions": section.get("regions"),
+                "detected_regions": section.get("detected_regions"),
+                "attempt": section.get("attempt"),
+                "escalation": section.get("escalation"),
+                "summary": section.get("summary"),
+            }
+        verified = (getattr(context, "plan", {}) or {}).get("erase_verify")
+        if verified:
+            detail["erase_verify"] = verified
+        if getattr(context, "notes", None):
+            detail["notes"] = list(context.notes)
+        return detail
+
+    def _enqueue_review(self, conn, task: dict, context,
+                        artifact_id: Optional[str] = None) -> None:
+        """产物已生成但需要人工抽查（warn 结论）时登记复核记录。"""
+        request = (getattr(context, "plan", {}) or {}).get("review") or {}
+        if not request.get("required"):
+            return
+        reasons = request.get("reasons") or [str(request.get("reason") or "需要人工抽查")]
+        review.create_review(
+            conn,
+            task["id"],
+            review.REASON_WARN,
+            severity=str(request.get("severity") or "warn"),
+            detail={**self._review_detail(context, []), "reasons": reasons},
+            artifact_id=artifact_id,
+            actor=self.worker_id,
+        )
+
+    def _retain_candidate(self, conn, task_id: str, context) -> Optional[str]:
+        """把「重试耗尽时最后一遍擦除结果」留成候选产物。
+
+        结论为 fail 时不会走正常发布路径（失败的任务不产出成品），但人工复核需要一个
+        能看的实物，否则「标记通过」根本无从谈起。这里单独登记成 `inpaint_candidate`，
+        并在质量信息里写明**它没有通过自动校验**：放行是人的决定，不是系统的默认结论。
+        """
+        if context is None:
+            return None
+        section = (getattr(context, "plan", {}) or {}).get("inpaint") or {}
+        candidate = section.get("output")
+        if not candidate:
+            return None
+        path = Path(str(candidate))
+        if not path.exists():
+            return None
+        summary = section.get("summary") or {}
+        attempt = section.get("attempt") or 0
+        artifact = service.register_artifact(
+            conn,
+            self.storage,
+            task_id,
+            "inpaint_candidate",
+            path,
+            media=summary,
+            quality={"auto_verified": False, "verdict": section.get("verdict")},
+            name=f"candidate_attempt{attempt}{path.suffix or '.mp4'}",
+            retain_days=self.settings.artifact_retention_days,
+        )
+        return artifact["id"]
+
+    def _enqueue_exhausted_review(self, conn, task_id: str, attempt: int, detail: str,
+                                  steps: List[StepOutcome], context) -> None:
+        """自动重试已用尽：把任务送进人工复核队列，并给出可执行的修正线索。"""
+        candidate_id = self._retain_candidate(conn, task_id, context)
+        suggestions = [
+            "加大 video.inpaint 的 dilate / context 后重跑",
+            "把 detector 换成 worker（内容级检测）后再重跑",
+            "人工框选更紧的 mask 区域（regions）后重跑",
+        ]
+        if candidate_id is not None:
+            suggestions.append(
+                "确认残留 / 闪烁可接受时，可直接「标记通过」放行这份候选产物（它没有通过自动校验）"
+            )
+        review.create_review(
+            conn,
+            task_id,
+            review.REASON_AUTO_FAILED,
+            severity="high",
+            detail={
+                **self._review_detail(context, steps),
+                "error_class": str(ErrorClass.QUALITY_RETRYABLE),
+                "message": detail,
+                "attempts": attempt,
+                "candidate_unverified": candidate_id is not None,
+                "suggestions": suggestions,
+            },
+            artifact_id=candidate_id,
+            actor=self.worker_id,
+        )
 
     def _record_attempt_error(self, conn, task_id: str, attempt: int,
                               error_class: ErrorClass, detail: str) -> None:

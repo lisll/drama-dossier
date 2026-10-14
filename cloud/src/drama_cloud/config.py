@@ -7,8 +7,10 @@
 from __future__ import annotations
 
 import os
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional, Tuple
 
 
 def _default_home() -> Path:
@@ -32,6 +34,13 @@ class Settings:
     artifact_retention_days: int = 0
     #: Worker 声明的能力集，用于配方兼容性检查。
     capabilities: tuple = ()
+    #: 擦除工具（Rust 侧 `dossier-inpaint`）路径；留空时按 PATH → 仓库 target/ 自动查找。
+    #: 属于**部署配置**而不是配方参数：配方不能指定可执行文件（§10 不执行配方内任意命令）。
+    inpaint_bin: Optional[str] = None
+    #: 模型 worker 的解释器/可执行文件（如 python3）与固定参数（worker 脚本、检测后端等）。
+    #: 同样只由部署方声明；配方只能选择「用哪个后端」，不能指定命令。
+    inpaint_worker_program: Optional[str] = None
+    inpaint_worker_args: Tuple[str, ...] = ()
 
     @property
     def db_path(self) -> Path:
@@ -64,10 +73,20 @@ class Settings:
 
 def load_settings(**overrides) -> Settings:
     home = Path(os.environ.get("DRAMA_CLOUD_HOME") or _default_home()).expanduser()
+    raw_worker_args = os.environ.get("DRAMA_CLOUD_INPAINT_WORKER_ARGS", "")
+    raw_capabilities = os.environ.get("DRAMA_CLOUD_CAPABILITIES", "")
     base = {
         "home": home,
         "ffmpeg": os.environ.get("DRAMA_CLOUD_FFMPEG", "ffmpeg"),
         "ffprobe": os.environ.get("DRAMA_CLOUD_FFPROBE", "ffprobe"),
+        "inpaint_bin": os.environ.get("DRAMA_CLOUD_INPAINT_BIN") or None,
+        "inpaint_worker_program": os.environ.get("DRAMA_CLOUD_INPAINT_WORKER") or None,
+        # shlex 而不是 split：worker 脚本路径可能带空格，配引号即可。
+        "inpaint_worker_args": tuple(shlex.split(raw_worker_args)) if raw_worker_args else (),
+        # 部署方额外声明的能力（如只有 GPU 机器才有的 `video_inpaint_model`）。
+        "capabilities": tuple(
+            item for item in shlex.split(raw_capabilities.replace(",", " ")) if item
+        ),
     }
     base.update({k: v for k, v in overrides.items() if v is not None})
     settings = Settings(**base)

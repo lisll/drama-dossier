@@ -29,6 +29,11 @@ class ModuleSpec:
     #: `transcode` 类模块会改视频本体；`gate` 只读；`plan` 只产出计划数据。
     kind: str = "transform"
     implement: Optional[Callable] = None
+    #: 能力可用性判定：`None` 表示「代码里注册了就一定具备」；给了函数则按部署配置判定
+    #: （例如 `dossier-inpaint` 可执行文件是否真的存在、模型 worker 是否已配置）。
+    #: 判定为假时该能力**不会**出现在 Worker 的能力清单里，不兼容的任务在计划阶段就被
+    #: 路由到别的 Worker，而不是领了任务再发现跑不动。
+    capability_probe: Optional[Callable] = None
 
 
 REGISTRY: Dict[str, ModuleSpec] = {}
@@ -88,7 +93,12 @@ def worker_capabilities(settings=None) -> list:
     extra = settings.capabilities
     capabilities = {"ffmpeg", "ffprobe"}
     for spec in REGISTRY.values():
-        if spec.capability:
-            capabilities.add(spec.capability)
+        if not spec.capability:
+            continue
+        probe = spec.capability_probe
+        if probe is not None and not probe(settings):
+            # 部署侧条件不成立（缺可执行文件/模型），能力如实缺席。
+            continue
+        capabilities.add(spec.capability)
     capabilities.update(extra)
     return sorted(capabilities)

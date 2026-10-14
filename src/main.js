@@ -285,6 +285,306 @@ async function generate() {
   }
 }
 
+function selectedDrama() {
+  if (state.selected == null) throw new Error("请先在左侧选择一部剧");
+  return state.dramas[state.selected];
+}
+
+function transcodeTarget() {
+  const number = (selector, fallback) => {
+    const value = $(selector).value.trim();
+    return value === "" ? fallback : Number(value);
+  };
+  return {
+    container: $("#transcode-container").value.trim() || "mp4",
+    maxBitrateBps: Math.round(number("#transcode-bitrate", 8) * 1e6),
+    maxWidth: number("#transcode-width", 1080),
+    maxHeight: number("#transcode-height", 1920),
+  };
+}
+
+async function transcodeAdvice() {
+  try {
+    const drama = selectedDrama();
+    const payload = await call("transcode_advice", {
+      root: state.root,
+      name: drama.name,
+      target: transcodeTarget(),
+      ffprobePath: $("#ffprobe-path").value.trim() || null,
+    });
+    const plan = payload.plan;
+    const rows = plan.episodes
+      .filter((episode) => episode.needsTranscode)
+      .map(
+        (episode) => `<tr>
+          <td>${esc(episode.episodeNumber ?? "?")}</td>
+          <td>${esc(episode.fileName)}</td>
+          <td>${esc(episode.reasons.join("；"))}</td>
+        </tr>`,
+      )
+      .join("");
+    const node = $("#transcode-result");
+    node.innerHTML = `
+      <strong>共 ${plan.episodes.length} 集：需转码 ${plan.transcodeCount} 集，已合规 ${plan.compliantCount} 集</strong><br />
+      输出目录：${esc(plan.outputDir)}<br />
+      ${
+        rows
+          ? `<table><thead><tr><th>集号</th><th>文件</th><th>原因</th></tr></thead><tbody>${rows}</tbody></table>`
+          : "<p>所有分集都符合目标规格。</p>"
+      }
+      ${plan.transcodeCount ? `<details><summary>批量脚本预览</summary><pre>${esc(payload.script)}</pre></details>` : ""}
+    `;
+    node.classList.remove("hidden");
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+async function diffReportPackages() {
+  try {
+    const result = await call("diff_report_packages", {
+      leftDir: $("#diff-left").value.trim(),
+      rightDir: $("#diff-right").value.trim(),
+    });
+    const rows = result.files
+      .map(
+        (file) => `<tr>
+          <td>${esc(file.path)}</td>
+          <td>${esc(file.kind)}</td>
+          <td>${Number(file.sizeDeltaBytes) >= 0 ? "+" : ""}${file.sizeDeltaBytes}</td>
+          <td>${esc(file.detail)}</td>
+        </tr>`,
+      )
+      .join("");
+    const node = $("#diff-result");
+    node.innerHTML = `
+      <strong>${esc(result.summary)}</strong><br />
+      ${esc(result.leftGeneratedAt)} → ${esc(result.rightGeneratedAt)}<br />
+      ${
+        rows
+          ? `<table><thead><tr><th>路径</th><th>变化</th><th>字节</th><th>说明</th></tr></thead><tbody>${rows}</tbody></table>`
+          : "<p>两份报审包内容一致。</p>"
+      }
+    `;
+    node.classList.remove("hidden");
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+async function loadPlatformProfiles() {
+  try {
+    const profiles = await call("platform_profiles");
+    const select = $("#platform-select");
+    select.innerHTML = profiles
+      .map((profile) => `<option value="${esc(profile.id)}">${esc(profile.name)}</option>`)
+      .join("");
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+async function platformReview() {
+  try {
+    const drama = selectedDrama();
+    const review = await call("platform_review", {
+      root: state.root,
+      name: drama.name,
+      profileId: $("#platform-select").value,
+      ffprobePath: $("#ffprobe-path").value.trim() || null,
+    });
+    const body = review.episodes
+      .map((episode) => {
+        const failed = episode.checks.filter((check) => check.status !== "pass");
+        const detail = failed.length
+          ? failed.map((check) => `${check.label}：${check.detail}`).join("；")
+          : "全部通过";
+        return `<tr>
+          <td>${esc(episode.episodeNumber ?? "?")}</td>
+          <td>${esc(episode.fileName)}</td>
+          <td>${esc(detail)}</td>
+        </tr>`;
+      })
+      .join("");
+    const node = $("#platform-result");
+    node.innerHTML = `
+      <strong>${esc(review.profileName)}：${review.clean ? "无阻断项" : `${review.failCount} 项阻断`}，${review.warnCount} 项警告</strong><br />
+      <table><thead><tr><th>集号</th><th>文件</th><th>需关注</th></tr></thead><tbody>${body}</tbody></table>
+      ${review.notes.length ? `<p>${esc(review.notes.join("；"))}</p>` : ""}
+    `;
+    node.classList.remove("hidden");
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+async function exportDraft() {
+  try {
+    const drama = selectedDrama();
+    const result = await call("export_draft", {
+      root: state.root,
+      name: drama.name,
+      options: { outputDir: $("#draft-dir").value.trim() || null },
+      ffprobePath: $("#ffprobe-path").value.trim() || null,
+    });
+    const node = $("#draft-result");
+    node.innerHTML = `
+      <strong>草稿已导出</strong><br />
+      目录：${esc(result.draftDir)}<br />
+      片段数：${result.segmentCount} · 总时长：${Number(result.durationSec).toFixed(1)} 秒
+    `;
+    node.classList.remove("hidden");
+    $("#draft-dir").value = result.draftDir;
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+async function importDraft() {
+  try {
+    const draft = await call("import_draft", { draftDir: $("#draft-dir").value.trim() });
+    const rows = draft.segments
+      .map(
+        (segment) => `<tr>
+          <td>${segment.order}</td>
+          <td>${esc(segment.name)}</td>
+          <td>${Number(segment.startSec).toFixed(2)}s</td>
+          <td>${Number(segment.durationSec).toFixed(2)}s</td>
+        </tr>`,
+      )
+      .join("");
+    const node = $("#draft-result");
+    node.innerHTML = `
+      <strong>草稿：${esc(draft.draftName || "（未命名）")}</strong> · ${draft.width}×${draft.height} @ ${draft.fps}fps<br />
+      总时长：${Number(draft.durationSec).toFixed(1)} 秒<br />
+      <table><thead><tr><th>#</th><th>素材</th><th>时间线起点</th><th>时长</th></tr></thead><tbody>${rows}</tbody></table>
+    `;
+    node.classList.remove("hidden");
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+function parseEraseRegions() {
+  const raw = $("#erase-regions").value.trim();
+  if (!raw) return [];
+  return raw
+    .split(/[;；\n]/)
+    .map((chunk) => chunk.trim())
+    .filter(Boolean)
+    .map((chunk) => {
+      const parts = chunk.split(/[,，\s]+/).map(Number);
+      if (parts.length !== 4 || parts.some((value) => !Number.isFinite(value))) {
+        throw new Error(`区域格式应为 x,y,w,h：${chunk}`);
+      }
+      const [x, y, width, height] = parts;
+      return { x, y, width, height };
+    });
+}
+
+function eraseRequest() {
+  const optionalNumber = (selector) => {
+    const value = $(selector).value.trim();
+    return value === "" ? null : Number(value);
+  };
+  const workerArgs = $("#erase-worker-args")
+    .value.split(/[,，]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return {
+    input: $("#erase-input").value.trim(),
+    output: $("#erase-output").value.trim(),
+    regions: parseEraseRegions(),
+    detector: $("#erase-detector").value,
+    inpainter: $("#erase-inpainter").value,
+    dilate: Number($("#erase-dilate").value || 4),
+    feather: Number($("#erase-feather").value || 2),
+    context: Number($("#erase-context").value || 1.6),
+    start: optionalNumber("#erase-start"),
+    duration: optionalNumber("#erase-duration"),
+    persistentWorker: $("#erase-persistent").checked,
+    workerProgram: $("#erase-worker-program").value.trim() || null,
+    workerArgs,
+  };
+}
+
+function renderErasePlan(plan) {
+  const node = $("#erase-result");
+  node.innerHTML = `
+    <strong>将要执行的命令</strong><br />
+    <code>${esc(plan.commandLine)}</code><br />
+    处理日志：${esc(plan.reportPath)}${
+      plan.requiresWorker ? " · 需要模型 worker" : ""
+    }
+  `;
+  node.classList.remove("hidden");
+}
+
+async function checkEraseStatus() {
+  try {
+    const status = await call("erase_status", {
+      toolPath: $("#erase-tool-path").value.trim() || null,
+    });
+    const node = $("#erase-result");
+    node.innerHTML = `
+      <strong>擦除工具：${status.available ? "可用" : "不可用"}</strong><br />
+      ${status.tool ? `路径：<code>${esc(status.tool)}</code><br />` : ""}
+      ${esc(status.message)}
+    `;
+    node.classList.remove("hidden");
+    toast(status.available ? "擦除工具可用" : "未找到擦除工具", !status.available);
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+async function planErase() {
+  try {
+    const plan = await call("plan_erase", {
+      request: eraseRequest(),
+      toolPath: $("#erase-tool-path").value.trim() || null,
+    });
+    renderErasePlan(plan);
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+async function runErase() {
+  const button = $("#erase-run");
+  button.disabled = true;
+  try {
+    const run = await call("run_erase", {
+      request: eraseRequest(),
+      toolPath: $("#erase-tool-path").value.trim() || null,
+      timeoutSeconds: 1800,
+    });
+    const report = run.report ?? {};
+    const verification = report.verification ?? {};
+    const residual = verification.residual ?? {};
+    const ssim = verification.ssim ?? {};
+    const node = $("#erase-result");
+    node.innerHTML = `
+      <strong>擦除结论：${esc(run.outcomeLabel)}（退出码 ${run.exitCode}）</strong><br />
+      ${verification.verdict ? `工具自检：${esc(String(verification.verdict))}<br />` : ""}
+      ${
+        residual.maxRatio != null
+          ? `残留峰值：${(Number(residual.maxRatio) * 100).toFixed(2)}%<br />`
+          : ""
+      }
+      ${ssim.minSsim != null ? `结构相似度最低：${Number(ssim.minSsim).toFixed(3)}<br />` : ""}
+      ${run.stderrTail ? `<pre>${esc(run.stderrTail)}</pre>` : ""}
+      处理日志：${esc(run.reportPath ?? "")}
+    `;
+    node.classList.remove("hidden");
+    toast(`擦除结束：${run.outcomeLabel}`);
+  } catch (error) {
+    toast(String(error), true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function browse(targetId) {
   try {
     const folder = await call("pick_folder");
@@ -295,6 +595,25 @@ async function browse(targetId) {
 }
 
 $("#browse-root").addEventListener("click", () => browse("#library-root"));
+$("#browse-erase-input").addEventListener("click", async () => {
+  try {
+    const file = await call("pick_video");
+    if (file) $("#erase-input").value = file;
+  } catch (error) {
+    toast(String(error), true);
+  }
+});
+$("#erase-status").addEventListener("click", checkEraseStatus);
+$("#erase-plan").addEventListener("click", planErase);
+$("#erase-run").addEventListener("click", runErase);
+$("#transcode-plan").addEventListener("click", transcodeAdvice);
+$("#diff-run").addEventListener("click", diffReportPackages);
+$("#diff-left-pick").addEventListener("click", () => browse("#diff-left"));
+$("#diff-right-pick").addEventListener("click", () => browse("#diff-right"));
+$("#platform-run").addEventListener("click", platformReview);
+$("#draft-pick").addEventListener("click", () => browse("#draft-dir"));
+$("#draft-export").addEventListener("click", exportDraft);
+$("#draft-import").addEventListener("click", importDraft);
 $("#browse-output").addEventListener("click", () => browse("#output-dir"));
 $("#scan").addEventListener("click", scan);
 $("#analyze").addEventListener("click", analyze);
@@ -312,4 +631,5 @@ $("#library-root").addEventListener("keydown", (event) => {
 
 if (invoke) {
   loadSettings();
+  loadPlatformProfiles();
 }

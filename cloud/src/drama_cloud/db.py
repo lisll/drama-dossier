@@ -151,6 +151,28 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id);
 
+-- 确认流的人工复核队列（分支B）。
+-- 自动校验失败（且自动重试已用尽）或只拿到 warn 结论时，任务会在这里排一条待复核记录；
+-- 复核者可以标记通过/失败，也可以修正 mask 后重跑（重跑会产生一个新任务，本记录转 superseded）。
+CREATE TABLE IF NOT EXISTS review_queue (
+    id            TEXT PRIMARY KEY,
+    task_id       TEXT NOT NULL REFERENCES tasks(id),
+    -- 关联的可交付产物；自动校验失败时通常为空（没有可放行的成品）。
+    artifact_id   TEXT,
+    reason        TEXT NOT NULL,
+    severity      TEXT NOT NULL CHECK (severity IN ('info', 'warn', 'high')),
+    status        TEXT NOT NULL DEFAULT 'pending'
+                  CHECK (status IN ('pending', 'approved', 'rejected', 'superseded')),
+    detail_json   TEXT,
+    claimed_by    TEXT,
+    created_at    TEXT NOT NULL,
+    decided_by    TEXT,
+    decided_at    TEXT,
+    decision_note TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_review_status ON review_queue(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_review_task ON review_queue(task_id);
+
 CREATE TABLE IF NOT EXISTS audit_events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     ts         TEXT NOT NULL,

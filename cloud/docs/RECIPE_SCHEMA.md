@@ -111,7 +111,7 @@
 
 模块 `media.quality_gate` 的同名参数若显式给出，则**覆盖**这里的策略值（便于单任务微调）。
 
-## 8. 模块参数表（13 个）
+## 8. 模块参数表（15 个）
 
 注册表在 `src/drama_cloud/recipes/registry.py`，字面量写死，配方改不动它。
 
@@ -264,6 +264,49 @@
 逻辑名 → 本机 ffmpeg 编码器：`h264`→`libx264`、`h265`→`libx265`、`vp9`→`libvpx-vp9`、
 `av1`→`libaom-av1`。
 
+### `video.inpaint` · 硬字幕/角标擦除（C12）
+
+| 参数 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `input_index` | int ≥0 | `0` | 要处理的输入下标；擦除结果会替换该路输入 |
+| `regions` | `[{x,y,width,height}]` | `[]` | 固定标识区域；`detector=fixed` 时必填 |
+| `start` / `duration` | float | 无 | 时间窗（秒），窗外帧原样输出 |
+| `start_frame` / `end_frame` | int | 无 | 帧级时间窗（优先于秒） |
+| `detector` | `fixed`/`worker` | `fixed` | 定位后端：固定区域 / 模型检测 |
+| `inpainter` | `column`/`worker` | `column` | 修复后端：本地基线 / 时序修复模型 |
+| `dilate` | int 0..64 | `4` | 掩码膨胀半径（像素） |
+| `feather` | int 0..64 | `2` | 回贴羽化半径 |
+| `context` | float 1..8 | `1.6` | ROI 相对检测框的外扩比例 |
+| `region_pad` | int 0..256 | `8` | 检测框落在区域内的判定外扩量 |
+| `temporal_smooth` | int 0..30 | `1` | 掩码时序平滑半径 |
+| `min_score` | float 0..1 | `0.5` | 检测置信度下限 |
+| `clip_frames` / `probe_frames` | int | `30` / `60` | 片段帧数 / 定位抽检帧数 |
+| `fps` | float\|null | `null` | 覆盖素材帧率 |
+| `vcodec`/`crf`/`preset` | str/int/str | `libx264`/`16`/`medium` | 中间态编码参数 |
+| `pix_fmt` | str | `yuv444p` | 默认不做 4:2:0（彩色小目标对色度抽样敏感） |
+| `defer_verdict` | bool | `false` | `true` = 结论交由 `video.erase_verify` 裁决 |
+| `escalation` | `off`/`mask`/`mask+backend` | `mask` | 自动重试的加力方式 |
+| `timeout_seconds` | float >0 | `1800` | 单次调用超时 |
+
+可执行文件与 worker 解释器**不是配方参数**（部署配置：`DRAMA_CLOUD_INPAINT_BIN` /
+`DRAMA_CLOUD_INPAINT_WORKER` / `DRAMA_CLOUD_INPAINT_WORKER_ARGS`），
+配方不能指定命令。
+
+### `video.erase_verify` · 擦除结果确认流（C12）
+
+| 参数 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `require_report` | bool | `true` | 没有擦除报告时失败（不静默放行） |
+| `require_content_check` | bool | `true` | 无内容级检测结果时是否仍要人工确认 |
+| `accept_warn` | bool | `true` | `warn` 放行但转人工抽查；`false` 表示警告也不放行 |
+| `residual_ratio_warn` / `_fail` | float 0..1 | `0.02` / `0.10` | 掩码内残留文本像素占比 |
+| `flicker_warn` / `flicker_fail` | float ≥0 | `1.2` / `3.0` | 闪烁指数 |
+| `seam_warn` / `seam_fail` | float ≥0 | `1.0` / `2.0` | 接缝分数 |
+| `psnr_warn_db` / `psnr_fail_db` | float ≥0 | `30.0` / `24.0` | 掩码内一致性 PSNR（越大越好） |
+
+结论为 `fail` → `quality_retryable`（自动重试，用尽转人工）；`warn` → 产物照常产出但登记人工抽查；
+`pass` → 自动确认通过。详见 `docs/INPAINT_REVIEW_FLOW.md`。
+
 ### `media.quality_gate` · 质量门禁（§10）
 
 | 参数 | 类型 | 默认 | 说明 |
@@ -291,6 +334,8 @@
 | `subtitle.mux` | `subtitles` | video | subtitle_plan | transform |
 | `metadata.policy` | `ffmpeg` | metadata | metadata_policy | transform |
 | `media.encode` | `h264_encode` | video | encoded | transform |
+| `video.inpaint` | `video_inpaint` | video | video | transcode |
+| `video.erase_verify` | `video_inpaint` | video | erase_verification | gate |
 | `media.quality_gate` | `ffprobe` | encoded | quality_report | transform |
 
 `kind` 只用于说明与检查点策略：只有 `media.encode` 物化文件，因此只有它的阶段产物可以被复用。

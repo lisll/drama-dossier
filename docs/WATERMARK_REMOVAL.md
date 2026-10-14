@@ -209,18 +209,60 @@ cargo run -p dossier-inpaint -- \
 E2FGVI 需要 torch，本机（aarch64、无 GPU）装不上，只能在 x86_64 + GPU 上端到端验证。
 本机能验证的是 CLI、帧 IO、mask、worker 协议与 `column` 基线全链路。
 
+角标场景常用的补充参数：
+
+```bash
+# 台标 + 角标两处同时擦（--roi 可重复）
+--roi 900,30,120,60 --roi 40,40,100,40 --detector fixed --inpainter column
+
+# 两处标识离得远：按面积阈值拆成多个裁剪作业，各自独立送模型
+--region-group-area-ratio 2.0
+
+# 常驻 worker：整段视频只启动一次解释器 + 模型（角标逐帧检测时收益最明显）
+--persistent-worker --worker-program python3 \
+  --worker-args tools/model_worker/worker.py,--serve,--inpaint-engine,e2fgvi
+
+# 也可选择其他修复后端（需要各自的权重与依赖）：
+#   --worker-args tools/model_worker/worker.py,--inpaint-engine,lama
+#   --worker-args tools/model_worker/worker.py,--inpaint-engine,propainter
+
+# 只处理片头片尾之间的正片（跳过无角标的片头）
+--start 45.0 --duration 1500.0
+
+# 擦除结果自动校验：角标是小面积标识，残留比字幕更容易肉眼看漏
+--verify-residual-ratio-fail 0.05 --report-json out.report.json
+```
+
+角标擦除的确认流与硬字幕共用同一套实现（残留 / 闪烁 / 接缝 / 一致性四项指标 +
+`pass/warn/fail` 退出码 0/3/2），见
+[SUBTITLE_REMOVAL.md 的「擦除结果自动校验（确认流）」](./SUBTITLE_REMOVAL.md#擦除结果自动校验确认流)。
+小 mask 场景下 `--temporal-smooth`（默认 1 帧）尤其值得保留：角标通常全程静止，
+漏检一帧就会在回放里闪一下。
+
 ## 已知局限与后续
 
-- **第二遍仍是整帧检测 + 整帧送 worker**。角标位置固定时第二遍只需在 ROI 内操作，
-  预期约 10× 提速，尚未实现。
-- **worker 每帧一次进程启动**，常驻 worker（长连接协议）能消掉这部分开销，尚未实现。
+- **~~第二遍仍是整帧检测 + 整帧送 worker~~（已实现）**：检测后端 `prefer_roi_detection()`
+  为真时，第二遍与自动校验都只在 ROI 裁剪图上跑模型，检测框再平移回整帧坐标。
+- **~~worker 每帧一次进程启动~~（已实现）**：`--persistent-worker` 让整段视频只启动一次
+  worker（`worker.py --serve`）。实测 20 帧样例 8.08 s → 1.14 s（约 7×）。
+- **~~多区域仍需一次裁剪~~（可拆分）**：`--region-group-area-ratio`（默认 2.0）会按面积
+  阈值把离得远的标识拆成多个裁剪作业，各自独立送模型；两处标识离得远时收益最大。
 - **光流传播在 1/4 分辨率**，ROI 短边过小时质量会明显下滑，只能靠取大 ROI 缓解。
 - **片段按固定帧长切分**，镜头切换处不切分，片段边界可能出现时序不一致（与硬字幕相同）。
 - **压缩伪影只能减复发**，无法还原源中已经丢失的信息。
+- **区域分组是贪心启发式**：按 `x,y` 排序后逐个尝试合并，不保证全局最优分组；
+  阈值只约束「面积代价」，不感知画面内容（例如被前景物体隔开的两个区域）。
+- **worker 修复仍是单掩码。** 逐帧掩码（`Inpainter::inpaint_frames`）只有 `column` 基线
+  用上了；E2FGVI / LaMa / ProPainter 走的是并集掩码，改协议才能吃到逐帧掩码的收益。
+- **单帧模型（LaMa）没有时序约束**，逐帧调用快但更容易闪；角标静止时可用，
+  画面轻微运动时仍应选视频模型。ProPainter 需要模型仓库自带 `dossier_backend.py`。
 
 ## 参考
 
 - [SUBTITLE_REMOVAL.md](./SUBTITLE_REMOVAL.md)：硬字幕擦除、架构、worker 交换协议
 - `crates/dossier-inpaint/src/mask.rs`：`feather` 实现（方框模糊）与单测
 - `crates/dossier-inpaint/src/frames.rs`：`encoder_command` 固定 swscale flags
-- `tools/model_worker/inpaint_backends.py`：E2FGVI 适配层（`neighbor_stride` / `num_ref` 分派）
+- `tools/model_worker/inpaint_backends.py`：修复后端适配层（E2FGVI 视频 / LaMa 单帧 /
+  ProPainter 外部适配 / 列填充基线），由 `backend` 参数选择
+- `crates/dossier-inpaint/src/worker.rs`：常驻 worker 会话（stdio 行协议）
+- `crates/dossier-inpaint/src/verify.rs`：擦除结果自动校验（残留/闪烁/接缝/一致性/SSIM）

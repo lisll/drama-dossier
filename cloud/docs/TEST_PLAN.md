@@ -12,6 +12,8 @@
 | --- | --- | --- | --- |
 | 单元 | `tests/test_recipes.py` `test_plan.py` `test_state_machine.py` `test_queue.py` `test_storage.py` | 无 ffmpeg | 快；校验规则、状态机、队列语义、签名 |
 | 模块 | `tests/test_modules.py` | 无 ffmpeg | 模块只写 `ctx.plan`，因此可直接断言「生成的滤镜链」 |
+| 模块（擦除） | `tests/test_inpaint_module.py` | 无 ffmpeg、无 GPU | 用「假工具脚本」替身驱动 `video.inpaint`/`video.erase_verify`：加力、判据方向、自动重试、转人工、warn 产出 |
+| 业务（复核） | `tests/test_review.py` | 无 ffmpeg | 人工复核队列生命周期、裁决约束、去重、任务投影与 API 端点/角色 |
 | 集成 | `tests/test_runner.py` | ffmpeg | 真跑 Worker：编码、门禁、检查点、取消、租约 |
 | 接口 | `tests/test_api.py` | ffmpeg（仅全链路用例） | FastAPI TestClient：认证、授权、限流、幂等 |
 | 端到端 | `cloud/demo.sh` → `drama_cloud.demo` | ffmpeg | 不起 HTTP，跑通 4 条配方并校验产物 |
@@ -26,6 +28,7 @@
 | `source.mp4` | `demo.make_source` | 1280×720 @25fps，6s | 端到端演示 |
 | `sample.srt` | `demo.make_subtitle` | 2 条字幕 | 演示 C3 |
 | `clip.mp4` | 手工（可选） | 640×360，4s | 开发期手工调试 |
+| `fake-inpaint` | `tests/test_inpaint_module.py` 临时脚本 | 可执行 shell/Python | 模拟 `dossier-inpaint` CLI 与 worker 协议，无需 GPU/模型即可跑通擦除确认流 |
 
 约定：**没有 ffmpeg 时**用 `requires_ffmpeg` 标记跳过，纯逻辑测试仍然全绿
 （`tests/conftest.py` 里的 `HAVE_FFMPEG`）。
@@ -166,6 +169,35 @@ cd cloud && PYTHONPATH=src ../.venv/bin/python -m pytest tests/ -q -k "not runne
 | 签名令牌往返 / 用途 / 篡改 / 过期 | `test_signed_payload_*`（4 例） |
 | 对象键签名校验 | `test_object_key_signature_verify` |
 
+### 4.9 擦除与确认流（C12）
+
+| 需求 | 用例 |
+| --- | --- |
+| 第 1 次不做加力，重试才提升 `dilate/feather/context/temporal_smooth` | `test_escalation_keeps_first_attempt_and_boosts_on_retry` |
+| `mask+backend` 仅在配置了 worker 时才切后端 | `test_escalation_switches_backend_only_when_worker_is_configured` |
+| 配方参数 → CLI 参数映射 | `test_build_args_maps_params_to_cli` |
+| SSIM 阈值透传给工具（工具认识该开关时） | `test_build_args_forwards_ssim_thresholds` |
+| 工具不认识 SSIM 开关时按能力降级（少传参数而不是解析失败） | `test_build_args_drops_ssim_flags_the_tool_does_not_know` |
+| `--help` 开关探测与结果缓存 | `test_tool_flags_reads_long_flags_from_help` |
+| 工具不可读时探测退化为空集合 | `test_tool_flags_degrades_to_empty_for_unreadable_tool` |
+| 未配置 worker 解释器时明确报错 | `test_build_args_requires_deployment_worker_config` |
+| 工具定位顺序：部署配置 → PATH → 仓库 target | `test_resolve_tool_prefers_deployment_configuration` |
+| 校验判据方向（残留/闪烁/接缝越低越好，PSNR 越高越好） | `test_judge_checks_consistency_direction` |
+| 干净指标 → Pass | `test_erase_verify_passes_when_metrics_are_clean` |
+| Fail → 质量类可重试错误 | `test_erase_verify_fail_is_retryable` |
+| Warn → 产物照常产出 + 复核项 | `test_erase_verify_warn_requires_human_spot_check`、`test_warn_verdict_produces_output_and_review_item` |
+| `accept_warn=false` 时 Warn 也判失败 | `test_erase_verify_warn_can_be_refused_by_policy` |
+| 默认要求内容级检测（`require_content_check`） | `test_erase_verify_requires_content_check_by_default` |
+| 缺报告 → 明确失败 | `test_erase_verify_rejects_missing_report` |
+| 缺日志目录 → `video.inpaint` 明确报错 | `test_implement_inpaint_reports_missing_log` |
+| 分支A：加力后第 2 次成功 | `test_quality_retry_escalates_then_succeeds` |
+| 分支A 用尽 → 分支B 入人工队列 + 保留候选产物 | `test_exhausted_quality_retry_goes_to_review_queue` |
+| 复核生命周期：reject → rerun 建新任务并 supersede | `test_review_lifecycle_reject_then_rerun` |
+| approve 必须有产物且只能裁决一次（失败任务的候选产物可以放行） | `test_approve_needs_an_artifact_and_cannot_repeat`、`test_exhausted_quality_retry_goes_to_review_queue` |
+| 同任务同原因 pending 去重 | `test_pending_review_is_deduplicated_per_task_and_reason` |
+| 任务详情投影复核汇总 | `test_worker_reports_are_visible_on_the_task`、`test_task_endpoint_exposes_review_projection` |
+| 复核端点与角色（viewer/operator/admin） | `test_review_endpoints_and_roles` |
+
 ## 5. 质量门禁测试
 
 门禁的每一项都可以通过「构造一个违反它的产物」来负向验证；原型里主要覆盖：
@@ -176,6 +208,7 @@ cd cloud && PYTHONPATH=src ../.venv/bin/python -m pytest tests/ -q -k "not runne
 | `target_*` / `duration` / `av_sync` / `audio_track` | `test_end_to_end_success` 与 `test_full_edit` 类配方的正向断言；负向靠 `duration_tolerance_seconds` 与 `max_av_sync_ms` 收紧参数 |
 | `subtitle_track` | `test_subtitle_burn_end_to_end`（烧录）+ 软字幕配方 |
 | `artifact_hash` | 所有端到端用例都会比对产物 sha256 |
+| 擦除确认门禁（`video.erase_verify`） | `test_erase_verify_*`（6 例）：Pass/Fail/Warn、判据方向、缺报告、`accept_warn` 策略；Fail 走质量类重试，Warn 走人工抽查 |
 
 手工负向验证（可选）：把 `quality_policy.min_duration_seconds` 提到远大于素材时长，
 或把 `max_av_sync_ms` 设成 `1`，任务应以 `quality_gate_failed` 结束且**不产生** `output` 产物。
@@ -192,6 +225,12 @@ cd cloud && PYTHONPATH=src ../.venv/bin/python -m pytest tests/ -q -k "not runne
    `run-worker`，任务应被回收重排并最终成功；`GET /tasks/{id}` 的 `attempts_detail` 能看到两次尝试。
 6. 取消：任务 `RUNNING` 时调 `POST /tasks/{id}/cancel`，任务应以 `CANCELLED` 结束，
    且 `artifacts` 里**没有** `output`。
+7. 擦除确认流（可选，需本机可执行 `dossier-inpaint`）：用 `cloud/recipes/drama-logo-erase.json`
+   对带角标素材建任务，期望 `SUCCEEDED` 且 `GET /tasks/{id}` 的 `plan.inpaint` 有报告、
+   `review` 无待办；若素材过于复杂则期望 `FAILED` + `GET /api/v1/reviews` 出现一条
+   `auto_verify_failed`（复核记录上挂着 `inpaint_candidate` 候选产物），
+   用 `review-approve` 放行候选、或 `review-rerun --param '{"erase":{"dilate":6}}'` 修正后重跑。
+   也可以直接在 Web 客户端的「7 · 人工复核队列」面板里点这几个动作。
 
 ## 7. 并发测试
 
@@ -213,8 +252,10 @@ TLS 反向代理、`kill -9` 恢复、升级不破坏旧库）。本机无法产
 
 ## 9. 已知未覆盖项
 
-1. **GPU / 模型类处理**（光流插帧、E2FGVI 一类修复）没有对应模块，因此没有测试——
-   本机无 GPU，且这类能力不在本原型范围内（见 `ARCHITECTURE.md` §9）。
+1. **GPU / 模型类处理**：擦除确认流（`video.inpaint`/`video.erase_verify`）已接线并有测试，
+   但**真实模型后端**（E2FGVI/ProPainter/LaMa 权重、逐帧掩码 worker）在本机（无 GPU、无 torch）
+   无法端到端验证；`tests/test_inpaint_module.py` 用「假工具脚本」验证协议与判据，
+   真实精度需要 x86_64 + GPU 环境另测（见 `INPAINT_REVIEW_FLOW.md` §6、`ARCHITECTURE.md` §9）。
 2. **ASR**：C11 的转写需要外部提供，没有自动语音识别测试。
 3. **多进程并发**：只有语义级自动化用例，真实多进程属于手工步骤。
 4. **桌面安装包**：见 §8。

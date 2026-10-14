@@ -58,6 +58,10 @@ DramaDossier 是一个本地优先的桌面应用，用于把散落在磁盘上�
 - **桌面应用**：基于 Tauri 2 构建 Windows NSIS 安装包与 macOS `.app` / `.dmg`。
 - **隐私优先**：素材、报告和生成结果都保留在本地文件系统。
 - **合规边界明确**：不伪造签名、印章、时间戳或权属证明。
+- **转码建议**：对照目标规格逐集判断是否需要转码、为什么，并生成可审阅的 `ffmpeg` 批处理脚本（只建议，不自动执行）。
+- **报审包差异对比**：读两份 `manifest.json`，列出改稿前后的新增 / 移除 / 修改文件。
+- **平台材料要求（示例档案）**：内置少量投放形态档案，逐集对照时长、画幅、码率、编码与必需材料。
+- **剪映草稿导入 / 导出**：把分集顺序与时长交接给剪辑工具，或把草稿时间线读回来核对。
 - **字幕与角标擦除实验（学习用）**：独立的 `dossier-inpaint` 管线，用 DBNet 定位字幕、时序模型（E2FGVI）重建像素；同一管线也可固定方形 ROI 擦除**自有素材**的角标/水印（小 mask 场景精度最高）。见 [硬字幕擦除](docs/SUBTITLE_REMOVAL.md) 与 [角标 / 水印擦除](docs/WATERMARK_REMOVAL.md)。
 
 ## 产品界面
@@ -67,6 +71,8 @@ DramaDossier 是一个本地优先的桌面应用，用于把散落在磁盘上�
 1. **素材路径区**：选择或输入剧集素材根目录，执行扫描。
 2. **剧目列表**：展示剧目名称、分集数量和素材体积。
 3. **检查与生成区**：查看检查结果，填写真实成本信息，生成报审包。
+4. **报审配套工具（折叠）**：转码建议、改稿差异对比、平台档案对照、剪映草稿导入/导出。
+5. **擦除实验（折叠）**：检测工具状态 → 预览 `dossier-inpaint` 命令 → 执行 → 回显确认流结论。
 
 界面只负责状态展示和触发 Rust 命令，业务规则全部保存在 `dossier-core` 中。
 
@@ -117,6 +123,10 @@ DramaDossier 是一个本地优先的桌面应用，用于把散落在磁盘上�
 │   │       ├── probe.rs         # ffprobe 调用与 JSON 解析
 │   │       ├── checklist.rs     # 报审材料检查规则
 │   │       ├── package.rs       # 报审包生成与 manifest
+│   │       ├── diff.rs          # 两份清单的改稿差异对比
+│   │       ├── transcode.rs     # 转码建议与批量规范化脚本
+│   │       ├── platforms.rs     # 平台材料要求知识库（示例档案）
+│   │       ├── draft.rs         # 剪映草稿导出 / 导入
 │   │       └── types.rs         # 共享领域模型
 │   └── dossier-inpaint/         # 字幕 / 角标擦除管线（学习用原型）
 │       └── src/
@@ -126,13 +136,19 @@ DramaDossier 是一个本地优先的桌面应用，用于把散落在磁盘上�
 │           ├── patch.rs         # ROI 裁剪与回贴
 │           ├── detect.rs        # DBNet 检测后端与跨帧聚合
 │           ├── inpaint.rs       # E2FGVI / 基线修复后端
-│           └── pipeline.rs      # 两遍管线
+│           ├── worker.rs        # 常驻 worker 会话（stdio 行协议）
+│           ├── verify.rs        # 擦除结果自动校验（确认流）
+│           ├── erase.rs         # 桌面入口的命令拼装与执行
+│           └── pipeline.rs      # 两遍管线 + 区域分组
 ├── src/                         # Tauri WebView 前端
 │   ├── index.html
 │   ├── main.js
 │   └── styles.css
 ├── src-tauri/                   # Tauri 桌面壳
-│   ├── src/lib.rs               # IPC commands 与应用入口
+│   ├── src/
+│   │   ├── lib.rs               # IPC commands 与应用入口
+│   │   ├── erase.rs             # 擦除入口命令（预览 / 执行）
+│   │   └── dossier.rs           # 转码建议 / 差异对比 / 平台档案 / 剪映草稿命令
 │   ├── tauri.conf.json          # 窗口、bundle 和打包配置
 │   ├── capabilities/            # Tauri capability 配置
 │   └── icons/                   # Windows / macOS 图标
@@ -144,13 +160,15 @@ DramaDossier 是一个本地优先的桌面应用，用于把散落在磁盘上�
 │       └── fetch_models.sh      # 模型获取（权重不入库）
 ├── cloud/                       # 云端制作系统（学习原型，Python）
 │   ├── src/drama_cloud/         # API / CLI / Worker / 配方 / 处理模块
-│   ├── recipes/                 # 内置配方（6 份）
-│   ├── docs/                    # 架构、配方、管线、API、数据库、打包、测试
-│   └── tests/                   # 117 个测试
+│   ├── recipes/                 # 内置配方（7 份，含 drama-logo-erase 擦除配方）
+│   ├── docs/                    # 架构、配方、管线、API、数据库、打包、测试、擦除确认流
+│   │   └── INPAINT_REVIEW_FLOW.md  # 确认流：自动校验 + 分支A 重试 + 分支B 人工复核
+│   └── tests/                   # 147 个测试
 ├── docs/
 │   ├── BUILD.md                 # 构建与发布说明
 │   ├── DEVELOPMENT.md           # 开发规范与模块边界
 │   ├── MATERIAL_SPEC.md         # 素材与报审包数据规格
+│   ├── PROJECT_REVIEW.md        # 全项目复盘、缺口清单与验证记录
 │   ├── SUBTITLE_REMOVAL.md      # 硬字幕擦除原理、协议与实测
 │   └── WATERMARK_REMOVAL.md     # 角标 / 水印擦除参数、编码策略与实测
 └── .github/workflows/           # CI 和桌面包构建
@@ -270,6 +288,21 @@ mp4, mov, mkv, flv, ts, m4v, webm
 
 manifest 是本地完整性清单，不是官方审核回执，也不能替代签名、公章或可信时间戳。
 
+### `transcode` / `diff` / `platforms` / `draft` — 报审配套能力
+
+- **`transcode`（转码建议与批量规范化）**：对照一个目标规格（容器 / 编码 / 码率上限 /
+  分辨率上限 / 帧率 / CRF）逐集给出「是否需要转码、为什么」，并生成可直接执行的
+  `ffmpeg` 命令与一份 `set -euo pipefail` 的批量脚本。**只产出建议、绝不隐式转码**，
+  脚本里对已存在的输出会跳过。
+- **`diff`（报审包差异对比）**：读两份 `manifest.json`，输出新增 / 移除 / 修改 / 未变
+  与大小变化；只比对清单登记的路径、大小、SHA-256，不读素材内容。
+- **`platforms`（平台材料要求知识库）**：内置少量**学习示例**档案（竖屏短剧 / 横屏长剧 /
+  预告切片 / 通用兜底），把「容器、编码、时长、画幅、码率、必需材料」结构化；
+  纯查表函数，不联网、不抓取平台页面。示例数据不是官方规范。
+- **`draft`（剪映草稿导入 / 导出）**：把分集顺序与时长导出成剪映草稿目录
+  （`draft_content.json` + `draft_meta_info.json`），也能把草稿里的时间线读回来核对。
+  草稿格式是未公开的私有 JSON，随版本变化，本模块只写「最小可用 + 常见字段」的骨架。
+
 ### `src-tauri` — Tauri IPC 桥
 
 | Command | 作用 |
@@ -280,6 +313,15 @@ manifest 是本地完整性清单，不是官方审核回执，也不能替代�
 | `save_app_settings` | 校验并写入本机配置文件 |
 | `analyze_drama` | 探测指定剧目，按传入或默认检查规则返回检查报告 |
 | `generate_package` | 重新扫描、探测并生成报审包 |
+| `pick_video` | 选择待擦除的视频文件 |
+| `erase_status` | 查询 `dossier-inpaint` 是否可用 |
+| `plan_erase` | 只拼装擦除命令，供界面预览（不执行） |
+| `run_erase` | 执行擦除并按确认流退出码（0 通过 / 3 需抽查 / 2 校验失败）回传结论 |
+| `transcode_advice` | 生成转码建议与批处理脚本（不执行转码） |
+| `diff_report_packages` | 对比两份报审包清单 |
+| `platform_profiles` | 列出内置平台档案（示例数据） |
+| `platform_review` | 按平台档案逐集对照 |
+| `export_draft` / `import_draft` | 导出 / 读回剪映草稿 |
 
 Rust command 使用 snake_case，JavaScript 调用时使用 camelCase 参数。命令层返回中文可读错误，前端只做展示和用户输入适配。
 
@@ -293,7 +335,8 @@ Rust command 使用 snake_case，JavaScript 调用时使用 camelCase 参数。�
 ## 字幕与角标擦除实验
 
 这是与报审材料链路**相互独立**的学习原型：`crates/dossier-inpaint`（Rust 管线）
-+ `tools/model_worker`（Python 模型 worker），命令行运行，不接入桌面 UI。
++ `tools/model_worker`（Python 模型 worker）。默认命令行运行；桌面端只在
+「擦除实验」里提供「预览命令 → 执行 → 回显确认流结论」的入口，业务规则仍在库里。
 
 - **思路**：两遍处理。第一遍抽帧用 **DBNet** 定位字幕区域，跨帧聚合出稳定的 ROI；
   第二遍按片段裁剪 ROI，生成掩码后用 **E2FGVI** 做时序视频修复，再羽化回贴。
@@ -304,6 +347,11 @@ Rust command 使用 snake_case，JavaScript 调用时使用 camelCase 参数。�
   只处理**自有素材**，不做 DRM 绕过，不处理他人作品的版权标识。
 - **编码**：`--intermediate delivery` 直接出片；`lossless` 先落 FFV1 无损母版，
   之后换 CRF / preset / pix-fmt 重出片不必重跑最贵的 inpaint 步骤。
+- **多标识与提速**：`--region-group-area-ratio`（默认 2.0）把离得远的标识拆成多个裁剪作业
+  各自送模型；`--persistent-worker` + `worker.py --serve` 让整段视频只启动一次 worker
+  （实测 20 帧样例 8.08s → 1.14s）。
+- **确认流**：输出帧自动校验残留 / 闪烁 / 接缝 / 一致性 / SSIM，退出码 0 通过、3 需人工抽查、
+  2 校验失败；桌面端「擦除实验」区可先预览命令再执行，并回显工具自检结论。
 - **现实**：aarch64 / 无 GPU 的机器上 DBNet 可用，E2FGVI 需要 GPU 机器；
   当前仍提供一个「列填充」基线后端，用来在没有模型时把整条链路跑通。
 
@@ -327,12 +375,16 @@ cargo run -p dossier-inpaint -- \
 ## 云端制作系统（学习原型）
 
 与桌面报审链路**相互独立**：`cloud/`（Python + FastAPI）实现设计文档里的
-「云端短剧视频制作与多平台适配系统」，覆盖 C1–C11 功能映射与阶段 1/2。
+「云端短剧视频制作与多平台适配系统」，覆盖 C1–C12 功能映射与阶段 1/2/3。
 **仅用于技术学习与自有素材**。
 
 - **能力**：配方发布/版本/灰度/回滚（C1/C2）、三档模式 no_edit / subtitle / full_edit（C3）、
   画面与音频处理（C4/C7）、帧率与去闪烁（C9）、时间线（C5）、编码与元数据（C6/C8）、
   分集重组（C10）、解说候选时间线（C11）、质量门禁；
+- **擦除确认流（C12）**：角标/水印擦除（`video.inpaint`）+ 擦除结果自动校验（`video.erase_verify`），
+  自动通过即输出；失败走**分支A 自动重试**（逐次加力 mask 膨胀 / 切换 worker 后端），
+  用尽则入**分支B 人工复核队列**（失败路径保留 `inpaint_candidate` 候选产物，人工可放行 / 判定失败 /
+  修正 mask 重跑），Web 客户端的「人工复核队列」面板与 `drama-cloud review-*` 命令都能操作；
 - **可靠性**：持久化队列 + 租约/心跳/失联回收、阶段检查点复用、协作式取消、
   指数退避重试、产物保留期清理；
 - **客户端**：API 自带的 Web 客户端（本机 gio 2.68 < Tauri 2 要求的 2.70，装不了桌面壳；
@@ -350,8 +402,8 @@ python3.9 -m venv .venv && ./.venv/bin/pip install -e cloud[dev]
 ./cloud/demo.sh                               # 一键端到端演示
 ```
 
-文档在 `cloud/docs/`：架构、配方规范（含 13 个模块参数表）、处理管线、API 规范、
-数据库 Schema、打包指南、测试计划。
+文档在 `cloud/docs/`：架构、配方规范（含 15 个模块参数表）、处理管线、API 规范、
+数据库 Schema、打包指南、测试计划、擦除确认流。
 
 ## 数据流
 
@@ -645,18 +697,22 @@ DramaDossier 只做真实材料的整理、格式化和完整性提示：
 - [x] Tauri 2 桌面壳
 - [x] Windows / macOS 构建目标
 - [x] GitHub Actions 质量与打包流水线
-- [ ] 转码建议与批量规范化
-- [ ] 剪映草稿导入 / 导出
-- [ ] 平台材料要求知识库
+- [x] 转码建议与批量规范化（`dossier-core::transcode`，只建议不执行）
+- [x] 剪映草稿导入 / 导出（`dossier-core::draft`，最小骨架 + 顺序核对）
+- [x] 平台材料要求知识库（`dossier-core::platforms`，内置示例档案）
 - [x] 检查规则自定义配置
 - [x] 硬字幕擦除原型（DBNet 检测 + 时序修复管线）
 - [x] 角标 / 水印擦除原型（E2FGVI 光流引导 + 无损中间态与两段式编码）
 - [x] 云端制作系统原型（C1–C11 配方、持久化队列、质量门禁、Web 客户端）
+- [x] 云端擦除确认流（C12：擦除 + 自动校验 + 分支A 重试 + 分支B 人工复核）
+- [x] 云端人工复核队列（Web 面板 + `drama-cloud review-*`，失败路径保留候选产物供放行）
 - [ ] 云端：GPU 侧模型类处理（光流插帧、模型修复）
 - [ ] 云端：桌面客户端（Tauri 2，需 glib ≥ 2.70）
-- [ ] 擦除管线：第二遍只在 ROI 内检测（约 10x 提速）
-- [ ] 擦除管线：worker 常驻以消除每帧进程启动开销
-- [ ] 报审包差异对比
+- [x] 擦除管线：第二遍只在 ROI 内检测（约 10x 提速）
+- [x] 擦除管线：多标识区域分组（`--region-group-area-ratio`，远距离标识各自送模型）
+- [x] 桌面端擦除入口（预览命令 → 执行 → 按确认流退出码归档结论）
+- [x] 擦除管线：worker 常驻以消除每帧进程启动开销（`--persistent-worker`，实测约 7×）
+- [x] 报审包差异对比（`dossier-core::diff`）
 - [ ] macOS 签名与公证示例
 - [ ] 应用内更新通道
 

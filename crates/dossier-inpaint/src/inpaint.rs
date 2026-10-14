@@ -7,12 +7,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
 
 use crate::detect::WorkerConfig;
 use crate::mask::{feather, BinaryMask, FrameSize};
 use crate::patch::ClipPatch;
+use crate::worker::WorkerSession;
 
 #[derive(Debug, Error)]
 pub enum InpaintError {
@@ -37,6 +39,50 @@ pub trait Inpainter {
         mask: &BinaryMask,
         feather_radius: u32,
     ) -> Result<(), InpaintError>;
+
+    /// 用**逐帧掩码**修复：`masks[i]` 只作用于 `patch.frames[i]`。
+    ///
+    /// 默认实现退化为「所有帧共用一个并集掩码」，这是目前 worker 协议
+    /// （单 `mask.pgm`）的语义；支持逐帧掩码的后端重写本方法后，
+    /// 掩码边界内的原始像素不会被无谓改写，模型上下文也更干净。
+    fn inpaint_frames(
+        &self,
+        patch: &mut ClipPatch,
+        masks: &[BinaryMask],
+        feather_radius: u32,
+    ) -> Result<(), InpaintError> {
+        if masks.len() != patch.len() {
+            return Err(InpaintError::FrameCount {
+                expected: patch.len(),
+                actual: masks.len(),
+            });
+        }
+        let mask = union_masks(masks)
+            .ok_or_else(|| InpaintError::Backend("逐帧掩码全部为空，没有需要修复的像素".into()))?;
+        self.inpaint(patch, &mask, feather_radius)
+    }
+}
+
+/// 按位或合并多个掩码；空输入或尺寸不一致时返回 `None`。
+pub fn union_masks(masks: &[BinaryMask]) -> Option<BinaryMask> {
+    let first = masks.first()?;
+    let size = first.size();
+    let mut out = BinaryMask::empty(size);
+    let mut any = false;
+    for mask in masks {
+        if mask.size() != size {
+            continue;
+        }
+        for y in 0..size.height {
+            for x in 0..size.width {
+                if mask.get(x, y) {
+                    out.set(x, y, true);
+                    any = true;
+                }
+            }
+        }
+    }
+    any.then_some(out)
 }
 
 /// 列填充修复（本地基线后端，非质量方案）。
@@ -58,6 +104,85 @@ impl Default for ColumnFillInpainter {
     }
 }
 
+impl ColumnFillInpainter {
+    /// 用单个掩码修复一帧（列中位数填充 + 羽化合成）。
+    fn fill_frame(
+        &self,
+        frame: &mut [u8],
+        size: FrameSize,
+        mask: &BinaryMask,
+        feather_radius: u32,
+    ) -> Result<(), InpaintError> {
+        if size != mask.size() {
+            return Err(InpaintError::MaskSize {
+                mask: mask.size(),
+                patch: size,
+            });
+        }
+        let width = size.width as usize;
+        let height = size.height as usize;
+        let frame_bytes = crate::frames::frame_bytes(size);
+        let sample_rows = self.sample_rows.max(1) as usize;
+        let alpha = feather(mask, feather_radius);
+
+        if frame.len() < frame_bytes {
+            return Err(InpaintError::FrameBytes {
+                expected: size,
+                actual: frame.len(),
+            });
+        }
+        let mut filled = frame.to_vec();
+
+        for x in 0..width {
+            let masked_rows: Vec<usize> = (0..height)
+                .filter(|y| mask.get(x as u32, *y as u32))
+                .collect();
+            if masked_rows.is_empty() {
+                continue;
+            }
+
+            // 优先从掩码上方向上采样；上方不足时改为向下采样。
+            let mut source_rows: Vec<usize> = Vec::new();
+            let mut cursor = masked_rows[0];
+            while cursor > 0 && source_rows.len() < sample_rows {
+                cursor -= 1;
+                if !mask.get(x as u32, cursor as u32) {
+                    source_rows.push(cursor);
+                }
+            }
+            if source_rows.is_empty() {
+                cursor = masked_rows[masked_rows.len() - 1] + 1;
+                while cursor < height && source_rows.len() < sample_rows {
+                    if !mask.get(x as u32, cursor as u32) {
+                        source_rows.push(cursor);
+                    }
+                    cursor += 1;
+                }
+            }
+            if source_rows.is_empty() {
+                // 该列全部被掩码覆盖，没有可用参考像素
+                continue;
+            }
+
+            let mut color = [0_u8; 3];
+            for (channel, value) in color.iter_mut().enumerate() {
+                let mut samples: Vec<u8> = source_rows
+                    .iter()
+                    .map(|y| frame[(y * width + x) * 3 + channel])
+                    .collect();
+                *value = median(&mut samples);
+            }
+            for y in &masked_rows {
+                let index = (y * width + x) * 3;
+                filled[index..index + 3].copy_from_slice(&color);
+            }
+        }
+
+        crate::mask::blend_bgr(frame, &filled, &alpha);
+        Ok(())
+    }
+}
+
 impl Inpainter for ColumnFillInpainter {
     fn inpaint(
         &self,
@@ -65,73 +190,28 @@ impl Inpainter for ColumnFillInpainter {
         mask: &BinaryMask,
         feather_radius: u32,
     ) -> Result<(), InpaintError> {
-        if patch.size != mask.size() {
-            return Err(InpaintError::MaskSize {
-                mask: mask.size(),
-                patch: patch.size,
+        let size = patch.size;
+        for frame in patch.frames.iter_mut() {
+            self.fill_frame(frame, size, mask, feather_radius)?;
+        }
+        Ok(())
+    }
+
+    fn inpaint_frames(
+        &self,
+        patch: &mut ClipPatch,
+        masks: &[BinaryMask],
+        feather_radius: u32,
+    ) -> Result<(), InpaintError> {
+        if masks.len() != patch.len() {
+            return Err(InpaintError::FrameCount {
+                expected: patch.len(),
+                actual: masks.len(),
             });
         }
-        let width = patch.size.width as usize;
-        let height = patch.size.height as usize;
-        let frame_bytes = patch.frame_bytes();
-        let sample_rows = self.sample_rows.max(1) as usize;
-        let alpha = feather(mask, feather_radius);
-
-        for frame in patch.frames.iter_mut() {
-            if frame.len() < frame_bytes {
-                return Err(InpaintError::FrameBytes {
-                    expected: patch.size,
-                    actual: frame.len(),
-                });
-            }
-            let mut filled = frame.clone();
-
-            for x in 0..width {
-                let masked_rows: Vec<usize> = (0..height)
-                    .filter(|y| mask.get(x as u32, *y as u32))
-                    .collect();
-                if masked_rows.is_empty() {
-                    continue;
-                }
-
-                // 优先从掩码上方向上采样；上方不足时改为向下采样。
-                let mut source_rows: Vec<usize> = Vec::new();
-                let mut cursor = masked_rows[0];
-                while cursor > 0 && source_rows.len() < sample_rows {
-                    cursor -= 1;
-                    if !mask.get(x as u32, cursor as u32) {
-                        source_rows.push(cursor);
-                    }
-                }
-                if source_rows.is_empty() {
-                    cursor = masked_rows[masked_rows.len() - 1] + 1;
-                    while cursor < height && source_rows.len() < sample_rows {
-                        if !mask.get(x as u32, cursor as u32) {
-                            source_rows.push(cursor);
-                        }
-                        cursor += 1;
-                    }
-                }
-                if source_rows.is_empty() {
-                    // 该列全部被掩码覆盖，没有可用参考像素
-                    continue;
-                }
-
-                let mut color = [0_u8; 3];
-                for (channel, value) in color.iter_mut().enumerate() {
-                    let mut samples: Vec<u8> = source_rows
-                        .iter()
-                        .map(|y| frame[(y * width + x) * 3 + channel])
-                        .collect();
-                    *value = median(&mut samples);
-                }
-                for y in &masked_rows {
-                    let index = (y * width + x) * 3;
-                    filled[index..index + 3].copy_from_slice(&color);
-                }
-            }
-
-            crate::mask::blend_bgr(frame, &filled, &alpha);
+        let size = patch.size;
+        for (frame, mask) in patch.frames.iter_mut().zip(masks.iter()) {
+            self.fill_frame(frame, size, mask, feather_radius)?;
         }
         Ok(())
     }
@@ -153,6 +233,8 @@ fn median(values: &mut [u8]) -> u8 {
 pub struct WorkerInpainter {
     pub config: WorkerConfig,
     pub work_dir: PathBuf,
+    /// 可选的常驻 worker 会话；`None` 时每个片段单独起进程。
+    session: Option<Arc<Mutex<WorkerSession>>>,
 }
 
 impl WorkerInpainter {
@@ -160,7 +242,44 @@ impl WorkerInpainter {
         Self {
             config,
             work_dir: work_dir.into(),
+            session: None,
         }
+    }
+
+    /// 复用外部传入的常驻 worker（与检测后端共享同一个进程）。
+    pub fn with_session(mut self, session: Arc<Mutex<WorkerSession>>) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    /// 把 `work_dir` 里的请求交给后端：常驻会话优先，否则一次性起进程。
+    fn invoke_backend(&self) -> Result<(), InpaintError> {
+        if let Some(session) = &self.session {
+            let mut guard = session
+                .lock()
+                .map_err(|_| InpaintError::Backend("常驻 worker 会话已中毒".into()))?;
+            return guard
+                .run(&self.work_dir)
+                .map_err(|error| InpaintError::Backend(error.to_string()));
+        }
+        let output = Command::new(&self.config.program)
+            .args(&self.config.args)
+            .arg(&self.work_dir)
+            .output()
+            .map_err(|error| {
+                InpaintError::Backend(format!(
+                    "无法启动修复后端 {}：{error}",
+                    self.config.program.display()
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(InpaintError::Backend(format!(
+                "修复后端退出码 {:?}：{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -216,23 +335,7 @@ impl Inpainter for WorkerInpainter {
                 .map_err(|error| InpaintError::Backend(format!("请求序列化失败：{error}")))?,
         )?;
 
-        let output = Command::new(&self.config.program)
-            .args(&self.config.args)
-            .arg(&self.work_dir)
-            .output()
-            .map_err(|error| {
-                InpaintError::Backend(format!(
-                    "无法启动修复后端 {}：{error}",
-                    self.config.program.display()
-                ))
-            })?;
-        if !output.status.success() {
-            return Err(InpaintError::Backend(format!(
-                "修复后端退出码 {:?}：{}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
+        self.invoke_backend()?;
 
         let mut frames = Vec::with_capacity(patch.len());
         for index in 0..patch.len() {
@@ -508,5 +611,61 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn union_masks_combines_and_ignores_size_mismatch() {
+        let roi = MaskRect::new(0, 0, 4, 4);
+        let mut a = BinaryMask::empty(FrameSize::new(4, 4));
+        a.paint_rect(roi, MaskRect::new(0, 0, 2, 2));
+        let mut b = BinaryMask::empty(FrameSize::new(4, 4));
+        b.paint_rect(roi, MaskRect::new(2, 2, 2, 2));
+
+        let merged = union_masks(&[a.clone(), b]).expect("并集应非空");
+        assert!(merged.get(0, 0));
+        assert!(merged.get(3, 3));
+
+        // 尺寸不一致的掩码被跳过，不会污染结果
+        let other = BinaryMask::empty(FrameSize::new(8, 8));
+        let merged = union_masks(&[a, other]).expect("仍应有有效掩码");
+        assert_eq!(merged.size(), FrameSize::new(4, 4));
+        assert!(merged.get(0, 0));
+        assert!(!merged.get(3, 3));
+
+        assert!(union_masks(&[]).is_none());
+        assert!(union_masks(&[BinaryMask::empty(FrameSize::new(2, 2))]).is_none());
+    }
+
+    #[test]
+    fn column_fill_honours_per_frame_masks() {
+        // 两帧同一 ROI：第 0 帧第 4 行是字幕（250），第 1 帧没有字幕。
+        let size = FrameSize::new(4, 6);
+        let stride = size.width as usize * 3;
+        let mut patch = ClipPatch::new(size);
+        for has_subtitle in [true, false] {
+            let mut frame = vec![40_u8; stride * size.height as usize];
+            if has_subtitle {
+                frame[4 * stride..5 * stride].fill(250);
+            }
+            patch.push(frame);
+        }
+
+        let mut first = BinaryMask::empty(size);
+        first.paint_rect(MaskRect::new(0, 0, 4, 6), MaskRect::new(0, 4, 4, 1));
+        let masks = vec![first, BinaryMask::empty(size)];
+
+        ColumnFillInpainter { sample_rows: 2 }
+            .inpaint_frames(&mut patch, &masks, 0)
+            .unwrap();
+
+        assert_eq!(patch.frames[0][4 * stride], 40, "第 0 帧字幕应被填充");
+        // 第 1 帧掩码为空，任何像素都不应被改写
+        assert!(patch.frames[1].iter().all(|value| *value == 40));
+
+        // 掩码数量与帧数不符时报错
+        let error = ColumnFillInpainter::default()
+            .inpaint_frames(&mut patch, &masks[..1], 0)
+            .unwrap_err();
+        assert!(matches!(error, InpaintError::FrameCount { .. }));
     }
 }

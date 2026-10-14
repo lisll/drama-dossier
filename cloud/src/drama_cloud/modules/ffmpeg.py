@@ -64,6 +64,9 @@ class MediaContext:
     notes: List[str] = field(default_factory=list)
     #: 用户本次任务的运行期参数（覆盖配方参数时使用）。
     user_params: Dict = field(default_factory=dict)
+    #: 当前是第几次尝试（从 1 开始）。质量类重试靠它逐级加力：
+    #: 第 2 次加大 mask 膨胀/羽化，第 3 次可切换更强的修复后端。
+    attempt: int = 1
 
     @property
     def ffmpeg(self) -> str:
