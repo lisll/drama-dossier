@@ -18,7 +18,9 @@ cargo tauri build
 |---|---|---|---|
 | Windows x64 | `windows-latest` | `x86_64-pc-windows-msvc` | NSIS `.exe` |
 | macOS Apple Silicon | `macos-14` 或更新 | `aarch64-apple-darwin` | `.app` / `.dmg` |
-| macOS Intel | `macos-13` | `x86_64-apple-darwin` | `.app` / `.dmg` |
+| macOS Intel | `macos-15-intel` | `x86_64-apple-darwin` | `.app` / `.dmg` |
+
+> macOS Intel 使用 `macos-15-intel` 标签：`macos-13` 镜像已于 2025 年 12 月退役，使用该标签的任务会一直排队而无法启动。`macos-15-intel` 是 GitHub Actions 最后一个 x86_64 macOS 镜像，支持至 2027 年秋季。
 
 GitHub Actions 工作流会先运行 Rust 测试和 Clippy，再使用 Tauri Action 构建安装包。发布 tag 形如 `app-v0.1.0` 时会创建 GitHub Release。
 
