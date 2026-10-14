@@ -76,6 +76,8 @@ DramaDossier 是一个本地优先的桌面应用，用于把散落在磁盘上�
 
 界面只负责状态展示和触发 Rust 命令，业务规则全部保存在 `dossier-core` 中。
 
+界面操作（含四模块工作台、工具箱与常见排错）见 [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md)。
+
 ## 系统架构
 
 ```text
@@ -197,6 +199,7 @@ DramaDossier 是一个本地优先的桌面应用，用于把散落在磁盘上�
 │   ├── PROJECT_REVIEW.md        # 全项目复盘、缺口清单与验证记录
 │   ├── RUNTIME.md               # Tier 1/2/3：运行时、后期与长任务能力层
 │   ├── SUBTITLE_REMOVAL.md      # 硬字幕擦除原理、协议与实测
+│   ├── USER_GUIDE.md            # 用户使用手册（界面操作、工具箱与排错）
 │   └── WATERMARK_REMOVAL.md     # 角标 / 水印擦除参数、编码策略与实测
 └── .github/workflows/           # CI 和桌面包构建
 ```
