@@ -19,7 +19,7 @@ use dossier_core::{
 use serde::Serialize;
 
 /// 逐集探测（与 `analyze_drama` 走同一个探测函数，避免两套行为）。
-fn probe_all(drama: &Drama, ffprobe_path: Option<String>) -> Vec<ProbedEpisode> {
+pub(crate) fn probe_all(drama: &Drama, ffprobe_path: Option<String>) -> Vec<ProbedEpisode> {
     let config = FfprobeConfig {
         bin: ffprobe_path.map(PathBuf::from),
     };
@@ -30,7 +30,7 @@ fn probe_all(drama: &Drama, ffprobe_path: Option<String>) -> Vec<ProbedEpisode> 
         .collect()
 }
 
-fn load_drama(root: &str, name: &str) -> Result<Drama, String> {
+pub(crate) fn load_drama(root: &str, name: &str) -> Result<Drama, String> {
     let root = PathBuf::from(root);
     validate_library_root(&root).map_err(|error| error.to_string())?;
     validate_drama_name(name).map_err(|error| error.to_string())?;

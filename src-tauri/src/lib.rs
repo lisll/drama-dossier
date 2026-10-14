@@ -11,6 +11,7 @@ use tauri::{AppHandle, Manager};
 
 mod dossier;
 mod erase;
+mod toolbox;
 
 #[derive(Debug, Serialize)]
 struct ProbeOutcome {
@@ -196,7 +197,13 @@ pub fn run() {
             dossier::platform_profiles,
             dossier::platform_review,
             dossier::export_draft,
-            dossier::import_draft
+            dossier::import_draft,
+            toolbox::runtime_status,
+            toolbox::list_rename_plan,
+            toolbox::apply_rename,
+            toolbox::probe_bitrate,
+            toolbox::fix_bitrate,
+            toolbox::transcode_execute
         ])
         .run(tauri::generate_context!())
         .expect("failed to run DramaDossier");

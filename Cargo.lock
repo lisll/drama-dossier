@@ -1030,6 +1030,8 @@ version = "0.1.1"
 dependencies = [
  "dossier-core",
  "dossier-inpaint",
+ "dossier-media",
+ "dossier-runtime",
  "rfd",
  "serde",
  "tauri",

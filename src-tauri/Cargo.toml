@@ -12,6 +12,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 dossier-core = { path = "../crates/dossier-core" }
 dossier-inpaint = { path = "../crates/dossier-inpaint" }
+dossier-media = { path = "../crates/dossier-media" }
+dossier-runtime = { path = "../crates/dossier-runtime" }
 serde = { version = "1", features = ["derive"] }
 tauri = { version = "2", features = [] }
 rfd = "0.15"

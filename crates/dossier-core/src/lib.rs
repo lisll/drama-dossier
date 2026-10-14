@@ -27,6 +27,7 @@ pub mod probe;
 pub mod progress;
 pub mod scanner;
 pub mod settings;
+pub mod tools;
 pub mod transcode;
 pub mod types;
 
@@ -60,4 +61,8 @@ pub use scanner::{
 };
 pub use settings::{load_settings, save_settings, AppSettings, LoadedSettings};
 pub use transcode::{advise_episode, plan_normalization, NormalizationPlan, TranscodeTarget};
+pub use tools::{
+    bitrate_report, episode_target_name, nudge_frames, plan_recut_segments, plan_rename,
+    BitrateItem, RenameItem, RenamePlan,
+};
 pub use types::{CheckStatus, Drama, EpisodeFile, EpisodeSpec, ProbedEpisode};

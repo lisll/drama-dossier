@@ -135,9 +135,131 @@ button:disabled {
 .workspace {
   flex: 1;
   display: grid;
-  grid-template-columns: 295px minmax(0, 1fr);
+  grid-template-columns: 176px minmax(0, 1fr);
   gap: 18px;
   padding: 18px 24px 24px;
+  align-items: start;
+}
+
+.sidenav {
+  display: grid;
+  gap: 8px;
+  position: sticky;
+  top: 18px;
+}
+
+.nav-item {
+  text-align: left;
+  padding: 12px 14px;
+  font-size: 14px;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.nav-item:hover {
+  background: var(--panel);
+  color: var(--text);
+}
+
+.nav-item.active {
+  background: rgba(91, 115, 255, 0.16);
+  border-color: rgba(91, 115, 255, 0.42);
+  color: var(--text);
+}
+
+.modules {
+  min-width: 0;
+}
+
+.module-library {
+  display: grid;
+  grid-template-columns: 295px minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.drama-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  padding: 0 14px;
+  border-radius: 999px;
+  border: 1px solid rgba(91, 115, 255, 0.42);
+  background: rgba(91, 115, 255, 0.14);
+  font-size: 13px;
+  max-width: 40vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.drama-context {
+  margin-bottom: 16px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  font-size: 13px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+}
+
+.drama-context.empty {
+  color: var(--muted);
+}
+
+.env-banner {
+  margin-bottom: 16px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  font-size: 13px;
+  line-height: 1.6;
+  border: 1px solid var(--border);
+}
+
+.env-banner.ok {
+  background: rgba(37, 197, 137, 0.12);
+  border-color: rgba(37, 197, 137, 0.3);
+  color: #ceffe9;
+}
+
+.env-banner.warn {
+  background: rgba(240, 182, 77, 0.12);
+  border-color: rgba(240, 182, 77, 0.32);
+  color: #ffe9c2;
+}
+
+.env-banner.error {
+  background: rgba(255, 91, 107, 0.12);
+  border-color: rgba(255, 91, 107, 0.32);
+  color: #ffd6da;
+}
+
+.tool-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(430px, 1fr));
+  gap: 16px;
+  align-items: start;
+}
+
+.adv {
+  margin-top: 10px;
+  border-top: 1px dashed var(--border);
+  padding-top: 8px;
+}
+
+.adv summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.adv[open] summary {
+  margin-bottom: 10px;
+}
+
+.runtime-list table {
+  width: 100%;
 }
 
 .panel {
@@ -417,43 +539,40 @@ code {
   font-size: 12px;
 }
 
-.settings-panel {
-  margin-top: 16px;
-}
-
-.settings-panel summary {
+/* 工具箱卡片：可独立折叠的 details 面板。 */
+.tool-card summary {
   cursor: pointer;
   font-weight: 600;
   color: var(--text);
   list-style: none;
 }
 
-.settings-panel summary::-webkit-details-marker {
+.tool-card summary::-webkit-details-marker {
   display: none;
 }
 
-.settings-panel summary::after {
+.tool-card summary::after {
   content: "▾";
   float: right;
   color: var(--muted);
 }
 
-.settings-panel[open] summary {
+.tool-card[open] summary {
   margin-bottom: 14px;
 }
 
-.settings-panel[open] summary::after {
+.tool-card[open] summary::after {
   content: "▴";
 }
 
-.settings-panel .checkbox-label {
+.checkbox-label {
   display: flex;
   align-items: center;
   gap: 7px;
   font-size: 13px;
 }
 
-.settings-panel .checkbox-label input[type="checkbox"] {
+.checkbox-label input[type="checkbox"] {
   width: 16px;
   height: 16px;
   min-height: 0;
@@ -481,46 +600,17 @@ code {
   }
 
   .workspace,
+  .module-library,
   .grid,
-  .form-grid {
+  .form-grid,
+  .tool-grid {
     grid-template-columns: 1fr;
   }
-}
 
-/* 「报审配套工具」与「擦除实验」两个折叠面板：沿用设置面板的 summary 外观。 */
-.toolbox-panel,
-.erase-panel {
-  margin-top: 16px;
-}
-
-.toolbox-panel summary,
-.erase-panel summary {
-  cursor: pointer;
-  font-weight: 600;
-  color: var(--text);
-  list-style: none;
-}
-
-.toolbox-panel summary::-webkit-details-marker,
-.erase-panel summary::-webkit-details-marker {
-  display: none;
-}
-
-.toolbox-panel summary::after,
-.erase-panel summary::after {
-  content: "▾";
-  float: right;
-  color: var(--muted);
-}
-
-.toolbox-panel[open] summary,
-.erase-panel[open] summary {
-  margin-bottom: 14px;
-}
-
-.toolbox-panel[open] summary::after,
-.erase-panel[open] summary::after {
-  content: "▴";
+  .sidenav {
+    position: static;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  }
 }
 
 .form-grid select {

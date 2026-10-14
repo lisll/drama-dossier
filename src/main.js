@@ -14,7 +14,11 @@ const state = {
   dramas: [],
   selected: null,
   analysis: null,
+  module: "library",
+  runtime: null,
 };
+let renamePlan = null;
+let bitrateItems = null;
 
 const $ = (selector) => document.querySelector(selector);
 const esc = (value) =>
@@ -178,7 +182,52 @@ function selectDrama(index) {
   $("#episode-body").innerHTML =
     '<tr><td colspan="5" class="empty">尚未探测。</td></tr>';
   $("#generate-result").classList.add("hidden");
+  // 剧目切换后，工具箱里的旧计划全部作废。
+  renamePlan = null;
+  bitrateItems = null;
+  $("#rename-apply").disabled = true;
+  $("#bitrate-fix").disabled = true;
+  $("#rename-result").classList.add("hidden");
+  $("#bitrate-result").classList.add("hidden");
   renderDramas();
+  renderContexts();
+}
+
+// ============ 模块导航 ============
+
+function switchModule(name) {
+  state.module = name;
+  document.querySelectorAll(".nav-item").forEach((node) => {
+    node.classList.toggle("active", node.dataset.module === name);
+  });
+  document.querySelectorAll(".module").forEach((node) => {
+    node.classList.toggle("hidden", node.id !== `module-${name}`);
+  });
+  if (name === "generate" || name === "settings") {
+    checkRuntime();
+  }
+}
+
+function renderContexts() {
+  const chip = $("#current-drama");
+  const selected = state.selected == null ? null : state.dramas[state.selected];
+  if (!selected) {
+    chip.classList.add("hidden");
+    const emptyText =
+      "尚未选择剧目——请先到「剧目库」扫描并点选一部剧。";
+    $("#generate-context").textContent = emptyText;
+    $("#toolbox-context").textContent = emptyText;
+    $("#generate-context").classList.add("empty");
+    $("#toolbox-context").classList.add("empty");
+    return;
+  }
+  chip.textContent = `当前剧目：${selected.name}`;
+  chip.classList.remove("hidden");
+  for (const id of ["#generate-context", "#toolbox-context"]) {
+    const node = $(id);
+    node.textContent = `当前剧目：${selected.name}（${selected.episodes.length} 集）`;
+    node.classList.remove("empty");
+  }
 }
 
 function renderChecklist(report) {
@@ -227,6 +276,7 @@ async function scan() {
     $("#detail-view").classList.add("hidden");
     $("#detail-placeholder").classList.remove("hidden");
     renderDramas();
+    renderContexts();
     toast(`已发现 ${state.dramas.length} 个剧目`);
   } catch (error) {
     toast(String(error), true);
@@ -594,7 +644,278 @@ async function browse(targetId) {
   }
 }
 
+// ============ 工具箱：批量改名 ============
+
+async function buildRenamePlan() {
+  try {
+    const drama = selectedDrama();
+    renamePlan = await call("list_rename_plan", {
+      root: state.root,
+      name: drama.name,
+    });
+    const rows = renamePlan.items
+      .map(
+        (item) => `<tr>
+          <td>${esc(item.from)}</td>
+          <td>${item.unchanged ? "—" : esc(item.to)}</td>
+          <td>${item.unchanged ? "已合规" : "待改名"}</td>
+        </tr>`,
+      )
+      .join("");
+    const skipped = renamePlan.skipped.length
+      ? `<p>无法解析集号、保持不动：${esc(renamePlan.skipped.join("、"))}</p>`
+      : "";
+    const pending = renamePlan.items.filter((item) => !item.unchanged).length;
+    const node = $("#rename-result");
+    node.innerHTML = `
+      <strong>共 ${renamePlan.items.length} 集：待改名 ${pending} 集，已合规 ${
+        renamePlan.items.length - pending
+      } 集</strong>
+      <table><thead><tr><th>当前文件名</th><th>目标文件名</th><th>状态</th></tr></thead><tbody>${rows}</tbody></table>
+      ${skipped}
+    `;
+    node.classList.remove("hidden");
+    $("#rename-apply").disabled = pending === 0;
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+async function applyRename() {
+  if (!renamePlan) return;
+  const items = renamePlan.items
+    .filter((item) => !item.unchanged)
+    .map(({ from, to }) => ({ from, to }));
+  if (!items.length) {
+    toast("没有需要改名的文件");
+    return;
+  }
+  const button = $("#rename-apply");
+  button.disabled = true;
+  try {
+    const drama = selectedDrama();
+    const renamed = await call("apply_rename", {
+      root: state.root,
+      name: drama.name,
+      items,
+    });
+    toast(`已重命名 ${renamed} 个文件；建议重新扫描并检查`);
+    await buildRenamePlan();
+  } catch (error) {
+    toast(String(error), true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+// ============ 工具箱：码率修复 ============
+
+function bitrateMinBps() {
+  const value = Number($("#bitrate-min").value);
+  if (!(value > 0)) throw new Error("码率安全线必须大于 0。");
+  return Math.round(value * 1e6);
+}
+
+async function probeBitrate() {
+  try {
+    const drama = selectedDrama();
+    bitrateItems = await call("probe_bitrate", {
+      root: state.root,
+      name: drama.name,
+      minKbps: Math.round(bitrateMinBps() / 1000),
+      ffprobePath: $("#ffprobe-path").value.trim() || null,
+    });
+    const rows = bitrateItems
+      .map((item) => {
+        const kbps = item.bitrateBps == null ? null : Number(item.bitrateBps);
+        const status = kbps == null ? "unknown" : item.needsFix ? "fail" : "pass";
+        return `<tr>
+          <td>${esc(item.fileName)}</td>
+          <td>${kbps == null ? "未知" : `${(kbps / 1000).toFixed(0)} kbps`}</td>
+          <td class="status-${status}">${
+            kbps == null ? "探测不到码率" : item.needsFix ? "低于安全线" : "达标"
+          }</td>
+        </tr>`;
+      })
+      .join("");
+    const fixable = bitrateItems.filter((item) => item.needsFix).length;
+    const node = $("#bitrate-result");
+    node.innerHTML = `
+      <strong>共 ${bitrateItems.length} 集：${fixable} 集低于安全线</strong>
+      <table><thead><tr><th>文件</th><th>码率</th><th>状态</th></tr></thead><tbody>${rows}</tbody></table>
+    `;
+    node.classList.remove("hidden");
+    $("#bitrate-fix").disabled = fixable === 0;
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+async function fixBitrate() {
+  const button = $("#bitrate-fix");
+  button.disabled = true;
+  button.textContent = "正在重编码…";
+  try {
+    const drama = selectedDrama();
+    const report = await call("fix_bitrate", {
+      root: state.root,
+      name: drama.name,
+      minKbps: Math.round(bitrateMinBps() / 1000),
+      ffprobePath: $("#ffprobe-path").value.trim() || null,
+    });
+    const fixedRows = report.fixed
+      .map(
+        (item) =>
+          `<tr><td>${esc(item.fileName)}</td><td>${item.fromKbps} → ${
+            item.toKbps ?? "?"
+          } kbps</td></tr>`,
+      )
+      .join("");
+    const failedRows = report.failed
+      .map((item) => `<tr><td>${esc(item.fileName)}</td><td>${esc(item.reason)}</td></tr>`)
+      .join("");
+    const node = $("#bitrate-result");
+    node.innerHTML = `
+      <strong>修复完成：成功 ${report.fixed.length} 集，失败 ${report.failed.length} 集，达标未动 ${report.untouched} 集</strong>
+      ${fixedRows ? `<table><thead><tr><th>已修复</th><th>码率变化</th></tr></thead><tbody>${fixedRows}</tbody></table>` : ""}
+      ${failedRows ? `<table><thead><tr><th>失败</th><th>原因</th></tr></thead><tbody>${failedRows}</tbody></table>` : ""}
+    `;
+    node.classList.remove("hidden");
+    toast("码率修复结束");
+  } catch (error) {
+    toast(String(error), true);
+  } finally {
+    button.textContent = "修复不达标分集";
+    button.disabled = false;
+  }
+}
+
+// ============ 工具箱：执行转码（微调 / 重组） ============
+
+async function executeTranscode() {
+  const button = $("#exec-run");
+  const mode = $("#exec-mode").value;
+  const targetRaw = $("#exec-target").value.trim();
+  button.disabled = true;
+  button.textContent = "正在转码…（全剧重编码，可能需要几分钟）";
+  try {
+    const drama = selectedDrama();
+    const report = await call("transcode_execute", {
+      root: state.root,
+      name: drama.name,
+      request: {
+        mode,
+        targetCount: targetRaw === "" ? null : Number(targetRaw),
+        outputDir: $("#exec-output").value.trim() || null,
+      },
+      ffprobePath: $("#ffprobe-path").value.trim() || null,
+    });
+    const rows = report.items
+      .map(
+        (item) => `<tr>
+          <td>${esc(item.source)}</td>
+          <td>${esc(item.output)}</td>
+          <td>${esc(item.detail)}</td>
+        </tr>`,
+      )
+      .join("");
+    const node = $("#exec-result");
+    node.innerHTML = `
+      <strong>${esc(report.note)}</strong><br />
+      输出目录：${esc(report.outputDir)}
+      ${
+        rows
+          ? `<table><thead><tr><th>来源</th><th>输出</th><th>说明</th></tr></thead><tbody>${rows}</tbody></table>`
+          : ""
+      }
+    `;
+    node.classList.remove("hidden");
+    toast("转码完成");
+  } catch (error) {
+    toast(String(error), true);
+  } finally {
+    button.disabled = false;
+    button.textContent = "执行转码";
+  }
+}
+
+// ============ 运行环境（生成页横幅 + 设置-本机环境） ============
+
+async function checkRuntime(force = false) {
+  if (state.runtime && !force) {
+    renderEnvBanner(state.runtime);
+    renderRuntimeList(state.runtime);
+    return;
+  }
+  try {
+    const status = await call("runtime_status", {
+      ffprobePath: $("#ffprobe-path").value.trim() || null,
+    });
+    state.runtime = status;
+    renderEnvBanner(status);
+    renderRuntimeList(status);
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+function renderEnvBanner(status) {
+  const tools = [status.ffmpeg, status.ffprobe];
+  const missing = tools.filter((tool) => !tool.found);
+  const node = $("#env-banner");
+  node.classList.remove("hidden", "ok", "warn", "error");
+  if (!missing.length) {
+    node.classList.add("ok");
+    node.innerHTML = `运行环境就绪：ffmpeg <code>${esc(
+      status.ffmpeg.displayVersion ?? status.ffmpeg.version ?? "",
+    )}</code> · ffprobe <code>${esc(
+      status.ffprobe.displayVersion ?? status.ffprobe.version ?? "",
+    )}</code>`;
+  } else {
+    node.classList.add("error");
+    node.innerHTML = `运行环境未就绪：缺少 ${esc(
+      missing.map((tool) => tool.name).join("、"),
+    )}。请安装 ffmpeg（含 ffprobe）并确保在 PATH 中，或在「生成报审包」里填写 ffprobe 路径。`;
+  }
+}
+
+function renderRuntimeList(status) {
+  const rows = [status.ffmpeg, status.ffprobe, status.python]
+    .map((tool) => {
+      const stateClass = tool.found ? (tool.ok ? "pass" : "warn") : "fail";
+      return `<tr>
+        <td>${esc(tool.name)}</td>
+        <td class="status-${stateClass}">${tool.found ? "已找到" : "未找到"}</td>
+        <td>${esc(tool.version ?? tool.detail ?? "")}</td>
+      </tr>`;
+    })
+    .join("");
+  $("#runtime-list").innerHTML = `
+    <table><thead><tr><th>组件</th><th>状态</th><th>版本 / 说明</th></tr></thead><tbody>${rows}</tbody></table>
+  `;
+}
+
+// ============ 关于 ============
+
+async function loadVersion() {
+  try {
+    const version = await window.__TAURI__?.app?.getVersion?.();
+    $("#about-version").textContent = version ?? "未知";
+  } catch {
+    $("#about-version").textContent = "未知";
+  }
+}
+
 $("#browse-root").addEventListener("click", () => browse("#library-root"));
+document.querySelectorAll(".nav-item").forEach((node) => {
+  node.addEventListener("click", () => switchModule(node.dataset.module));
+});
+$("#rename-plan").addEventListener("click", buildRenamePlan);
+$("#rename-apply").addEventListener("click", applyRename);
+$("#bitrate-probe").addEventListener("click", probeBitrate);
+$("#bitrate-fix").addEventListener("click", fixBitrate);
+$("#exec-run").addEventListener("click", executeTranscode);
+$("#runtime-recheck").addEventListener("click", () => checkRuntime(true));
 $("#browse-erase-input").addEventListener("click", async () => {
   try {
     const file = await call("pick_video");
@@ -632,4 +953,6 @@ $("#library-root").addEventListener("keydown", (event) => {
 if (invoke) {
   loadSettings();
   loadPlatformProfiles();
+  loadVersion();
+  checkRuntime();
 }
