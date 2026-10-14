@@ -10,6 +10,8 @@
 
 DramaDossier 是一个本地优先的桌面应用，用于把散落在磁盘上的剧集素材整理成结构化、可人工复核、可提交的报审材料包。项目聚焦“素材扫描 → 媒体探测 → 合规检查 → 材料包生成”的完整链路，不提供网页版，也不会上传用户素材。
 
+> **定位说明**：本项目仅用于技术学习与交流（Rust 领域工程、Tauri 2 桌面应用、本地媒体处理管线），不用于实际报审提交或对外分发。文中的报审格式、平台要求与发布流程都是学习示例，不构成任何合规或法律意见。
+
 ## 目录
 
 - [项目定位](#项目定位)
@@ -18,6 +20,7 @@ DramaDossier 是一个本地优先的桌面应用，用于把散落在磁盘上�
 - [目录结构](#目录结构)
 - [技术栈](#技术栈)
 - [核心模块](#核心模块)
+- [字幕与角标擦除实验](#字幕与角标擦除实验)
 - [数据流](#数据流)
 - [快速开始](#快速开始)
 - [素材目录规范](#素材目录规范)
@@ -49,10 +52,12 @@ DramaDossier 是一个本地优先的桌面应用，用于把散落在磁盘上�
 - **集号识别**：支持 `第01集`、`E01`、`01.mp4` 等常见命名，并按集号排序。
 - **媒体探测**：通过外部 `ffprobe` 获取时长、分辨率、编码、帧率和码率。
 - **材料检查**：区分 `pass` / `warn` / `fail` / `pending`，避免把人工判断伪装成自动结论。
+- **规则可配置**：检查阈值可在界面覆盖，并与 ffprobe 路径、输出目录一起持久化到本机配置文件。
 - **报审包生成**：输出剧集信息、封面海报、分集清单、成本表、权属声明和 `manifest.json`。
 - **桌面应用**：基于 Tauri 2 构建 Windows NSIS 安装包与 macOS `.app` / `.dmg`。
 - **隐私优先**：素材、报告和生成结果都保留在本地文件系统。
 - **合规边界明确**：不伪造签名、印章、时间戳或权属证明。
+- **字幕与角标擦除实验（学习用）**：独立的 `dossier-inpaint` 管线，用 DBNet 定位字幕、时序模型（E2FGVI）重建像素；同一管线也可固定方形 ROI 擦除**自有素材**的角标/水印（小 mask 场景精度最高）。见 [硬字幕擦除](docs/SUBTITLE_REMOVAL.md) 与 [角标 / 水印擦除](docs/WATERMARK_REMOVAL.md)。
 
 ## 产品界面
 
@@ -105,13 +110,22 @@ DramaDossier 是一个本地优先的桌面应用，用于把散落在磁盘上�
 ```text
 .
 ├── crates/
-│   └── dossier-core/            # 纯 Rust 领域核心
+│   ├── dossier-core/            # 纯 Rust 领域核心
+│   │   └── src/
+│   │       ├── scanner.rs       # 目录扫描与集号解析
+│   │       ├── probe.rs         # ffprobe 调用与 JSON 解析
+│   │       ├── checklist.rs     # 报审材料检查规则
+│   │       ├── package.rs       # 报审包生成与 manifest
+│   │       └── types.rs         # 共享领域模型
+│   └── dossier-inpaint/         # 字幕 / 角标擦除管线（学习用原型）
 │       └── src/
-│           ├── scanner.rs       # 目录扫描与集号解析
-│           ├── probe.rs         # ffprobe 调用与 JSON 解析
-│           ├── checklist.rs     # 报审材料检查规则
-│           ├── package.rs       # 报审包生成与 manifest
-│           └── types.rs         # 共享领域模型
+│           ├── probe.rs         # ffprobe 解析
+│           ├── frames.rs        # bgr24 rawvideo 编解码
+│           ├── mask.rs          # 掩码、膨胀、羽化、合成
+│           ├── patch.rs         # ROI 裁剪与回贴
+│           ├── detect.rs        # DBNet 检测后端与跨帧聚合
+│           ├── inpaint.rs       # E2FGVI / 基线修复后端
+│           └── pipeline.rs      # 两遍管线
 ├── src/                         # Tauri WebView 前端
 │   ├── index.html
 │   ├── main.js
@@ -121,10 +135,18 @@ DramaDossier 是一个本地优先的桌面应用，用于把散落在磁盘上�
 │   ├── tauri.conf.json          # 窗口、bundle 和打包配置
 │   ├── capabilities/            # Tauri capability 配置
 │   └── icons/                   # Windows / macOS 图标
+├── tools/
+│   └── model_worker/            # 模型 worker（DBNet / E2FGVI）
+│       ├── worker.py            # 入口：读请求 → 跑模型 → 写产物
+│       ├── dbnet.py             # DBNet ONNX 推理与后处理
+│       ├── inpaint_backends.py  # E2FGVI 适配层与基线
+│       └── fetch_models.sh      # 模型获取（权重不入库）
 ├── docs/
 │   ├── BUILD.md                 # 构建与发布说明
 │   ├── DEVELOPMENT.md           # 开发规范与模块边界
-│   └── MATERIAL_SPEC.md         # 素材与报审包数据规格
+│   ├── MATERIAL_SPEC.md         # 素材与报审包数据规格
+│   ├── SUBTITLE_REMOVAL.md      # 硬字幕擦除原理、协议与实测
+│   └── WATERMARK_REMOVAL.md     # 角标 / 水印擦除参数、编码策略与实测
 └── .github/workflows/           # CI 和桌面包构建
 ```
 
@@ -248,7 +270,9 @@ manifest 是本地完整性清单，不是官方审核回执，也不能替代�
 |---|---|
 | `pick_folder` | 打开系统文件夹选择器 |
 | `scan_library` | 扫描素材根目录下的所有剧目 |
-| `analyze_drama` | 探测指定剧目并返回检查报告 |
+| `load_app_settings` | 读取本机配置文件中的检查规则、ffprobe 路径与输出目录 |
+| `save_app_settings` | 校验并写入本机配置文件 |
+| `analyze_drama` | 探测指定剧目，按传入或默认检查规则返回检查报告 |
 | `generate_package` | 重新扫描、探测并生成报审包 |
 
 Rust command 使用 snake_case，JavaScript 调用时使用 camelCase 参数。命令层返回中文可读错误，前端只做展示和用户输入适配。
@@ -259,6 +283,40 @@ Rust command 使用 snake_case，JavaScript 调用时使用 camelCase 参数。�
 - 使用原生 HTML/CSS/JavaScript；
 - 通过 `window.__TAURI__.core.invoke` 调用命令；
 - 页面 CSP 与 Tauri security 配置保持本地资源边界。
+
+## 字幕与角标擦除实验
+
+这是与报审材料链路**相互独立**的学习原型：`crates/dossier-inpaint`（Rust 管线）
++ `tools/model_worker`（Python 模型 worker），命令行运行，不接入桌面 UI。
+
+- **思路**：两遍处理。第一遍抽帧用 **DBNet** 定位字幕区域，跨帧聚合出稳定的 ROI；
+  第二遍按片段裁剪 ROI，生成掩码后用 **E2FGVI** 做时序视频修复，再羽化回贴。
+- **角标 / 水印**：同一管线，跳过检测、直接用紧贴角标的 `--roi` 定掩码、`--context` 给 E2FGVI
+  留接近方形的上下文窗口（小 mask 场景精度最高）。掩码规则是 `--dilate ≥ --feather`；
+  参数表与实测见 [角标 / 水印擦除](docs/WATERMARK_REMOVAL.md)。
+- **边界**：只改掩码覆盖的像素（有逐字节回归测试守住），音轨直接 copy 不重编码；
+  只处理**自有素材**，不做 DRM 绕过，不处理他人作品的版权标识。
+- **编码**：`--intermediate delivery` 直接出片；`lossless` 先落 FFV1 无损母版，
+  之后换 CRF / preset / pix-fmt 重出片不必重跑最贵的 inpaint 步骤。
+- **现实**：aarch64 / 无 GPU 的机器上 DBNet 可用，E2FGVI 需要 GPU 机器；
+  当前仍提供一个「列填充」基线后端，用来在没有模型时把整条链路跑通。
+
+```bash
+# 不需要任何模型即可跑通链路（固定区域 + 本地基线）
+cargo run -p dossier-inpaint -- \
+  --input in.mp4 --output out.mp4 --roi 120,300,400,40 \
+  --detector fixed --inpainter column
+
+# 完整方案（DBNet + E2FGVI）
+tools/model_worker/fetch_models.sh detect
+cargo run -p dossier-inpaint -- \
+  --input in.mp4 --output out.mp4 \
+  --detector worker --inpainter worker \
+  --worker-program python3 --worker-args tools/model_worker/worker.py
+```
+
+原理、交换机协议、实测数据与已知局限见 [docs/SUBTITLE_REMOVAL.md](docs/SUBTITLE_REMOVAL.md)
+与 [docs/WATERMARK_REMOVAL.md](docs/WATERMARK_REMOVAL.md)。
 
 ## 数据流
 
@@ -537,9 +595,9 @@ DramaDossier 通过外部 `ffprobe` 读取媒体信息，不重新分发 FFmpeg�
 
 DramaDossier 只做真实材料的整理、格式化和完整性提示：
 
-- 不绕过版权保护；
+- 不绕过版权保护或 DRM；
 - 不识别或清洗盗版素材；
-- 不去除水印；
+- 不去除他人作品的版权标识、水印或台标，也不把擦除结果用于对外分发；仅允许清理**自有素材**的角标/台标，见 [docs/WATERMARK_REMOVAL.md](docs/WATERMARK_REMOVAL.md)；
 - 不伪造公章、签名或可信时间戳；
 - 不生成虚假投资或成本数据；
 - 不代替用户确认著作权或授权状态。
@@ -555,7 +613,11 @@ DramaDossier 只做真实材料的整理、格式化和完整性提示：
 - [ ] 转码建议与批量规范化
 - [ ] 剪映草稿导入 / 导出
 - [ ] 平台材料要求知识库
-- [ ] 检查规则自定义配置
+- [x] 检查规则自定义配置
+- [x] 硬字幕擦除原型（DBNet 检测 + 时序修复管线）
+- [x] 角标 / 水印擦除原型（E2FGVI 光流引导 + 无损中间态与两段式编码）
+- [ ] 擦除管线：第二遍只在 ROI 内检测（约 10x 提速）
+- [ ] 擦除管线：worker 常驻以消除每帧进程启动开销
 - [ ] 报审包差异对比
 - [ ] macOS 签名与公证示例
 - [ ] 应用内更新通道

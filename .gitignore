@@ -2,6 +2,10 @@
 node_modules/
 dist/
 
+# Python
+__pycache__/
+*.py[cod]
+
 # Rust
 target/
 
@@ -15,3 +19,9 @@ Thumbs.db
 # 本地环境
 .env
 .env.*
+
+# 模型权重（体积大、许可证独立，一律不入库）
+tools/model_worker/models/
+*.onnx
+*.pth
+*.pt

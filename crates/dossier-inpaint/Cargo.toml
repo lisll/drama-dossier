@@ -1,0 +1,12 @@
+[package]
+name = "dossier-inpaint"
+version = "0.1.0"
+edition = "2021"
+description = "Hard-subtitle removal pipeline for drama-dossier (剧备): ROI masks, ffmpeg rawvideo I/O, and pluggable text-detection / inpainting backends."
+license = "MIT"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"

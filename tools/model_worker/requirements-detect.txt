@@ -1,0 +1,4 @@
+# DBNet 文本检测（CPU 可用；本机 aarch64 已实测可行）
+# onnxruntime 官方提供 manylinux2014_aarch64 wheel，无需 CUDA。
+onnxruntime>=1.16
+numpy>=1.21

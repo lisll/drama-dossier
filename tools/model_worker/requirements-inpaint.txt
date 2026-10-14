@@ -1,0 +1,12 @@
+# E2FGVI 时序视频修复
+#
+# 注意：官方 E2FGVI 依赖 PyTorch。aarch64 Linux 没有官方 torch wheel，
+# 在没有 NVIDIA GPU（JetPack/CUDA 或 ROCm）的机器上基本装不上。
+# 因此这条路径需要一台带 GPU 的 x86_64 机器，或自行解决 aarch64 的 torch 构建。
+torch>=1.10
+torchvision>=0.11
+numpy>=1.21
+
+# E2FGVI 官方仓库（模型定义）：
+#   https://github.com/mc-e/Enhancing-Video-Inpainting
+# 权重不在本仓库内分发，见 fetch_models.sh 与 docs/SUBTITLE_REMOVAL.md。
