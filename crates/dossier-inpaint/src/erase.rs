@@ -530,8 +530,12 @@ mod tests {
 
     #[test]
     fn run_plan_reports_exec_error_for_a_failing_command() {
+        // 用 PATH 里的 `sh` 而不是绝对路径：CI 的 Windows runner 没有盘符根下的
+        // /bin/sh，但 Git Bash 提供了 sh.exe（detect.rs / inpaint.rs 的 shell 桩
+        // 测试同款做法，已在三平台通过）。测试意图是「退出码 3 → NeedsReview」，
+        // 不依赖具体某个 shell。
         let plan = ErasePlan {
-            program: PathBuf::from("/bin/sh"),
+            program: PathBuf::from("sh"),
             args: vec!["-c".into(), "exit 3".into()],
             command_line: String::new(),
             report_path: PathBuf::from("/tmp/does-not-exist-report.json"),
