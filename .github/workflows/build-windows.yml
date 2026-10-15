@@ -1,6 +1,7 @@
 # Windows 安装包构建：在 GitHub 的 windows-latest 云端编译（Tauri 不支持从 macOS
-# 交叉编译 Windows 包，本地 Mac 只能出 DMG）。手动触发，或推送 v* 标签时自动构建。
-# 产物在 Actions 运行页底部 Artifacts 下载：DramaDossier_x.y.z_x64-setup.exe（NSIS 安装器）。
+# 交叉编译 Windows 包，本地 Mac 只能出 DMG）。手动触发，或推送 v* / app-v* 标签时自动构建
+# （仓库的版本标签惯例是 app-v*）。产物在 Actions 运行页底部 Artifacts 下载：
+# DramaDossier_x.y.z_x64-setup.exe（NSIS 安装器）。
 name: Build Windows
 
 on:
@@ -8,6 +9,7 @@ on:
   push:
     tags:
       - "v*"
+      - "app-v*"
 
 jobs:
   build:
