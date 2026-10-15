@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from drama_cloud.commerce import codes, security
-from drama_cloud.commerce.api import SEND_CODE_PER_EMAIL
+from drama_cloud.commerce.auth_routes import SEND_CODE_PER_EMAIL
 
 from .conftest import CODE_SECRET
 

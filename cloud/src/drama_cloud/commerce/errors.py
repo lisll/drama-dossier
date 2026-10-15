@@ -10,13 +10,22 @@ from typing import Optional
 
 
 class CommerceError(Exception):
-    def __init__(self, status: int, code: str, message: str, retry_after: Optional[int] = None):
+    def __init__(
+        self,
+        status: int,
+        code: str,
+        message: str,
+        retry_after: Optional[int] = None,
+        extra: Optional[dict] = None,
+    ):
         super().__init__(message)
         self.status = status
         self.code = code
         self.message = message
         #: 只有 429 才带：客户端多少秒后可以重试（写进 Retry-After 响应头）。
         self.retry_after = retry_after
+        #: 附加在响应体里的字段，例如设备名额满了时带上已绑定的设备，方便客户端让用户选一台解绑。
+        self.extra = extra or {}
 
 
 def unauthorized(message: str = "登录已失效，请重新登录") -> CommerceError:

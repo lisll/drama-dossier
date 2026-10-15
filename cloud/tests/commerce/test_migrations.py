@@ -9,13 +9,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 from drama_cloud.commerce.api import create_app
-from drama_cloud.commerce.db import MigrationError, connect, migrate, pending
+from drama_cloud.commerce.db import MigrationError, connect, discover, migrate, pending
 
 from .conftest import FAST_HASHER, MemoryMailer
 
 
 def test_migrate_is_idempotent(scratch_dsn):
-    assert migrate(scratch_dsn) == ["0001_accounts.sql"]
+    names = [item.name for item in discover()]
+    assert names[:2] == ["0001_accounts.sql", "0002_licensing.sql"]
+    assert migrate(scratch_dsn) == names
     assert migrate(scratch_dsn) == []
     with connect(scratch_dsn) as conn:
         tables = {
@@ -24,7 +26,36 @@ def test_migrate_is_idempotent(scratch_dsn):
         }
         assert pending(conn) == []
     assert {"users", "email_codes", "sessions", "access_tokens", "refresh_tokens", "rate_limits",
-            "audit_log", "schema_migrations"} <= tables
+            "audit_log", "schema_migrations", "card_batches", "cards", "entitlements", "devices"} <= tables
+
+
+def test_licensing_schema_backstops(pg):
+    """应用层之外，表结构本身也挡住几类坏数据。"""
+    user = pg.execute(
+        "INSERT INTO users (email, password_hash, terms_version, terms_accepted_at)"
+        " VALUES ('c@example.com', 'x', 'v', now()) RETURNING id"
+    ).fetchone()["id"]
+    device = "f" * 64
+    insert = ("INSERT INTO devices (user_id, device_id, name, platform, app_version)"
+              " VALUES (%s, %s, 'n', 'linux', '1.0')")
+    pg.execute(insert, (user, device))
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        pg.execute(insert, (user, device))  # 同一台电脑不能有两条有效绑定
+    pg.execute("UPDATE devices SET unbound_at = now(), unbind_reason = 'user'")
+    pg.execute(insert, (user, device))  # 解绑以后可以重新绑定，历史行保留
+    assert pg.execute("SELECT count(*) AS n FROM devices").fetchone()["n"] == 2
+    bad_statements = [
+        (insert, (user, "F" * 64)),
+        (insert, (user, "f" * 63)),
+        ("UPDATE devices SET unbound_at = now() WHERE unbound_at IS NULL", None),  # 解绑必须写原因
+        ("INSERT INTO entitlements (user_id, kind) VALUES (%s, 'timed')", (user,)),
+        ("INSERT INTO entitlements (user_id, kind, expires_at) VALUES (%s, 'lifetime', now())", (user,)),
+        ("INSERT INTO card_batches (name, kind, days, created_by) VALUES ('b', 'lifetime', 30, 't')", None),
+        ("INSERT INTO card_batches (name, kind, created_by) VALUES ('b', 'timed', 't')", None),
+    ]
+    for statement, params in bad_statements:
+        with pytest.raises(psycopg.errors.CheckViolation):
+            pg.execute(statement, params)
 
 
 def test_service_refuses_to_start_before_migrations(scratch_dsn, commerce_settings):

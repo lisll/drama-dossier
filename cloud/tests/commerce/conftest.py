@@ -8,12 +8,14 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 import re
 import secrets
+import threading
 import time
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 import psycopg
 import pytest
@@ -22,16 +24,21 @@ from fastapi.testclient import TestClient
 from psycopg import sql
 from psycopg.conninfo import make_conninfo
 
+from drama_cloud.commerce import cards
 from drama_cloud.commerce.api import create_app
 from drama_cloud.commerce.config import CommerceSettings, SmtpSettings
 from drama_cloud.commerce.db import migrate, open_pool
+from drama_cloud.commerce.license_token import Signer, generate_key_file
 from drama_cloud.commerce.mailer import MailError
 
 TEST_DSN_ENV = "COMMERCE_TEST_DSN"
 CODE_SECRET = "test-code-secret-0123456789abcdef-xyz"
 #: 测试用的低开销参数，只为跑得快；生产用 argon2-cffi 的默认参数。
 FAST_HASHER = PasswordHasher(time_cost=1, memory_cost=8, parallelism=1)
-TABLES = ("audit_log", "rate_limits", "refresh_tokens", "access_tokens", "sessions", "email_codes", "users")
+TABLES = (
+    "audit_log", "rate_limits", "refresh_tokens", "access_tokens", "sessions", "email_codes",
+    "devices", "entitlements", "cards", "card_batches", "users",
+)
 _CODE_IN_BODY = re.compile(r"验证码是：([0-9]{6})")
 
 
@@ -76,7 +83,8 @@ def scratch_dsn():
 
 @pytest.fixture(scope="session")
 def pool(database_dsn):
-    pool = open_pool(database_dsn, min_size=1, max_size=4)
+    # 并发测试里会有几个请求同时占着连接等锁，连接池要留够余量。
+    pool = open_pool(database_dsn, min_size=1, max_size=8)
     yield pool
     pool.close()
 
@@ -113,11 +121,25 @@ def mailer():
 
 
 @pytest.fixture(scope="session")
-def commerce_settings(database_dsn):
+def license_key_file(tmp_path_factory):
+    """测试会话专用的授权签名私钥（每次现生成，不进仓库）。"""
+    path = tmp_path_factory.mktemp("license") / "license-ed25519.pem"
+    generate_key_file(path)
+    return str(path)
+
+
+@pytest.fixture(scope="session")
+def signer(license_key_file):
+    return Signer.from_pem_file(license_key_file)
+
+
+@pytest.fixture(scope="session")
+def commerce_settings(database_dsn, license_key_file):
     return CommerceSettings(
         dsn=database_dsn,
         code_secret=CODE_SECRET,
         smtp=SmtpSettings(host="127.0.0.1", port=1025, security="plain", sender="no-reply@drama.test"),
+        license_key_file=license_key_file,
     )
 
 
@@ -158,3 +180,61 @@ def fresh_window(pg):
             time.sleep(float(left) + 0.5)
 
     return _wait
+
+
+# ---------- 卡密、设备、并发 ----------
+
+
+def device_id(label: str) -> str:
+    """测试用机器码：64 位小写十六进制，同一个 label 永远得到同一个值。"""
+    return hashlib.sha256(label.encode("utf-8")).hexdigest()
+
+
+def activate(client, token: str, device: str, **overrides):
+    body = {"device_id": device, "name": "测试电脑", "platform": "windows", "app_version": "0.3.0"}
+    body.update(overrides)
+    return client.post("/api/v1/license/activate", json=body, headers=auth(token))
+
+
+def new_cards(pg, count: int = 1, days: Optional[int] = 30, name: str = "测试批次") -> List[str]:
+    """直接在库里生成一批卡密，返回明文（真实环境只能从导出的 CSV 拿到明文）。"""
+    codes = [cards.generate_code() for _ in range(count)]
+    cards.create_batch(pg, name=name, days=days, codes=codes, operator="test")
+    return codes
+
+
+@contextlib.contextmanager
+def rival_lock(database_dsn: str, pg, lock_sql: str, params, waiting_fragment: str, waiters: int):
+    """在另一个连接里锁住一行，等 waiters 个请求都卡在含 waiting_fragment 的语句上，再提交放行。
+
+    用来把「同时」变成确定的事：几个请求一定是在同一把锁前排队，而不是碰巧先后到达。
+    yield 出来的列表非空，说明确实等到了；为空说明竞争场景没有构造出来。
+    """
+    rival = psycopg.connect(database_dsn)  # 不开 autocommit：锁一直占着，直到提交
+    rival.execute(lock_sql, params)
+    blocked: List[bool] = []
+
+    def release_once_blocked():
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                waiting = pg.execute(
+                    "SELECT count(*) AS n FROM pg_stat_activity"
+                    " WHERE datname = current_database() AND wait_event_type = 'Lock'"
+                    "   AND pid <> pg_backend_pid() AND position(%s in query) > 0",
+                    (waiting_fragment,),
+                ).fetchone()["n"]
+                if waiting >= waiters:
+                    blocked.append(True)
+                    return
+                time.sleep(0.02)
+        finally:
+            rival.commit()
+
+    watcher = threading.Thread(target=release_once_blocked)
+    watcher.start()
+    try:
+        yield blocked
+    finally:
+        watcher.join()
+        rival.close()

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import re
-from typing import Annotated, Literal
+import unicodedata
+from typing import Annotated, Literal, Optional
 
 from pydantic import AfterValidator, StrictBool, field_validator
 
 from ..base import StrictModel
+from . import cards
 
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _CODE = re.compile(r"^[0-9]{6}$")
@@ -92,3 +94,60 @@ class ResetPasswordRequest(StrictModel):
 class ChangePasswordRequest(StrictModel):
     current_password: AnyPassword
     new_password: NewPassword
+
+
+# ---------- 卡密与授权 ----------
+
+#: 机器码：桌面端算出的 SHA-256 摘要，64 位小写十六进制。只认这一种写法，免得同一台电脑被当成两台。
+_DEVICE_ID = re.compile(r"[0-9a-f]{64}")
+_APP_VERSION = re.compile(r"[0-9][0-9A-Za-z.+-]{0,31}")
+
+
+def _card_code(value: str) -> str:
+    code = cards.normalize(value) if len(value) <= 64 else None
+    if code is None:
+        raise ValueError(cards.FORMAT_MESSAGE)
+    return code
+
+
+def _device_id(value: str) -> str:
+    if not _DEVICE_ID.fullmatch(value):
+        raise ValueError("机器码格式不正确")
+    return value
+
+
+def _device_name(value: str) -> str:
+    value = value.strip()
+    # 设备名会显示在设备列表里，不接受控制字符和零宽字符之类看不见的字符。
+    # 全角空格、不换行空格这类看得见的空白（Unicode Zs 类）要放行：macOS 的电脑名可以含这些字符，
+    # 而 str.isprintable() 只放行半角空格。
+    visible = all(char.isprintable() or unicodedata.category(char) == "Zs" for char in value)
+    if not 1 <= len(value) <= 64 or not visible:
+        raise ValueError("设备名称要在 1 到 64 个字符之间，且不能含不可见字符")
+    return value
+
+
+def _app_version(value: str) -> str:
+    if not _APP_VERSION.fullmatch(value):
+        raise ValueError("版本号格式不正确")
+    return value
+
+
+DeviceId = Annotated[str, AfterValidator(_device_id)]
+AppVersion = Annotated[str, AfterValidator(_app_version)]
+
+
+class RedeemRequest(StrictModel):
+    code: Annotated[str, AfterValidator(_card_code)]
+
+
+class ActivateRequest(StrictModel):
+    device_id: DeviceId
+    name: Annotated[str, AfterValidator(_device_name)]
+    platform: Literal["windows", "macos", "linux"]
+    app_version: AppVersion
+
+
+class LicenseRefreshRequest(StrictModel):
+    device_id: DeviceId
+    app_version: Optional[AppVersion] = None

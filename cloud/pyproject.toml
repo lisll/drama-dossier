@@ -13,10 +13,12 @@ dependencies = [
     "pydantic>=2.5",
     "jsonschema>=4.20",
     "python-multipart>=0.0.9",
-    # 账号与授权服务（drama_cloud.commerce）：PostgreSQL 驱动与连接池、argon2id 密码哈希
+    # 账号与授权服务（drama_cloud.commerce）：PostgreSQL 驱动与连接池、argon2id 密码哈希、
+    # Ed25519 授权凭证签名
     "psycopg[binary]==3.3.6",
     "psycopg-pool==3.3.3",
     "argon2-cffi==25.1.0",
+    "cryptography==50.0.2",
 ]
 
 [project.optional-dependencies]

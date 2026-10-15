@@ -36,6 +36,8 @@ class CommerceSettings:
     dsn: str = field(repr=False)
     code_secret: str = field(repr=False)
     smtp: SmtpSettings
+    #: 授权签名私钥（Ed25519 PEM）的文件路径。私钥本身不进环境变量，也不进日志。
+    license_key_file: str
     product_name: str = "剧备 DramaDossier"
     terms_version: str = "2026-10-draft"
     #: 前面有几层可信的反向代理。0 表示直接面向客户端，不读 X-Forwarded-For。
@@ -44,6 +46,15 @@ class CommerceSettings:
     pool_max_size: int = 10
     #: 同时进行的密码哈希上限。默认参数下每次哈希占 64 MiB 内存，不设上限时并发登录能把内存撑爆。
     hash_concurrency: int = 4
+    #: 每个账号同时绑定的电脑数。
+    device_limit: int = 1
+    #: 解绑（踢设备）次数上限：每 unbind_window_days 天最多 unbind_limit 次，防止一个账号轮流给多台电脑用。
+    unbind_limit: int = 3
+    unbind_window_days: int = 30
+    #: 授权凭证有效期，也就是断网后还能用多久（离线宽限期）。
+    license_ttl_hours: int = 72
+    #: 联网时桌面端每隔多久刷新一次凭证，让断网时剩下的宽限期接近完整的 license_ttl_hours。
+    license_refresh_hours: int = 1
 
 
 def _get(env: Mapping[str, str], name: str) -> str:
@@ -105,14 +116,29 @@ def load_settings(env: Optional[Mapping[str, str]] = None) -> CommerceSettings:
         username=_get(env, "SMTP_USERNAME") or None,
         password=env.get(ENV_PREFIX + "SMTP_PASSWORD") or None,
     )
+    license_key_file = _get(env, "LICENSE_KEY_FILE")
+    if not license_key_file:
+        raise ConfigError(
+            f"缺少 {ENV_PREFIX}LICENSE_KEY_FILE（授权签名私钥的文件路径，可以用 drama-commerce keygen 生成）"
+        )
+    ttl_hours = _int(env, "LICENSE_TTL_HOURS", 72, 1, 720)
+    refresh_hours = _int(env, "LICENSE_REFRESH_HOURS", 1, 1, 720)
+    if refresh_hours >= ttl_hours:
+        raise ConfigError(f"{ENV_PREFIX}LICENSE_REFRESH_HOURS 必须小于 {ENV_PREFIX}LICENSE_TTL_HOURS")
     return CommerceSettings(
         dsn=dsn,
         code_secret=code_secret,
         smtp=smtp,
+        license_key_file=license_key_file,
         product_name=_get(env, "PRODUCT_NAME") or CommerceSettings.product_name,
         terms_version=_get(env, "TERMS_VERSION") or CommerceSettings.terms_version,
         trusted_proxies=_int(env, "TRUSTED_PROXIES", 0, 0, 5),
         pool_min_size=_int(env, "POOL_MIN_SIZE", 1, 1, 50),
         pool_max_size=_int(env, "POOL_MAX_SIZE", 10, 1, 200),
         hash_concurrency=_int(env, "HASH_CONCURRENCY", 4, 1, 64),
+        device_limit=_int(env, "DEVICE_LIMIT", 1, 1, 20),
+        unbind_limit=_int(env, "UNBIND_LIMIT", 3, 1, 100),
+        unbind_window_days=_int(env, "UNBIND_WINDOW_DAYS", 30, 1, 365),
+        license_ttl_hours=ttl_hours,
+        license_refresh_hours=refresh_hours,
     )

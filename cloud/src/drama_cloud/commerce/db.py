@@ -17,6 +17,8 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
+from .errors import unauthorized
+
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 _MIGRATION_NAME = re.compile(r"^(\d{4})_[a-z0-9_]+\.sql$")
 #: 迁移用的会话级咨询锁，防止两个进程同时迁移。取值是任意固定的整数。
@@ -120,6 +122,17 @@ def pending(conn, directory: Path = MIGRATIONS_DIR) -> List[str]:
     if row["ready"]:
         applied = {item["version"] for item in conn.execute("SELECT version FROM schema_migrations")}
     return [item.name for item in migrations if item.version not in applied]
+
+
+def lock_user(conn, user_id: str) -> None:
+    """在当前事务里锁住用户行：同一个用户的兑换、绑定、解绑排队执行，名额和次数才数得准。
+
+    用 FOR NO KEY UPDATE 而不是 FOR UPDATE：登录时插入会话只需要 KEY SHARE 锁，两者不冲突，
+    兑换卡密不会挡住同一账号在别处登录。
+    """
+    row = conn.execute("SELECT id FROM users WHERE id = %s::uuid FOR NO KEY UPDATE", (user_id,)).fetchone()
+    if row is None:
+        raise unauthorized()
 
 
 def audit(conn, actor: str, action: str, subject: str = "", detail: Optional[dict] = None) -> None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import psycopg
 from argon2 import PasswordHasher
 
-from drama_cloud.commerce.api import LOGIN_PER_EMAIL
+from drama_cloud.commerce.auth_routes import LOGIN_PER_EMAIL
 
 from .conftest import FAST_HASHER, auth
 

@@ -1,4 +1,4 @@
-"""不需要数据库的单元测试：配置、令牌与验证码摘要、请求校验、SMTP 发信、迁移文件发现。"""
+"""不需要数据库的单元测试：配置、令牌与验证码摘要、请求校验、SMTP 发信、迁移文件发现、卡密格式。"""
 
 from __future__ import annotations
 
@@ -12,11 +12,19 @@ from email import message_from_string
 import pytest
 from pydantic import ValidationError
 
-from drama_cloud.commerce import db, security
+from drama_cloud.commerce import cards, db, security
 from drama_cloud.commerce.accounts import AccountService
+from drama_cloud.commerce.api import create_app
 from drama_cloud.commerce.config import ConfigError, SmtpSettings, load_settings
 from drama_cloud.commerce.mailer import MailError, SmtpMailer
-from drama_cloud.commerce.schemas import LoginRequest, RegisterRequest, SendCodeRequest
+from drama_cloud.commerce.schemas import (
+    ActivateRequest,
+    LicenseRefreshRequest,
+    LoginRequest,
+    RedeemRequest,
+    RegisterRequest,
+    SendCodeRequest,
+)
 
 from .conftest import MemoryMailer
 
@@ -25,6 +33,7 @@ BASE_ENV = {
     "DRAMA_COMMERCE_DSN": "postgresql://u:p@db.internal/x",
     "DRAMA_COMMERCE_CODE_SECRET": SECRET,
     "DRAMA_COMMERCE_SMTP_HOST": "smtp.example.com",
+    "DRAMA_COMMERCE_LICENSE_KEY_FILE": "/run/secrets/license.pem",
 }
 
 
@@ -36,6 +45,10 @@ def test_settings_defaults():
     assert settings.smtp.security == "starttls" and settings.smtp.port == 587
     assert settings.smtp.sender == "no-reply@smtp.example.com"
     assert settings.trusted_proxies == 0 and settings.hash_concurrency == 4
+    # 方案定下的授权规则：每账号 1 台、30 天最多解绑 3 次、离线宽限 72 小时。
+    assert (settings.device_limit, settings.unbind_limit, settings.unbind_window_days) == (1, 3, 30)
+    assert (settings.license_ttl_hours, settings.license_refresh_hours) == (72, 1)
+    assert settings.license_key_file == "/run/secrets/license.pem"
     # 密钥和连接串不出现在 repr 里，免得被打进日志。
     text = repr(settings)
     assert SECRET not in text and "u:p@" not in text
@@ -53,6 +66,11 @@ def test_settings_defaults():
         ({"DRAMA_COMMERCE_SMTP_PORT": "70000"}, "SMTP_PORT"),
         ({"DRAMA_COMMERCE_TRUSTED_PROXIES": "9"}, "TRUSTED_PROXIES"),
         ({"DRAMA_COMMERCE_HASH_CONCURRENCY": "0"}, "HASH_CONCURRENCY"),
+        ({"DRAMA_COMMERCE_LICENSE_KEY_FILE": ""}, "LICENSE_KEY_FILE"),
+        ({"DRAMA_COMMERCE_DEVICE_LIMIT": "0"}, "DEVICE_LIMIT"),
+        ({"DRAMA_COMMERCE_UNBIND_LIMIT": "0"}, "UNBIND_LIMIT"),
+        ({"DRAMA_COMMERCE_LICENSE_TTL_HOURS": "0"}, "LICENSE_TTL_HOURS"),
+        ({"DRAMA_COMMERCE_LICENSE_REFRESH_HOURS": "72"}, "必须小于"),
     ],
 )
 def test_settings_reject_bad_config(override, fragment):
@@ -310,3 +328,77 @@ def test_duplicate_migration_version_rejected(tmp_path):
     (tmp_path / "0001_b.sql").write_text("SELECT 2;", encoding="utf-8")
     with pytest.raises(db.MigrationError, match="重复"):
         db.discover(tmp_path)
+
+
+# ---------- 卡密格式与授权请求校验 ----------
+
+
+@pytest.mark.parametrize("raw", [
+    "DD-ABCD-EFGH-JKLM-NPQR", "dd abcd efgh jkLM npqr", "ABCDEFGHJKLMNPQR", "  abcd-efgh-jklm-npqr\n",
+])
+def test_card_code_normalization(raw):
+    assert cards.normalize(raw) == "ABCDEFGHJKLMNPQR"
+
+
+@pytest.mark.parametrize("raw", [
+    "", "ABCDEFGHJKLMNPQ", "ABCDEFGHJKLMNPQRS",
+    "ABCDEFGHJKLMNPQ0", "ABCDEFGHJKLMNPQ1", "ABCDEFGHJKLMNPQI", "ABCDEFGHJKLMNPQO",
+    "ＡBCDEFGHJKLMNPQR",  # 全角字母
+    "XX-ABCD-EFGH-JKLM-NPQR",  # 别家的前缀
+])
+def test_card_code_rejects_bad_input(raw):
+    assert cards.normalize(raw) is None
+
+
+def test_card_code_starting_with_prefix_letters():
+    assert cards.normalize("DDABCDEFGHJKLMNP") == "DDABCDEFGHJKLMNP"
+    assert cards.normalize(cards.display("DDABCDEFGHJKLMNP")) == "DDABCDEFGHJKLMNP"
+
+
+def test_card_digest_format_is_pinned():
+    # 已经卖出去、还没兑换的卡只在库里留着这个摘要：算法一变，这些卡就全部兑换不了。
+    # 期望值用 `printf 'drama-dossier/card/v1\nABCDEFGHJKLMNPQR' | sha256sum` 独立算出。
+    assert cards.digest("ABCDEFGHJKLMNPQR").hex() == (
+        "aa804650b7a8a2fba4229133a4c0b14a14924e19a63bd56b948ba67a182824db"
+    )
+
+
+def test_generated_codes_are_distinct_and_roundtrip():
+    assert len(cards.ALPHABET) == 32 and not set(cards.ALPHABET) & set("01IO")
+    codes = {cards.generate_code() for _ in range(2000)}
+    assert len(codes) == 2000
+    for code in list(codes)[:50]:
+        shown = cards.display(code)
+        assert shown.startswith("DD-") and len(shown) == 22
+        assert cards.normalize(shown) == code
+    assert len(cards.digest(code)) == 32
+
+
+def test_license_requests_validate_strictly():
+    good = "0123456789abcdef" * 4
+    ActivateRequest(device_id=good, name="办公室的电脑", platform="windows", app_version="0.3.0")
+    for bad in [good.upper(), good[:-1], good + "\n", "g" * 64]:
+        with pytest.raises(ValidationError, match="机器码"):
+            ActivateRequest(device_id=bad, name="x", platform="windows", app_version="0.3.0")
+    for name in ["", "   ", "\u3000\u3000", "a\u200bb", "x\ny", "x\ty", "a\u2028b", "\ufeffPC", "n" * 65]:
+        with pytest.raises(ValidationError, match="设备名称"):
+            ActivateRequest(device_id=good, name=name, platform="windows", app_version="0.3.0")
+    # 全角空格、不换行空格是看得见的空白，电脑名里可能有（比如 macOS 的电脑名），要放行。
+    for name in ["办公室\u3000电脑", "Office\u00a0PC", "PC💻"]:
+        assert ActivateRequest(device_id=good, name=name, platform="windows", app_version="0.3.0").name == name
+    with pytest.raises(ValidationError):
+        ActivateRequest(device_id=good, name="x", platform="android", app_version="0.3.0")
+    with pytest.raises(ValidationError, match="版本号"):
+        LicenseRefreshRequest(device_id=good, app_version="v1")
+    assert LicenseRefreshRequest(device_id=good).app_version is None
+    assert RedeemRequest(code="dd-abcd-efgh-jklm-npqr").code == "ABCDEFGHJKLMNPQR"
+    with pytest.raises(ValidationError, match="16 位"):
+        RedeemRequest(code="x" * 10000)
+
+
+def test_service_refuses_to_start_without_signing_key(tmp_path):
+    # 私钥先于连接池检查：这里的数据库地址根本连不上，报的必须是私钥的错。
+    settings = dataclasses.replace(load_settings(BASE_ENV), license_key_file=str(tmp_path / "missing.pem"))
+    with pytest.raises(ConfigError, match="keygen") as caught:
+        create_app(settings, mailer=MemoryMailer())
+    assert SECRET not in str(caught.value) and "u:p@" not in str(caught.value)

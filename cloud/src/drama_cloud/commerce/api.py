@@ -1,7 +1,7 @@
-"""账号服务的 HTTP 接口（FastAPI）。
+"""账号与授权服务的 HTTP 接口（FastAPI）：应用工厂、统一的错误响应、健康检查。
 
-令牌只认 `Authorization: Bearer <访问令牌>` 请求头，不接受网址参数：
-网址会被写进访问日志和浏览器历史，令牌放在网址里就等于公开了。
+路由按业务拆在 auth_routes（账号）和 license_routes（卡密、授权、设备）里。
+令牌只认 `Authorization: Bearer <访问令牌>` 请求头，不接受网址参数（见 deps.require_auth）。
 """
 
 from __future__ import annotations
@@ -12,38 +12,22 @@ from typing import Optional
 
 import psycopg
 from argon2 import PasswordHasher
-from fastapi import Depends, FastAPI, Header, Request, Response
+from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from psycopg_pool import ConnectionPool
 
-from . import ratelimit, security
+from . import auth_routes, license_routes
 from .accounts import AccountService
 from .config import CommerceSettings, load_settings
 from .db import MigrationError, open_pool, pending
-from .errors import CommerceError, unauthorized
+from .deps import get_conn
+from .errors import CommerceError
+from .license_service import LicenseService
+from .license_token import Signer
 from .mailer import Mailer, SmtpMailer
-from .ratelimit import Rule
-from .schemas import (
-    ChangePasswordRequest,
-    LoginRequest,
-    RefreshRequest,
-    RegisterRequest,
-    ResetPasswordRequest,
-    SendCodeRequest,
-)
-from .sessions import AuthContext
 
 log = logging.getLogger(__name__)
-
-# 限流规则（名称、上限、时间窗秒数）。验证码自己还有 60 秒冷却和 5 次上限，这里再按 IP、邮箱各挡一层。
-SEND_CODE_PER_IP = Rule("send_code:ip", 20, 3600)
-SEND_CODE_PER_EMAIL = Rule("send_code:email", 10, 3600)
-REGISTER_PER_IP = Rule("register:ip", 20, 3600)
-LOGIN_PER_IP = Rule("login:ip", 30, 600)
-LOGIN_PER_EMAIL = Rule("login:email", 10, 600)
-RESET_PER_IP = Rule("reset:ip", 20, 3600)
-CHANGE_PASSWORD_PER_USER = Rule("change_password:user", 10, 3600)
 
 _FIELD_MESSAGES = {
     "missing": "缺少这个字段",
@@ -81,6 +65,8 @@ def create_app(
 ) -> FastAPI:
     """应用工厂。测试可以注入连接池、发信器和低开销的密码哈希器。"""
     settings = settings or load_settings()
+    # 先加载签名私钥：私钥有问题就在打开连接池之前报错。
+    signer = Signer.from_pem_file(settings.license_key_file)
     owns_pool = pool is None
     if pool is None:
         pool = open_pool(settings.dsn, settings.pool_min_size, settings.pool_max_size)
@@ -95,7 +81,6 @@ def create_app(
         if owns_pool:
             pool.close()
         raise
-    service = AccountService(settings, mailer or SmtpMailer(settings.smtp), hasher)
 
     @asynccontextmanager
     async def lifespan(_app):
@@ -105,42 +90,19 @@ def create_app(
             if owns_pool:
                 pool.close()
 
-    app = FastAPI(title="剧备账号服务", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="剧备账号与授权服务", version="0.2.0", lifespan=lifespan)
     app.state.settings = settings
-    app.state.service = service
-
-    def get_conn():
-        with pool.connection() as conn:
-            yield conn
-
-    def client_key(request: Request) -> str:
-        host = request.client.host if request.client else "unknown"
-        if settings.trusted_proxies:
-            # 每层可信代理都会在 X-Forwarded-For 末尾追加它看到的来源地址。
-            hops = [part.strip() for part in request.headers.get("x-forwarded-for", "").split(",")]
-            hops = [part for part in hops if part]
-            if len(hops) >= settings.trusted_proxies:
-                host = hops[-settings.trusted_proxies]
-        return security.privacy_key(settings.code_secret, host)
-
-    def email_key(email: str) -> str:
-        return security.privacy_key(settings.code_secret, email)
-
-    def require_auth(authorization: Optional[str] = Header(None), conn=Depends(get_conn)) -> AuthContext:
-        scheme, _, token = (authorization or "").partition(" ")
-        if scheme.lower() != "bearer" or not token.strip():
-            raise unauthorized("需要登录：请在 Authorization 请求头里带上 Bearer 访问令牌")
-        ctx = service.authenticate(conn, token.strip())
-        if ctx is None:
-            raise unauthorized()
-        return ctx
+    app.state.pool = pool
+    app.state.service = AccountService(settings, mailer or SmtpMailer(settings.smtp), hasher)
+    app.state.licenses = LicenseService(settings, signer)
+    log.info("授权签名公钥 kid=%s", signer.kid)
 
     @app.exception_handler(CommerceError)
     async def _commerce_error(_request: Request, error: CommerceError):
         headers = {"Retry-After": str(error.retry_after)} if error.retry_after else None
         return JSONResponse(
             status_code=error.status,
-            content={"error": error.code, "message": error.message},
+            content={**error.extra, "error": error.code, "message": error.message},
             headers=headers,
         )
 
@@ -164,50 +126,6 @@ def create_app(
         conn.execute("SELECT 1")
         return {"ok": True}
 
-    @app.post("/api/v1/auth/codes", status_code=202)
-    def send_code(payload: SendCodeRequest, request: Request, conn=Depends(get_conn)):
-        ratelimit.hit(conn, SEND_CODE_PER_IP, client_key(request))
-        ratelimit.hit(conn, SEND_CODE_PER_EMAIL, email_key(payload.email))
-        return service.send_code(conn, payload.email, payload.purpose)
-
-    @app.post("/api/v1/auth/register", status_code=201)
-    def register(payload: RegisterRequest, request: Request, conn=Depends(get_conn)):
-        ratelimit.hit(conn, REGISTER_PER_IP, client_key(request))
-        return service.register(conn, payload.email, payload.code, payload.password)
-
-    @app.post("/api/v1/auth/login")
-    def login(payload: LoginRequest, request: Request, conn=Depends(get_conn)):
-        ratelimit.hit(conn, LOGIN_PER_IP, client_key(request))
-        ratelimit.hit(conn, LOGIN_PER_EMAIL, email_key(payload.email))
-        return service.login(conn, payload.email, payload.password)
-
-    @app.post("/api/v1/auth/refresh")
-    def refresh(payload: RefreshRequest, conn=Depends(get_conn)):
-        return service.refresh(conn, payload.refresh_token)
-
-    @app.post("/api/v1/auth/logout", status_code=204)
-    def logout(ctx: AuthContext = Depends(require_auth), conn=Depends(get_conn)):
-        service.logout(conn, ctx)
-        return Response(status_code=204)
-
-    @app.post("/api/v1/auth/password/reset", status_code=204)
-    def reset_password(payload: ResetPasswordRequest, request: Request, conn=Depends(get_conn)):
-        ratelimit.hit(conn, RESET_PER_IP, client_key(request))
-        service.reset_password(conn, payload.email, payload.code, payload.new_password)
-        return Response(status_code=204)
-
-    @app.post("/api/v1/auth/password/change", status_code=204)
-    def change_password(
-        payload: ChangePasswordRequest,
-        ctx: AuthContext = Depends(require_auth),
-        conn=Depends(get_conn),
-    ):
-        ratelimit.hit(conn, CHANGE_PASSWORD_PER_USER, ctx.user_id)
-        service.change_password(conn, ctx, payload.current_password, payload.new_password)
-        return Response(status_code=204)
-
-    @app.get("/api/v1/me")
-    def me(ctx: AuthContext = Depends(require_auth), conn=Depends(get_conn)):
-        return service.me(conn, ctx)
-
+    app.include_router(auth_routes.router)
+    app.include_router(license_routes.router)
     return app
