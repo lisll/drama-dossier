@@ -16,7 +16,6 @@
 //! 合规边界：本 crate 不提供、也不应加入任何内容指纹规避、
 //! 版权保护绕过或材料伪造能力。报审包内置于权属声明模板。
 
-pub mod account;
 pub mod checklist;
 pub mod checkpoint;
 pub mod diff;
@@ -34,10 +33,6 @@ pub mod tools;
 pub mod transcode;
 pub mod types;
 
-pub use account::{
-    change_password, generate_salt, hash_password, login, logout, register, status, validate_email,
-    validate_password, AccountError, AccountRecord, AccountStatus, AccountStore,
-};
 pub use checklist::{run_checks, ChecklistReport, ChecklistRules};
 pub use checkpoint::{
     load_checkpoint, save_checkpoint, ArtifactRef, Checkpoint, CheckpointError, StepState,

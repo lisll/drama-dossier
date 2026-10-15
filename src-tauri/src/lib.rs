@@ -262,8 +262,13 @@ fn open_path(path: String) -> Result<(), String> {
 }
 
 pub fn run() {
-    tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![
+    let app = tauri::Builder::default()
+        .setup(|app| {
+            account::init(app.handle());
+            Ok(())
+        })
+        // 闸门套在所有应用命令外面：本地功能要有使用权，生成报审包还要联网（见 account/gate.rs）。
+        .invoke_handler(account::gate(tauri::generate_handler![
             pick_folder,
             scan_library,
             load_app_settings,
@@ -271,11 +276,21 @@ pub fn run() {
             analyze_drama,
             generate_package,
             open_path,
-            account::account_register,
-            account::account_login,
-            account::account_logout,
-            account::account_status,
-            account::account_change_password,
+            account::commands::account_status,
+            account::commands::account_retry,
+            account::commands::account_send_code,
+            account::commands::account_register,
+            account::commands::account_login,
+            account::commands::account_logout,
+            account::commands::account_reset_password,
+            account::commands::account_change_password,
+            account::commands::license_redeem,
+            account::commands::license_refresh,
+            account::commands::device_list,
+            account::commands::device_unbind,
+            account::commands::device_activate,
+            account::commands::account_export,
+            account::commands::account_delete,
             jianying::jianying_detect,
             mount::mount_plan_save,
             mount::mount_plan_load,
@@ -305,7 +320,13 @@ pub fn run() {
             dossier::save_mount_copy,
             dossier::transition_mount_copy_row,
             dossier::preview_mount_copy_publish
-        ])
-        .run(tauri::generate_context!())
-        .expect("failed to run DramaDossier");
+        ]))
+        .build(tauri::generate_context!())
+        .expect("failed to build DramaDossier");
+    app.run(|handle, event| {
+        // 退出前把「见过的最晚时间」写回钥匙串（平时最多每分钟写一次）。
+        if let tauri::RunEvent::Exit = event {
+            handle.state::<account::AccountState>().flush();
+        }
+    });
 }
