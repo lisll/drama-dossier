@@ -34,9 +34,9 @@ impl std::fmt::Display for AccountError {
         let text = match self {
             AccountError::InvalidEmail => "邮箱格式不正确",
             AccountError::WeakPassword => "密码需至少 8 位，且同时包含字母和数字",
-            AccountError::AlreadyRegistered => "该邮箱已注册，请直接登录",
+            AccountError::AlreadyRegistered => "本机已有账号处于登录状态，请先退出登录再注册",
             AccountError::NotRegistered => "尚未注册账号",
-            AccountError::EmailMismatch => "邮箱与注册邮箱不一致",
+            AccountError::EmailMismatch => "邮箱与本机注册的账号不一致（演示版仅支持单个本地账号）",
             AccountError::WrongPassword => "密码不正确",
             AccountError::NotLoggedIn => "尚未登录",
         };
@@ -165,19 +165,22 @@ fn now_iso() -> String {
     format!("{secs}")
 }
 
-/// 注册：校验邮箱 / 密码格式；本地演示版已有账号时拒绝。
-/// 成功后视为已登录（注册即登录，与竞品一致）。
+/// 注册：校验邮箱 / 密码格式；注册成功即视为已登录（与竞品一致）。
+///
+/// 演示版单账号的替换规则：**已登录**时不允许注册新号；**已退出登录**时允许
+/// 用新邮箱覆盖本机旧账号——否则会出现「注册说已注册、登录说不一致」的
+/// 死循环（旧账号邮箱往往已无人记得）。本地演示数据无关紧要，覆盖是安全的。
 pub fn register(
     store: &mut AccountStore,
     email: &str,
     password: &str,
 ) -> Result<AccountStatus, AccountError> {
-    if store.account.is_some() {
-        return Err(AccountError::AlreadyRegistered);
-    }
     let email = email.trim().to_string();
     validate_email(&email)?;
     validate_password(password)?;
+    if store.account.is_some() && store.logged_in {
+        return Err(AccountError::AlreadyRegistered);
+    }
     let salt = generate_salt();
     store.account = Some(AccountRecord {
         email,
@@ -266,6 +269,31 @@ mod tests {
         register(&mut store, "a@b.co", "abc12345").unwrap();
         assert_eq!(
             register(&mut store, "a@b.co", "xyz98765"),
+            Err(AccountError::AlreadyRegistered)
+        );
+    }
+
+    /// 回归：曾出现「注册说已注册、登录说不一致」的死循环——本机留有旧账号时，
+    /// 新邮箱注册被拒、登录又对不上。登出状态下注册应覆盖旧账号。
+    #[test]
+    fn register_after_logout_replaces_stale_account() {
+        let mut store = fresh_store();
+        register(&mut store, "old@b.co", "abc12345").unwrap();
+        logout(&mut store);
+        // 未登录时换新邮箱注册：覆盖旧账号并直接登录。
+        let status = register(&mut store, "new@b.co", "xyz98765").unwrap();
+        assert!(status.logged_in);
+        assert_eq!(status.email.as_deref(), Some("new@b.co"));
+        // 旧密码失效，新账号可用新密码登录。
+        logout(&mut store);
+        assert_eq!(
+            login(&mut store, "new@b.co", "abc12345"),
+            Err(AccountError::WrongPassword)
+        );
+        assert!(login(&mut store, "new@b.co", "xyz98765").is_ok());
+        // 登录状态下仍不允许再注册。
+        assert_eq!(
+            register(&mut store, "third@b.co", "abc12345"),
             Err(AccountError::AlreadyRegistered)
         );
     }
