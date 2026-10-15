@@ -280,7 +280,10 @@ mod tests {
         std::fs::write(p.join("剧A").join("第1集.mp4"), b"x").unwrap();
         std::fs::write(p.join("剧A").join("微调输出").join("第1集.mp4"), b"x").unwrap();
         std::fs::write(
-            p.join("剧A").join("报审包").join("06_分集视频").join("第1集.mp4"),
+            p.join("剧A")
+                .join("报审包")
+                .join("06_分集视频")
+                .join("第1集.mp4"),
             b"x",
         )
         .unwrap();

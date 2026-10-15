@@ -238,7 +238,12 @@ pub fn build_plan(request: &EraseRequest, tool: &Path) -> Result<ErasePlan, Stri
     }
     // CLI 缺省会从 PATH 找 ffprobe，而 GUI 子进程的 PATH 几乎是空的；
     // 桌面端把应用解析好的 ffprobe 路径显式传进来，行为才与「本机环境就绪」一致。
-    if let Some(ffprobe) = request.ffprobe.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+    if let Some(ffprobe) = request
+        .ffprobe
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
         args.push("--ffprobe".into());
         args.push(ffprobe.to_string());
     }
@@ -560,7 +565,10 @@ mod tests {
             .unwrap()
             .args
             .join(" ");
-        assert!(args.contains("--ffprobe /opt/homebrew/bin/ffprobe"), "{args}");
+        assert!(
+            args.contains("--ffprobe /opt/homebrew/bin/ffprobe"),
+            "{args}"
+        );
 
         // 缺省时不加 --ffprobe，交给 CLI 自己从 PATH 找。
         let args = build_plan(&request(), Path::new("/bin/tool"))

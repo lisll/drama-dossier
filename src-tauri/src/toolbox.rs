@@ -368,9 +368,7 @@ fn run_ffmpeg(program: &Path, args: &[&str]) -> Result<(), String> {
         Err(dossier_runtime::CommandError::Cancelled { .. }) => {
             return Err("ffmpeg 已被停止".into());
         }
-        Err(error) => {
-            return Err(format!("ffmpeg 启动失败（{}）：{error}", program.display()))
-        }
+        Err(error) => return Err(format!("ffmpeg 启动失败（{}）：{error}", program.display())),
     };
     if output.success() {
         return Ok(());
@@ -945,7 +943,11 @@ fn transcode_blocking(
                 cleanup_transcode_output(&output_dir, dir_existed, &produced);
                 crate::logging::log_event(
                     "转码",
-                    format!("已停止：删除输出 {}（{} 个本次产物）", output_dir.display(), produced.len()),
+                    format!(
+                        "已停止：删除输出 {}（{} 个本次产物）",
+                        output_dir.display(),
+                        produced.len()
+                    ),
                 );
                 return Err("已按要求停止转码，正在输出的目录已删除。".into());
             }
@@ -1048,12 +1050,7 @@ pub struct InstallRuntimeReport {
 /// 期间每 0.4 秒轮询一次落盘大小并上报 `install-progress`；
 /// 总大小先用 HEAD 请求探测 content-length，探测不到就只报已下载量。
 #[cfg(target_os = "macos")]
-fn download_file(
-    app: &AppHandle,
-    component: &str,
-    url: &str,
-    target: &Path,
-) -> Result<(), String> {
+fn download_file(app: &AppHandle, component: &str, url: &str, target: &Path) -> Result<(), String> {
     let total = probe_content_length(url);
     emit_install_progress(app, component, "connecting", "连接下载源", total, 0);
     let mut command = std::process::Command::new("/usr/bin/curl");
@@ -1127,14 +1124,10 @@ fn probe_content_length(url: &str) -> Option<u64> {
     if !output.success() {
         return None;
     }
-    output
-        .combined()
-        .lines()
-        .rev()
-        .find_map(|line| {
-            let value = line.strip_prefix("content-length:")?;
-            value.trim().parse::<u64>().ok()
-        })
+    output.combined().lines().rev().find_map(|line| {
+        let value = line.strip_prefix("content-length:")?;
+        value.trim().parse::<u64>().ok()
+    })
 }
 
 /// 安装单个工具：下载 zip → 解压到临时目录 → 授权 → 移到目标位置。

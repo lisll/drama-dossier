@@ -139,7 +139,11 @@ pub fn plan_erase(
     ensure_distinct_io(&request)?;
     request.progress_json = Some(erase_progress_path(&request.output));
     // 预览里的命令必须和真正执行的同一条：ffprobe 也在这一步解析好填进去。
-    request.ffprobe = Some(crate::toolbox::resolve_ffprobe(&app, ffprobe_path.as_deref())?.display().to_string());
+    request.ffprobe = Some(
+        crate::toolbox::resolve_ffprobe(&app, ffprobe_path.as_deref())?
+            .display()
+            .to_string(),
+    );
     let tool = locate(tool_path.as_deref())?;
     build_plan(&request, &tool)
 }
