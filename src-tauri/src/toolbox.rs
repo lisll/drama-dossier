@@ -205,6 +205,7 @@ fn emit_task_progress(app: &AppHandle, task: &str, done: u64, total: u64, label:
 
 /// 一键安装的进度事件：弹窗据此渲染「需要下载 / 已下载 / 组件」和进度条。
 #[derive(Debug, Clone, Serialize)]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[serde(rename_all = "camelCase")]
 pub struct InstallProgress {
     /// 正在处理的组件：ffmpeg / ffprobe。
@@ -218,6 +219,7 @@ pub struct InstallProgress {
     pub downloaded_bytes: u64,
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn emit_install_progress(
     app: &AppHandle,
     component: &str,
@@ -1067,6 +1069,7 @@ pub struct InstallRuntimeReport {
 /// 用系统 curl 下载（macOS / Windows 10+ 均自带，支持重试与断点续传）。
 /// 期间每 0.4 秒轮询一次落盘大小并上报 `install-progress`；
 /// 总大小先用 HEAD 请求探测 content-length，探测不到就只报已下载量。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn download_file(app: &AppHandle, component: &str, url: &str, target: &Path) -> Result<(), String> {
     let total = probe_content_length(url);
     emit_install_progress(app, component, "connecting", "连接下载源", total, 0);
@@ -1130,6 +1133,7 @@ fn download_file(app: &AppHandle, component: &str, url: &str, target: &Path) -> 
 }
 
 /// HEAD 请求探测下载总大小；失败不影响安装，只是进度条没有百分比。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn probe_content_length(url: &str) -> Option<u64> {
     let spec = CommandSpec::new(CURL_PROGRAM)
         .arg("-sIL")
@@ -1213,6 +1217,7 @@ fn find_extracted(dir: &Path, file_name: &str, depth: u8) -> Option<PathBuf> {
 
 /// 安装单个工具：下载 zip → 解压到临时目录 → 授权 → 移到目标位置。
 /// 返回 `Ok(true)` 表示目标已存在、本次跳过。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn install_one(app: &AppHandle, bin_dir: &Path, name: &str, url: &str) -> Result<bool, String> {
     let exe_name = dossier_inpaint::erase::binary_name(name);
     let target = bin_dir.join(&exe_name);
