@@ -9,7 +9,7 @@
 
 | 文档建议 | 实际选型 | 原因 |
 | --- | --- | --- |
-| PostgreSQL | SQLite（WAL + `BEGIN IMMEDIATE`） | 本机无 PG 服务；仓储层隔离，换 PG 只改 `db.py` 与 SQL 方言 |
+| PostgreSQL | 媒体控制面用 SQLite（WAL + `BEGIN IMMEDIATE`） | 仓储层隔离，换 PG 只改 `db.py` 与 SQL 方言。账号服务（`commerce`）已用 PostgreSQL，开发环境见 `docs/COMMERCE.md` |
 | Celery + Redis | SQLite 持久化队列 + 租约/心跳 | 无 Redis；文档本身要求「关键任务状态仍以数据库为准」 |
 | S3 兼容对象存储 | 本地文件系统实现 | 无对象存储；保留上传会话与短时凭证接口以便替换 |
 | Tauri / Electron 客户端 | API 自带的 Web 客户端 | 本机 gio 2.68 < Tauri 2 要求的 2.70，装不了；见 `docs/PACKAGING_GUIDE.md` |
@@ -117,6 +117,7 @@ drama-cloud runtime-rollback ffmpeg
 | `docs/recipe.schema.json` | 配方 JSON Schema 快照（运行时也可从 `/api/v1/recipes/schema.json` 取） |
 | `docs/PROCESSING_PIPELINE.md` | 计划构造、模块契约、一次性编码、检查点复用、门禁、产物登记、质量类重试 |
 | `docs/API_SPEC.md` | 端点总表与详情、错误码表、认证与幂等规则、调用示例 |
+| `docs/COMMERCE.md` | 账号服务（PostgreSQL）：本地开发环境、配置、接口与错误码、安全规则、运维、测试 |
 | `docs/DATABASE_SCHEMA.md` | 11 张表（含 `review_queue`）的字段/索引/约束、状态机约束、迁移策略与 PG 替换点 |
 | `docs/PACKAGING_GUIDE.md` | 服务端部署、桌面 `.exe`/`.dmg` 方案、签名、升级与验收清单 |
 | `docs/TEST_PLAN.md` | 测试层次、媒体样本、覆盖矩阵、恢复/并发/安装/质量测试 |

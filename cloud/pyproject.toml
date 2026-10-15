@@ -6,13 +6,17 @@ build-backend = "setuptools.build_meta"
 name = "drama-cloud"
 version = "0.1.0"
 description = "云端短剧视频制作与多平台适配系统（控制面 + 媒体 Worker）"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
     "pydantic>=2.5",
     "jsonschema>=4.20",
     "python-multipart>=0.0.9",
+    # 账号与授权服务（drama_cloud.commerce）：PostgreSQL 驱动与连接池、argon2id 密码哈希
+    "psycopg[binary]==3.3.6",
+    "psycopg-pool==3.3.3",
+    "argon2-cffi==25.1.0",
 ]
 
 [project.optional-dependencies]
@@ -20,12 +24,13 @@ dev = ["pytest>=8", "httpx>=0.27"]
 
 [project.scripts]
 drama-cloud = "drama_cloud.cli:main"
+drama-commerce = "drama_cloud.commerce.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-drama_cloud = ["web/*.html"]
+drama_cloud = ["web/*.html", "commerce/migrations/*.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
