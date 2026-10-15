@@ -8,47 +8,96 @@
       content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:"
     />
     <title>剧备 DramaDossier</title>
+    <!-- 先定主题再加载样式，避免先闪一下错误的颜色（见 theme.js）。 -->
+    <script src="./logic.js"></script>
+    <script src="./theme.js"></script>
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
-    <!-- ============ 登录 / 注册视图（首启与未登录时显示） ============ -->
+    <!-- ============ 启动时恢复登录 ============ -->
+    <div id="restoring-view" class="center-view" role="status" aria-live="polite">
+      <div class="center-card">
+        <img src="./icon.svg" alt="" width="44" height="44" />
+        <p>正在恢复登录…</p>
+      </div>
+    </div>
+
+    <!-- ============ 全屏锁定页（离线期已过、时钟倒退、钥匙串不可用、配置错误） ============ -->
+    <div id="lock-view" class="center-view hidden">
+      <div class="center-card lock-card" role="alert">
+        <img src="./icon.svg" alt="" width="44" height="44" />
+        <h1 id="lock-title">暂时不能使用</h1>
+        <p id="lock-message"></p>
+        <div class="option-row center">
+          <button id="lock-retry" type="button" class="primary">重试</button>
+          <button id="lock-logout" type="button" class="ghost">退出登录</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ 登录 / 注册 / 重设密码（未登录时显示） ============ -->
     <div id="auth-view" class="auth-view hidden">
       <div class="auth-card">
+        <button type="button" class="ghost theme-toggle auth-theme" data-theme-toggle>切换亮色</button>
         <div class="auth-brand">
           <img src="./icon.svg" alt="" width="44" height="44" />
           <h1>剧备 <span>DramaDossier</span></h1>
           <p>从素材目录到结构化报审材料包</p>
         </div>
 
-        <!-- 登录卡 -->
-        <form id="auth-login-form" class="auth-form">
+        <p id="auth-notice" class="auth-notice hidden" role="alert"></p>
+
+        <!-- 登录 -->
+        <form id="auth-login-form" class="auth-form" novalidate>
           <h2>登录</h2>
-          <label>邮箱<input id="login-email" type="email" placeholder="you@example.com" autocomplete="email" /></label>
-          <label>密码<input id="login-password" type="password" placeholder="••••••••" autocomplete="current-password" /></label>
+          <label>邮箱<input id="login-email" type="email" placeholder="you@example.com" autocomplete="email" required /></label>
+          <label>密码<input id="login-password" type="password" autocomplete="current-password" required /></label>
           <div class="auth-row">
-            <button type="button" id="forgot-password" class="link">忘记密码？</button>
+            <button type="button" class="link" data-auth-view="reset">忘记密码？</button>
           </div>
+          <p id="login-error" class="field-error hidden" role="alert"></p>
           <button type="submit" id="login-submit" class="primary wide">登录</button>
-          <p class="auth-switch">还没有账号？<button type="button" class="link" id="goto-register">创建账号</button></p>
+          <p class="auth-switch">还没有账号？<button type="button" class="link" data-auth-view="register">创建账号</button></p>
         </form>
 
-        <!-- 注册卡 -->
-        <form id="auth-register-form" class="auth-form hidden">
+        <!-- 注册 -->
+        <form id="auth-register-form" class="auth-form hidden" novalidate>
           <h2>创建账号</h2>
-          <label>邮箱<input id="register-email" type="email" placeholder="you@example.com" autocomplete="email" /></label>
+          <label>邮箱<input id="register-email" type="email" placeholder="you@example.com" autocomplete="email" required /></label>
           <label>验证码
             <div class="code-row">
-              <input id="register-code" type="text" inputmode="numeric" maxlength="6" placeholder="6 位验证码" />
-              <button type="button" id="send-code" class="ghost">获取验证码</button>
+              <input id="register-code" type="text" inputmode="numeric" maxlength="6" placeholder="6 位数字" autocomplete="one-time-code" required />
+              <button type="button" class="ghost" data-send-code="register">获取验证码</button>
             </div>
           </label>
-          <label>密码<input id="register-password" type="password" placeholder="至少 8 位，含字母和数字" autocomplete="new-password" /></label>
-          <p class="hint">密码需至少 8 位，且同时包含字母和数字。</p>
-          <button type="submit" id="register-submit" class="success wide">创建账号</button>
-          <p class="auth-switch">已有账号？<button type="button" class="link" id="goto-login">直接登录</button></p>
+          <label>密码<input id="register-password" type="password" placeholder="8 到 128 个字符" autocomplete="new-password" required /></label>
+          <label class="checkbox-label terms">
+            <input id="register-terms" type="checkbox" />
+            <span>我已阅读并同意《用户协议》《隐私政策》和《付费服务条款》</span>
+          </label>
+          <p id="register-error" class="field-error hidden" role="alert"></p>
+          <button type="submit" id="register-submit" class="success wide" disabled>创建账号</button>
+          <p class="auth-switch">已有账号？<button type="button" class="link" data-auth-view="login">直接登录</button></p>
         </form>
 
-        <p class="auth-note">报审包只生成在本地目录，账号仅用于 AI 积分与账单。</p>
+        <!-- 重设密码 -->
+        <form id="auth-reset-form" class="auth-form hidden" novalidate>
+          <h2>重设密码</h2>
+          <label>邮箱<input id="reset-email" type="email" placeholder="you@example.com" autocomplete="email" required /></label>
+          <label>验证码
+            <div class="code-row">
+              <input id="reset-code" type="text" inputmode="numeric" maxlength="6" placeholder="6 位数字" autocomplete="one-time-code" required />
+              <button type="button" class="ghost" data-send-code="reset_password">获取验证码</button>
+            </div>
+          </label>
+          <label>新密码<input id="reset-password" type="password" placeholder="8 到 128 个字符" autocomplete="new-password" required /></label>
+          <p class="hint">重设后，所有电脑上的登录都会失效，需要重新登录。</p>
+          <p id="reset-error" class="field-error hidden" role="alert"></p>
+          <button type="submit" id="reset-submit" class="primary wide">重设密码</button>
+          <p class="auth-switch"><button type="button" class="link" data-auth-view="login">返回登录</button></p>
+        </form>
+
+        <p class="auth-note">素材和报审包只保存在本机；账号用于授权和设备管理。</p>
       </div>
     </div>
 
@@ -73,8 +122,12 @@
           </button>
           <span id="env-chip-detail" class="sr-only"></span>
           <span id="current-drama" class="drama-chip hidden"></span>
+          <button type="button" class="ghost theme-toggle" data-theme-toggle>切换亮色</button>
         </div>
       </header>
+
+      <!-- 账号横幅：离线、快到期、钥匙串写入失败（可以同时有几条） -->
+      <div id="account-banners" aria-live="polite"></div>
 
       <!-- 运行环境横幅：全局首屏，未就绪时显示（含一键配置入口），就绪后隐藏 -->
       <div id="env-banner" class="env-banner hidden"></div>
@@ -86,23 +139,124 @@
 
       <main class="workspace">
         <nav class="sidenav" id="sidenav">
-          <button class="nav-item active" data-module="library">剧目库</button>
+          <button class="nav-item active" data-module="home">首页</button>
+          <button class="nav-item" data-module="library">剧目库</button>
           <button class="nav-item" data-module="generate">生成报审包</button>
           <button class="nav-item" data-module="mount">挂载</button>
           <button class="nav-item" data-module="transcode">转码</button>
           <button class="nav-item" data-module="toolbox">工具箱</button>
           <button class="nav-item" data-module="settings">设置</button>
           <div class="sidenav-foot">
-            <div class="account-chip">
+            <button
+              id="account-chip"
+              type="button"
+              class="account-chip"
+              aria-haspopup="menu"
+              aria-expanded="false"
+              aria-controls="account-menu"
+            >
               <span id="chip-email" class="account-email">未登录</span>
-              <span id="chip-badge" class="badge">离线</span>
+              <span id="chip-badge" class="badge">未登录</span>
+            </button>
+            <div id="account-menu" class="account-menu hidden" role="menu" aria-labelledby="account-chip">
+              <button type="button" role="menuitem" data-account-action="redeem">兑换卡密</button>
+              <button type="button" role="menuitem" data-account-action="devices">设备管理</button>
+              <button type="button" role="menuitem" data-account-action="settings">账号设置</button>
+              <button type="button" role="menuitem" data-account-action="logout" class="menu-danger">退出登录</button>
             </div>
           </div>
         </nav>
 
         <div class="modules">
+          <!-- ============ 首页：欢迎、公告、新手引导、近 7 天、教程 ============ -->
+          <section id="module-home" class="module module-home">
+            <section class="panel welcome-card">
+              <div>
+                <h2 id="home-welcome">欢迎使用剧备</h2>
+                <p id="home-entitlement" class="hint">—</p>
+              </div>
+              <div class="option-row">
+                <button type="button" class="primary" data-account-action="redeem">兑换卡密</button>
+                <button type="button" class="ghost" data-goto-module="library">去剧目库</button>
+              </div>
+            </section>
+
+            <section class="panel announce" aria-roledescription="轮播" aria-label="公告">
+              <div class="panel-header">
+                <h3>公告</h3>
+                <div class="actions">
+                  <span id="announce-index" class="hint" aria-hidden="true"></span>
+                  <button id="announce-prev" type="button" class="ghost" aria-label="上一条公告">‹</button>
+                  <button id="announce-toggle" type="button" class="ghost" aria-pressed="false">暂停</button>
+                  <button id="announce-next" type="button" class="ghost" aria-label="下一条公告">›</button>
+                </div>
+              </div>
+              <div id="announce-body" class="announce-body" aria-live="off"></div>
+            </section>
+
+            <section id="home-guide" class="panel">
+              <div class="panel-header">
+                <h3>新手引导 <span id="guide-progress" class="badge"></span></h3>
+                <div class="actions">
+                  <button id="guide-collapse" type="button" class="ghost">收起</button>
+                </div>
+              </div>
+              <ol id="guide-steps" class="guide onboarding"></ol>
+            </section>
+            <p id="guide-reopen-row" class="hint hidden">
+              新手引导已收起。<button id="guide-reopen" type="button" class="link">重新打开</button>
+            </p>
+
+            <div class="home-grid">
+              <section class="panel">
+                <div class="panel-header">
+                  <h3>近 7 天生成报审包</h3>
+                  <span id="chart-total" class="badge"></span>
+                </div>
+                <figure class="chart">
+                  <div id="chart-svg" aria-hidden="true"></div>
+                  <figcaption>
+                    <table class="sr-only" id="chart-table">
+                      <caption>近 7 天每天生成报审包的次数</caption>
+                      <thead><tr><th scope="col">日期</th><th scope="col">次数</th></tr></thead>
+                      <tbody></tbody>
+                    </table>
+                  </figcaption>
+                </figure>
+              </section>
+              <section class="panel coming-soon" aria-disabled="true">
+                <div class="panel-header">
+                  <h3>积分余额</h3>
+                  <span class="badge">即将推出</span>
+                </div>
+                <p class="hint">积分与充值即将推出。现在报审包生成不消耗积分。</p>
+                <button type="button" class="ghost" disabled>充值（即将推出）</button>
+              </section>
+            </div>
+
+            <section class="panel guidance">
+              <h3>使用教程</h3>
+              <ol>
+                <li><strong>兑换卡密</strong>：侧栏底部点账号 → 兑换卡密，开通功能。</li>
+                <li><strong>扫描剧目</strong>：在「剧目库」选素材根目录，一部剧一个子目录，点「扫描剧目」。</li>
+                <li><strong>检查材料</strong>：点选剧目，点「探测并检查」，按清单补齐缺失项。</li>
+                <li><strong>生成报审包</strong>：在「生成报审包」填好成本信息后生成（需要联网）。</li>
+                <li><strong>挂载与后期</strong>：在「挂载」「转码」「工具箱」里处理分集和挂载文案。</li>
+              </ol>
+            </section>
+          </section>
+
+          <!-- 没有使用权时，受限模块换成这块遮罩 -->
+          <section id="module-locked" class="module hidden">
+            <section class="panel locked-panel">
+              <h2 id="locked-title">还没有使用权</h2>
+              <p id="locked-message" class="hint"></p>
+              <button id="locked-action" type="button" class="primary">兑换卡密</button>
+            </section>
+          </section>
+
           <!-- ============ 模块一：剧目库 ============ -->
-          <section id="module-library" class="module module-library">
+          <section id="module-library" class="module module-library hidden">
             <section class="panel library-panel">
               <section class="panel-header">
                 <h2>剧目</h2>
@@ -509,11 +663,11 @@
         </nav>
 
         <div class="settings-pages">
-          <!-- 子页 1：账号（登录方式卡） -->
+          <!-- 子页 1：账号与授权 -->
           <section id="sub-account" class="settings-page">
             <section class="panel">
               <section class="panel-header">
-                <h3>登录方式</h3>
+                <h3>账号</h3>
               </section>
               <div class="account-row">
                 <div>
@@ -526,24 +680,75 @@
                   <div class="account-label">密码</div>
                   <div class="account-value">••••••••</div>
                 </div>
-                <button id="open-change-password" class="ghost">修改密码</button>
+                <button id="open-change-password" class="ghost" aria-expanded="false" aria-controls="password-change-form">修改密码</button>
               </div>
-              <form id="password-change-form" class="auth-form hidden">
-                <label>原密码<input id="old-password" type="password" autocomplete="current-password" /></label>
-                <label>新密码<input id="new-password" type="password" placeholder="至少 8 位，含字母和数字" autocomplete="new-password" /></label>
+              <form id="password-change-form" class="auth-form hidden" novalidate>
+                <label>当前密码<input id="old-password" type="password" autocomplete="current-password" /></label>
+                <label>新密码<input id="new-password" type="password" placeholder="8 到 128 个字符" autocomplete="new-password" /></label>
+                <p class="hint">修改后，其他电脑上的登录会失效，这台电脑保持登录。</p>
+                <p id="password-change-error" class="field-error hidden" role="alert"></p>
                 <div class="option-row">
                   <button type="submit" id="change-password-submit" class="primary">确认修改</button>
                   <button type="button" id="cancel-change-password" class="ghost">取消</button>
                 </div>
               </form>
             </section>
+
             <section class="panel">
               <section class="panel-header">
-                <h3>账号状态</h3>
+                <h3>授权</h3>
               </section>
-              <p class="hint">本地演示版：账号只保存在本机 <span id="account-path">…</span>，不上传；报审包生成与账号无关。</p>
+              <div class="account-row">
+                <div>
+                  <div class="account-label">使用权</div>
+                  <div id="account-entitlement" class="account-value">—</div>
+                </div>
+                <button type="button" class="ghost" data-account-action="redeem">兑换卡密</button>
+              </div>
+              <div class="account-row">
+                <div>
+                  <div class="account-label">本机机器码</div>
+                  <div id="account-device-code" class="account-value mono">—</div>
+                </div>
+                <button id="copy-device-code" type="button" class="ghost">复制</button>
+              </div>
+              <div class="account-row">
+                <div>
+                  <div class="account-label">联网状态</div>
+                  <div id="account-tier" class="account-value">—</div>
+                </div>
+                <button id="account-sync" type="button" class="ghost">立即刷新</button>
+              </div>
+              <p class="hint">
+                一个账号同时绑定 1 台电脑。退出登录不会归还名额；换电脑要先在「设备管理」里解绑旧电脑，每 30 天最多解绑 3 次。
+                机器码只用来区分电脑，报给发卡方时用它。
+              </p>
               <div class="option-row">
-                <button id="logout" class="danger">退出登录</button>
+                <button type="button" class="ghost" data-account-action="devices">设备管理</button>
+                <button id="logout" type="button" class="ghost">退出登录</button>
+              </div>
+            </section>
+
+            <section class="panel">
+              <section class="panel-header">
+                <h3>个人数据</h3>
+              </section>
+              <p class="hint">导出服务端保存的账号资料、使用权、设备、兑换记录、登录记录和操作记录，保存为一个 JSON 文件。不含密码和卡密。</p>
+              <div class="option-row">
+                <button id="account-export" type="button" class="ghost">导出个人数据</button>
+              </div>
+            </section>
+
+            <section class="panel danger-zone">
+              <section class="panel-header">
+                <h3>危险操作</h3>
+              </section>
+              <p class="hint">
+                注销账号会立即生效，<strong>不可撤销</strong>：账号里剩余的使用权全部作废，所有电脑解绑并退出登录。
+                兑换记录等交易信息按法律要求的期限匿名保留，不再和你的邮箱关联。本机的素材和报审包不受影响。
+              </p>
+              <div class="option-row">
+                <button id="open-delete-account" type="button" class="danger">注销账号</button>
               </div>
             </section>
           </section>
@@ -552,14 +757,14 @@
           <section id="sub-billing" class="settings-page hidden">
             <div class="billing-cards">
               <div class="panel billing-card">
-                <div class="account-label">还能生成</div>
-                <div class="account-value big">不限制</div>
-                <div class="hint">本地演示版不设配额</div>
+                <div class="account-label">使用权</div>
+                <div id="billing-entitlement" class="account-value big">—</div>
+                <div class="hint">兑换卡密开通或续期</div>
               </div>
-              <div class="panel billing-card">
-                <div class="account-label">当前余额</div>
-                <div class="account-value big">演示版</div>
-                <div class="hint">不计积分</div>
+              <div class="panel billing-card coming-soon" aria-disabled="true">
+                <div class="account-label">积分余额</div>
+                <div class="account-value big">即将推出</div>
+                <div class="hint">积分与充值即将推出</div>
               </div>
               <div class="panel billing-card">
                 <div class="account-label">本月已生成</div>
@@ -572,8 +777,7 @@
                 <h3>积分说明</h3>
               </section>
               <p class="hint">
-                报审包生成完全在本地进行，不消耗积分；后续云端版将在此展示 AI 积分余额、
-                最近 30 天消耗与积分流水。
+                现在生成报审包不消耗积分。积分与充值上线后，这里会显示积分余额、最近 30 天的消耗和积分流水。
               </p>
             </section>
             <section class="panel">
@@ -732,13 +936,93 @@
               </p>
               <p class="settings-note">
                 从素材目录到结构化报审材料包：扫描剧目、检查材料、生成报审包、挂载 / 转码 / 后期工具箱。
-                所有数据只保存在本机，不做云端同步。
+                素材和报审包只保存在本机，不上传；账号、使用权和设备绑定记录保存在服务端。
               </p>
             </section>
           </section>
         </div>
       </div>
     </div>
+    <!-- ============ 弹窗（统一走 main.js 的 openDialog：焦点进出、Esc、Tab 循环、背后内容 inert） ============ -->
+    <div id="dialog-redeem" class="modal hidden">
+      <form class="dialog" role="dialog" aria-modal="true" aria-labelledby="redeem-title" aria-describedby="redeem-desc" novalidate>
+        <h2 id="redeem-title">兑换卡密</h2>
+        <p id="redeem-desc" class="hint">卡密是 16 位，由数字 2-9 和除 I、O 以外的大写字母组成。可以带「DD-」前缀，大小写、空格和短横线都不影响。</p>
+        <label>卡密
+          <input id="redeem-code" type="text" class="mono card-input" maxlength="40" autocomplete="off" spellcheck="false" autocapitalize="characters" placeholder="DD-XXXX-XXXX-XXXX-XXXX" aria-describedby="redeem-error" />
+        </label>
+        <p id="redeem-error" class="field-error hidden" role="alert"></p>
+        <p id="redeem-success" class="result hidden" role="status"></p>
+        <div class="option-row end">
+          <button type="button" class="ghost" data-dialog-close>关闭</button>
+          <button id="redeem-submit" type="submit" class="primary">兑换</button>
+        </div>
+      </form>
+    </div>
+
+    <div id="dialog-devices" class="modal hidden">
+      <div class="dialog wide-dialog" role="dialog" aria-modal="true" aria-labelledby="devices-title" aria-describedby="devices-desc">
+        <h2 id="devices-title">设备管理</h2>
+        <p id="devices-desc" class="hint">—</p>
+        <p id="devices-error" class="field-error hidden" role="alert"></p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">设备</th>
+                <th scope="col">机器码</th>
+                <th scope="col">绑定时间</th>
+                <th scope="col">最近在线</th>
+                <th scope="col"><span class="sr-only">操作</span></th>
+              </tr>
+            </thead>
+            <tbody id="devices-body">
+              <tr><td colspan="5" class="empty">正在读取…</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="option-row end">
+          <button id="devices-activate" type="button" class="primary hidden">绑定这台电脑</button>
+          <button id="devices-logout" type="button" class="ghost hidden">退出登录</button>
+          <button type="button" class="ghost" data-dialog-close>关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="dialog-confirm" class="modal hidden">
+      <div class="dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-body">
+        <h2 id="confirm-title">确认</h2>
+        <p id="confirm-body"></p>
+        <div class="option-row end">
+          <button id="confirm-no" type="button" class="ghost" data-dialog-close>取消</button>
+          <button id="confirm-yes" type="button" class="danger">确认</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="dialog-delete" class="modal hidden">
+      <form class="dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-title" aria-describedby="delete-desc" novalidate>
+        <h2 id="delete-title">注销账号</h2>
+        <div id="delete-desc">
+          <p>注销会<strong>立即生效，不可撤销</strong>：</p>
+          <ul>
+            <li>账号里剩余的使用权全部作废，已兑换的卡密不会退回；</li>
+            <li>所有电脑解绑并退出登录；</li>
+            <li>兑换记录等交易信息按法律要求的期限匿名保留，不再和你的邮箱关联；</li>
+            <li>之后用同一个邮箱可以重新注册，但那是一个全新的账号。</li>
+          </ul>
+          <p>需要留存的话，先在「个人数据」里导出。</p>
+        </div>
+        <label>当前密码<input id="delete-password" type="password" autocomplete="current-password" /></label>
+        <label>再输一遍登录邮箱，确认是要注销这个账号<input id="delete-email" type="email" autocomplete="off" /></label>
+        <p id="delete-error" class="field-error hidden" role="alert"></p>
+        <div class="option-row end">
+          <button type="button" class="ghost" data-dialog-close>取消</button>
+          <button id="delete-submit" type="submit" class="danger" disabled>永久注销</button>
+        </div>
+      </form>
+    </div>
+
     <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
     <script src="./main.js"></script>
   </body>

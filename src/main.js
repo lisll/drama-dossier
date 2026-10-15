@@ -23,7 +23,7 @@ const state = {
   dramas: [],
   selected: null,
   analysis: null,
-  module: "library",
+  module: "home",
   runtime: null,
   // 已保存的设置：探测与生成都读这里，设置页里没保存的改动不生效。
   settings: {},
@@ -35,7 +35,12 @@ const state = {
   busyButtons: [],
   // 结果区按钮引用的路径（键 → 绝对路径），避免把路径拼进 HTML 属性。
   paths: {},
-  account: null, // 最近一次 account_* 命令回包（含 loggedIn / email / path）。
+  // 最近一次账号状态（account_status / account-changed 事件的负载，见 src-tauri/src/account/session.rs）。
+  account: null,
+  // 最近一次读到的生成流水：首页的引导和近 7 天图表用。
+  ledger: [],
+  // 本次运行里剪映探测是否找到了草稿目录（引导第 5 步）。
+  jianyingFound: false,
   mountStep: 1,
   mountPlan: null,
   publishRows: [],
@@ -44,12 +49,12 @@ const state = {
 let renamePlan = null;
 let bitrateItems = null;
 let bitratePending = null;
-// 本地演示验证码：前端生成、toast 回显（云端版改为服务端下发）。
-let demoVerifyCode = "";
-/// 打开码率确认弹窗前聚焦的元素，关闭后要还回去。
-let bitrateConfirmReturnFocus = null;
 // 最近一次从配置文件读到的设置：保存时用它带回 ffmpegPath（界面上没有对应输入框）。
 let loadedSettings = null;
+
+// 纯函数在 logic.js（可以单独测试），这里只管 DOM。
+const L = window.DossierLogic;
+const nowSecs = () => Math.floor(Date.now() / 1000);
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
@@ -101,7 +106,12 @@ function gotoRuntimeSettings() {
  * 其余保持原样，不让所有错误都被塞进同一个入口。
  */
 function reportError(error) {
-  const message = String(error);
+  // 被功能闸门拒绝：刷新账号状态（界面会切到锁定页或遮罩），再给一个能直接处理的按钮。
+  if (error instanceof CommandError && error.code === "license_locked") {
+    handleLicenseLocked(error);
+    return;
+  }
+  const message = error instanceof CommandError ? L.errorText(error) : String(error);
   if (/ffmpeg|ffprobe|运行环境/i.test(message)) {
     toast(message, true, { label: "重新检测", run: gotoRuntimeSettings });
     return;
@@ -370,11 +380,37 @@ function handleEraseProgress(payload) {
   });
 }
 
+/**
+ * 后端返回的结构化错误（账号命令的 `{error, message, ...}`、闸门的 `{error: "license_locked", reason, message}`）。
+ * `String(error)` 仍然得到中文说明，所以原来按字符串处理错误的地方不用改。
+ */
+class CommandError extends Error {
+  constructor(payload) {
+    super(String(payload?.message ?? "操作失败"));
+    this.name = "CommandError";
+    this.code = String(payload?.error ?? "");
+    this.reason = payload?.reason ?? null;
+    this.retryAfter = payload?.retryAfter ?? null;
+    this.extra = payload?.extra ?? null;
+  }
+
+  toString() {
+    return this.message;
+  }
+}
+
 async function call(command, args) {
   if (!invoke) {
     throw new Error("请在 DramaDossier 桌面应用中运行界面。");
   }
-  return invoke(command, args);
+  try {
+    return await invoke(command, args);
+  } catch (error) {
+    if (error && typeof error === "object" && !(error instanceof Error) && "error" in error) {
+      throw new CommandError(error);
+    }
+    throw error;
+  }
 }
 
 function formatBytes(bytes) {
@@ -675,7 +711,7 @@ function invalidatePlans() {
   bitrateItems = null;
   bitratePending = null;
   $("#rename-apply").disabled = true;
-  $("#bitrate-confirm").classList.add("hidden");
+  closeDialog($("#bitrate-confirm"), { restoreFocus: false });
   syncBitrateFixState();
 }
 
@@ -731,12 +767,31 @@ function switchModule(name) {
   document.querySelectorAll(".nav-item").forEach((node) => {
     node.classList.toggle("active", node.dataset.module === name);
   });
+  // 没有使用权时，受限模块换成遮罩（真正的拦截在 Rust 端的闸门，这里只是让用户一眼看明白）。
+  const lock = L.moduleLock(state.account, name);
+  const visible = lock ? "module-locked" : `module-${name}`;
   document.querySelectorAll(".module").forEach((node) => {
-    node.classList.toggle("hidden", node.id !== `module-${name}`);
+    node.classList.toggle("hidden", node.id !== visible);
   });
+  if (lock) {
+    $("#locked-title").textContent = lock.title;
+    $("#locked-message").textContent = lock.message;
+    $("#locked-action").textContent = lock.actionLabel;
+    return;
+  }
   // 转码模块需要运行环境；切进去时按当前状态刷新阻断层。
   if (name === "transcode") renderTranscodeGate();
   if (name === "mount") refreshMountContext();
+  if (name === "home") loadHome();
+}
+
+/** 账号状态变了：当前模块要不要换成遮罩（或从遮罩恢复）跟着重算。只换显示，不重新读数据。 */
+function refreshModuleLock() {
+  if (!$("#settings-view").classList.contains("hidden")) return;
+  const lock = L.moduleLock(state.account, state.module);
+  const showingLock = !$("#module-locked").classList.contains("hidden");
+  if (Boolean(lock) !== showingLock || lock) switchModule(state.module);
+  if (state.module === "home") renderHome();
 }
 
 function renderContexts() {
@@ -917,9 +972,11 @@ async function generate() {
       html: `<strong>报审包已生成</strong><br />
         位置：${esc(result.packageDir)}<br />
         文件数：${result.fileCount} · 总大小：${formatBytes(Number(result.totalBytes))}`,
-      paths: [["package", result.packageDir]],
+        paths: [["package", result.packageDir]],
     });
     toast("报审包生成完成");
+    // 流水多了一条：首页的引导和近 7 天图表跟着更新。
+    loadHome();
   } catch (error) {
     const message = String(error);
     // 「目录已存在」是可控的：后端没有动任何文件，把旧包位置摆出来，
@@ -1185,7 +1242,7 @@ async function generatePublishCopy() {
     state.publishRows = await call("load_mount_copy", { path: result.path });
     renderPublishCopy(`<strong>模板已生成</strong><br />行数：${result.rowCount} · SHA-256：<code>${esc(result.sha256)}</code>`);
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   }
 }
 
@@ -1196,7 +1253,7 @@ async function loadPublishCopy() {
     state.publishRows = await call("load_mount_copy", { path });
     renderPublishCopy();
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   }
 }
 
@@ -1254,7 +1311,7 @@ async function previewPublishCopy() {
       <div class="table-scroll"><table><thead><tr><th>成片</th><th>状态</th><th>校验</th><th>原因</th></tr></thead><tbody>${rows}</tbody></table></div>`;
     renderPublishCopy(result);
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   }
 }
 
@@ -1265,7 +1322,7 @@ async function savePublishCopy() {
     const result = await call("save_mount_copy", { path, rows: state.publishRows });
     toast(`已保存 ${result.rowCount} 行文案，SHA-256 ${result.sha256.slice(0, 12)}…`);
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   }
 }
 
@@ -1585,29 +1642,32 @@ function requestBitrateFix() {
     }。<br />
     <strong>原文件会被替换</strong>（视频与音频都会重新编码），<strong>没有备份、不能撤销</strong>。
     建议先备份，或先在副本上试一集。`;
-  // 弹窗关掉后要把焦点还给触发它的按钮，否则键盘用户会被丢回页面开头。
-  bitrateConfirmReturnFocus = $("#bitrate-fix");
-  $("#bitrate-confirm").classList.remove("hidden");
+  // 弹窗关掉后要把焦点还给触发它的按钮（openDialog 记着），否则键盘用户会被丢回页面开头。
+  const opener = $("#bitrate-fix");
   $("#bitrate-fix").disabled = true;
-  $("#bitrate-confirm-yes").focus();
+  openDialog($("#bitrate-confirm"), {
+    modal: false,
+    opener,
+    initialFocus: $("#bitrate-confirm-yes"),
+    onCancel: cancelBitrateFix,
+  });
 }
 
 function cancelBitrateFix() {
   bitratePending = null;
-  $("#bitrate-confirm").classList.add("hidden");
+  // 先让按钮恢复可聚焦状态（上面刚把它禁用），再关弹窗还焦点。
   syncBitrateFixState();
-  // 先让按钮恢复可聚焦状态（上面可能刚把它禁用），再把焦点还回去。
-  const back = bitrateConfirmReturnFocus;
-  bitrateConfirmReturnFocus = null;
-  if (back && !back.disabled) back.focus();
+  closeDialog($("#bitrate-confirm"));
 }
 
 async function applyBitrateFix() {
   if (!bitratePending) return;
+  const targets = bitratePending;
+  bitratePending = null;
   // 走确认路径时不还焦点：紧接着就会开始长任务并禁用按钮。
-  bitrateConfirmReturnFocus = null;
-  cancelBitrateFix();
-  if (!beginTask(`正在重编码 ${bitratePending.length} 集（原文件会被替换）`)) return;
+  closeDialog($("#bitrate-confirm"), { restoreFocus: false });
+  syncBitrateFixState();
+  if (!beginTask(`正在重编码 ${targets.length} 集（原文件会被替换）`)) return;
   try {
     const drama = selectedDrama();
     const report = await call("fix_bitrate", {
@@ -1898,129 +1958,978 @@ function renderRuntimeList(status) {
   renderTranscodeGate();
 }
 
-// ============ 登录 / 注册（本地演示版，接口与云端版一致） ============
+// ============ 账号：登录闸门、状态提示、账号菜单 ============
+// 账号状态以 Rust 端为准（account_status / account-changed 事件），这里只负责显示。
+// 真正的功能拦截在 src-tauri/src/account/gate.rs，前端被改了也绕不过去。
 
-function showAuthView() {
-  $("#auth-view").classList.remove("hidden");
-  document.querySelector(".app").classList.add("hidden");
-  closeSettingsView();
+const accountUi = {
+  // 当前显示的是哪一屏：restoring / auth / lock / app。
+  screen: "restoring",
+  // 登录区当前是哪张卡：login / register / reset。
+  authView: "login",
+  // 用户关掉过的横幅（只在本次运行里记着）。
+  dismissed: new Set(),
+  // 验证码冷却：purpose → 截止时间（毫秒）。
+  cooldowns: {},
+  cooldownTimer: null,
+  // 名额满时自动弹设备管理，同一次只弹一回。
+  activationPrompted: false,
+};
+
+/** 切换整屏。离开主界面时关掉所有弹窗和菜单，免得盖在登录页上。 */
+function setScreen(screen) {
+  if (accountUi.screen === screen) return;
+  accountUi.screen = screen;
+  $("#restoring-view").classList.toggle("hidden", screen !== "restoring");
+  $("#lock-view").classList.toggle("hidden", screen !== "lock");
+  $("#auth-view").classList.toggle("hidden", screen !== "auth");
+  const inApp = screen === "app";
+  if (!inApp) {
+    closeAllDialogs();
+    closeAccountMenu();
+    $("#settings-view").classList.add("hidden");
+  }
+  document.querySelector(".app").classList.toggle("hidden", !inApp);
+  if (screen === "auth") switchAuthView(accountUi.authView);
+  if (screen === "lock") $("#lock-retry").focus();
 }
 
-function showApp() {
-  $("#auth-view").classList.add("hidden");
-  document.querySelector(".app").classList.remove("hidden");
-}
-
-function switchAuthCard(showRegister) {
-  $("#auth-login-form").classList.toggle("hidden", showRegister);
-  $("#auth-register-form").classList.toggle("hidden", !showRegister);
+/** 收到新的账号状态：决定显示哪一屏，刷新所有和账号有关的地方。 */
+function applyAccount(status) {
+  if (!status) return;
+  const previous = state.account;
+  state.account = status;
+  const view = L.accountView(status);
+  if (view === "auth") renderAuthNotice(status);
+  if (view === "lock") renderLockPage(status);
+  setScreen(view);
+  renderAccountChip();
+  renderAccountBanners();
+  renderAccountSettings();
+  if (view === "app") {
+    refreshModuleLock();
+    promptActivation(status);
+  }
+  // 刚登录进来（包括注册、启动恢复成功）：读一遍首页要的数据。
+  if (view === "app" && !previous?.loggedIn && status.loggedIn) loadHome();
+  if (!status.pendingActivation) accountUi.activationPrompted = false;
 }
 
 function renderAccountChip() {
-  const account = state.account;
-  const loggedIn = Boolean(account?.loggedIn);
-  $("#chip-email").textContent = loggedIn ? account.email : "未登录";
-  $("#chip-badge").textContent = loggedIn ? "已登录" : "离线";
-  $("#chip-badge").className = `badge ${loggedIn ? "status-ready" : ""}`;
+  const status = state.account;
+  const badge = L.accountBadge(status, nowSecs());
+  $("#chip-email").textContent = status?.loggedIn ? status.email : "未登录";
+  // 侧栏窄，长邮箱会被省略号截断：鼠标悬停能看到完整的。
+  $("#chip-email").title = status?.loggedIn ? status.email : "";
+  const node = $("#chip-badge");
+  node.textContent = badge.text;
+  const tone = { ok: "status-ready", warn: "status-warn", err: "status-fail" }[badge.tone] ?? "";
+  node.className = `badge ${tone}`;
+  $("#account-chip").setAttribute(
+    "aria-label",
+    status?.loggedIn ? `账号 ${status.email}，${badge.text}，打开账号菜单` : "未登录",
+  );
 }
 
-function applyAccount(payload) {
-  state.account = payload;
-  renderAccountChip();
-  // 设置-账号子页同步。
-  const emailNode = $("#account-email");
-  if (emailNode) emailNode.textContent = payload?.loggedIn ? payload.email : "—";
-  if (payload?.path) $("#account-path").textContent = payload.path;
+function renderAccountBanners() {
+  const banners = L.accountBanners(state.account, nowSecs(), accountUi.dismissed);
+  $("#account-banners").innerHTML = banners
+    .map((banner) => {
+      const action = banner.action
+        ? `<button type="button" class="ghost" data-banner-action="${esc(banner.action)}">${esc(banner.actionLabel)}</button>`
+        : "";
+      const close = banner.dismissible
+        ? `<button type="button" class="ghost" data-banner-dismiss="${esc(banner.id)}" aria-label="关闭这条提示">关闭</button>`
+        : "";
+      return `<div class="env-banner ${esc(banner.tone)}" role="status">${esc(banner.text)}${action}${close}</div>`;
+    })
+    .join("");
+}
+/** 登录页顶部的说明：为什么回到了登录页（被解绑、注销、会话失效）。 */
+function renderAuthNotice(status) {
+  const text =
+    status.lockReason === "device_unbound"
+      ? status.message
+      : status.signedOutReason || status.storageWarning || "";
+  const node = $("#auth-notice");
+  node.textContent = text ?? "";
+  node.classList.toggle("hidden", !text);
 }
 
-async function sendVerifyCode() {
-  const email = $("#register-email").value.trim();
-  if (!email) {
-    toast("请先填写邮箱", true);
+function renderLockPage(status) {
+  const page = L.lockPage(status);
+  $("#lock-title").textContent = page.title;
+  $("#lock-message").textContent = page.message;
+  $("#lock-retry").textContent = page.actionLabel || "重试";
+  $("#lock-retry").classList.toggle("hidden", !page.action);
+  $("#lock-logout").classList.toggle("hidden", !page.logout);
+}
+
+/** 名额满了：自动打开设备管理，让用户选一台解绑。 */
+function promptActivation(status) {
+  if (!status.pendingActivation || accountUi.activationPrompted) return;
+  accountUi.activationPrompted = true;
+  openDevicesDialog({ activation: true });
+}
+
+/** 功能闸门拒绝了某个命令。 */
+async function handleLicenseLocked(error) {
+  await refreshAccount();
+  const actions = {
+    no_entitlement: { label: "兑换卡密", run: openRedeemDialog },
+    entitlement_expired: { label: "兑换卡密续期", run: openRedeemDialog },
+    needs_activation: { label: "管理设备", run: () => openDevicesDialog({ activation: true }) },
+    needs_online: { label: "重新连接", run: retryAccount },
+  };
+  toast(error.message, true, actions[error.reason] ?? null);
+}
+
+async function refreshAccount() {
+  if (!invoke) return;
+  try {
+    applyAccount(await call("account_status"));
+  } catch (error) {
+    // 连账号状态都拿不到（后端出错）：不能停在「正在恢复登录」，给一个能重试的锁定页。
+    if (!state.account) {
+      renderLockPage({ lockReason: null, message: `读取登录状态失败：${String(error)}`, loggedIn: false });
+      setScreen("lock");
+    } else {
+      toast(String(error), true);
+    }
+  }
+}
+
+/** 「重试 / 重新连接」：后端按情况重新自检钥匙串或联网刷新。 */
+async function retryAccount() {
+  try {
+    const status = await call("account_retry");
+    applyAccount(status);
+    if (status.tier === "online") toast("已连上服务端");
+    else if (status.tier === "offline") toast("还是连不上服务端，请检查网络", true);
+  } catch (error) {
+    toast(L.errorText(error), true);
+  }
+}
+
+// ---- 登录 / 注册 / 重设密码 ----
+
+const AUTH_FORMS = { login: "#auth-login-form", register: "#auth-register-form", reset: "#auth-reset-form" };
+
+function switchAuthView(name) {
+  accountUi.authView = name;
+  for (const [key, selector] of Object.entries(AUTH_FORMS)) {
+    $(selector).classList.toggle("hidden", key !== name);
+  }
+  ["#login-error", "#register-error", "#reset-error"].forEach((selector) => showFormError(selector, null));
+  // 已经填过的邮箱带到下一张卡上，省得重输。
+  const email = ["#login-email", "#register-email", "#reset-email"].map((s) => $(s).value.trim()).find(Boolean);
+  const target = { login: "#login-email", register: "#register-email", reset: "#reset-email" }[name];
+  if (email && !$(target).value) $(target).value = email;
+  const first = $(AUTH_FORMS[name]).querySelector("input");
+  first?.focus();
+  renderCodeButtons();
+}
+
+function showFormError(selector, message) {
+  const node = $(selector);
+  node.textContent = message ?? "";
+  node.classList.toggle("hidden", !message);
+}
+
+/** 按住提交按钮防重复点击，结束后恢复。 */
+async function withBusy(button, run) {
+  if (button.disabled) return;
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  try {
+    await run();
+  } finally {
+    button.removeAttribute("aria-busy");
+    button.disabled = false;
+    syncRegisterSubmit();
+  }
+}
+
+/** 密码长度按字符数算（和服务端一样），不按 UTF-16 码元。 */
+const passwordLength = (value) => Array.from(value).length;
+
+function checkNewPassword(password) {
+  const length = passwordLength(password);
+  return length >= 8 && length <= 128 ? null : "密码长度要在 8 到 128 个字符之间";
+}
+// 验证码：60 秒冷却，以服务端返回的 cooldown_seconds 为准；被限流时按 retryAfter 等。
+
+function startCooldown(purpose, seconds) {
+  accountUi.cooldowns[purpose] = Date.now() + seconds * 1000;
+  renderCodeButtons();
+  if (!accountUi.cooldownTimer) {
+    accountUi.cooldownTimer = setInterval(() => {
+      renderCodeButtons();
+      const active = Object.values(accountUi.cooldowns).some((until) => until > Date.now());
+      if (!active) {
+        clearInterval(accountUi.cooldownTimer);
+        accountUi.cooldownTimer = null;
+      }
+    }, 1000);
+  }
+}
+
+function renderCodeButtons() {
+  $$("[data-send-code]").forEach((button) => {
+    if (button.getAttribute("aria-busy") === "true") return;
+    const until = accountUi.cooldowns[button.dataset.sendCode] ?? 0;
+    const label = L.codeButtonLabel((until - Date.now()) / 1000);
+    button.textContent = label.text;
+    button.disabled = label.disabled;
+  });
+}
+
+async function sendCode(button) {
+  const purpose = button.dataset.sendCode;
+  const isRegister = purpose === "register";
+  const emailInput = $(isRegister ? "#register-email" : "#reset-email");
+  const errorSelector = isRegister ? "#register-error" : "#reset-error";
+  const email = emailInput.value.trim();
+  if (!email.includes("@")) {
+    showFormError(errorSelector, "请先填写正确的邮箱");
+    emailInput.focus();
     return;
   }
-  // 本地演示：随机 6 位、toast 回显；云端版改为调用服务端发送。
-  demoVerifyCode = String(Math.floor(100000 + Math.random() * 900000));
-  toast(`演示验证码：${demoVerifyCode}（本地演示，未发送邮件）`);
+  showFormError(errorSelector, null);
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  try {
+    const reply = await call("account_send_code", { args: { email, purpose } });
+    startCooldown(purpose, Number(reply?.cooldown_seconds) || 60);
+    toast(`验证码已发到 ${email}，10 分钟内有效`);
+    $(isRegister ? "#register-code" : "#reset-code").focus();
+  } catch (error) {
+    showFormError(errorSelector, L.errorText(error));
+    if (error?.code === "rate_limited" && error.retryAfter) startCooldown(purpose, error.retryAfter);
+  } finally {
+    button.removeAttribute("aria-busy");
+    renderCodeButtons();
+  }
+}
+
+function syncRegisterSubmit() {
+  $("#register-submit").disabled = !$("#register-terms").checked;
 }
 
 async function registerAccount(event) {
   event.preventDefault();
   const email = $("#register-email").value.trim();
-  const password = $("#register-password").value;
   const code = $("#register-code").value.trim();
-  if (!/^\d{6}$/.test(code)) {
-    toast("验证码应为 6 位数字", true);
-    return;
-  }
-  if (demoVerifyCode && code !== demoVerifyCode) {
-    toast("验证码不正确（演示验证码见 toast 提示）", true);
-    return;
-  }
-  try {
-    const payload = await call("account_register", {
-      args: { email, password, code },
-    });
-    applyAccount(payload);
-    showApp();
-    toast(`注册成功，已登录：${payload.email}`);
-    await afterLoginInit();
-  } catch (error) {
-    toast(String(error), true);
-  }
+  const password = $("#register-password").value;
+  if (!$("#register-terms").checked) return showFormError("#register-error", "请先阅读并勾选同意条款");
+  if (!email.includes("@")) return showFormError("#register-error", "请填写正确的邮箱");
+  if (!/^\d{6}$/.test(code)) return showFormError("#register-error", "验证码是 6 位数字");
+  const problem = checkNewPassword(password);
+  if (problem) return showFormError("#register-error", problem);
+  showFormError("#register-error", null);
+  await withBusy($("#register-submit"), async () => {
+    try {
+      const status = await call("account_register", {
+        args: { email, code, password, acceptTerms: true },
+      });
+      $("#register-password").value = "";
+      $("#register-code").value = "";
+      applyAccount(status);
+      toast(`注册成功，已登录：${status.email}`);
+    } catch (error) {
+      showFormError("#register-error", L.errorText(error));
+    }
+  });
 }
 
 async function loginAccount(event) {
   event.preventDefault();
   const email = $("#login-email").value.trim();
   const password = $("#login-password").value;
-  try {
-    const payload = await call("account_login", { email, password });
-    applyAccount(payload);
-    showApp();
-    toast(`欢迎回来，${payload.email}`);
-    await afterLoginInit();
-  } catch (error) {
-    toast(String(error), true);
-  }
+  if (!email || !password) return showFormError("#login-error", "请填写邮箱和密码");
+  showFormError("#login-error", null);
+  await withBusy($("#login-submit"), async () => {
+    try {
+      const status = await call("account_login", { email, password });
+      $("#login-password").value = "";
+      applyAccount(status);
+      toast(`欢迎回来，${status.email}`);
+    } catch (error) {
+      showFormError("#login-error", L.errorText(error));
+    }
+  });
 }
 
+async function resetPassword(event) {
+  event.preventDefault();
+  const email = $("#reset-email").value.trim();
+  const code = $("#reset-code").value.trim();
+  const newPassword = $("#reset-password").value;
+  if (!email.includes("@")) return showFormError("#reset-error", "请填写正确的邮箱");
+  if (!/^\d{6}$/.test(code)) return showFormError("#reset-error", "验证码是 6 位数字");
+  const problem = checkNewPassword(newPassword);
+  if (problem) return showFormError("#reset-error", problem);
+  showFormError("#reset-error", null);
+  await withBusy($("#reset-submit"), async () => {
+    try {
+      await call("account_reset_password", { args: { email, code, newPassword } });
+      $("#reset-password").value = "";
+      $("#reset-code").value = "";
+      $("#login-email").value = email;
+      switchAuthView("login");
+      const notice = $("#auth-notice");
+      notice.textContent = "密码已重设，请用新密码登录";
+      notice.classList.remove("hidden");
+    } catch (error) {
+      showFormError("#reset-error", L.errorText(error));
+    }
+  });
+}
 async function logoutAccount() {
+  const ok = await confirmDialog({
+    title: "退出登录",
+    body: "退出后这台电脑仍然占着账号的设备名额。要换电脑，请在「设备管理」里解绑这台电脑，而不是只退出登录。",
+    confirmLabel: "退出登录",
+  });
+  if (!ok) return;
   try {
     applyAccount(await call("account_logout"));
-    switchAuthCard(false);
-    showAuthView();
     toast("已退出登录");
   } catch (error) {
-    toast(String(error), true);
+    toast(L.errorText(error), true);
   }
 }
 
-// 登录后（含注册即登录）需要初始化的数据。
-async function afterLoginInit() {
-  await loadSettings();
-  await checkRuntime(true);
+// ---- 账号菜单（侧栏底部） ----
+
+function openAccountMenu() {
+  if (!state.account?.loggedIn) return;
+  $("#account-menu").classList.remove("hidden");
+  $("#account-chip").setAttribute("aria-expanded", "true");
+  $("#account-menu [role=menuitem]")?.focus();
 }
 
-// 启动分流：未登录 → 登录卡；已登录 / 浏览器预览 → 主应用。
-async function boot() {
-  if (!invoke) {
-    // 浏览器静态预览（无 Tauri IPC）：跳过登录直接展示主界面，便于布局验证。
-    showApp();
+function closeAccountMenu({ restoreFocus = false } = {}) {
+  const menu = $("#account-menu");
+  if (menu.classList.contains("hidden")) return;
+  menu.classList.add("hidden");
+  $("#account-chip").setAttribute("aria-expanded", "false");
+  if (restoreFocus) $("#account-chip").focus();
+}
+
+/** 菜单里的键盘：Esc 关闭，上下方向键在选项间移动。 */
+function handleAccountMenuKeys(event) {
+  const menu = $("#account-menu");
+  if (menu.classList.contains("hidden")) return false;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeAccountMenu({ restoreFocus: true });
+    return true;
+  }
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    const items = $$("#account-menu [role=menuitem]");
+    const index = items.indexOf(document.activeElement);
+    const step = event.key === "ArrowDown" ? 1 : -1;
+    items[(index + step + items.length) % items.length].focus();
+    return true;
+  }
+  if (event.key === "Tab") closeAccountMenu();
+  return false;
+}
+
+/** 账号菜单、首页、设置页里 `data-account-action` 的按钮都走这里。 */
+function runAccountAction(action) {
+  closeAccountMenu();
+  if (action === "redeem") openRedeemDialog();
+  else if (action === "devices") openDevicesDialog({ activation: false });
+  else if (action === "settings") {
+    state.settingsSub = "account";
+    switchModule("settings");
+  } else if (action === "logout") logoutAccount();
+}
+
+// ---- 卡密兑换 ----
+
+function openRedeemDialog() {
+  if (!state.account?.loggedIn) return;
+  $("#redeem-code").value = "";
+  showFormError("#redeem-error", null);
+  $("#redeem-success").classList.add("hidden");
+  $("#redeem-code").removeAttribute("aria-invalid");
+  openDialog($("#dialog-redeem"), { initialFocus: $("#redeem-code") });
+}
+
+function formatRedeemInput() {
+  const input = $("#redeem-code");
+  const { value, caret } = L.formatCardInput(input.value, input.selectionStart);
+  if (value !== input.value) {
+    input.value = value;
+    input.setSelectionRange(caret, caret);
+  }
+  input.removeAttribute("aria-invalid");
+  showFormError("#redeem-error", null);
+}
+
+async function redeemCard(event) {
+  event.preventDefault();
+  const input = $("#redeem-code");
+  const checked = L.validateCard(input.value);
+  if (!checked.ok) {
+    input.setAttribute("aria-invalid", "true");
+    showFormError("#redeem-error", checked.message);
+    input.focus();
     return;
   }
-  try {
-    applyAccount(await call("account_status"));
-    if (state.account?.loggedIn) {
-      showApp();
-    } else {
-      switchAuthCard(false);
-      showAuthView();
+  $("#redeem-success").classList.add("hidden");
+  await withBusy($("#redeem-submit"), async () => {
+    try {
+      const reply = await call("license_redeem", { code: checked.code });
+      applyAccount(reply.status);
+      const until = L.entitlementText(reply.status, nowSecs());
+      const text = reply.alreadyRedeemed
+        ? `这张卡之前已经兑换过了，没有重复加时间。当前：${until}`
+        : `兑换成功。当前：${until}`;
+      const node = $("#redeem-success");
+      node.textContent = text;
+      node.classList.remove("hidden");
+      input.value = "";
+      toast(text);
+    } catch (error) {
+      input.setAttribute("aria-invalid", "true");
+      showFormError("#redeem-error", L.errorText(error));
     }
+  });
+}
+// ---- 设备管理 ----
+// `activation: true`：名额满了、这台电脑还没绑上，用户要先解绑一台再绑定本机。
+
+const devicesUi = { activation: false, list: null };
+
+async function openDevicesDialog({ activation }) {
+  if (!state.account?.loggedIn) return;
+  devicesUi.activation = Boolean(activation) || Boolean(state.account.pendingActivation);
+  $("#devices-title").textContent = devicesUi.activation ? "电脑数量已满" : "设备管理";
+  $("#devices-activate").classList.toggle("hidden", !devicesUi.activation);
+  $("#devices-logout").classList.toggle("hidden", !devicesUi.activation);
+  showFormError("#devices-error", null);
+  const dialog = $("#dialog-devices");
+  if (dialog.classList.contains("hidden")) openDialog(dialog, {});
+  await loadDevices();
+}
+
+async function loadDevices() {
+  $("#devices-body").innerHTML = '<tr><td colspan="5" class="empty">正在读取…</td></tr>';
+  try {
+    devicesUi.list = await call("device_list");
+    renderDevices();
   } catch (error) {
-    toast(String(error), true);
-    showAuthView();
+    // 名额满时后端在状态里带了一份设备列表，联网读失败就先用它。
+    const pending = state.account?.pendingActivation;
+    if (pending?.devices) {
+      devicesUi.list = pending;
+      renderDevices();
+    } else {
+      $("#devices-body").innerHTML = '<tr><td colspan="5" class="empty">没读到设备列表。</td></tr>';
+    }
+    showFormError("#devices-error", L.errorText(error));
   }
+}
+
+function renderDevices() {
+  const list = devicesUi.list;
+  const devices = L.sortDevices(list?.devices);
+  const quota = L.unbindQuotaText(list?.unbind_quota);
+  const limit = list?.device_limit ?? 1;
+  $("#devices-desc").textContent = devicesUi.activation
+    ? `这个账号最多同时绑定 ${limit} 台电脑，现在已经满了。解绑一台不用的电脑，再绑定这台。${quota}。`
+    : `这个账号最多同时绑定 ${limit} 台电脑。${quota}。解绑这台电脑等于退出登录。`;
+  $("#devices-body").innerHTML =
+    devices
+      .map(
+        (device) => `<tr>
+          <td>${esc(device.name)}${
+            device.current ? ' <span class="badge status-ready">本机</span>' : ""
+          }<div class="hint">${esc(L.platformLabel(device.platform))}</div></td>
+          <td class="mono">${esc(device.code)}</td>
+          <td>${esc(L.formatIso(device.bound_at))}</td>
+          <td>${esc(L.formatIso(device.last_seen_at))}</td>
+          <td><button type="button" class="ghost" data-unbind="${esc(device.id)}">解绑</button></td>
+        </tr>`,
+      )
+      .join("") || '<tr><td colspan="5" class="empty">没有绑定的电脑。</td></tr>';
+}
+
+async function unbindDevice(id) {
+  const device = devicesUi.list?.devices?.find((item) => item.id === id);
+  if (!device) return;
+  const quota = L.unbindQuotaText(devicesUi.list?.unbind_quota);
+  const self = device.current
+    ? "这是本机：解绑后这台电脑会立即退出登录。"
+    : "那台电脑会立即退出登录；它要是一直断网，最多还能离线用到凭证到期（72 小时内）。";
+  const ok = await confirmDialog({
+    title: "解绑电脑",
+    body: `确定解绑「${device.name}」（${device.code}）？${self}${quota}。`,
+    confirmLabel: "解绑",
+  });
+  if (!ok) return;
+  try {
+    const status = await call("device_unbind", { id });
+    toast("已解绑");
+    applyAccount(status);
+    if (device.current || !status.loggedIn) return;
+    // 在等名额的话，后端刷新时会自动重新绑定本机；绑上了就关掉弹窗。
+    if (devicesUi.activation && !status.pendingActivation) {
+      closeDialog($("#dialog-devices"));
+      toast("已绑定这台电脑");
+      return;
+    }
+    await loadDevices();
+  } catch (error) {
+    showFormError("#devices-error", L.errorText(error));
+    // 会话失效（被别处解绑）时，状态已经变了。
+    refreshAccount();
+  }
+}
+
+async function activateDevice() {
+  await withBusy($("#devices-activate"), async () => {
+    try {
+      const status = await call("device_activate");
+      applyAccount(status);
+      if (status.pendingActivation) {
+        showFormError("#devices-error", "电脑数量还是满的，请先解绑一台");
+        await loadDevices();
+      } else {
+        closeDialog($("#dialog-devices"));
+        toast("已绑定这台电脑");
+      }
+    } catch (error) {
+      showFormError("#devices-error", L.errorText(error));
+    }
+  });
+}
+// ---- 设置：账号与授权 ----
+
+function tierText(status) {
+  if (!status?.loggedIn) return "—";
+  if (status.tier === "online") return "已联网";
+  if (status.tier === "offline") {
+    const left = status.offlineUntil != null ? status.offlineUntil - nowSecs() : status.offlineRemainingSecs;
+    return `离线（还能用 ${L.formatRemaining(left)}）`;
+  }
+  return status.message || "已锁定";
+}
+
+function renderAccountSettings() {
+  const status = state.account;
+  const entitlement = status?.loggedIn ? L.entitlementText(status, nowSecs()) : "—";
+  $("#account-email").textContent = status?.loggedIn ? status.email : "—";
+  $("#account-entitlement").textContent = entitlement;
+  $("#billing-entitlement").textContent = entitlement;
+  $("#account-device-code").textContent = status?.deviceCode ?? "—";
+  $("#account-tier").textContent = tierText(status);
+  // 首页欢迎卡。
+  $("#home-welcome").textContent = status?.loggedIn ? `欢迎回来，${status.email}` : "欢迎使用剧备";
+  $("#home-entitlement").textContent = status?.loggedIn ? `使用权：${entitlement}` : "";
+}
+
+async function copyDeviceCode() {
+  const code = state.account?.deviceCode;
+  if (!code) return;
+  const copied = await copyText(code);
+  toast(copied ? "机器码已复制" : `复制失败，请手动复制：${code}`, !copied);
+}
+
+async function syncLicense() {
+  await withBusy($("#account-sync"), async () => {
+    try {
+      const status = await call("license_refresh");
+      applyAccount(status);
+      toast(status.tier === "online" ? "授权已刷新" : tierText(status), status.tier !== "online");
+    } catch (error) {
+      toast(L.errorText(error), true);
+    }
+  });
+}
+
+async function exportAccountData() {
+  await withBusy($("#account-export"), async () => {
+    try {
+      const path = await call("account_export");
+      if (path) toast(`个人数据已保存到 ${path}`);
+    } catch (error) {
+      toast(L.errorText(error), true);
+    }
+  });
+}
+
+function closePasswordForm() {
+  $("#password-change-form").classList.add("hidden");
+  $("#open-change-password").setAttribute("aria-expanded", "false");
+  $("#old-password").value = "";
+  $("#new-password").value = "";
+  showFormError("#password-change-error", null);
+}
+
+async function changePassword(event) {
+  event.preventDefault();
+  const currentPassword = $("#old-password").value;
+  const newPassword = $("#new-password").value;
+  if (!currentPassword) return showFormError("#password-change-error", "请输入当前密码");
+  const problem = checkNewPassword(newPassword);
+  if (problem) return showFormError("#password-change-error", problem);
+  showFormError("#password-change-error", null);
+  await withBusy($("#change-password-submit"), async () => {
+    try {
+      applyAccount(await call("account_change_password", { args: { currentPassword, newPassword } }));
+      closePasswordForm();
+      toast("密码已修改，其他电脑上的登录已失效");
+    } catch (error) {
+      showFormError("#password-change-error", L.errorText(error));
+    }
+  });
+}
+
+// ---- 注销账号 ----
+
+function openDeleteDialog() {
+  if (!state.account?.loggedIn) return;
+  $("#delete-password").value = "";
+  $("#delete-email").value = "";
+  showFormError("#delete-error", null);
+  syncDeleteSubmit();
+  openDialog($("#dialog-delete"), { initialFocus: $("#delete-password") });
+}
+
+function syncDeleteSubmit() {
+  $("#delete-submit").disabled = !L.canConfirmDelete(
+    state.account?.email,
+    $("#delete-email").value,
+    $("#delete-password").value,
+  );
+}
+
+async function deleteAccount(event) {
+  event.preventDefault();
+  if (!L.canConfirmDelete(state.account?.email, $("#delete-email").value, $("#delete-password").value)) return;
+  await withBusy($("#delete-submit"), async () => {
+    try {
+      const status = await call("account_delete", { password: $("#delete-password").value });
+      $("#delete-password").value = "";
+      applyAccount(status);
+      toast("账号已注销");
+    } catch (error) {
+      showFormError("#delete-error", L.errorText(error));
+    }
+  });
+  syncDeleteSubmit();
+}
+// ============ 弹窗体系 ============
+// 所有弹窗走 openDialog / closeDialog：
+// - 打开时把焦点放进弹窗，关闭时还给打开它的按钮；
+// - Esc 关闭（等同取消），Tab / Shift+Tab 在弹窗内循环；
+// - 模态弹窗打开时，背后的内容设为 inert：读屏和鼠标都碰不到。
+// 可以叠：设备管理里点「解绑」，确认弹窗叠在上面，关掉后焦点回到「解绑」按钮。
+
+const dialogStack = [];
+
+function openDialog(node, { modal = true, opener = document.activeElement, initialFocus = null, onCancel = null } = {}) {
+  if (dialogStack.some((entry) => entry.node === node)) return;
+  dialogStack.push({ node, modal, opener, onCancel });
+  node.classList.remove("hidden");
+  syncInert();
+  const target = initialFocus ?? focusableIn(node)[0];
+  target?.focus();
+}
+
+function closeDialog(node, { restoreFocus = true } = {}) {
+  const index = dialogStack.findIndex((entry) => entry.node === node);
+  node.classList.add("hidden");
+  if (index < 0) return;
+  const [entry] = dialogStack.splice(index, 1);
+  syncInert();
+  if (!restoreFocus) return;
+  const back = entry.opener;
+  const usable = (element) =>
+    element && document.contains(element) && !element.disabled && element.getClientRects().length > 0;
+  // 打开它的按钮可能已经不在了（例如兑换成功后遮罩消失）：退回到当前模块的导航项，别让焦点掉到页面开头。
+  const target = usable(back) ? back : $(".nav-item.active");
+  if (usable(target)) target.focus();
+}
+
+function closeAllDialogs() {
+  while (dialogStack.length) {
+    const entry = dialogStack[dialogStack.length - 1];
+    if (entry.onCancel) entry.onCancel();
+    closeDialog(entry.node, { restoreFocus: false });
+  }
+}
+
+/** Esc 和「取消 / 关闭」按钮走同一条路：有 onCancel 的交给它（它负责关），没有的直接关。 */
+function cancelDialog(entry) {
+  if (entry.onCancel) entry.onCancel();
+  else closeDialog(entry.node);
+}
+
+function focusableIn(node) {
+  const selector = "button, [href], input, select, textarea, [tabindex]:not([tabindex='-1'])";
+  return Array.from(node.querySelectorAll(selector)).filter(
+    (element) => !element.disabled && element.getClientRects().length > 0,
+  );
+}
+
+/** 最上面的模态弹窗之外，body 下的其它内容都设为 inert（提示条除外，读屏要能听到）。 */
+function syncInert() {
+  const top = [...dialogStack].reverse().find((entry) => entry.modal);
+  for (const child of document.body.children) {
+    if (child.tagName === "SCRIPT" || child.id === "toast") continue;
+    child.inert = Boolean(top) && child !== top.node;
+  }
+}
+
+function handleDialogKeys(event) {
+  const entry = dialogStack[dialogStack.length - 1];
+  if (!entry) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    cancelDialog(entry);
+    return;
+  }
+  if (event.key !== "Tab") return;
+  const focusables = focusableIn(entry.node);
+  if (!focusables.length) return;
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+  const active = document.activeElement;
+  const inside = Boolean(active) && entry.node.contains(active);
+  if (event.shiftKey ? active === first || !inside : active === last || !inside) {
+    event.preventDefault();
+    (event.shiftKey ? last : first).focus();
+  }
+}
+
+/** 二次确认，返回 Promise<boolean>。 */
+function confirmDialog({ title, body, confirmLabel = "确认", danger = true }) {
+  return new Promise((resolve) => {
+    const node = $("#dialog-confirm");
+    // 同一时间只问一件事：已经有确认弹窗开着，就当这次没确认。
+    if (!node.classList.contains("hidden")) {
+      resolve(false);
+      return;
+    }
+    const yes = $("#confirm-yes");
+    $("#confirm-title").textContent = title;
+    $("#confirm-body").textContent = body;
+    yes.textContent = confirmLabel;
+    yes.className = danger ? "danger" : "primary";
+    const finish = (answer) => {
+      yes.onclick = null;
+      closeDialog(node);
+      resolve(answer);
+    };
+    yes.onclick = () => finish(true);
+    // 默认焦点放在「取消」上：危险操作不该一按回车就执行。
+    openDialog(node, { initialFocus: $("#confirm-no"), onCancel: () => finish(false) });
+  });
+}
+
+// ============ 亮暗主题 ============
+
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  try {
+    localStorage.setItem(L.THEME_KEY, theme);
+  } catch {
+    // 存不下就只在本次生效。
+  }
+  renderThemeToggles();
+}
+
+function renderThemeToggles() {
+  // 按钮文字说的是「点了会怎样」，读屏读到的也是这句，不另设 aria-label（可见文字和可读名称要一致）。
+  const light = document.documentElement.dataset.theme === "light";
+  $$("[data-theme-toggle]").forEach((button) => {
+    button.textContent = light ? "切换暗色" : "切换亮色";
+  });
+}
+// ============ 首页：新手引导、近 7 天、公告 ============
+
+const GUIDE_COLLAPSED_KEY = "dossier.guideCollapsed";
+
+function guideCollapsed() {
+  try {
+    return localStorage.getItem(GUIDE_COLLAPSED_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function setGuideCollapsed(collapsed) {
+  try {
+    if (collapsed) localStorage.setItem(GUIDE_COLLAPSED_KEY, "1");
+    else localStorage.removeItem(GUIDE_COLLAPSED_KEY);
+  } catch {
+    // 存不下就只在本次生效。
+  }
+  renderHome();
+  (collapsed ? $("#guide-reopen") : $("#guide-collapse")).focus();
+}
+
+/** 读首页要的数据（生成流水），再画。流水是本地文件，不需要使用权也能读。 */
+async function loadHome() {
+  if (invoke) {
+    try {
+      const payload = await call("ledger_list");
+      state.ledger = payload.records ?? [];
+    } catch (error) {
+      reportError(error);
+    }
+  }
+  renderHome();
+}
+
+function renderHome() {
+  const entitled = ["online", "offline"].includes(state.account?.tier);
+  const steps = L.guideSteps({
+    entitled,
+    libraryRoot: state.settings?.libraryRoot,
+    dramaCount: state.dramas.length,
+    ledgerCount: state.ledger.length,
+    jianyingReady: Boolean(state.settings?.jianyingDraftDir) || state.jianyingFound,
+  });
+  const progress = L.guideProgress(steps);
+  const collapsed = guideCollapsed();
+  const visible = L.guideVisible(state.ledger.length, collapsed);
+  $("#home-guide").classList.toggle("hidden", !visible);
+  // 自动收起（已经生成过报审包）时不提示「重新打开」；手动收起的才给入口。
+  $("#guide-reopen-row").classList.toggle("hidden", visible || !collapsed);
+  $("#guide-progress").textContent = `${progress.done}/${progress.total}`;
+  $("#guide-steps").innerHTML = steps
+    .map((step, index) => {
+      const mark = step.done ? "✓" : String(index + 1);
+      const status = step.done ? "已完成" : step.disabled ? "即将推出" : "未完成";
+      const button = step.disabled
+        ? `<button type="button" class="ghost" disabled>${esc(step.actionLabel)}</button>`
+        : step.done
+          ? ""
+          : `<button type="button" class="ghost" data-onboard-action="${esc(step.action)}">${esc(step.actionLabel)}</button>`;
+      return `<li class="guide-step ${step.done ? "done" : ""} ${step.disabled ? "disabled" : ""}">
+        <span class="guide-mark" aria-hidden="true">${mark}</span>
+        <div class="guide-body">
+          <p class="guide-title">${esc(step.title)}<span class="sr-only">（${status}）</span></p>
+          <p class="guide-detail">${esc(step.detail)}</p>
+          ${button}
+        </div>
+      </li>`;
+    })
+    .join("");
+  renderChart();
+  renderAnnouncement();
+}
+
+function runOnboardAction(action) {
+  if (action === "redeem") openRedeemDialog();
+  else if (action === "jianying") {
+    state.settingsSub = "jianying";
+    switchModule("settings");
+  } else switchModule(action);
+}
+
+function renderChart() {
+  const days = L.last7Days(state.ledger);
+  const chart = L.barChart(days);
+  const bars = chart.bars
+    .map(
+      (bar) => `<g>
+        <rect class="chart-bar" x="${bar.x}" y="${bar.y}" width="${bar.width}" height="${Math.max(bar.height, 0)}" rx="3"></rect>
+        <text class="chart-value" x="${bar.x + bar.width / 2}" y="${bar.y - 4}" text-anchor="middle">${bar.count || ""}</text>
+        <text class="chart-label" x="${bar.x + bar.width / 2}" y="${chart.height - 6}" text-anchor="middle">${esc(bar.label)}</text>
+      </g>`,
+    )
+    .join("");
+  $("#chart-svg").innerHTML = `<svg viewBox="0 0 ${chart.width} ${chart.height}" role="presentation" focusable="false">
+    <line class="chart-axis" x1="0" x2="${chart.width}" y1="${chart.baseline}" y2="${chart.baseline}"></line>
+    ${bars}
+  </svg>`;
+  $("#chart-total").textContent = `共 ${chart.total} 次`;
+  $("#chart-table tbody").innerHTML = days
+    .map((day) => `<tr><td>${esc(day.key)}</td><td>${day.count}</td></tr>`)
+    .join("");
+}
+// 公告轮播：6 秒一条；鼠标悬停或焦点在里面时暂停；用户点了「暂停」就一直停着；
+// 系统设置了「减少动态效果」时不自动轮播。
+const carousel = {
+  index: 0,
+  timer: null,
+  paused: false,
+  hovering: false,
+  reducedMotion: window.matchMedia?.("(prefers-reduced-motion: reduce)") ?? null,
+};
+
+function renderAnnouncement() {
+  const items = L.ANNOUNCEMENTS;
+  const item = items[carousel.index % items.length];
+  $("#announce-body").innerHTML = `<h4>${esc(item.title)}</h4><p>${esc(item.body)}</p>`;
+  $("#announce-index").textContent = `${(carousel.index % items.length) + 1} / ${items.length}`;
+  const stopped = carousel.paused || carousel.reducedMotion?.matches;
+  $("#announce-toggle").textContent = stopped ? "播放" : "暂停";
+  $("#announce-toggle").setAttribute("aria-pressed", String(Boolean(stopped)));
+  scheduleAnnouncement();
+}
+
+function stepAnnouncement(delta, { manual = false } = {}) {
+  const count = L.ANNOUNCEMENTS.length;
+  carousel.index = (carousel.index + delta + count) % count;
+  // 手动翻页时读屏要读出新内容；自动轮播时不打扰。
+  $("#announce-body").setAttribute("aria-live", manual ? "polite" : "off");
+  renderAnnouncement();
+}
+
+function scheduleAnnouncement() {
+  clearTimeout(carousel.timer);
+  carousel.timer = null;
+  const homeVisible = !$("#module-home").classList.contains("hidden") && accountUi.screen === "app";
+  if (carousel.paused || carousel.hovering || carousel.reducedMotion?.matches || !homeVisible) return;
+  carousel.timer = setTimeout(() => stepAnnouncement(1), 6000);
+}
+
+function toggleAnnouncement() {
+  if (carousel.reducedMotion?.matches) {
+    toast("系统设置了「减少动态效果」，公告不自动轮播；可以用左右按钮翻页");
+    return;
+  }
+  carousel.paused = !carousel.paused;
+  renderAnnouncement();
+}
+
+// ============ 启动 ============
+
+/** 启动：先等 Rust 端恢复登录（restoring），期间显示「正在恢复登录」。 */
+async function boot() {
+  renderThemeToggles();
+  if (!invoke) {
+    // 浏览器静态预览（无 Tauri IPC）：跳过登录直接展示主界面，便于布局验证。
+    setScreen("app");
+    switchModule("home");
+    return;
+  }
+  if (tauriEvent?.listen) {
+    await tauriEvent.listen("account-changed", (event) => applyAccount(event.payload));
+  }
+  await refreshAccount();
+  // 事件可能在监听注册之前就发过了：恢复没做完时，每 1.5 秒再问一次，直到做完。
+  while (state.account?.restoring) {
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    await refreshAccount();
+  }
+  // 离线剩余时间、快到期提醒按分钟走，不等后端事件。
+  setInterval(() => {
+    if (!state.account?.loggedIn) return;
+    renderAccountChip();
+    renderAccountBanners();
+    renderAccountSettings();
+  }, 60_000);
 }
 
 // ============ 设置：独立视图（七子页） ============
@@ -2034,7 +2943,8 @@ function openSettingsView() {
 
 function closeSettingsView() {
   $("#settings-view")?.classList.add("hidden");
-  document.querySelector(".app")?.classList.remove("hidden");
+  // 只有在主界面这一屏才把主界面露出来：登录页、锁定页上不能透出主界面。
+  if (accountUi.screen === "app") document.querySelector(".app")?.classList.remove("hidden");
 }
 
 function switchSettingsSub(name) {
@@ -2051,11 +2961,7 @@ function switchSettingsSub(name) {
 async function refreshSettingsData() {
   if (state.root) $("#env-workdir").value = state.root;
   if (invoke) {
-    try {
-      applyAccount(await call("account_status"));
-    } catch {
-      /* 未登录时保持占位文案 */
-    }
+    await refreshAccount();
     await loadLedger();
   }
 }
@@ -2092,26 +2998,7 @@ async function loadLedger() {
   }
 }
 
-// ---- 设置：修改密码 / 退出登录 ----
-
-async function changePassword(event) {
-  event.preventDefault();
-  const oldPassword = $("#old-password").value;
-  const newPassword = $("#new-password").value;
-  try {
-    const payload = await call("account_change_password", {
-      args: { oldPassword, newPassword },
-    });
-    applyAccount(payload);
-    $("#password-change-form").classList.add("hidden");
-    $("#old-password").value = "";
-    $("#new-password").value = "";
-    toast("密码已修改");
-  } catch (error) {
-    toast(String(error), true);
-  }
-}
-
+// 修改密码、导出、注销见上面「设置：账号与授权」。
 // ---- 设置：剪映 ----
 
 async function jianyingDetect() {
@@ -2128,8 +3015,10 @@ async function jianyingDetect() {
       toast(`未在 ${result.installDir} 找到剪映专业版`, true);
     }
     if (result.draftDir) $("#jianying-draft-dir").placeholder = result.draftDir;
+    // 引导第 5 步：探测到草稿目录就算完成。
+    state.jianyingFound = Boolean(result.draftDirExists);
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   }
 }
 
@@ -2222,7 +3111,7 @@ async function mountBind() {
     });
     toast("已绑定当前剧目，文案模板就绪");
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   }
 }
 
@@ -2240,7 +3129,7 @@ async function mountCsvGenerate() {
     $("#mount-csv-path").textContent = check.csvPath;
     $("#mount-csv-save").disabled = false;
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   }
 }
 
@@ -2258,7 +3147,7 @@ async function mountCsvSave() {
     $("#mount-csv-path").textContent = check.csvPath;
     $("#mount-csv-save").disabled = false;
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   }
 }
 
@@ -2307,7 +3196,7 @@ async function mountPlanSave() {
     renderMountPlanSummary();
     toast("挂载计划已保存到本机");
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   }
 }
 
@@ -2352,32 +3241,125 @@ document.querySelectorAll(".nav-item").forEach((node) => {
 $("#env-chip").addEventListener("click", () => {
   gotoRuntimeSettings();
 });
-// ============ 登录 / 注册 ============
-$("#goto-register").addEventListener("click", () => switchAuthCard(true));
-$("#goto-login").addEventListener("click", () => switchAuthCard(false));
-$("#forgot-password").addEventListener("click", () =>
-  toast("找回密码需要邮件服务，云端版开放后可用", true),
-);
-$("#send-code").addEventListener("click", sendVerifyCode);
+// ============ 登录 / 注册 / 重设密码 ============
+$$("[data-auth-view]").forEach((node) => {
+  node.addEventListener("click", () => {
+    $("#auth-notice").classList.add("hidden");
+    switchAuthView(node.dataset.authView);
+  });
+});
+$$("[data-send-code]").forEach((node) => node.addEventListener("click", () => sendCode(node)));
 $("#auth-login-form").addEventListener("submit", loginAccount);
 $("#auth-register-form").addEventListener("submit", registerAccount);
+$("#auth-reset-form").addEventListener("submit", resetPassword);
+$("#register-terms").addEventListener("change", syncRegisterSubmit);
+$("#register-code").addEventListener("input", (event) => {
+  event.target.value = event.target.value.replace(/\D/g, "").slice(0, 6);
+});
+$("#reset-code").addEventListener("input", (event) => {
+  event.target.value = event.target.value.replace(/\D/g, "").slice(0, 6);
+});
+// ============ 锁定页 / 账号横幅 / 账号菜单 ============
+$("#lock-retry").addEventListener("click", () => (state.account ? retryAccount() : refreshAccount()));
+$("#lock-logout").addEventListener("click", logoutAccount);
+$("#account-banners").addEventListener("click", (event) => {
+  const action = event.target.closest("[data-banner-action]")?.dataset.bannerAction;
+  if (action === "retry") retryAccount();
+  else if (action === "redeem") openRedeemDialog();
+  const dismiss = event.target.closest("[data-banner-dismiss]")?.dataset.bannerDismiss;
+  if (dismiss) {
+    accountUi.dismissed.add(dismiss);
+    renderAccountBanners();
+  }
+});
+$("#account-chip").addEventListener("click", (event) => {
+  event.stopPropagation();
+  if ($("#account-menu").classList.contains("hidden")) openAccountMenu();
+  else closeAccountMenu({ restoreFocus: true });
+});
+$("#locked-action").addEventListener("click", () => {
+  if (state.account?.lockReason === "needs_activation") openDevicesDialog({ activation: true });
+  else openRedeemDialog();
+});
+// ============ 弹窗 ============
+$("#dialog-redeem form").addEventListener("submit", redeemCard);
+$("#redeem-code").addEventListener("input", formatRedeemInput);
+$("#devices-body").addEventListener("click", (event) => {
+  const id = event.target.closest("[data-unbind]")?.dataset.unbind;
+  if (id) unbindDevice(id);
+});
+$("#devices-activate").addEventListener("click", activateDevice);
+$("#devices-logout").addEventListener("click", logoutAccount);
+$("#dialog-delete form").addEventListener("submit", deleteAccount);
+["#delete-password", "#delete-email"].forEach((selector) => {
+  $(selector).addEventListener("input", syncDeleteSubmit);
+});
+// 弹窗里的「关闭 / 取消」：和 Esc 走同一条路。
+document.addEventListener("click", (event) => {
+  const close = event.target.closest("[data-dialog-close]");
+  if (!close) return;
+  const entry = dialogStack.find((item) => item.node.contains(close));
+  if (entry) cancelDialog(entry);
+});
+// 点遮罩空白处等于取消（点在弹窗本身上不算）。
+$$(".modal").forEach((node) => {
+  node.addEventListener("click", (event) => {
+    if (event.target !== node) return;
+    const entry = dialogStack.find((item) => item.node === node);
+    if (entry) cancelDialog(entry);
+  });
+});
+// ============ 主题 ============
+$$("[data-theme-toggle]").forEach((node) => {
+  node.addEventListener("click", () =>
+    applyTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light"),
+  );
+});
+// ============ 首页 ============
+$("#guide-collapse").addEventListener("click", () => setGuideCollapsed(true));
+$("#guide-reopen").addEventListener("click", () => setGuideCollapsed(false));
+$("#guide-steps").addEventListener("click", (event) => {
+  const action = event.target.closest("[data-onboard-action]")?.dataset.onboardAction;
+  if (action) runOnboardAction(action);
+});
+$("#announce-prev").addEventListener("click", () => stepAnnouncement(-1, { manual: true }));
+$("#announce-next").addEventListener("click", () => stepAnnouncement(1, { manual: true }));
+$("#announce-toggle").addEventListener("click", toggleAnnouncement);
+const announce = $(".announce");
+["mouseenter", "focusin"].forEach((type) =>
+  announce.addEventListener(type, () => {
+    carousel.hovering = true;
+    scheduleAnnouncement();
+  }),
+);
+["mouseleave", "focusout"].forEach((type) =>
+  announce.addEventListener(type, () => {
+    carousel.hovering = announce.matches(":hover") || announce.contains(document.activeElement);
+    scheduleAnnouncement();
+  }),
+);
+carousel.reducedMotion?.addEventListener?.("change", renderAnnouncement);
 // ============ 设置独立视图 ============
 $("#settings-back").addEventListener("click", () => {
-  switchModule("library");
+  switchModule(state.module === "settings" ? "home" : state.module);
 });
 document.querySelectorAll(".settings-nav").forEach((node) => {
   node.addEventListener("click", () => switchToSubAnd(node.dataset.sub));
 });
 $("#password-change-form").addEventListener("submit", changePassword);
 $("#open-change-password").addEventListener("click", () => {
-  $("#password-change-form").classList.toggle("hidden");
+  const form = $("#password-change-form");
+  if (!form.classList.contains("hidden")) return closePasswordForm();
+  form.classList.remove("hidden");
+  $("#open-change-password").setAttribute("aria-expanded", "true");
+  $("#old-password").focus();
 });
-$("#cancel-change-password").addEventListener("click", () => {
-  $("#password-change-form").classList.add("hidden");
-  $("#old-password").value = "";
-  $("#new-password").value = "";
-});
+$("#cancel-change-password").addEventListener("click", closePasswordForm);
 $("#logout").addEventListener("click", logoutAccount);
+$("#copy-device-code").addEventListener("click", copyDeviceCode);
+$("#account-sync").addEventListener("click", syncLicense);
+$("#account-export").addEventListener("click", exportAccountData);
+$("#open-delete-account").addEventListener("click", openDeleteDialog);
 $("#ledger-refresh").addEventListener("click", () => loadLedger());
 $("#jianying-detect").addEventListener("click", jianyingDetect);
 $("#jianying-save").addEventListener("click", jianyingSave);
@@ -2406,32 +3388,15 @@ $("#bitrate-fix").addEventListener("click", requestBitrateFix);
 $("#bitrate-confirm-yes").addEventListener("click", applyBitrateFix);
 $("#bitrate-confirm-no").addEventListener("click", cancelBitrateFix);
 
-/**
- * 确认弹窗的键盘行为：Esc 取消、Tab 在弹窗内循环。
- * `alertdialog` 只声明了语义，焦点仍然会跑到背后的表单上，必须自己兜住。
- */
-function handleConfirmKeys(event) {
-  const node = $("#bitrate-confirm");
-  if (node.classList.contains("hidden")) return;
-  if (event.key === "Escape") {
-    event.preventDefault();
-    cancelBitrateFix();
-    return;
-  }
-  if (event.key !== "Tab") return;
-  const focusables = $$("#bitrate-confirm button:not([disabled])");
-  if (!focusables.length) return;
-  const first = focusables[0];
-  const last = focusables[focusables.length - 1];
-  const active = document.activeElement;
-  const inside = Boolean(active) && node.contains(active);
-  if (event.shiftKey ? active === first || !inside : active === last || !inside) {
-    event.preventDefault();
-    (event.shiftKey ? last : first).focus();
-  }
-}
-
-document.addEventListener("keydown", handleConfirmKeys);
+// 键盘：账号菜单开着时先交给菜单，否则交给最上面的弹窗（Esc 取消、Tab 循环）。
+document.addEventListener("keydown", (event) => {
+  if (handleAccountMenuKeys(event)) return;
+  handleDialogKeys(event);
+});
+// 点菜单外面就关掉菜单。
+document.addEventListener("click", (event) => {
+  if (!event.target.closest("#account-menu, #account-chip")) closeAccountMenu();
+});
 $("#exec-run").addEventListener("click", executeTranscode);
 $("#runtime-recheck").addEventListener("click", () => checkRuntime(true));
 $("#runtime-install").addEventListener("click", runtimeInstall);
@@ -2506,6 +3471,16 @@ document.addEventListener("click", (event) => {
     else if (guideButton.dataset.guideAction === "scan") scan();
     return;
   }
+  const accountButton = event.target.closest("[data-account-action]");
+  if (accountButton) {
+    runAccountAction(accountButton.dataset.accountAction);
+    return;
+  }
+  const gotoButton = event.target.closest("[data-goto-module]");
+  if (gotoButton) {
+    switchModule(gotoButton.dataset.gotoModule);
+    return;
+  }
   const openButton = event.target.closest("[data-open-key]");
   if (openButton) {
     openPath(openButton.dataset.openKey);
@@ -2524,10 +3499,15 @@ if (tauriEvent?.listen) {
   tauriEvent.listen("erase-progress", (event) => handleEraseProgress(event.payload));
 }
 
-// 启动：决定显示登录卡还是主应用（浏览器预览无 IPC 时直接进主应用便于布局验证）。
+// 启动：先等恢复登录，再决定显示登录页、锁定页还是主界面（浏览器预览无 IPC 时直接进主界面便于布局验证）。
 boot();
 if (invoke) {
-  loadSettings().then(() => checkRuntime());
+  // 设置、本机环境、平台规则都是本机信息，不需要登录（闸门里是「不设闸门」）。
+  loadSettings().then(() => {
+    checkRuntime();
+    // 引导「准备素材」「剪映」两步看设置里记下的目录。
+    if (state.module === "home") renderHome();
+  });
   loadPlatformProfiles();
 }
 loadVersion();
