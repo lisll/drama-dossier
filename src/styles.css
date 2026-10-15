@@ -1,15 +1,70 @@
 :root {
   color-scheme: dark;
-  --bg: #0b1020;
-  --panel: rgba(255, 255, 255, 0.055);
-  --panel-strong: rgba(255, 255, 255, 0.08);
-  --border: rgba(255, 255, 255, 0.11);
-  --text: #edf1fb;
-  --muted: #a4adc4;
-  --primary: #5b73ff;
-  --success: #25c589;
-  --danger: #ff5b6b;
-  --warn: #f0b64d;
+
+  /* 画布与层级：中性冷灰，配「顶亮底平」的单一点光。
+     旧版用紫、绿两个径向光晕铺满整屏，半透明面板叠上去就变成一片浑汤——
+     语义色（成功/警告/失败）也跟着一起脏。所以这里只保留一层很淡的品牌顶光。 */
+  --canvas: #0c1016;
+  --canvas-top: #101620;
+  --surface: #151b24;
+  --surface-2: #1a222c;
+  --surface-3: #212a35;
+  --line: #232c38;
+  --line-strong: #33404f;
+
+  /* 文字三级：正文 / 次要 / 极弱（极弱只用在装饰性说明，仍需 ≥ 3:1） */
+  --text: #e8edf5;
+  --muted: #9aa7b8;
+  --faint: #6f7d90;
+
+  /* 品牌蓝：全app唯一的强调色，负责「可交互」与「已选中」 */
+  --accent: #5b8cff;
+  --accent-text: #79a2ff;
+  --accent-soft: #16203a;
+  --accent-fill: #3566e0;
+  --accent-fill-hover: #2a58cc;
+  --accent-line: rgba(91, 140, 255, 0.42);
+  --accent-tint: rgba(91, 140, 255, 0.14);
+
+  /* 语义色：亮色只用于文字/描边，深色用于填充——白字压深填充才能过 4.5:1。
+     旧版把白字压在亮绿 #2ed694 / 亮红 #ff6b7a 上，实测只有 1.9、2.8。 */
+  --ok-text: #45d68f;
+  --ok-soft: #0f2a24;
+  --ok-line: rgba(69, 214, 143, 0.34);
+  --ok-fill: #15805c;
+  --ok-fill-hover: #116a4c;
+
+  --warn-text: #f2c46b;
+  --warn-soft: #2e2415;
+  --warn-line: rgba(242, 196, 107, 0.32);
+
+  --err-text: #ff8f99;
+  --err-soft: #2f1b20;
+  --err-line: rgba(255, 143, 153, 0.36);
+  --err-fill: #c03a4b;
+  --err-fill-hover: #a83246;
+
+  /* 兼容既有写法：这些名字仍被下面大量规则引用 */
+  --bg: var(--canvas);
+  --panel: var(--surface);
+  --panel-strong: var(--surface-2);
+  --border: var(--line);
+  --primary: var(--accent);
+  --success: var(--ok-text);
+  --danger: var(--err-text);
+  --warn: var(--warn-text);
+
+  /* 圆角 / 焦点环 / 高度：统一取值，避免 9/10/11/12/14/18 混用 */
+  --r-sm: 8px;
+  --r-md: 10px;
+  --r-lg: 14px;
+  --r-xl: 18px;
+  --r-pill: 999px;
+  --ring: 0 0 0 3px rgba(91, 140, 255, 0.28);
+  --edge: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  --shadow-1: 0 1px 2px rgba(3, 6, 12, 0.4);
+  --shadow-2: 0 10px 28px rgba(3, 6, 12, 0.42);
+  --shadow-3: 0 26px 64px rgba(3, 6, 12, 0.5);
 }
 
 * {
@@ -20,12 +75,52 @@ html,
 body {
   height: 100%;
   margin: 0;
-  background:
-    radial-gradient(circle at 92% 4%, rgba(91, 115, 255, 0.2), transparent 28rem),
-    radial-gradient(circle at 4% 92%, rgba(37, 197, 137, 0.12), transparent 24rem),
-    var(--bg);
+  background-color: var(--canvas);
+  /* 顶光只铺满首屏高度，往下就是干净的画布——空态不再是一片发绿发紫的雾。 */
+  background-image:
+    radial-gradient(1100px 380px at 50% -14%, rgba(91, 140, 255, 0.12), transparent 72%),
+    linear-gradient(180deg, var(--canvas-top), var(--canvas) 380px);
+  background-repeat: no-repeat;
   color: var(--text);
-  font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  /* 拉丁字形走系统 UI 字体，中文再退回中文字体：混排时数字与英文更利落 */
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei",
+    "Noto Sans CJK SC", "Source Han Sans SC", sans-serif;
+  font-size: 13px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::selection {
+  background: rgba(91, 140, 255, 0.32);
+}
+
+/* 深色界面里系统默认的亮色滚动条很扎眼，统一成细轨 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-strong) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--line-strong);
+  background-clip: content-box;
+  border: 3px solid transparent;
+  border-radius: var(--r-pill);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3f4d5e;
+  background-clip: content-box;
 }
 
 .app {
@@ -35,12 +130,17 @@ body {
 }
 
 .app-header {
+  position: sticky;
+  top: 0;
+  z-index: 5;
   display: flex;
   gap: 24px;
   align-items: center;
   justify-content: space-between;
-  padding: 20px 24px;
-  border-bottom: 1px solid var(--border);
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--line);
+  /* 有底色，backdrop-filter 才真的糊得住下面的内容 */
+  background: rgba(12, 16, 22, 0.74);
   backdrop-filter: blur(18px);
 }
 
@@ -52,12 +152,13 @@ body {
 
 .brand h1 {
   margin: 0;
-  font-size: 21px;
-  letter-spacing: 0.02em;
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
 }
 
 .brand h1 span {
-  color: var(--muted);
+  color: var(--faint);
   font-weight: 400;
 }
 
@@ -69,20 +170,35 @@ body {
   font-size: 13px;
 }
 
+/* 旧版给这一行写死 min-width: min(620px, 58vw)，而它所在的剧目面板只有 295px 宽，
+   于是输入框和按钮直接溢出面板、压到右侧「检查结果 / 分集」上（1280 宽必现）。 */
 .path-row {
   display: flex;
-  min-width: min(620px, 58vw);
+  flex-wrap: wrap;
+  width: 100%;
+  min-width: 0;
   gap: 8px;
 }
 
+.path-row input {
+  flex: 1 1 150px;
+  min-width: 0;
+}
+
+.path-row button {
+  flex: 0 0 auto;
+}
+
 input,
-button {
+button,
+select {
   min-height: 38px;
-  border-radius: 9px;
-  border: 1px solid var(--border);
-  background: rgba(5, 8, 18, 0.58);
+  border-radius: var(--r-md);
+  border: 1px solid var(--line);
+  background: rgba(9, 13, 19, 0.72);
   color: var(--text);
   font-size: 13px;
+  font-family: inherit;
 }
 
 input {
@@ -91,45 +207,88 @@ input {
   outline: none;
 }
 
-input:focus {
-  border-color: rgba(91, 115, 255, 0.9);
-  box-shadow: 0 0 0 3px rgba(91, 115, 255, 0.14);
+input::placeholder,
+textarea::placeholder {
+  color: var(--faint);
 }
 
 button {
   padding: 0 15px;
   cursor: pointer;
-  transition: 0.18s ease;
-}
-
-button:hover {
-  transform: translateY(-1px);
-  filter: brightness(1.1);
+  transition:
+    background-color 0.16s ease,
+    border-color 0.16s ease,
+    transform 0.16s ease;
 }
 
 button:disabled {
-  opacity: 0.5;
+  opacity: 0.45;
   cursor: not-allowed;
   transform: none;
 }
 
-.primary,
-.success {
-  border: 0;
+/* 键盘焦点：旧版只给 input 做了焦点框，按钮/导航/步骤条键盘走到时没有任何反馈 */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--ring);
+}
+
+/* 主按钮：白字压深蓝填充（5.1:1）。旧版是 #647eff 亮端，白字只有 3.5:1。 */
+.primary {
+  border-color: transparent;
+  background: var(--accent-fill);
   color: #fff;
   font-weight: 600;
+  box-shadow: var(--edge);
 }
 
-.primary {
-  background: linear-gradient(135deg, #647eff, #4657d7);
+.primary:hover:not(:disabled) {
+  background: var(--accent-fill-hover);
 }
 
+/* 成功按钮：旧版白字压 #2ed694 只有 1.9:1，等于看不清 */
 .success {
-  background: linear-gradient(135deg, #2ed694, #159c6b);
+  border-color: transparent;
+  background: var(--ok-fill);
+  color: #fff;
+  font-weight: 600;
+  box-shadow: var(--edge);
+}
+
+.success:hover:not(:disabled) {
+  background: var(--ok-fill-hover);
+}
+
+.danger {
+  border-color: transparent;
+  background: var(--err-fill);
+  color: #fff;
+  font-weight: 600;
+  box-shadow: var(--edge);
+}
+
+.danger:hover:not(:disabled) {
+  background: var(--err-fill-hover);
+  transform: translateY(-1px);
 }
 
 .ghost {
-  background: var(--panel);
+  background: var(--surface-2);
+  border-color: var(--line);
+}
+
+.ghost:hover:not(:disabled) {
+  background: var(--surface-3);
+  border-color: var(--line-strong);
+  transform: translateY(-1px);
 }
 
 .workspace {
@@ -159,14 +318,15 @@ button:disabled {
 }
 
 .nav-item:hover {
-  background: var(--panel);
+  background: var(--surface-2);
   color: var(--text);
 }
 
 .nav-item.active {
-  background: rgba(91, 115, 255, 0.16);
-  border-color: rgba(91, 115, 255, 0.42);
+  background: var(--accent-tint);
+  border-color: var(--accent-line);
   color: var(--text);
+  box-shadow: var(--edge);
 }
 
 .modules {
@@ -180,14 +340,17 @@ button:disabled {
   align-items: start;
 }
 
+/* 「当前剧目」是上下文、不是状态：用中性面 + 品牌细边，
+   这样页头不会同时出现蓝绿两颗同样抢眼的胶囊。 */
 .drama-chip {
   display: inline-flex;
   align-items: center;
   min-height: 32px;
   padding: 0 14px;
-  border-radius: 999px;
-  border: 1px solid rgba(91, 115, 255, 0.42);
-  background: rgba(91, 115, 255, 0.14);
+  border-radius: var(--r-pill);
+  border: 1px solid var(--accent-line);
+  background: var(--surface-2);
+  color: var(--text);
   font-size: 13px;
   max-width: 40vw;
   overflow: hidden;
@@ -212,10 +375,10 @@ button:disabled {
 .env-banner {
   margin: 14px 24px 0;
   padding: 12px 14px;
-  border-radius: 10px;
+  border-radius: var(--r-md);
   font-size: 13px;
   line-height: 1.6;
-  border: 1px solid var(--border);
+  border: 1px solid var(--line);
 }
 
 .env-banner button {
@@ -223,21 +386,21 @@ button:disabled {
 }
 
 .env-banner.ok {
-  background: rgba(37, 197, 137, 0.12);
-  border-color: rgba(37, 197, 137, 0.3);
-  color: #ceffe9;
+  background: var(--ok-soft);
+  border-color: var(--ok-line);
+  color: var(--ok-text);
 }
 
 .env-banner.warn {
-  background: rgba(240, 182, 77, 0.12);
-  border-color: rgba(240, 182, 77, 0.32);
-  color: #ffe9c2;
+  background: var(--warn-soft);
+  border-color: var(--warn-line);
+  color: var(--warn-text);
 }
 
 .env-banner.error {
-  background: rgba(255, 91, 107, 0.12);
-  border-color: rgba(255, 91, 107, 0.32);
-  color: #ffd6da;
+  background: var(--err-soft);
+  border-color: var(--err-line);
+  color: var(--err-text);
 }
 
 .tool-grid {
@@ -259,6 +422,10 @@ button:disabled {
   font-size: 12px;
 }
 
+.adv summary:hover {
+  color: var(--text);
+}
+
 .adv[open] summary {
   margin-bottom: 10px;
 }
@@ -268,11 +435,11 @@ button:disabled {
 }
 
 .panel {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 14px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
   padding: 16px;
-  box-shadow: 0 18px 45px rgba(0, 0, 0, 0.16);
+  box-shadow: var(--shadow-2), var(--edge);
 }
 
 .panel-header {
@@ -300,10 +467,12 @@ button:disabled {
   align-items: center;
   min-height: 24px;
   padding: 0 9px;
-  border-radius: 999px;
-  background: var(--panel-strong);
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
   color: var(--muted);
   font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .drama-list {
@@ -316,19 +485,25 @@ button:disabled {
 .drama-item,
 .check-item {
   width: 100%;
-  border-radius: 10px;
+  border-radius: var(--r-md);
   padding: 12px;
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--surface-2);
   border: 1px solid transparent;
+  color: var(--text);
 }
 
 .drama-item {
   text-align: left;
 }
 
+.drama-item:hover {
+  background: var(--surface-3);
+  transform: none;
+}
+
 .drama-item.active {
-  background: rgba(91, 115, 255, 0.16);
-  border-color: rgba(91, 115, 255, 0.42);
+  background: var(--accent-tint);
+  border-color: var(--accent-line);
 }
 
 .drama-title {
@@ -356,22 +531,34 @@ button:disabled {
   margin-bottom: 16px;
 }
 
+/* 「检查结果 / 分集」两栏。旧版死守 0.8fr : 1.2fr，默认 1200 宽窗口下分集面板只有
+   376px，而分集表本身要 520px——文件名被拆成三行、状态列被挤出可视区。
+   改成按容器宽度自动换行：放得下两栏就并排，放不下就各自占满整行。 */
 .grid {
   display: grid;
-  grid-template-columns: minmax(250px, 0.8fr) minmax(0, 1.2fr);
+  grid-template-columns: repeat(auto-fit, minmax(540px, 1fr));
   gap: 18px;
+  align-items: start;
 }
 
 .checklist {
   display: grid;
+  /* 满行时自动分成多列，避免单列把面板拉得很长 */
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
   gap: 8px;
   max-height: 360px;
   overflow: auto;
 }
 
+/* 空态文案占满整行，不要被挤进某一列 */
+.checklist > .empty {
+  grid-column: 1 / -1;
+}
+
 .check-item {
   display: grid;
   gap: 3px;
+  min-width: 0;
 }
 
 .check-label {
@@ -407,6 +594,7 @@ button:disabled {
 .table-wrap {
   overflow: auto;
   max-height: 360px;
+  border-radius: var(--r-sm);
 }
 
 table {
@@ -418,7 +606,7 @@ table {
 th,
 td {
   padding: 10px 8px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  border-bottom: 1px solid var(--line);
   text-align: left;
   vertical-align: top;
 }
@@ -426,13 +614,24 @@ td {
 th {
   position: sticky;
   top: 0;
-  background: #131a2f;
+  background: var(--surface-2);
   color: var(--muted);
   font-weight: 500;
 }
 
 td {
   overflow-wrap: anywhere;
+}
+
+table {
+  font-variant-numeric: tabular-nums;
+}
+
+/* 分集表：规格/时长这类短值整块显示（旧版会把 1080×1920 拆成两行），
+   只有文件名在面板过窄时才允许折行兜底。表格本身约需 520px，
+   由下面的 .grid 响应式规则保证默认窗口下也有足够宽度。 */
+#episode-body td:not(:nth-child(2)) {
+  white-space: nowrap;
 }
 
 .package-panel {
@@ -476,17 +675,18 @@ td {
   width: 16px;
   height: 16px;
   min-height: 0;
-  accent-color: var(--primary);
+  accent-color: var(--accent);
 }
 
 .result {
   margin-top: 14px;
   padding: 12px;
-  border-radius: 10px;
-  background: rgba(37, 197, 137, 0.12);
-  border: 1px solid rgba(37, 197, 137, 0.25);
-  color: #ceffe9;
+  border-radius: var(--r-md);
+  background: var(--ok-soft);
+  border: 1px solid var(--ok-line);
+  color: var(--ok-text);
   font-size: 13px;
+  line-height: 1.65;
 }
 
 .legal {
@@ -498,9 +698,9 @@ td {
 
 .empty {
   padding: 14px;
-  border: 1px dashed var(--border);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.02);
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--r-md);
+  background: transparent;
 }
 
 .empty.large {
@@ -549,9 +749,9 @@ td {
 }
 
 .guide-step.done .guide-mark {
-  border-color: rgba(37, 197, 137, 0.5);
-  background: rgba(37, 197, 137, 0.15);
-  color: var(--success);
+  border-color: var(--ok-line);
+  background: var(--ok-soft);
+  color: var(--ok-text);
 }
 
 .guide-body {
@@ -598,17 +798,17 @@ td {
   z-index: 10;
   max-width: min(440px, 80vw);
   padding: 13px 16px;
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  border-radius: 11px;
-  background: #1c2438;
-  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.28);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-lg);
+  background: var(--surface-3);
+  box-shadow: var(--shadow-3), var(--edge);
   font-size: 13px;
 }
 
 .toast.error {
-  border-color: rgba(255, 91, 107, 0.45);
-  background: #37202a;
-  color: #ffd6da;
+  border-color: var(--err-line);
+  background: var(--err-soft);
+  color: var(--err-text);
 }
 
 /* 提示里的「下一步」按钮：右侧对齐，不换行挤掉正文。 */
@@ -619,8 +819,9 @@ td {
 
 code {
   padding: 2px 5px;
-  border-radius: 5px;
-  background: rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  background: var(--surface-3);
+  border: 1px solid var(--line);
   font-size: 12px;
 }
 
@@ -630,6 +831,10 @@ code {
   font-weight: 600;
   color: var(--text);
   list-style: none;
+}
+
+.tool-card summary:hover {
+  color: var(--accent-text);
 }
 
 .tool-card summary::-webkit-details-marker {
@@ -661,7 +866,7 @@ code {
   width: 16px;
   height: 16px;
   min-height: 0;
-  accent-color: var(--primary);
+  accent-color: var(--accent);
 }
 
 .settings-note {
@@ -731,7 +936,7 @@ code {
 .result td {
   padding: 4px 6px;
   text-align: left;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid var(--line);
 }
 
 .result pre,
@@ -754,30 +959,30 @@ code {
 }
 
 .env-chip {
-  border-radius: 999px;
+  border-radius: var(--r-pill);
   padding: 0 14px;
   font-size: 12px;
   font-weight: 600;
-  background: var(--panel);
+  background: var(--surface-2);
   color: var(--muted);
 }
 
 .env-chip.ok {
-  color: #b7f5d8;
-  border-color: rgba(37, 197, 137, 0.4);
-  background: rgba(37, 197, 137, 0.14);
+  color: var(--ok-text);
+  border-color: var(--ok-line);
+  background: var(--ok-soft);
 }
 
 .env-chip.warn {
-  color: #ffe9c2;
-  border-color: rgba(240, 182, 77, 0.4);
-  background: rgba(240, 182, 77, 0.14);
+  color: var(--warn-text);
+  border-color: var(--warn-line);
+  background: var(--warn-soft);
 }
 
 .env-chip.error {
-  color: #ffd6da;
-  border-color: rgba(255, 91, 107, 0.45);
-  background: rgba(255, 91, 107, 0.14);
+  color: var(--err-text);
+  border-color: var(--err-line);
+  background: var(--err-soft);
 }
 
 .progress {
@@ -788,17 +993,18 @@ code {
 
 .progress-track {
   height: 6px;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.08);
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
   overflow: hidden;
 }
 
+/* 进度条只走品牌色：旧版是蓝→绿的彩虹渐变，和「成功」色撞语义 */
 .progress-track > span {
   display: block;
   width: 0;
   height: 100%;
-  border-radius: 999px;
-  background: linear-gradient(90deg, #647eff, #2ed694);
+  border-radius: var(--r-pill);
+  background: linear-gradient(90deg, #2c58cc, var(--accent));
   transition: width 0.25s ease;
 }
 
@@ -824,24 +1030,24 @@ code {
 
 .field-error {
   margin: 4px 0 0;
-  color: var(--danger);
+  color: var(--err-text);
   font-size: 12px;
 }
 
 input[aria-invalid="true"] {
-  border-color: rgba(255, 91, 107, 0.7);
+  border-color: rgba(255, 143, 153, 0.72);
 }
 
 .result.warn {
-  background: rgba(240, 182, 77, 0.12);
-  border-color: rgba(240, 182, 77, 0.3);
-  color: #ffe9c2;
+  background: var(--warn-soft);
+  border-color: var(--warn-line);
+  color: var(--warn-text);
 }
 
 .result.error {
-  background: rgba(255, 91, 107, 0.12);
-  border-color: rgba(255, 91, 107, 0.32);
-  color: #ffd6da;
+  background: var(--err-soft);
+  border-color: var(--err-line);
+  color: var(--err-text);
 }
 
 .result-actions {
@@ -856,16 +1062,13 @@ input[aria-invalid="true"] {
   font-size: 12px;
 }
 
-.danger {
-  background: linear-gradient(135deg, #ff6b7a, #d63a4c);
-}
-
 .confirm {
   margin-top: 12px;
   padding: 12px;
-  border-radius: 10px;
-  border: 1px solid rgba(255, 91, 107, 0.45);
-  background: rgba(255, 91, 107, 0.1);
+  border-radius: var(--r-md);
+  border: 1px solid var(--err-line);
+  background: var(--err-soft);
+  color: var(--err-text);
   font-size: 13px;
 }
 
@@ -883,31 +1086,24 @@ input[aria-invalid="true"] {
   font-size: 15px;
 }
 
-/* ============ 新增通用：链接按钮 / 危险按钮 / 全宽 / 等宽 ============ */
+/* ============ 通用：链接按钮 / 全宽 / 等宽 ============ */
 
 .link {
   background: transparent;
   border: 0;
   min-height: 0;
   padding: 2px 4px;
-  color: var(--primary);
+  border-radius: var(--r-sm);
+  /* 旧版 #5b73ff 在面板上只有 4.1:1，作为正文链接偏弱 */
+  color: var(--accent-text);
   font-size: 13px;
+  font-weight: 500;
 }
 
-.link:hover {
+.link:hover:not(:disabled) {
+  color: var(--accent);
   text-decoration: underline;
   transform: none;
-}
-
-.danger {
-  border: 0;
-  color: #fff;
-  font-weight: 600;
-  background: rgba(255, 91, 107, 0.82);
-}
-
-.danger:hover {
-  background: rgba(255, 91, 107, 0.95);
 }
 
 .wide {
@@ -924,18 +1120,13 @@ textarea {
   width: 100%;
   min-height: 120px;
   padding: 10px 12px;
-  border-radius: 9px;
-  border: 1px solid var(--border);
-  background: rgba(5, 8, 18, 0.58);
+  border-radius: var(--r-md);
+  border: 1px solid var(--line);
+  background: rgba(9, 13, 19, 0.72);
   color: var(--text);
   font: 13px/1.7 "SF Mono", Menlo, Consolas, monospace;
   outline: none;
   resize: vertical;
-}
-
-textarea:focus {
-  border-color: rgba(91, 115, 255, 0.9);
-  box-shadow: 0 0 0 3px rgba(91, 115, 255, 0.14);
 }
 
 /* ============ 登录 / 注册视图 ============ */
@@ -951,10 +1142,10 @@ textarea:focus {
 .auth-card {
   width: min(400px, 100%);
   padding: 30px 28px 22px;
-  border-radius: 18px;
-  border: 1px solid var(--border);
-  background: var(--panel-strong);
-  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.4);
+  border-radius: var(--r-xl);
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  box-shadow: var(--shadow-3), var(--edge);
 }
 
 .auth-brand {
@@ -968,7 +1159,8 @@ textarea:focus {
 
 .auth-brand h1 {
   margin: 10px 0 4px;
-  font-size: 22px;
+  font-size: 20px;
+  letter-spacing: 0.01em;
 }
 
 .auth-brand h1 span {
@@ -1049,9 +1241,9 @@ textarea:focus {
   justify-content: space-between;
   gap: 8px;
   padding: 10px 12px;
-  border-radius: 10px;
-  border: 1px solid var(--border);
-  background: var(--panel);
+  border-radius: var(--r-md);
+  border: 1px solid var(--line);
+  background: var(--surface-2);
 }
 
 .account-email {
@@ -1077,9 +1269,9 @@ textarea:focus {
   gap: 9px;
   justify-content: flex-start;
   padding: 11px 14px;
-  border-radius: 11px;
-  border: 1px solid var(--border);
-  background: var(--panel);
+  border-radius: var(--r-md);
+  border: 1px solid var(--line);
+  background: var(--surface);
   color: var(--muted);
   font-size: 14px;
   font-weight: 600;
@@ -1093,18 +1285,19 @@ textarea:focus {
   align-items: center;
   justify-content: center;
   border-radius: 50%;
-  background: rgba(255, 255, 255, 0.1);
+  background: var(--surface-3);
   font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
 
 .step.active {
-  border-color: rgba(37, 197, 137, 0.55);
-  background: rgba(37, 197, 137, 0.12);
+  border-color: var(--accent-line);
+  background: var(--accent-tint);
   color: var(--text);
 }
 
 .step.active i {
-  background: var(--success);
+  background: var(--accent-fill);
   color: #fff;
 }
 
@@ -1114,8 +1307,8 @@ textarea:focus {
 
 .placeholder-card {
   padding: 26px 20px;
-  border: 1px dashed var(--border);
-  border-radius: 12px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--r-md);
   text-align: center;
 }
 
@@ -1137,13 +1330,13 @@ textarea:focus {
 }
 
 .guidance em {
-  color: var(--warn);
+  color: var(--warn-text);
   font-style: normal;
 }
 
 .badge.dirty {
-  color: #ffe9c2;
-  background: rgba(240, 182, 77, 0.16);
+  color: var(--warn-text);
+  background: var(--warn-soft);
 }
 
 .csv-label {
@@ -1157,7 +1350,7 @@ textarea:focus {
 .issue-list {
   margin: 8px 0 0;
   padding-left: 18px;
-  color: #ffd6da;
+  color: var(--err-text);
   font-size: 12px;
   line-height: 1.8;
 }
@@ -1176,10 +1369,15 @@ textarea:focus {
   gap: 6px;
   text-align: left;
   padding: 15px 16px;
-  border-radius: 12px;
-  border: 1px solid var(--border);
-  background: var(--panel);
+  border-radius: var(--r-md);
+  border: 1px solid var(--line);
+  background: var(--surface);
   min-height: 0;
+}
+
+.mode-card:hover {
+  background: var(--surface-2);
+  transform: none;
 }
 
 .mode-card strong {
@@ -1192,24 +1390,24 @@ textarea:focus {
   line-height: 1.6;
 }
 
-/* 竞品样式：选中的模式卡片绿色描边。 */
+/* 选中 = 品牌色（旧版沿用竞品的绿色描边，与「检查通过」的绿混在同一个语义位上） */
 .mode-card.active {
-  border-color: rgba(37, 197, 137, 0.7);
-  box-shadow: 0 0 0 3px rgba(37, 197, 137, 0.14);
+  border-color: var(--accent-line);
+  box-shadow: var(--ring);
 }
 
 .gate {
   margin-bottom: 16px;
   padding: 22px 20px;
-  border-radius: 14px;
-  border: 1px solid rgba(255, 91, 107, 0.35);
-  background: rgba(255, 91, 107, 0.08);
+  border-radius: var(--r-lg);
+  border: 1px solid var(--err-line);
+  background: var(--err-soft);
   text-align: center;
 }
 
 .gate p {
   margin: 0 0 12px;
-  color: #ffd6da;
+  color: var(--err-text);
   font-size: 14px;
 }
 
@@ -1250,12 +1448,12 @@ textarea:focus {
   top: 18px;
 }
 
+/* 中文分组标题不需要伪大写，字距也要收回来（0.14em 是给拉丁大写的写法） */
 .settings-group {
   margin: 12px 6px 4px;
-  color: var(--muted);
+  color: var(--faint);
   font-size: 11px;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
+  letter-spacing: 0.02em;
 }
 
 .settings-group:first-child {
@@ -1274,13 +1472,13 @@ textarea:focus {
 }
 
 .settings-nav:hover {
-  background: var(--panel);
+  background: var(--surface-2);
   color: var(--text);
 }
 
 .settings-nav.active {
-  background: rgba(91, 115, 255, 0.16);
-  border-color: rgba(91, 115, 255, 0.42);
+  background: var(--accent-tint);
+  border-color: var(--accent-line);
   color: var(--text);
 }
 
@@ -1302,7 +1500,7 @@ textarea:focus {
   justify-content: space-between;
   gap: 14px;
   padding: 11px 0;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  border-bottom: 1px solid var(--line);
 }
 
 .account-row:last-of-type {
@@ -1323,6 +1521,7 @@ textarea:focus {
 .account-value.big {
   font-size: 22px;
   font-weight: 700;
+  font-variant-numeric: tabular-nums;
 }
 
 .account-row .auth-form {
@@ -1346,10 +1545,10 @@ textarea:focus {
 .runtime-error {
   margin-top: 12px;
   padding: 10px 12px;
-  border-radius: 9px;
-  border: 1px solid rgba(255, 91, 107, 0.4);
-  background: rgba(255, 91, 107, 0.1);
-  color: #ffd6da;
+  border-radius: var(--r-md);
+  border: 1px solid var(--err-line);
+  background: var(--err-soft);
+  color: var(--err-text);
   font-size: 12px;
   line-height: 1.6;
   word-break: break-all;
@@ -1379,5 +1578,31 @@ textarea:focus {
 
   .settings-group {
     grid-column: 1 / -1;
+  }
+}
+
+/* ============ 可达性收尾 ============ */
+
+/* 系统开启「减少动态效果」时不再做位移动画（进度条的滑动是状态反馈，保留） */
+@media (prefers-reduced-motion: reduce) {
+  button,
+  .drama-item,
+  .mode-card {
+    transition: none;
+  }
+
+  button:hover:not(:disabled),
+  .drama-item:hover,
+  .mode-card:hover {
+    transform: none;
+  }
+}
+
+/* 深色高对比需求：把最弱的文字提到可读线以上 */
+@media (prefers-contrast: more) {
+  :root {
+    --muted: #b9c4d4;
+    --faint: #98a5b8;
+    --line: #37424f;
   }
 }
