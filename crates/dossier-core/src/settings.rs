@@ -110,11 +110,14 @@ pub fn save_settings(path: &Path, settings: &AppSettings) -> std::io::Result<()>
 /// 剧名要参与拼路径，而剧名来自扫描结果、可能带路径分隔符，所以这里先做一次净化：
 /// 只保留最后一个路径分量，并挡掉 `.` / `..` / 空名，避免「输出根目录」被剧名带偏到别处。
 ///
-/// 桌面端（`src-tauri`）通过 `dossier_core::resolve_product_dir` 使用这个函数，
-/// 下面这个例子顺带守住「这个名字确实是公开可用的」——本机编不了 `src-tauri`，
-/// 少一个 re-export 会让它直接编译失败，而换个 crate 视角的 doctest 能立刻发现。
+/// 桌面端（`src-tauri`）通过 `dossier_core::resolve_product_dir` 使用这个函数；这条公开路径
+/// 由 `tests/settings_product_dir.rs` 换一个 crate 视角编译，少一个 re-export 就会失败。
 ///
-/// ```
+// 示例刻意写成 ```text 而不是 doctest：`tauri-build` 在 MSVC 下会往自己的 `OUT_DIR`
+// 写一个空壳 `msvcrt.lib` 并加进原生库搜索路径，而配套的 `/NODEFAULTLIB:msvcrt.lib`
+// 只作用于 `src-tauri` 自己的产物，doctest 的链接会先搜到这个空壳而失败（只影响
+// Windows CI）。不要改回可执行代码块——可执行版本就是上面那个集成测试。
+/// ```text
 /// use dossier_core::resolve_product_dir;
 /// use std::path::Path;
 ///

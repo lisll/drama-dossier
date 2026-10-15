@@ -87,6 +87,13 @@ node --check src/main.js
 
 新增领域规则必须有单元测试；处理不可信文件名或文件系统错误时优先返回可操作的中文错误信息。
 
+工作区里**不要写 doctest**。`tauri-build` 在 MSVC 下会往 `src-tauri` 的 `OUT_DIR` 写一个空壳
+`msvcrt.lib`（为了让 app 静态链接 VC 运行时）并把它加进原生库搜索路径，而配套的
+`/NODEFAULTLIB:msvcrt.lib` 只作用于 `src-tauri` 自己的产物；于是别的链接会先搜到这个空壳，
+Windows CI 上直接报 `LNK4003: invalid library format` 加一连串
+`unresolved external symbol memcpy`。要守住公开接口（例如 `resolve_product_dir` 的
+re-export）就放进 `crates/*/tests/`——集成测试走普通 `cargo test` 链接，不受影响。
+
 `src-tauri` 需要 Tauri 的系统依赖（Linux 上要求 `glib >= 2.70`），在不满足的机器上
 `cargo test --workspace` 会失败。只想验证核心与擦除管线时可以按 crate 跑：
 
