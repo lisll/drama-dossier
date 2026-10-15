@@ -82,7 +82,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-features
 python3 -m json.tool src-tauri/tauri.conf.json
 python3 -m json.tool src-tauri/capabilities/default.json
-node --check src/main.js
+for file in src/main.js src/logic.js src/theme.js; do node --check "$file"; done   # 只给一个文件才会全检查
+node --test 'tests/frontend/*.test.js'   # 界面纯函数（src/logic.js）的单元测试；不能只写目录
 ```
 
 新增领域规则必须有单元测试；处理不可信文件名或文件系统错误时优先返回可操作的中文错误信息。
@@ -111,6 +112,63 @@ cd tools/model_worker && python3 -m unittest discover -s tests -v
 与 crate 之间的 `path` 依赖。
 
 擦除管线的一键体验脚本（造测试素材 → 跑链路）：`tools/prototype_demo.sh`。
+
+## 桌面端账号与授权（本地联调）
+
+桌面端连 `cloud/` 里的账号与授权服务（`drama_cloud.commerce`，接口见 `cloud/docs/COMMERCE.md`）。
+各部分的位置：
+
+- `crates/dossier-license`：授权凭证验签、防时钟倒退、使用权判定、机器码。纯逻辑，不联网；
+- `src-tauri/src/account/`：联网（`api.rs`）、钥匙串（`store.rs`）、会话与自动刷新（`session.rs`）、
+  功能闸门（`gate.rs`，按命令名放行或拒绝，没登记的命令按「本地功能」处理）、命令（`commands.rs`）；
+- `src/logic.js`：界面用到的纯函数（卡密格式、倒计时、错误文案、引导、近 7 天统计），`node --test` 直接测。
+
+### 1. 拉起服务端
+
+按 `cloud/docs/COMMERCE.md` 第 1 节启动 PostgreSQL、Mailpit 和服务（`serve --port 8100`）。
+`keygen` 打印的 `public_key` 下一步要用。
+
+### 2. 编译时变量
+
+| 变量 | 作用 |
+| --- | --- |
+| `DOSSIER_API_BASE` | 服务端地址，编译进程序。不设时是 `http://127.0.0.1:8100`。不是本机地址的必须用 `https://`。调试版运行时也能用同名环境变量覆盖，正式版不能 |
+| `DOSSIER_LICENSE_PUBKEYS` | 受信的授权签名公钥（base64url，逗号分隔），追加在内置列表后面。现在内置列表是空的，**不设就验不过任何凭证**，登录后会停在「授权凭证无效」 |
+
+```bash
+export DOSSIER_LICENSE_PUBKEYS='<keygen 打印的 public_key>'
+cargo tauri dev                       # 或 cargo build -p drama-dossier
+```
+
+- 换了公钥要重新编译（`option_env!` 在编译时读取）。
+- 测试向量 `cloud/tests/commerce/license_vectors_v1.json` 里的两把公钥是公开种子算出来的，
+  出现在受信列表里一律按「安装包配置有误」处理。
+
+### 3. 联调要点
+
+- 验证码在 Mailpit（<http://127.0.0.1:8025>）里看；卡密用 `drama-commerce cards generate` 生成。
+- 登录状态存在系统钥匙串：Windows 凭据管理器、macOS 钥匙串；Linux 存在 `<应用数据目录>/credentials/`
+  下权限 0600 的文件。服务名 `dev.dramadossier.app`，两条记录 `session`、`license`。退出登录、注销都会删掉这两条。
+- 断网测试：停掉服务端即可。进入离线档后，本地功能照常可用，「生成报审包」会被拒绝。
+- 「名额满了」要两台机器（机器码不同）登录同一个账号才能触发：同一台电脑重复绑定不占新名额。
+- 机器码由系统编号加盐计算：克隆的虚拟机会被当成同一台电脑。
+
+### 4. 端到端测试（真实 HTTP）
+
+`src-tauri/src/account/e2e_tests.rs` 默认忽略，只在 Linux 上编译（Windows / macOS 上存储是系统钥匙串，测试不该往里写）。
+走一遍：注册（验证码从 Mailpit 取）→ 兑换 → 第二台电脑名额满 → 踢掉第一台 → 第一台刷新失败并退出 →
+断网进离线档、往回调时间判倒退 → 导出 → 注销 → 再登录失败。
+
+```bash
+# 按第 1 节拉起服务端（建议用一个临时库，跑完删掉），再生成一张月卡
+export DOSSIER_E2E_BASE=http://127.0.0.1:8100
+export DOSSIER_E2E_MAILPIT=http://127.0.0.1:8025
+export DOSSIER_E2E_PUBKEY='<keygen 打印的 public_key>'
+export DOSSIER_E2E_CARD='<cards.csv 里一张没用过的卡>'
+cargo test -p drama-dossier --lib e2e -- --ignored
+```
+
+「服务端停了」用指向没人监听的端口模拟，不用真的停服务；时钟倒退用注入的时钟模拟，不改系统时间。
 
 ## 云端制作系统（`cloud/`）
 

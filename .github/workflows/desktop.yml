@@ -35,6 +35,20 @@ jobs:
         run: choco install ffmpeg -y
       - name: Rust cache
         uses: swatinem/rust-cache@v2
+      # 前端是纯 JS（没有打包步骤），各平台结果一样，只在 Linux 上跑。
+      - name: Install Node.js
+        if: runner.os == 'Linux'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Frontend syntax
+        if: runner.os == 'Linux'
+        # node --check 只检查第一个文件，后面的会被当成脚本参数，所以要逐个检查。
+        run: for file in src/main.js src/logic.js src/theme.js; do node --check "$file"; done
+      - name: Frontend tests
+        if: runner.os == 'Linux'
+        # 写成 glob：Node 22 的 --test 把目录参数当成文件找，会直接失败。
+        run: node --test 'tests/frontend/*.test.js'
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
