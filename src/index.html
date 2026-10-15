@@ -62,9 +62,16 @@
           </div>
         </div>
         <div class="header-status">
-          <button id="env-chip" class="env-chip" type="button" title="查看本机环境检测结果">
+          <button
+            id="env-chip"
+            class="env-chip"
+            type="button"
+            title="查看本机环境检测结果"
+            aria-describedby="env-chip-detail"
+          >
             正在检测本机环境…
           </button>
+          <span id="env-chip-detail" class="sr-only"></span>
           <span id="current-drama" class="drama-chip hidden"></span>
         </div>
       </header>
@@ -114,11 +121,7 @@
             <section class="detail">
               <div id="detail-placeholder" class="empty large">
                 <h2>准备就绪</h2>
-                <p>
-                  剧备按「一部剧一个子目录」扫描。请把分集视频放入子目录，并尽量命名为
-                  <code>第01集.mp4</code>；封面可命名为 <code>封面.jpg</code>，简介可命名为
-                  <code>简介.txt</code>。
-                </p>
+                <ol id="empty-guide" class="guide"></ol>
               </div>
 
               <div id="detail-view" class="hidden">
@@ -179,7 +182,7 @@
                 <h3>生成报审包</h3>
               </section>
               <p class="hint">
-                「本次运行覆盖」只在这一次生效；长期默认值请到「设置」里改，留空即用默认。
+                「本次运行覆盖」只在这一次生效；留空时写到「剧目目录/报审包」。
               </p>
               <div class="form-grid">
                 <label>输出目录（本次覆盖）<input id="output-dir" type="text" placeholder="留空时生成到剧目目录/报审包" /></label>
@@ -363,7 +366,14 @@
                   <button id="bitrate-probe" data-long-task class="primary">检测码率</button>
                   <button id="bitrate-fix" data-long-task class="danger" disabled>修复不达标分集</button>
                 </div>
-                <div id="bitrate-confirm" class="confirm hidden" role="alertdialog" aria-live="assertive">
+                <div
+                  id="bitrate-confirm"
+                  class="confirm hidden"
+                  role="alertdialog"
+                  aria-modal="true"
+                  aria-labelledby="bitrate-confirm-text"
+                  aria-live="assertive"
+                >
                   <p id="bitrate-confirm-text"></p>
                   <div class="option-row">
                     <button id="bitrate-confirm-yes" data-long-task class="danger">确认：重编码并替换原文件</button>
@@ -642,6 +652,7 @@
                 <div class="empty">尚未检测。</div>
               </div>
               <div id="runtime-error" class="runtime-error hidden"></div>
+              <p id="runtime-install-hint" class="settings-note hidden"></p>
               <div class="form-grid">
                 <label
                   >ffprobe 路径（高级，留空自动查找）<input
@@ -662,7 +673,11 @@
                 <span id="settings-dirty" class="badge dirty hidden">有改动未保存</span>
               </section>
               <p class="hint">
-                这里的值保存后才会生效（探测与生成都读已保存的设置）；「生成报审包」里的输出目录只是本次运行的临时覆盖。
+                这里的值保存后才会生效（探测、生成报审包与工具箱都会读已保存的设置）；
+                「生成报审包」和「执行转码」里的输出目录只是本次运行的临时覆盖。
+                <br />
+                「默认输出目录」是<strong>产物的根目录</strong>：留空时产物写在各自剧目目录内；
+                填了则按「该目录 / 剧名 / 产物名」落盘，这样多部剧各占一个子目录、不会互相顶掉。
               </p>
               <div class="form-grid">
                 <label>最少集数<input id="rule-min-episodes" type="number" min="1" step="1" /></label>
@@ -674,7 +689,7 @@
                 </label>
               </div>
               <div class="form-grid">
-                <label>默认输出目录<input id="settings-output" type="text" placeholder="留空时生成到剧目目录/报审包" /></label>
+                <label>默认输出目录（产物根目录）<input id="settings-output" type="text" placeholder="留空时写在剧目目录内；填了会写到 该目录/剧名/报审包" /></label>
               </div>
               <div class="option-row">
                 <button id="save-settings" class="primary">保存设置</button>

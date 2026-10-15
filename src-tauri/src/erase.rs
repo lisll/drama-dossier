@@ -12,9 +12,10 @@ use std::path::{Path, PathBuf};
 
 use dossier_core::same_path;
 use dossier_inpaint::erase::{
-    build_plan, resolve_tool, run_plan, ErasePlan, EraseRequest, EraseRun,
+    build_plan, resolve_tool, run_plan_with_progress, ErasePlan, EraseRequest, EraseRun,
 };
 use serde::Serialize;
+use tauri::{AppHandle, Emitter};
 
 use crate::paths::normalize;
 
@@ -25,6 +26,43 @@ pub struct EraseStatus {
     pub available: bool,
     pub tool: Option<String>,
     pub message: String,
+}
+
+/// 擦除进度的界面负载（`erase-progress` 事件）。
+///
+/// 直接对应进度流里一条 `TaskProgress`：`stageIndex/stageTotal` 给「第几段」，
+/// `unitDone/unitTotal` 给「这一段跑到第几帧」。擦除的进度单位是**帧**，
+/// 与最终报告里的 `framesOut` 同源。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EraseProgress {
+    stage: String,
+    stage_index: u32,
+    stage_total: u32,
+    unit_done: u64,
+    unit_total: u64,
+    message: String,
+    /// 终态事件（finished / failed）：界面据此收尾，不再等下一次轮询。
+    terminal: bool,
+    failed: bool,
+}
+
+/// 本次运行的进度流落点。
+///
+/// 放在系统临时目录里，而不是输出目录旁边：它只是「跑到哪了」的实时快照，
+/// 结论在 `<输出>.inpaint-report.json` 里，跑完就删（失败也删），不该出现在使用者的素材/产物目录里。
+///
+/// 路径**按输出文件名派生**，不掺时间戳或随机数：这样「预览命令」和真正执行拼出的是同一个路径，
+/// 预览才算名副其实的「将要执行的命令」。
+///
+/// 代价是同名不同目录的输出会共用同一个文件——界面同一时刻只允许一个长任务
+/// （`beginTask` 会拦住第二次点击），所以这条不会真的撞上；换掉它反而不划算。
+fn erase_progress_path(output: &Path) -> PathBuf {
+    let stem = output
+        .file_stem()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "erase".to_string());
+    std::env::temp_dir().join(format!("dossier-erase-progress-{stem}.jsonl"))
 }
 
 /// 开发期仓库根目录（用于在没装到 PATH 时找到 `target/` 里的构建产物）。
@@ -88,17 +126,44 @@ fn ensure_distinct_io(request: &EraseRequest) -> Result<(), String> {
 }
 
 /// 只拼装命令，不执行——界面据此展示「将要运行什么」。
+///
+/// 这里也要挂上 `--progress-json`：预览的意义就是「和真正执行的是同一条命令」，
+/// 少一个参数就不是同一条了。
 #[tauri::command]
-pub fn plan_erase(request: EraseRequest, tool_path: Option<String>) -> Result<ErasePlan, String> {
+pub fn plan_erase(
+    mut request: EraseRequest,
+    tool_path: Option<String>,
+) -> Result<ErasePlan, String> {
     ensure_distinct_io(&request)?;
+    request.progress_json = Some(erase_progress_path(&request.output));
     let tool = locate(tool_path.as_deref())?;
     build_plan(&request, &tool)
 }
 
 /// 执行擦除并按确认流退出码回报结论。
+///
+/// **必须是 async + `spawn_blocking`**：擦除要跑几分钟到几十分钟，而同步命令是在
+/// IPC 处理线程上直接调用的——那样会卡住主线程，进度事件也排到进程结束才送出去，
+/// 进度条就白做了。工具箱的转码走的是同一条路子（`transcode_execute`）。
 #[tauri::command]
-pub fn run_erase(
+pub async fn run_erase(
+    app: AppHandle,
     request: EraseRequest,
+    tool_path: Option<String>,
+    timeout_seconds: Option<u64>,
+) -> Result<EraseRun, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        run_erase_blocking(&app, request, tool_path, timeout_seconds)
+    })
+    .await
+    .map_err(|error| format!("擦除任务失败：{error}"))?
+}
+
+/// 真正干活的那一半：给工具挂上 `--progress-json`，边跑边把进度流里的新事件
+/// 转成 `erase-progress` 推给界面。
+fn run_erase_blocking(
+    app: &AppHandle,
+    mut request: EraseRequest,
     tool_path: Option<String>,
     timeout_seconds: Option<u64>,
 ) -> Result<EraseRun, String> {
@@ -111,7 +176,26 @@ pub fn run_erase(
             return Err(format!("输出目录不存在：{}", parent.display()));
         }
     }
+    let progress_path = erase_progress_path(&request.output);
+    request.progress_json = Some(progress_path.clone());
+
     let tool = locate(tool_path.as_deref())?;
     let plan = build_plan(&request, &tool)?;
-    run_plan(&plan, timeout_seconds.unwrap_or(1800))
+    let result = run_plan_with_progress(&plan, timeout_seconds.unwrap_or(1800), |event| {
+        let _ = app.emit(
+            "erase-progress",
+            EraseProgress {
+                stage: event.progress.stage.clone(),
+                stage_index: event.progress.stage_index,
+                stage_total: event.progress.stage_total,
+                unit_done: event.progress.unit_done,
+                unit_total: event.progress.unit_total,
+                message: event.progress.message.clone(),
+                terminal: event.is_terminal(),
+                failed: matches!(event.kind, dossier_core::ProgressEventKind::Failed),
+            },
+        );
+    });
+    let _ = std::fs::remove_file(&progress_path);
+    result
 }

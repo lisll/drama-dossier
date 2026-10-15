@@ -7,10 +7,12 @@
 //!
 //! 合规边界：只用于处理使用者自有的素材，不做 DRM 绕过，不处理他人作品的版权标识。
 
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use dossier_core::ProgressEvent;
 use serde::{Deserialize, Serialize};
 
 /// 一个矩形区域（像素，原点左上角）。
@@ -56,6 +58,12 @@ pub struct EraseRequest {
     pub persistent_worker: bool,
     /// 处理日志路径；缺省写到 `<输出>.inpaint-report.json`。
     pub report_json: Option<PathBuf>,
+    /// 进度流路径（JSONL，覆盖写）；缺省不写。
+    ///
+    /// 擦除是逐帧长任务，桌面端只轮询进程会拿不到「跑到哪了」。给了路径后，
+    /// 管线会把 `locate` / `inpaint` 两个阶段与逐片段帧计数按
+    /// `dossier-core::progress` 的格式写进这个文件，桌面端边跑边读即可画确定进度条。
+    pub progress_json: Option<PathBuf>,
     /// worker 可执行文件；worker 模式必填。
     pub worker_program: Option<String>,
     /// worker 参数。
@@ -80,6 +88,7 @@ impl Default for EraseRequest {
             min_score: 0.5,
             persistent_worker: false,
             report_json: None,
+            progress_json: None,
             worker_program: None,
             worker_args: Vec::new(),
             no_verify: false,
@@ -167,6 +176,8 @@ pub struct ErasePlan {
     /// 供界面复制的完整命令（shell 已转义）。
     pub command_line: String,
     pub report_path: PathBuf,
+    /// 进度流路径（`None` = 本次不写进度）；桌面端据此边跑边读。
+    pub progress_path: Option<PathBuf>,
     pub requires_worker: bool,
 }
 
@@ -216,6 +227,12 @@ pub fn build_plan(request: &EraseRequest, tool: &Path) -> Result<ErasePlan, Stri
         request.output.display().to_string(),
         "--report-json".into(),
         report_path.display().to_string(),
+    ];
+    if let Some(progress) = &request.progress_json {
+        args.push("--progress-json".into());
+        args.push(progress.display().to_string());
+    }
+    args.extend([
         "--detector".into(),
         request.detector.clone(),
         "--inpainter".into(),
@@ -228,7 +245,7 @@ pub fn build_plan(request: &EraseRequest, tool: &Path) -> Result<ErasePlan, Stri
         format!("{:.3}", request.context),
         "--min-score".into(),
         format!("{:.3}", request.min_score),
-    ];
+    ]);
     for region in &request.regions {
         args.push("--roi".into());
         args.push(region.cli_value());
@@ -271,6 +288,7 @@ pub fn build_plan(request: &EraseRequest, tool: &Path) -> Result<ErasePlan, Stri
         args,
         command_line,
         report_path,
+        progress_path: request.progress_json.clone(),
         requires_worker: request.needs_worker(),
     })
 }
@@ -331,6 +349,61 @@ pub struct EraseRun {
 ///
 /// `timeout_secs` 为 0 表示不超时；超时后会结束子进程并返回执行错误。
 pub fn run_plan(plan: &ErasePlan, timeout_secs: u64) -> Result<EraseRun, String> {
+    run_plan_with_progress(plan, timeout_secs, |_| {})
+}
+
+/// 进度流游标：只消费**完整行**，把可能写到一半的尾部留到下一次读取。
+///
+/// 为什么要按字节而不是 `read_to_string`：进度里的 `message` 是中文，
+/// 写到一半时尾部可能停在某个多字节字符中间；按 UTF-8 整体解码会直接报错，
+/// 把这一段已经落盘的事件一起丢掉。按 `\n` 切行再逐行解码就不会有这个问题
+/// （换行是 ASCII，不会被多字节字符误伤）。
+#[derive(Default)]
+struct ProgressTail {
+    offset: u64,
+    pending: Vec<u8>,
+}
+
+impl ProgressTail {
+    /// 读取自上次调用以来新增的完整行；文件还不存在或读不动时返回空。
+    fn drain(&mut self, path: &Path) -> Vec<ProgressEvent> {
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return Vec::new();
+        };
+        if file.seek(SeekFrom::Start(self.offset)).is_err() {
+            return Vec::new();
+        }
+        let mut chunk = Vec::new();
+        if file.read_to_end(&mut chunk).is_err() {
+            return Vec::new();
+        }
+        self.offset += chunk.len() as u64;
+        self.pending.extend_from_slice(&chunk);
+
+        let mut events = Vec::new();
+        while let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=newline).collect();
+            let text = String::from_utf8_lossy(&line[..line.len() - 1]);
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(event) = serde_json::from_str::<ProgressEvent>(trimmed) {
+                events.push(event);
+            }
+        }
+        events
+    }
+}
+
+/// 执行擦除，并把进度流里的新事件实时交给 `on_progress`。
+///
+/// 进度文件由子进程追加写，这里只读；进程被杀/超时也只会丢掉最后半行。
+pub fn run_plan_with_progress(
+    plan: &ErasePlan,
+    timeout_secs: u64,
+    mut on_progress: impl FnMut(&ProgressEvent),
+) -> Result<EraseRun, String> {
     let mut child = Command::new(&plan.program)
         .args(&plan.args)
         .stdin(Stdio::null())
@@ -344,7 +417,13 @@ pub fn run_plan(plan: &ErasePlan, timeout_secs: u64) -> Result<EraseRun, String>
     } else {
         Some(Instant::now() + Duration::from_secs(timeout_secs))
     };
+    let mut tail = ProgressTail::default();
     let status = loop {
+        if let Some(path) = plan.progress_path.as_deref() {
+            for event in tail.drain(path) {
+                on_progress(&event);
+            }
+        }
         if let Some(exit) = child
             .try_wait()
             .map_err(|error| format!("等待擦除工具失败：{error}"))?
@@ -360,13 +439,19 @@ pub fn run_plan(plan: &ErasePlan, timeout_secs: u64) -> Result<EraseRun, String>
         }
         std::thread::sleep(Duration::from_millis(100));
     };
+    // 进程退出后可能还有最后几条事件没读：补一次，免得界面少收一个终态。
+    if let Some(path) = plan.progress_path.as_deref() {
+        for event in tail.drain(path) {
+            on_progress(&event);
+        }
+    }
 
     let output = child
         .wait_with_output()
         .map_err(|error| format!("读取擦除工具输出失败：{error}"))?;
     let exit_code = status.code().unwrap_or(-1);
-    let stdout_tail = tail(&String::from_utf8_lossy(&output.stdout));
-    let stderr_tail = tail(&String::from_utf8_lossy(&output.stderr));
+    let stdout_tail = tail_text(&String::from_utf8_lossy(&output.stdout));
+    let stderr_tail = tail_text(&String::from_utf8_lossy(&output.stderr));
     let report = std::fs::read_to_string(&plan.report_path)
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
@@ -383,7 +468,7 @@ pub fn run_plan(plan: &ErasePlan, timeout_secs: u64) -> Result<EraseRun, String>
     })
 }
 
-fn tail(text: &str) -> String {
+fn tail_text(text: &str) -> String {
     let trimmed = text.trim();
     const LIMIT: usize = 4000;
     if trimmed.chars().count() <= LIMIT {
@@ -545,6 +630,110 @@ mod tests {
         assert!(resolve_tool(None, Some(Path::new("/nonexistent-repo"))).is_err());
     }
 
+    use std::io::Write;
+
+    fn progress_dir(tag: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        let dir = std::env::temp_dir().join(format!("dossier-inpaint-{tag}-{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn progress_line(seq: u64, kind: &str, done: u64, message: &str) -> String {
+        format!(
+            r#"{{"seq":{seq},"at":"2026-10-15T00:00:00Z","kind":"{kind}","taskId":"t1","pipeline":"drama.logo.erase","stage":"inpaint","stageIndex":1,"stageTotal":2,"unitDone":{done},"unitTotal":10,"message":"{message}"}}"#
+        )
+    }
+
+    /// 写入器把半行留在磁盘上时，游标不能把它当成一条事件，也不能吞掉它。
+    #[test]
+    fn progress_tail_waits_for_a_complete_line() {
+        let dir = progress_dir("tail");
+        let path = dir.join("run.progress.jsonl");
+        let line = progress_line(1, "progress", 4, "片段修复完成");
+
+        // 先写「少一个字节」的半行（切在中文中间，故意制造半个多字节字符）。
+        let bytes = line.as_bytes();
+        std::fs::write(&path, &bytes[..bytes.len() - 3]).unwrap();
+        let mut tail = ProgressTail::default();
+        assert!(tail.drain(&path).is_empty(), "半行不应被解析成事件");
+
+        // 补齐剩余字节 + 换行，这时才应该读到 1 条。
+        let mut rest = bytes[bytes.len() - 3..].to_vec();
+        rest.push(b'\n');
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&rest).unwrap();
+        drop(file);
+
+        let events = tail.drain(&path);
+        assert_eq!(events.len(), 1, "补齐后应读到 1 条事件");
+        assert_eq!(events[0].progress.unit_done, 4);
+        assert_eq!(events[0].progress.message, "片段修复完成");
+        assert!(tail.drain(&path).is_empty(), "重复读取不应重复上报");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 工具怎么写，桌面端就怎么读：两份事件按顺序交回，终态可被识别。
+    #[test]
+    fn run_plan_streams_progress_written_by_the_tool() {
+        let dir = progress_dir("stream");
+        let progress = dir.join("run.progress.jsonl");
+        std::fs::write(
+            &progress,
+            format!(
+                "{}\n{}\n",
+                progress_line(1, "started", 0, "逐片段修复"),
+                progress_line(2, "finished", 10, "擦除完成")
+            ),
+        )
+        .unwrap();
+
+        let plan = ErasePlan {
+            program: PathBuf::from("sh"),
+            args: vec!["-c".into(), "exit 0".into()],
+            command_line: String::new(),
+            report_path: dir.join("report.json"),
+            progress_path: Some(progress),
+            requires_worker: false,
+        };
+
+        let seen = std::cell::RefCell::new(Vec::new());
+        let run = run_plan_with_progress(&plan, 10, |event| seen.borrow_mut().push(event.clone()))
+            .unwrap();
+
+        assert_eq!(run.exit_code, 0);
+        let seen = seen.into_inner();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].progress.stage, "inpaint");
+        assert_eq!(seen[0].kind, dossier_core::ProgressEventKind::Started);
+        assert!(seen[1].is_terminal());
+        assert_eq!(seen[1].progress.unit_done, 10);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 没有进度流时是空操作：不能因为多了这个能力就改变既有行为。
+    #[test]
+    fn run_plan_without_progress_stream_still_works() {
+        let plan = ErasePlan {
+            program: PathBuf::from("sh"),
+            args: vec!["-c".into(), "exit 0".into()],
+            command_line: String::new(),
+            report_path: PathBuf::from("/tmp/does-not-exist-report.json"),
+            progress_path: None,
+            requires_worker: false,
+        };
+        let mut calls = 0;
+        let run = run_plan_with_progress(&plan, 10, |_| calls += 1).unwrap();
+        assert_eq!(run.exit_code, 0);
+        assert_eq!(calls, 0);
+    }
+
     #[test]
     fn run_plan_reports_exec_error_for_a_failing_command() {
         // 用 PATH 里的 `sh` 而不是绝对路径：CI 的 Windows runner 没有盘符根下的
@@ -556,6 +745,7 @@ mod tests {
             args: vec!["-c".into(), "exit 3".into()],
             command_line: String::new(),
             report_path: PathBuf::from("/tmp/does-not-exist-report.json"),
+            progress_path: None,
             requires_worker: false,
         };
         let run = run_plan(&plan, 10).unwrap();

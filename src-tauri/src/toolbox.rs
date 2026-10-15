@@ -14,13 +14,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use dossier_core::{
     bitrate_report, load_settings, nudge_frames, output_dir_hits_sources, plan_recut_segments,
-    plan_rename, probe_episode, BitrateItem, EpisodeFile, FfprobeConfig, ProbedEpisode,
+    plan_rename, probe_episode, resolve_product_dir, BitrateItem, EpisodeFile, FfprobeConfig,
+    ProbedEpisode,
 };
 use dossier_media::shot::{detect_shots, ShotDetectConfig};
 use dossier_runtime::probe::probe_tool;
 use dossier_runtime::{CommandRunner, CommandSpec, SystemRunner, ToolReport};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::dossier::{load_drama, probe_all};
 use crate::paths::normalize;
@@ -94,6 +95,11 @@ pub struct RuntimeStatus {
     pub ffmpeg: ToolReport,
     pub ffprobe: ToolReport,
     pub python: ToolReport,
+    /// 运行环境自动安装只有 macOS 有可用下载源；其余平台前端据此隐藏入口，
+    /// 避免给出「点了必然报错」的按钮。
+    pub install_supported: bool,
+    /// 平台标识（macos / windows / linux），前端据此给出对应平台的手动安装指引。
+    pub platform: String,
 }
 
 #[tauri::command]
@@ -109,7 +115,39 @@ pub fn runtime_status(
         ffmpeg: probe_tool(&runner, "ffmpeg", &ffmpeg, &["-hide_banner", "-version"]),
         ffprobe: probe_tool(&runner, "ffprobe", &ffprobe, &["-hide_banner", "-version"]),
         python: probe_tool(&runner, "python", Path::new("python3"), &["--version"]),
+        install_supported: cfg!(target_os = "macos"),
+        platform: std::env::consts::OS.to_string(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// 长任务单元进度
+// ---------------------------------------------------------------------------
+
+/// 工具箱长任务的单元进度（`task-progress` 事件）。
+///
+/// 与逐集探测的 `probe-progress` 同构，但服务于**由本应用直接驱动 ffmpeg** 的任务
+/// （智能微调 / 分集重组 / 码率修复）：这些任务之前只有「不确定进度条 + 已用秒数」，
+/// 一部剧重编码几分钟时界面看着像卡死。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskProgress {
+    /// 任务标识（`transcode` / `bitrate`）：界面目前只用文案，标识留给排查与后续分措辞。
+    pub task: String,
+    pub done: u64,
+    pub total: u64,
+    pub label: String,
+}
+
+/// 发一条单元进度。UI 未监听或窗口已关闭都不该让长任务失败，因此忽略发送错误。
+fn emit_task_progress(app: &AppHandle, task: &str, done: u64, total: u64, label: &str) {
+    let payload = TaskProgress {
+        task: task.to_string(),
+        done,
+        total,
+        label: label.to_string(),
+    };
+    let _ = app.emit("task-progress", payload);
 }
 
 // ---------------------------------------------------------------------------
@@ -321,11 +359,24 @@ fn fix_bitrate_blocking(
     let mut fixed = Vec::new();
     let mut failed = Vec::new();
     let mut untouched = 0_usize;
+    let fix_total = report.iter().filter(|item| item.needs_fix).count() as u64;
+    let mut fix_index = 0_u64;
     for item in &report {
         if !item.needs_fix {
             untouched += 1;
             continue;
         }
+        fix_index += 1;
+        emit_task_progress(
+            app,
+            "bitrate",
+            fix_index - 1,
+            fix_total,
+            &format!(
+                "正在重编码第 {}/{} 个分集：{}",
+                fix_index, fix_total, item.file_name
+            ),
+        );
         let from_kbps = item.bitrate_bps.unwrap_or(0) / 1000;
         let path = PathBuf::from(&item.path);
         match reencode_to_bitrate(&ffmpeg, &path, min_bps) {
@@ -391,7 +442,8 @@ pub struct TranscodeRequest {
     pub mode: String,
     /// recut 的目标集数；缺省 = 保持原集数。
     pub target_count: Option<usize>,
-    /// 输出目录；缺省 = 剧目目录/微调输出 或 剧目目录/重组输出。
+    /// 输出目录；缺省 = 设置里的「默认输出目录」（产物根目录）下的 `<剧名>/<微调输出|重组输出>`，
+    /// 设置也为空时退回剧目目录内的同名子目录。
     pub output_dir: Option<String>,
 }
 
@@ -442,11 +494,24 @@ fn transcode_nudge_blocking(
     drama_name: &str,
     episodes: &[ProbedEpisode],
     output_dir: &Path,
+    on_step: &mut dyn FnMut(u64, u64, &str),
 ) -> Result<TranscodeRunReport, String> {
     std::fs::create_dir_all(output_dir)
         .map_err(|error| format!("创建输出目录失败（{}）：{error}", output_dir.display()))?;
     let mut items = Vec::new();
-    for episode in episodes {
+    let total = episodes.len() as u64;
+    for (index, episode) in episodes.iter().enumerate() {
+        // 全剧重编码动辄几分钟，逐集上报让进度条能真的动起来（done = 已完成集数）。
+        on_step(
+            index as u64,
+            total,
+            &format!(
+                "正在微调第 {}/{} 集：{}",
+                index + 1,
+                total,
+                episode.file.file_name
+            ),
+        );
         let frames = nudge_frames(seed_for(&episode.file.file_name));
         let fps = episode.spec.fps.unwrap_or(30.0).max(1.0);
         let offset = frames as f64 / fps;
@@ -519,6 +584,7 @@ fn transcode_recut_blocking(
     episodes: &[ProbedEpisode],
     target_count: usize,
     output_dir: &Path,
+    on_step: &mut dyn FnMut(u64, u64, &str),
 ) -> Result<TranscodeRunReport, String> {
     std::fs::create_dir_all(output_dir)
         .map_err(|error| format!("创建输出目录失败（{}）：{error}", output_dir.display()))?;
@@ -528,7 +594,18 @@ fn transcode_recut_blocking(
     let mut file_starts: Vec<f64> = Vec::with_capacity(episodes.len());
     let mut offset = 0.0;
     let ffmpeg_str = ffmpeg.display().to_string();
-    for episode in episodes {
+    let detect_total = episodes.len() as u64;
+    for (index, episode) in episodes.iter().enumerate() {
+        on_step(
+            index as u64,
+            detect_total,
+            &format!(
+                "正在检测场景切点 第 {}/{} 集：{}",
+                index + 1,
+                detect_total,
+                episode.file.file_name
+            ),
+        );
         file_starts.push(offset);
         let report = detect_shots(
             &ffmpeg_str,
@@ -547,7 +624,13 @@ fn transcode_recut_blocking(
 
     let segments = plan_recut_segments(&boundaries, total, target_count, 1.0);
     let mut items = Vec::new();
+    let segment_total = segments.len() as u64;
     for (index, segment) in segments.iter().enumerate() {
+        on_step(
+            index as u64,
+            segment_total,
+            &format!("正在重组第 {}/{} 集", index + 1, segment_total),
+        );
         let output = output_dir.join(format!("第{:02}集.mp4", index + 1));
         let spans = spans_for_segment(episodes, &file_starts, *segment);
         if spans.is_empty() {
@@ -674,6 +757,7 @@ fn transcode_blocking(
     name: String,
     request: TranscodeRequest,
     ffprobe_path: Option<String>,
+    output_root: Option<String>,
 ) -> Result<TranscodeRunReport, String> {
     let ffmpeg = resolve_ffmpeg(app)?;
     let ffprobe = resolve_ffprobe(app, ffprobe_path.as_deref())?;
@@ -691,21 +775,29 @@ fn transcode_blocking(
         "recut" => "重组输出",
         _ => "微调输出",
     };
-    let output_dir = request
-        .output_dir
-        .map(PathBuf::from)
-        .unwrap_or_else(|| drama.dir.join(subdir));
+    // 与报审包同一套落点规则（`dossier_core::resolve_product_dir`）：
+    // 本次覆盖 → 设置里的产物根目录下的 `<剧名>/<子目录>` → 剧目目录内的同名子目录。
+    let output_dir = resolve_product_dir(
+        request.output_dir.as_deref().map(Path::new),
+        output_root.as_deref().map(Path::new),
+        &drama.dir,
+        &drama.name,
+        subdir,
+    );
     reject_source_dir(&output_dir, &episodes)?;
 
+    let mut on_step = |done: u64, total: u64, label: &str| {
+        emit_task_progress(app, "transcode", done, total, label);
+    };
     match mode {
         "recut" => {
             let target = request
                 .target_count
                 .unwrap_or(episodes.len())
                 .clamp(1, episodes.len().max(1) * 10);
-            transcode_recut_blocking(&ffmpeg, &episodes, target, &output_dir)
+            transcode_recut_blocking(&ffmpeg, &episodes, target, &output_dir, &mut on_step)
         }
-        _ => transcode_nudge_blocking(&ffmpeg, &drama.name, &episodes, &output_dir),
+        _ => transcode_nudge_blocking(&ffmpeg, &drama.name, &episodes, &output_dir, &mut on_step),
     }
 }
 
@@ -736,9 +828,10 @@ pub async fn transcode_execute(
     name: String,
     request: TranscodeRequest,
     ffprobe_path: Option<String>,
+    output_root: Option<String>,
 ) -> Result<TranscodeRunReport, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        transcode_blocking(&app, root, name, request, ffprobe_path)
+        transcode_blocking(&app, root, name, request, ffprobe_path, output_root)
     })
     .await
     .map_err(|error| format!("转码任务失败：{error}"))?

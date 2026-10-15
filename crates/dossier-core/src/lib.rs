@@ -66,7 +66,9 @@ pub use progress::{
 pub use scanner::{
     scan_drama_dir, scan_library, validate_drama_dir, validate_drama_name, validate_library_root,
 };
-pub use settings::{load_settings, save_settings, AppSettings, LoadedSettings};
+pub use settings::{
+    load_settings, resolve_product_dir, save_settings, AppSettings, LoadedSettings,
+};
 pub use tools::{
     bitrate_report, episode_target_name, nudge_frames, output_dir_hits_sources,
     plan_recut_segments, plan_rename, same_path, validate_mount_csv, BitrateItem, MountCsvCheck,

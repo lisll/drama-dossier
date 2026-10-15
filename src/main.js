@@ -45,6 +45,8 @@ let bitrateItems = null;
 let bitratePending = null;
 // 本地演示验证码：前端生成、toast 回显（云端版改为服务端下发）。
 let demoVerifyCode = "";
+/// 打开码率确认弹窗前聚焦的元素，关闭后要还回去。
+let bitrateConfirmReturnFocus = null;
 // 最近一次从配置文件读到的设置：保存时用它带回 ffmpegPath（界面上没有对应输入框）。
 let loadedSettings = null;
 
@@ -57,14 +59,57 @@ const esc = (value) =>
       ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[c],
   );
 
-function toast(message, isError = false) {
+/**
+ * 弹出提示。`action` 形如 `{ label, run }`，把「下一步该去哪」做成按钮，
+ * 避免用户看完一句路径报错后还得自己找设置页。
+ */
+function toast(message, isError = false, action = null) {
   const node = $("#toast");
   // 颜色之外再给一个文字信号：色觉差异、投屏或截图里也能分辨成功与失败。
   node.textContent = isError ? `出错了：${message}` : message;
+  if (action) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "toast-action";
+    button.textContent = action.label;
+    button.addEventListener("click", action.run);
+    node.appendChild(button);
+  }
   node.classList.toggle("error", isError);
   node.classList.remove("hidden");
+  node.onclick = () => node.classList.add("hidden");
   clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => node.classList.add("hidden"), isError ? 9000 : 4500);
+  // 带按钮的提示要留出「读完再点」的时间，不能和纯文字一样 9 秒就消失。
+  toast.timer = setTimeout(
+    () => node.classList.add("hidden"),
+    isError ? (action ? 25000 : 9000) : 4500,
+  );
+}
+
+/** 跳到「设置 → 本机环境」并重新检测；环境类问题的一键去处。 */
+function gotoRuntimeSettings() {
+  // 设置是独立视图：打开后直接跳到「本机环境」子页看检测详情。
+  switchModule("settings");
+  switchToSubAnd("env");
+  $("#runtime-list").closest(".panel")?.scrollIntoView({ behavior: "smooth", block: "center" });
+  checkRuntime(true);
+}
+
+/**
+ * 后端错误的统一出口：环境类附「重新检测」、路径类附「打开设置」，
+ * 其余保持原样，不让所有错误都被塞进同一个入口。
+ */
+function reportError(error) {
+  const message = String(error);
+  if (/ffmpeg|ffprobe|运行环境/i.test(message)) {
+    toast(message, true, { label: "重新检测", run: gotoRuntimeSettings });
+    return;
+  }
+  if (/目录|路径|权限|不存在|磁盘|空间/i.test(message)) {
+    toast(message, true, { label: "打开设置", run: () => switchModule("settings") });
+    return;
+  }
+  toast(message, true);
 }
 
 // ============ 字段级校验 ============
@@ -161,7 +206,7 @@ async function openPath(key) {
   try {
     await call("open_path", { path });
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   }
 }
 
@@ -262,6 +307,68 @@ function handleProbeProgress(payload) {
   setProgress({ label: `正在探测分集 ${done}/${total}：${fileName}`, done, total });
 }
 
+/**
+ * 处理后端推来的工具箱单元进度（`task-progress`）。
+ * 转码/码率修复是「逐个文件跑 ffmpeg」，后端按单元上报，这里直接画确定进度条。
+ */
+function handleTaskProgress(payload) {
+  // 没有进行中的任务就忽略：进度条只服务于当前这次操作。
+  if (!state.task || !payload || !payload.total) return;
+  const { done, total, label } = payload;
+  setProgress({
+    label: label ?? `已完成 ${done}/${total}`,
+    done: Math.min(Number(done) || 0, total),
+    total,
+  });
+}
+
+/**
+ * 擦除的两个阶段（与 `dossier-inpaint` 的 `LOCATE_STAGE` / `INPAINT_STAGE` 一致）。
+ * 阶段名只用于显示，进度本身完全由后端上报，界面不猜。
+ */
+const ERASE_STAGES = {
+  locate: "定位字幕区域",
+  inpaint: "逐片段修复画面",
+};
+
+/**
+ * 处理后端推来的擦除进度（`erase-progress`）。
+ *
+ * 擦除按「阶段 + 已完成帧数」上报（`stageIndex/stageTotal` + `unitDone/unitTotal`），
+ * 所以总进度由两段合成：`(阶段序号 + 阶段内比例) / 阶段总数`。
+ * 阶段内还没拿到总量时退回不确定进度——宁可显示「不知道」也不显示假百分比。
+ *
+ * 失败也是终态事件；进度条收起前留下的最后一句话最需要说清结论，
+ * 所以失败时把「失败」提到最前面，而不是让它读起来和正常收尾一样。
+ */
+function handleEraseProgress(payload) {
+  if (!state.task || !payload) return;
+  const stageTotal = Number(payload.stageTotal) || 0;
+  const stageIndex = Number(payload.stageIndex) || 0;
+  const done = Number(payload.unitDone) || 0;
+  const total = Number(payload.unitTotal) || 0;
+  const stageLabel = ERASE_STAGES[payload.stage] ?? payload.stage ?? "处理中";
+  if (payload.message && payload.terminal) {
+    setProgress({
+      label: payload.failed
+        ? `擦除失败 · ${stageLabel}：${payload.message}`
+        : `${stageLabel} · ${payload.message}`,
+    });
+    return;
+  }
+  if (!stageTotal || total <= 0) {
+    setProgress({ label: `擦除中 · ${stageLabel}（已处理 ${done} 帧）` });
+    return;
+  }
+  // 用 1000 份的粒度合成总进度，避免浮点百分比出现 0.1% 的抖动。
+  const within = Math.min(done / total, 1);
+  setProgress({
+    label: `擦除中 · ${stageLabel}（第 ${stageIndex + 1}/${stageTotal} 段）：已完成 ${done}/${total} 帧`,
+    done: Math.round((stageIndex + within) * 1000),
+    total: stageTotal * 1000,
+  });
+}
+
 async function call(command, args) {
   if (!invoke) {
     throw new Error("请在 DramaDossier 桌面应用中运行界面。");
@@ -347,12 +454,23 @@ function fillRules(rules) {
   $("#rule-prefer-portrait").checked = merged.preferPortrait !== false;
 }
 
-/** 生成页的「本次覆盖」输入只放占位提示，默认值始终来自已保存的设置。 */
+/**
+ * 生成页与工具箱的输出目录都只放占位提示：真正的落点由后端算
+ * （`dossier_core::resolve_product_dir`），这里只如实复述那条规则，不参与决策。
+ *
+ * 三层规则：本次覆盖 → 设置里的「默认输出目录」（产物根目录）下的 `<剧名>/<产物名>`
+ * → 剧目目录内的 `<产物名>`。
+ */
 function renderDefaultHints() {
-  const output = state.settings?.outputDir;
-  $("#output-dir").placeholder = output
-    ? `留空时用设置里的：${output}`
-    : "留空时生成到剧目目录/报审包";
+  const root = state.settings?.outputDir?.trim()
+    ? stripPath(state.settings.outputDir.trim())
+    : "";
+  $("#output-dir").placeholder = root
+    ? `留空时生成到 ${root}/<剧名>/报审包`
+    : "留空时生成到 剧目目录/报审包";
+  $("#exec-output").placeholder = root
+    ? `留空时写到 ${root}/<剧名>/微调输出 或 /重组输出`
+    : "留空时写到剧目目录/微调输出 或 /重组输出";
   $("#library-root").placeholder = state.settings?.libraryRoot
     ? `上次扫描：${state.settings.libraryRoot}`
     : "选择或输入剧集素材根目录";
@@ -400,10 +518,11 @@ async function loadSettings() {
     if (settings.aiTemplate) $("#ai-template").value = settings.aiTemplate;
     if (state.root) $("#env-workdir").value = state.root;
     renderDefaultHints();
+    renderEmptyGuide();
     refreshDirtyBadge();
     if (payload.warning) toast(payload.warning, true);
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   }
 }
 
@@ -412,7 +531,7 @@ async function saveSettings() {
   try {
     rules = readRulesForm(true);
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
     return;
   }
   try {
@@ -438,7 +557,7 @@ async function saveSettings() {
     // ffprobe 路径可能变了，重新探一次，头部状态才不会说假话。
     checkRuntime(true);
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   }
 }
 
@@ -481,6 +600,7 @@ function renderDramas() {
   const list = $("#drama-list");
   if (!state.dramas.length) {
     list.innerHTML = '<div class="empty">未找到剧目子目录。</div>';
+    renderEmptyGuide();
     return;
   }
 
@@ -499,6 +619,53 @@ function renderDramas() {
   list.querySelectorAll(".drama-item").forEach((node) => {
     node.addEventListener("click", () => selectDrama(Number(node.dataset.index)));
   });
+  renderEmptyGuide();
+}
+
+/** 首屏空态：按「选目录 → 扫描 → 点选剧目」三步走，已完成的一步打勾。 */
+function renderEmptyGuide() {
+  const hasRoot = Boolean($("#library-root").value.trim());
+  const hasDramas = state.dramas.length > 0;
+  const steps = [
+    {
+      title: "选择素材根目录",
+      detail:
+        "一部剧一个子目录，分集视频放子目录里（推荐命名「第01集.mp4」）；封面可叫「封面.jpg」，简介可叫「简介.txt」。",
+      done: hasRoot,
+      action: "browse",
+      actionLabel: "选择目录",
+    },
+    {
+      title: "扫描剧目",
+      detail: "扫描后左侧会列出每个剧目与集数，确认素材都被识别到。",
+      done: hasDramas,
+      action: "scan",
+      actionLabel: "扫描剧目",
+    },
+    {
+      title: "点选剧目并「探测并检查」",
+      detail: "探测每集的时长、分辨率与码率，确认材料符合报审要求。",
+      done: false,
+      action: null,
+      actionLabel: "",
+    },
+  ];
+  $("#empty-guide").innerHTML = steps
+    .map((step, index) => {
+      const mark = step.done ? "✓" : String(index + 1);
+      const button = step.action
+        ? `<button class="ghost" data-guide-action="${step.action}">${step.actionLabel}</button>`
+        : "";
+      return `<li class="guide-step ${step.done ? "done" : ""}">
+        <span class="guide-mark" aria-hidden="true">${mark}</span>
+        <div class="guide-body">
+          <p class="guide-title">${esc(step.title)}</p>
+          <p class="guide-detail">${esc(step.detail)}</p>
+          ${button}
+        </div>
+      </li>`;
+    })
+    .join("");
 }
 
 /// 剧目或目录一变，工具箱里的旧计划一律作废（别让人拿着上一部剧的计划点执行）。
@@ -654,7 +821,7 @@ async function scan() {
     // 记住素材根目录：下次启动直接回填，不用每次重新找。
     await rememberRoot(root);
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   } finally {
     endTask();
   }
@@ -672,10 +839,11 @@ function reportProbeFailure(error) {
     toast(
       `${message}（本机缺少 ${missing.join("、")}：请安装 ffmpeg，或在「设置 → 检查规则与路径」里指定 ffprobe 路径）`,
       true,
+      { label: "去设置环境", run: gotoRuntimeSettings },
     );
     return;
   }
-  toast(message, true);
+  reportError(error);
 }
 
 async function analyze() {
@@ -731,6 +899,7 @@ async function generate() {
       root: state.root,
       name: drama.name,
       outputDir: $("#output-dir").value.trim() || null,
+      outputRoot: state.settings?.outputDir ?? null,
       copyEpisodes: $("#copy-episodes").checked,
       aiGenerated: $("#ai-generated").checked,
       ffprobePath: effectiveFfprobe(),
@@ -751,11 +920,29 @@ async function generate() {
     });
     toast("报审包生成完成");
   } catch (error) {
-    renderResult("#generate-result", {
-      tone: "error",
-      html: `<strong>生成失败</strong><br />${esc(String(error))}`,
-    });
-    toast(String(error), true);
+    const message = String(error);
+    // 「目录已存在」是可控的：后端没有动任何文件，把旧包位置摆出来，
+    // 直接给「打开旧包 / 换个目录」两条路，而不是让人自己去找那个路径。
+    if (/已存在/.test(message)) {
+      const existing = effectivePackageDir();
+      renderResult("#generate-result", {
+        tone: "error",
+        html: `<strong>报审包目录已存在，本次未生成任何文件</strong><br />
+          ${esc(message)}<br />
+          旧目录不会被改动：可以先打开确认，也可以换一个输出目录后重试。`,
+        paths: existing ? [["package", existing]] : [],
+      });
+      toast("报审包目录已存在：已标出旧包位置", true, {
+        label: "换个输出目录",
+        run: () => browse("#output-dir"),
+      });
+    } else {
+      renderResult("#generate-result", {
+        tone: "error",
+        html: `<strong>生成失败</strong><br />${esc(message)}`,
+      });
+      reportError(error);
+    }
   } finally {
     endTask();
   }
@@ -764,6 +951,22 @@ async function generate() {
 function selectedDrama() {
   if (state.selected == null) throw new Error("请先在左侧选择一部剧");
   return state.dramas[state.selected];
+}
+
+/**
+ * 本次生成的报审包目录，与后端 `dossier_core::resolve_product_dir` 的三层规则保持一致：
+ * 本次覆盖 → 设置里的「默认输出目录」/剧名/报审包 → 剧目目录/报审包。
+ * 用在「目录已存在」的提示里，避免把用户指到一个错误的位置。
+ */
+function effectivePackageDir() {
+  const override = $("#output-dir").value.trim();
+  if (override) return stripPath(override);
+  const drama = state.selected == null ? null : state.dramas[state.selected];
+  if (!drama) return "";
+  const root = state.settings?.outputDir?.trim();
+  // 后端会用剧名拼一层；这里只做展示，剧名原样带入即可（后端会再净化一次）。
+  if (root) return `${stripPath(root)}/${drama.name}/报审包`;
+  return `${stripPath(drama.dir)}/报审包`;
 }
 
 function transcodeTarget() {
@@ -814,7 +1017,7 @@ async function transcodeAdvice() {
       paths: [["transcode-output", plan.outputDir]],
     });
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   } finally {
     endTask();
   }
@@ -853,7 +1056,7 @@ async function diffReportPackages() {
       }`,
     });
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   }
 }
 
@@ -865,7 +1068,7 @@ async function loadPlatformProfiles() {
       .map((profile) => `<option value="${esc(profile.id)}">${esc(profile.name)}</option>`)
       .join("");
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   }
 }
 
@@ -900,7 +1103,7 @@ async function platformReview() {
       ${review.notes.length ? `<p>${esc(review.notes.join("；"))}</p>` : ""}`,
     });
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   } finally {
     endTask();
   }
@@ -926,7 +1129,7 @@ async function exportDraft() {
     });
     $("#draft-dir").value = result.draftDir;
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   } finally {
     endTask();
   }
@@ -960,7 +1163,7 @@ async function importDraft() {
       <table><thead><tr><th>#</th><th>素材</th><th>时间线起点</th><th>时长</th></tr></thead><tbody>${rows}</tbody></table>`,
     });
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   } finally {
     endTask();
   }
@@ -1029,7 +1232,7 @@ function readEraseRequest() {
     request = eraseRequest();
   } catch (error) {
     setFieldError("#erase-regions", String(error));
-    toast(String(error), true);
+    reportError(error);
     return null;
   }
   if (!eraseIoProblems(request)) {
@@ -1065,7 +1268,7 @@ async function checkEraseStatus() {
     node.classList.remove("hidden");
     toast(status.available ? "擦除工具可用" : "未找到擦除工具", !status.available);
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   }
 }
 
@@ -1079,7 +1282,7 @@ async function planErase() {
     });
     renderErasePlan(plan);
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   }
 }
 
@@ -1113,7 +1316,7 @@ async function runErase() {
     node.classList.remove("hidden");
     toast(`擦除结束：${run.outcomeLabel}`);
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   } finally {
     endTask();
   }
@@ -1124,7 +1327,7 @@ async function browse(targetId) {
     const folder = await call("pick_folder");
     if (folder) $(targetId).value = folder;
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   }
 }
 
@@ -1165,7 +1368,7 @@ async function buildRenamePlan() {
       ${skipped}`,
     });
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   } finally {
     endTask();
     syncRenameApplyState();
@@ -1195,7 +1398,7 @@ async function applyRename() {
     renamePlan = null;
     toast(`已重命名 ${renamed} 个文件；建议重新扫描并检查`);
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   } finally {
     endTask();
   }
@@ -1227,7 +1430,7 @@ async function probeBitrate() {
   try {
     minKbps = Math.round(bitrateMinBps() / 1000);
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
     return;
   }
   if (!beginTask("正在检测分集码率")) return;
@@ -1261,7 +1464,7 @@ async function probeBitrate() {
       ${fixable ? "<p>下一步会重编码这些分集并替换原文件，点按钮后会再确认一次。</p>" : ""}`,
     });
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   } finally {
     endTask();
     syncBitrateFixState();
@@ -1282,6 +1485,8 @@ function requestBitrateFix() {
     }。<br />
     <strong>原文件会被替换</strong>（视频与音频都会重新编码），<strong>没有备份、不能撤销</strong>。
     建议先备份，或先在副本上试一集。`;
+  // 弹窗关掉后要把焦点还给触发它的按钮，否则键盘用户会被丢回页面开头。
+  bitrateConfirmReturnFocus = $("#bitrate-fix");
   $("#bitrate-confirm").classList.remove("hidden");
   $("#bitrate-fix").disabled = true;
   $("#bitrate-confirm-yes").focus();
@@ -1291,10 +1496,16 @@ function cancelBitrateFix() {
   bitratePending = null;
   $("#bitrate-confirm").classList.add("hidden");
   syncBitrateFixState();
+  // 先让按钮恢复可聚焦状态（上面可能刚把它禁用），再把焦点还回去。
+  const back = bitrateConfirmReturnFocus;
+  bitrateConfirmReturnFocus = null;
+  if (back && !back.disabled) back.focus();
 }
 
 async function applyBitrateFix() {
   if (!bitratePending) return;
+  // 走确认路径时不还焦点：紧接着就会开始长任务并禁用按钮。
+  bitrateConfirmReturnFocus = null;
   cancelBitrateFix();
   if (!beginTask(`正在重编码 ${bitratePending.length} 集（原文件会被替换）`)) return;
   try {
@@ -1328,7 +1539,7 @@ async function applyBitrateFix() {
     // 结果已变，旧的分级数据不再可信，要求重新检测。
     bitrateItems = null;
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   } finally {
     endTask();
     syncBitrateFixState();
@@ -1389,6 +1600,7 @@ async function executeTranscode() {
     const report = await call("transcode_execute", {
       root: state.root,
       name: drama.name,
+      outputRoot: state.settings?.outputDir ?? null,
       request: {
         mode,
         targetCount: targetRaw === "" ? null : Number(targetRaw),
@@ -1423,7 +1635,7 @@ async function executeTranscode() {
       tone: "error",
       html: `<strong>转码失败</strong><br />${esc(String(error))}`,
     });
-    toast(String(error), true);
+    reportError(error);
   } finally {
     endTask();
   }
@@ -1441,7 +1653,7 @@ async function checkRuntime(force = false) {
     state.runtime = status;
     renderRuntimeStatus(status);
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   }
 }
 
@@ -1449,6 +1661,27 @@ function renderRuntimeStatus(status) {
   renderEnvBanner(status);
   renderRuntimeList(status);
   renderEnvChip(status);
+  renderRuntimeInstallEntry(status);
+}
+
+/** 非 macOS 没有可用下载源，按键必然失败，改为给出对应平台的手动安装指引。 */
+function manualInstallHint(platform) {
+  if (platform === "windows") {
+    return "Windows 暂不支持一键配置：可执行「winget install Gyan.FFmpeg」，或从 https://www.gyan.dev/ffmpeg/builds/ 下载压缩包，解压后把其中的 bin 目录加入 PATH。";
+  }
+  if (platform === "linux") {
+    return "Linux 暂不支持一键配置：Debian/Ubuntu 执行「sudo apt install ffmpeg」，Fedora/RHEL 执行「sudo dnf install ffmpeg」。";
+  }
+  return "当前平台暂不支持一键配置，请手动安装 ffmpeg（含 ffprobe）。";
+}
+
+/** 设置页的「一键配置运行环境」入口：只在有下载源的平台显示。 */
+function renderRuntimeInstallEntry(status) {
+  const supported = status.installSupported === true;
+  $("#runtime-install").classList.toggle("hidden", !supported);
+  const hint = $("#runtime-install-hint");
+  hint.classList.toggle("hidden", supported);
+  hint.textContent = supported ? "" : manualInstallHint(status.platform);
 }
 
 /** 头部常驻状态：缺什么一眼可见（与全局横幅同一口径），点一下跳到本机环境详情。 */
@@ -1462,6 +1695,8 @@ function renderEnvChip(status) {
     chip.classList.add("ok");
     chip.textContent = "本机环境就绪";
     chip.title = `ffmpeg ${status.ffmpeg?.version ?? "?"} · ffprobe ${status.ffprobe?.version ?? "?"}`;
+    // 原生 title 只在鼠标悬停时出现，键盘用户读不到，补一份可朗读的说明。
+    $("#env-chip-detail").textContent = chip.title;
     return;
   }
   // 找到了但不可用（例如路径指向别的程序）也算未就绪，避免状态说假话。
@@ -1473,6 +1708,7 @@ function renderEnvChip(status) {
   chip.title = status.python && !status.python.found
     ? "另外未检测到 python（只影响模型类工具）"
     : "点击查看本机环境详情";
+  $("#env-chip-detail").textContent = chip.title;
 }
 
 function renderEnvBanner(status) {
@@ -1487,9 +1723,17 @@ function renderEnvBanner(status) {
   }
   node.classList.remove("hidden", "ok", "warn", "error");
   node.classList.add("error");
-  node.innerHTML = `运行环境未就绪：缺少 ${esc(
+  const missingText = `运行环境未就绪：缺少 ${esc(
     missing.map((tool) => tool.name).join("、"),
-  )}。点击「一键配置运行环境」自动下载安装（约 25 MB，需要网络）；也可以在「设置 → 本机环境」手动指定路径。<button id="env-install" class="ghost">一键配置运行环境</button>`;
+  )}。`;
+  if (status.installSupported !== true) {
+    // 没有下载源时不给按钮：点了必然报错，比不提供入口更糟。
+    node.innerHTML = `${missingText}${esc(
+      manualInstallHint(status.platform),
+    )}装好后在「设置 → 本机环境」点「重新检测」。`;
+    return;
+  }
+  node.innerHTML = `${missingText}点击「一键配置运行环境」自动下载安装（约 25 MB，需要网络）；也可以在「设置 → 本机环境」手动指定路径。<button id="env-install" class="ghost">一键配置运行环境</button>`;
 }
 
 // 一键配置运行环境：后台自动下载安装 ffmpeg/ffprobe 并写回设置，无需手动配置。
@@ -1506,7 +1750,7 @@ async function runtimeInstall() {
     const report = await call("install_runtime");
     toast(report.note);
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   } finally {
     for (const button of buttons) {
       button.disabled = false;
@@ -2006,9 +2250,7 @@ document.querySelectorAll(".nav-item").forEach((node) => {
   node.addEventListener("click", () => switchModule(node.dataset.module));
 });
 $("#env-chip").addEventListener("click", () => {
-  // 设置是独立视图：打开后直接跳到「本机环境」子页看检测详情。
-  switchModule("settings");
-  switchToSubAnd("env");
+  gotoRuntimeSettings();
 });
 // ============ 登录 / 注册 ============
 $("#goto-register").addEventListener("click", () => switchAuthCard(true));
@@ -2063,6 +2305,33 @@ $("#bitrate-probe").addEventListener("click", probeBitrate);
 $("#bitrate-fix").addEventListener("click", requestBitrateFix);
 $("#bitrate-confirm-yes").addEventListener("click", applyBitrateFix);
 $("#bitrate-confirm-no").addEventListener("click", cancelBitrateFix);
+
+/**
+ * 确认弹窗的键盘行为：Esc 取消、Tab 在弹窗内循环。
+ * `alertdialog` 只声明了语义，焦点仍然会跑到背后的表单上，必须自己兜住。
+ */
+function handleConfirmKeys(event) {
+  const node = $("#bitrate-confirm");
+  if (node.classList.contains("hidden")) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    cancelBitrateFix();
+    return;
+  }
+  if (event.key !== "Tab") return;
+  const focusables = $$("#bitrate-confirm button:not([disabled])");
+  if (!focusables.length) return;
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+  const active = document.activeElement;
+  const inside = Boolean(active) && node.contains(active);
+  if (event.shiftKey ? active === first || !inside : active === last || !inside) {
+    event.preventDefault();
+    (event.shiftKey ? last : first).focus();
+  }
+}
+
+document.addEventListener("keydown", handleConfirmKeys);
 $("#exec-run").addEventListener("click", executeTranscode);
 $("#runtime-recheck").addEventListener("click", () => checkRuntime(true));
 $("#runtime-install").addEventListener("click", runtimeInstall);
@@ -2077,7 +2346,7 @@ $("#browse-erase-input").addEventListener("click", async () => {
     const file = await call("pick_video");
     if (file) $("#erase-input").value = file;
   } catch (error) {
-    toast(String(error), true);
+    reportError(error);
   }
 });
 $("#erase-status").addEventListener("click", checkEraseStatus);
@@ -2106,6 +2375,7 @@ $("#reset-settings").addEventListener("click", () => {
 $("#library-root").addEventListener("keydown", (event) => {
   if (event.key === "Enter") scan();
 });
+$("#library-root").addEventListener("input", renderEmptyGuide);
 
 // 设置页任一改动都刷新「未保存」标记，避免改了以为已经生效。
 ["#rule-min-episodes", "#rule-min-duration", "#rule-max-duration", "#rule-max-bitrate",
@@ -2127,6 +2397,12 @@ $("#library-root").addEventListener("keydown", (event) => {
 
 // 结果区里的「打开目录 / 复制路径」用事件委托，避免把路径拼进 HTML。
 document.addEventListener("click", (event) => {
+  const guideButton = event.target.closest("[data-guide-action]");
+  if (guideButton) {
+    if (guideButton.dataset.guideAction === "browse") browse("#library-root");
+    else if (guideButton.dataset.guideAction === "scan") scan();
+    return;
+  }
   const openButton = event.target.closest("[data-open-key]");
   if (openButton) {
     openPath(openButton.dataset.openKey);
@@ -2141,6 +2417,8 @@ document.addEventListener("click", (event) => {
 // 后端逐集报进度，界面据此画确定进度条。
 if (tauriEvent?.listen) {
   tauriEvent.listen("probe-progress", (event) => handleProbeProgress(event.payload));
+  tauriEvent.listen("task-progress", (event) => handleTaskProgress(event.payload));
+  tauriEvent.listen("erase-progress", (event) => handleEraseProgress(event.payload));
 }
 
 // 启动：决定显示登录卡还是主应用（浏览器预览无 IPC 时直接进主应用便于布局验证）。
@@ -2150,3 +2428,6 @@ if (invoke) {
   loadPlatformProfiles();
 }
 loadVersion();
+
+// 首屏就画好三步引导，不必等设置读完（读失败时页面也不该是一片空白）。
+renderEmptyGuide();

@@ -828,6 +828,30 @@ mod desktop_entry_tests {
             Some(PathBuf::from("/tmp/out.mp4.inpaint-report.json"))
         );
         assert_eq!(args.worker_program, None);
+        assert_eq!(args.progress_json, None, "没给进度流就不该凭空多一个参数");
+    }
+
+    /// 桌面端给了进度流时，`--progress-json` 必须原样传到 CLI——
+    /// 进度条能不能画出来全靠这一条。
+    #[test]
+    fn desktop_plan_forwards_the_progress_stream() {
+        let request = EraseRequest {
+            progress_json: Some(PathBuf::from("/tmp/erase.progress.jsonl")),
+            ..request()
+        };
+        let plan = build_plan(&request, std::path::Path::new("/bin/dossier-inpaint")).unwrap();
+        // 预览命令里也要出现：预览的意义就是「和真正执行的是同一条命令」。
+        assert!(
+            plan.command_line.contains("--progress-json"),
+            "预览命令应包含进度流参数：{}",
+            plan.command_line
+        );
+        assert_eq!(plan.progress_path, request.progress_json);
+        let args = parse(&request);
+        assert_eq!(
+            args.progress_json,
+            Some(PathBuf::from("/tmp/erase.progress.jsonl"))
+        );
     }
 
     #[test]

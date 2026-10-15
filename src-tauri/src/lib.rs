@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use dossier_core::{
-    generate_report_package, load_settings, probe_episode, run_checks, save_settings,
-    scan_drama_dir, validate_drama_dir, validate_drama_name, validate_library_root, AppSettings,
-    ChecklistReport, ChecklistRules, CostSheetForm, Drama, EpisodeSpec, FfprobeConfig,
+    generate_report_package, load_settings, probe_episode, resolve_product_dir, run_checks,
+    save_settings, scan_drama_dir, validate_drama_dir, validate_drama_name, validate_library_root,
+    AppSettings, ChecklistReport, ChecklistRules, CostSheetForm, Drama, EpisodeSpec, FfprobeConfig,
     LoadedSettings, PackageOptions, PackageResult, ProbedEpisode,
 };
 use serde::Serialize;
@@ -189,6 +189,7 @@ fn generate_package(
     root: String,
     name: String,
     output_dir: Option<String>,
+    output_root: Option<String>,
     copy_episodes: bool,
     ai_generated: bool,
     cost_sheet: Option<CostSheetForm>,
@@ -216,8 +217,18 @@ fn generate_package(
         .filter_map(|(file, probe)| probe.spec.map(|spec| ProbedEpisode { file, spec }))
         .collect();
 
+    // 落点三层：本次覆盖 → 设置里的「默认输出目录」（产物根目录）→ 剧目目录内。
+    // 规则与单测都在 `dossier_core::resolve_product_dir`，这一层只做字符串到路径的转换。
+    let package_dir = resolve_product_dir(
+        output_dir.as_deref().map(Path::new),
+        output_root.as_deref().map(Path::new),
+        &drama.dir,
+        &drama.name,
+        "报审包",
+    );
+
     let opts = PackageOptions {
-        output_dir: output_dir.map(PathBuf::from),
+        output_dir: Some(package_dir),
         copy_episodes,
         cost_sheet,
         ai_generated,
