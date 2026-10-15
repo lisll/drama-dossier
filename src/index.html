@@ -423,6 +423,20 @@
                 </div>
                 <div id="draft-result" class="result hidden"></div>
               </details>
+              <details class="panel tool-card" id="tool-publish-copy">
+                <summary>发布素材文案（本地 CSV）</summary>
+                <p class="hint">生成并编辑「挂载文案.csv」。此功能只处理本地文案和状态，不连接第三方平台或读取登录会话。</p>
+                <div class="form-grid">
+                  <label>挂载文案 CSV<input id="publish-copy-path" type="text" placeholder="例如 /tmp/挂载文案.csv" /></label>
+                </div>
+                <div class="option-row">
+                  <button id="publish-copy-generate" class="primary">生成模板</button>
+                  <button id="publish-copy-load" class="ghost">读取并校验</button>
+                  <button id="publish-copy-preview" class="ghost">生成本地 dry-run 预览</button>
+                </div>
+                <div id="publish-copy-result" class="result hidden"></div>
+                <p class="hint">dry-run 只校验文案和 ready 状态，不连接平台、不模拟上传；预览中的“可提交”不代表已提交。</p>
+              </details>
 
               <details class="panel tool-card" id="tool-erase">
                 <summary>字幕 / 角标擦除（实验功能，仅限自有素材）</summary>

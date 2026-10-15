@@ -32,6 +32,7 @@ from pydantic import Field
 
 from . import __version__
 from .auth import ROLE_RANK, Principal, resolve_token
+from . import billing
 from .base import StrictModel
 from .config import Settings, load_settings
 from .db import connect, init_db, json_load, now_iso
@@ -39,6 +40,7 @@ from .errors import ErrorClass, WorkError
 from .plan import ENGINE_VERSION, WORKER_VERSION
 from .recipes.registry import registered_modules
 from .recipes.schema import recipe_json_schema
+from .runtime import RuntimeManager, RuntimeManifest, local_target
 from .storage import LocalStorage
 from .tasks import review as review_service
 from .tasks import service
@@ -83,6 +85,7 @@ class TaskRequest(StrictModel):
     priority: int = Field(100, ge=0, le=10000)
     project_id: Optional[str] = None
     idempotency_key: Optional[str] = None
+    billing_quote_id: Optional[str] = None
 
 
 class ReviewDecisionRequest(StrictModel):
@@ -105,6 +108,23 @@ class RecipePublishRequest(StrictModel):
     status: str = "published"
     rollout_percent: int = Field(100, ge=0, le=100)
     reviewed_by: Optional[str] = None
+
+
+class RuntimeInstallRequest(StrictModel):
+    """只允许选择本机 manifest 中声明的角色；客户端不能提交任意 URL 或哈希。"""
+
+    role: str
+
+
+class BillingQuoteRequest(StrictModel):
+    units: int = Field(..., ge=1, le=1_000_000)
+    unit_cost: int = Field(1, ge=1, le=1_000_000)
+    ttl_seconds: int = Field(900, ge=60, le=86400)
+    idempotency_key: Optional[str] = None
+
+
+class BillingSettleRequest(StrictModel):
+    task_id: str
 
 
 # ---------- 限流 ----------
@@ -158,6 +178,16 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     app.state.settings = settings
     app.state.limiter = limiter
     app.state.storage = storage
+
+    def runtime_manifest() -> RuntimeManifest:
+        if settings.runtime_manifest is None:
+            raise HTTPException(503, detail={"error": "runtime_manifest_missing",
+                                             "message": "尚未配置 DRAMA_CLOUD_RUNTIME_MANIFEST"})
+        try:
+            return RuntimeManifest.load(Path(settings.runtime_manifest))
+        except (OSError, ValueError) as error:
+            raise HTTPException(503, detail={"error": "runtime_manifest_invalid",
+                                             "message": str(error)}) from error
 
     def get_conn():
         conn = connect(settings)
@@ -253,10 +283,16 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         from .modules.ffmpeg import ffmpeg_version
 
         queue = TaskQueue(settings)
+        # 状态页本身不能因为可选的外部媒体工具缺失而不可用；把缺失记录成
+        # 可读的状态值，任务创建/执行时仍会按能力门禁返回明确错误。
+        try:
+            ffmpeg = ffmpeg_version(settings)
+        except WorkError as error:
+            ffmpeg = f"unavailable: {error.message}"
         return {
             "worker_version": WORKER_VERSION,
             "engine_version": ENGINE_VERSION,
-            "ffmpeg": ffmpeg_version(settings),
+            "ffmpeg": ffmpeg,
             "capabilities": service.cluster_capabilities(settings),
             "modules": sorted(registered_modules()),
             "queue_depth": queue.depth(conn),
@@ -266,8 +302,104 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 "root": str(settings.storage_dir),
                 "objects_bytes": _dir_size(settings.storage_dir),
             },
+            "runtimes": RuntimeManager(settings.runtime_root or (settings.home / "runtime")).status(),
             "home": str(settings.home),
         }
+
+    @app.get("/api/v1/runtimes")
+    def runtime_status_endpoint(principal: Principal = Depends(require_role("viewer"))):
+        """查询本地 RuntimeRoles 状态与当前设备适配角色。"""
+        manifest = runtime_manifest()
+        target = local_target()
+        return {
+            "target": {"platform": target[0], "arch": target[1]},
+            "available_roles": [role.name for role in manifest.for_target(*target)],
+            **RuntimeManager(settings.runtime_root or (settings.home / "runtime")).status(),
+        }
+
+    @app.post("/api/v1/runtimes/install")
+    def runtime_install_endpoint(
+        payload: RuntimeInstallRequest,
+        principal: Principal = Depends(require_role("admin")),
+    ):
+        """按可信 manifest 安装单个角色；不会接受命令、脚本或客户端 URL。"""
+        manifest = runtime_manifest()
+        target = local_target()
+        role = next((item for item in manifest.for_target(*target) if item.name == payload.role), None)
+        if role is None:
+            raise HTTPException(400, detail={"error": "runtime_role_unavailable",
+                                             "message": "manifest 中没有适配本机的该角色"})
+        try:
+            return RuntimeManager(settings.runtime_root or (settings.home / "runtime")).install(role)
+        except (OSError, ValueError) as error:
+            raise HTTPException(400, detail={"error": "runtime_install_failed",
+                                             "message": str(error)}) from error
+
+    @app.post("/api/v1/runtimes/{role_name}/rollback")
+    def runtime_rollback_endpoint(
+        role_name: str,
+        principal: Principal = Depends(require_role("admin")),
+    ):
+        try:
+            return RuntimeManager(settings.runtime_root or (settings.home / "runtime")).rollback(role_name)
+        except FileNotFoundError as error:
+            raise HTTPException(404, detail={"error": "runtime_rollback_missing",
+                                             "message": str(error)}) from error
+        except (OSError, ValueError) as error:
+            raise HTTPException(400, detail={"error": "runtime_rollback_failed",
+                                             "message": str(error)}) from error
+
+    # ---------- 本地积分账本（不连接支付网关） ----------
+
+    @app.get("/api/v1/billing/balance")
+    def billing_balance_endpoint(
+        principal: Principal = Depends(require_role("operator")), conn=Depends(get_conn)
+    ):
+        return billing.get_balance(conn, principal.user_id)
+
+    @app.post("/api/v1/billing/quotes", status_code=201)
+    def billing_quote_endpoint(
+        payload: BillingQuoteRequest,
+        principal: Principal = Depends(require_role("operator")), conn=Depends(get_conn),
+    ):
+        return billing.create_quote(conn, principal.user_id, payload.units, payload.unit_cost,
+                                    payload.ttl_seconds, payload.idempotency_key,
+                                    actor=principal.user_id)
+
+    @app.get("/api/v1/billing/quotes/{quote_id}")
+    def billing_get_quote_endpoint(
+        quote_id: str,
+        principal: Principal = Depends(require_role("operator")), conn=Depends(get_conn),
+    ):
+        quote = billing.get_quote(conn, quote_id)
+        if quote["user_id"] != principal.user_id and principal.role != "admin":
+            raise HTTPException(403, detail={"error": "forbidden", "message": "报价不属于当前用户"})
+        return quote
+
+    @app.post("/api/v1/billing/quotes/{quote_id}/settle")
+    def billing_settle_endpoint(
+        quote_id: str,
+        payload: BillingSettleRequest,
+        principal: Principal = Depends(require_role("operator")), conn=Depends(get_conn),
+    ):
+        quote = billing.get_quote(conn, quote_id)
+        if quote["user_id"] != principal.user_id:
+            raise HTTPException(403, detail={"error": "forbidden", "message": "报价不属于当前用户"})
+        task = conn.execute("SELECT state, project_id FROM tasks WHERE id = ?", (payload.task_id,)).fetchone()
+        if task is None:
+            raise HTTPException(404, detail={"error": "not_found", "message": "任务不存在"})
+        project = conn.execute("SELECT owner_id FROM projects WHERE id = ?", (task["project_id"],)).fetchone()
+        if project is None or project["owner_id"] != principal.user_id:
+            raise HTTPException(403, detail={"error": "forbidden", "message": "任务不属于当前用户"})
+        if task["state"] == "SUCCEEDED":
+            succeeded = True
+        elif task["state"] in ("FAILED", "CANCELLED"):
+            succeeded = False
+        else:
+            raise HTTPException(409, detail={"error": "task_not_terminal",
+                                             "message": "任务尚未结束，暂不能结算"})
+        return billing.settle_quote(conn, quote_id, principal.user_id, payload.task_id,
+                                    succeeded, actor=principal.user_id)
 
     # ---------- 上传 ----------
 
@@ -398,6 +530,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             priority=payload.priority,
             idempotency_key=idempotency_key,
             actor=principal.user_id,
+            billing_quote_id=payload.billing_quote_id,
+            billing_user_id=principal.user_id if payload.billing_quote_id else None,
         )
 
     @app.get("/api/v1/tasks")

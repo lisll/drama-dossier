@@ -11,10 +11,13 @@ use std::path::PathBuf;
 
 use dossier_core::{
     builtin_profiles, diff_packages as diff_packages_core, export_capcut_draft, find_profile,
-    import_capcut_draft, plan_normalization, probe_episode, review_drama, scan_drama_dir,
+    import_capcut_draft, build_mount_copy_rows, load_mount_copy_csv, plan_normalization,
+    make_publish_batch, preview_publish_batch, probe_episode, review_drama, scan_drama_dir,
+    transition_publish_row, validate_publish_update, write_mount_copy_csv,
     validate_drama_dir, validate_drama_name, validate_library_root, CapcutDraft,
-    DraftExportOptions, DraftExportResult, Drama, FfprobeConfig, NormalizationPlan, PackageDiff,
-    PlatformProfile, ProbedEpisode, ProfileReview, TranscodeTarget,
+    DraftExportOptions, DraftExportResult, Drama, FfprobeConfig, MountCopyRow, MountCopyWriteResult,
+    NormalizationPlan, PackageDiff, PlatformProfile, ProbedEpisode, ProfileReview, PublishPreview,
+    TranscodeTarget,
 };
 use serde::Serialize;
 
@@ -129,4 +132,70 @@ pub fn export_draft(
 #[tauri::command]
 pub fn import_draft(draft_dir: String) -> Result<CapcutDraft, String> {
     import_capcut_draft(&PathBuf::from(draft_dir)).map_err(|error| error.to_string())
+}
+
+/// 生成可编辑的「挂载文案.csv」。这里只生成本地元数据，不连接第三方平台。
+#[tauri::command]
+pub fn generate_mount_copy_csv(
+    root: String,
+    name: String,
+    output_path: String,
+    ffprobe_path: Option<String>,
+) -> Result<MountCopyWriteResult, String> {
+    let drama = load_drama(&root, &name)?;
+    let episodes = probe_all(&drama, ffprobe_path);
+    if episodes.is_empty() {
+        return Err("没有任何成功探测规格的分集，无法生成挂载文案。".into());
+    }
+    let rows = build_mount_copy_rows(&drama.name, &episodes);
+    write_mount_copy_csv(&PathBuf::from(output_path), &rows).map_err(|error| error.to_string())
+}
+
+/// 读回挂载文案 CSV，供人工修改后的结果复核。
+#[tauri::command]
+pub fn load_mount_copy(path: String) -> Result<Vec<MountCopyRow>, String> {
+    load_mount_copy_csv(&PathBuf::from(path)).map_err(|error| error.to_string())
+}
+
+/// 保存人工编辑后的挂载文案 CSV。不会触发外部发布。
+#[tauri::command]
+pub fn save_mount_copy(path: String, rows: Vec<MountCopyRow>) -> Result<MountCopyWriteResult, String> {
+    let path = PathBuf::from(path);
+    if path.exists() {
+        let previous = load_mount_copy_csv(&path).map_err(|error| error.to_string())?;
+        if previous.len() != rows.len() {
+            return Err("保存时不能增删行；请生成新的发布批次".into());
+        }
+        for (before, after) in previous.iter().zip(rows.iter()) {
+            validate_publish_update(before, after).map_err(|error| error.to_string())?;
+        }
+    } else if rows.iter().any(|row| row.status != "draft") {
+        return Err("新建发布 CSV 只能从 draft 状态开始".into());
+    }
+    write_mount_copy_csv(&path, &rows).map_err(|error| error.to_string())
+}
+
+/// 生成不联网的提交前预览，不上传、不创建平台单号，也不修改 CSV 状态。
+#[tauri::command]
+pub fn preview_mount_copy_publish(
+    path: String,
+    batch_id: String,
+    drama_name: String,
+) -> Result<PublishPreview, String> {
+    let batch = make_publish_batch(&batch_id, &drama_name, &PathBuf::from(path))
+        .map_err(|error| error.to_string())?;
+    Ok(preview_publish_batch(&batch_id, &batch))
+}
+
+/// 按本地发布状态机更新一条记录。这里只记账，不会向平台提交内容。
+#[tauri::command]
+pub fn transition_mount_copy_row(
+    row: MountCopyRow,
+    next_status: String,
+    result_note: String,
+) -> Result<MountCopyRow, String> {
+    let mut row = row;
+    transition_publish_row(&mut row, &next_status, result_note)
+        .map_err(|error| error.to_string())?;
+    Ok(row)
 }

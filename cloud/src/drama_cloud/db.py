@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS tasks (
                                'RETRY_WAITING', 'CANCEL_REQUESTED', 'CANCELLED', 'FAILED')),
     priority               INTEGER NOT NULL DEFAULT 100,
     idempotency_key        TEXT UNIQUE,
+    billing_quote_id       TEXT,
     input_asset_ids        TEXT NOT NULL,
     recipe_id              TEXT NOT NULL,
     recipe_version         INTEGER NOT NULL,
@@ -182,12 +183,45 @@ CREATE TABLE IF NOT EXISTS audit_events (
     detail_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_events(ts);
+
+-- 学习原型的积分账本：只记录本地 quote→task→settle，不连接支付网关或设备指纹。
+CREATE TABLE IF NOT EXISTS billing_accounts (
+    user_id      TEXT PRIMARY KEY REFERENCES users(id),
+    balance      INTEGER NOT NULL DEFAULT 0 CHECK (balance >= 0),
+    updated_at   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS billing_quotes (
+    id           TEXT PRIMARY KEY,
+    user_id      TEXT NOT NULL REFERENCES users(id),
+    units        INTEGER NOT NULL CHECK (units > 0),
+    unit_cost    INTEGER NOT NULL CHECK (unit_cost > 0),
+    amount       INTEGER NOT NULL CHECK (amount > 0),
+    status       TEXT NOT NULL CHECK (status IN ('issued', 'reserved', 'settled', 'released', 'expired')),
+    task_id      TEXT,
+    expires_at   TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_billing_quotes_user ON billing_quotes(user_id, created_at);
+
+CREATE TABLE IF NOT EXISTS billing_ledger (
+    idempotency_key TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL REFERENCES users(id),
+    quote_id        TEXT,
+    task_id         TEXT,
+    delta           INTEGER NOT NULL,
+    kind            TEXT NOT NULL CHECK (kind IN ('grant', 'hold', 'release')),
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_billing_ledger_user ON billing_ledger(user_id, created_at);
 """
 
 #: 旧库升级用：库已存在时 `CREATE TABLE IF NOT EXISTS` 不会补列，所以显式声明要补的列。
 #: 学习原型直接用 ALTER TABLE ADD COLUMN（SQLite 允许），换 PG 时这里替换成迁移工具。
 MIGRATIONS = {
     "tasks": {
+        "billing_quote_id": "TEXT",
         "recipe_snapshot_json": "TEXT NOT NULL DEFAULT '{}'",
         "plan_json": "TEXT NOT NULL DEFAULT '{}'",
         "required_capabilities": "TEXT NOT NULL DEFAULT '[]'",

@@ -71,7 +71,8 @@
 
 **幂等**：`POST /api/v1/tasks` 支持 `Idempotency-Key` 头（或请求体里的 `idempotency_key`）。
 同一个键重复提交返回**同一个任务**（HTTP 仍是 201 语义上的「已创建」，返回既有任务对象），
-不会新建第二条。键在库里是 `UNIQUE`。
+不会新建第二条。键在库里是 `UNIQUE`。如需计费，在请求体附带 `billing_quote_id`；报价
+保留和任务入队在同一事务内完成。
 
 ## 3. 端点总表
 
@@ -79,7 +80,10 @@
 | --- | --- | --- | --- |
 | GET | `/api/v1/health` | 无 | 存活探测 |
 | GET | `/api/v1/auth/whoami` | 登录 | 回显身份 |
-| GET | `/api/v1/system/status` | viewer | 环境、能力、队列、存储概览 |
+| GET | `/api/v1/system/status` | viewer | 环境、能力、队列、存储与运行时概览 |
+| GET | `/api/v1/runtimes` | viewer | RuntimeRoles 清单适配与激活状态 |
+| POST | `/api/v1/runtimes/install` | admin | 按可信 manifest 安装并激活一个角色 |
+| POST | `/api/v1/runtimes/{role}/rollback` | admin | 回滚 RuntimeRole |
 | POST | `/api/v1/uploads` | operator | 申请上传会话 |
 | PUT | `/api/v1/uploads/{upload_id}` | 上传令牌 | 直传文件字节 |
 | GET | `/api/v1/assets` | viewer | 列出素材 |
@@ -101,6 +105,10 @@
 | POST | `/api/v1/reviews/{review_id}/claim` | operator | 认领复核记录 |
 | POST | `/api/v1/reviews/{review_id}/decision` | operator | 标记通过 / 标记失败 |
 | POST | `/api/v1/reviews/{review_id}/rerun` | operator | 修正 mask/参数后重跑（新建任务） |
+| GET | `/api/v1/billing/balance` | operator | 查看本地积分余额 |
+| POST | `/api/v1/billing/quotes` | operator | 创建 quote（支持幂等键） |
+| GET | `/api/v1/billing/quotes/{quote_id}` | operator | 查看自己的 quote |
+| POST | `/api/v1/billing/quotes/{quote_id}/settle` | operator | 按已结束任务结果结算或释放 quote |
 | GET | `/api/v1/audit` | admin | 审计事件 |
 | GET | `/` `/static/*` | 无 | Web 客户端静态页 |
 
@@ -135,6 +143,22 @@
   "home": "/…/cloud/var"
 }
 ```
+
+### RuntimeRoles
+
+运行时组件由 `DRAMA_CLOUD_RUNTIME_MANIFEST` 指定的清单声明，`source` 必须是绝对
+HTTPS 地址，安装前校验大小与 SHA-256；安装器只处理单文件 artifact，不执行清单里的
+脚本或命令。`GET /api/v1/runtimes` 返回本机平台/架构、可用角色与激活指针；安装和
+回滚需要 admin。指针、artifact 路径必须位于 `DRAMA_CLOUD_RUNTIME_ROOT` 内，切换采用
+临时文件替换，失败不会覆盖当前版本。
+
+### 本地积分账本
+
+`POST /api/v1/billing/quotes` 创建报价；创建任务时在任务请求中附带 `billing_quote_id`，
+服务端在同一 SQLite 事务内把报价保留并扣除可用余额，避免“任务已创建但未扣款”。任务
+进入 `SUCCEEDED` 时 settle，进入 `FAILED`/`CANCELLED` 时 release；重复请求按 quote/task
+状态幂等。该模块不连接 Z-Pay、不生成卡密、不读取 keyring/SMBIOS/注册表，也不提供邀请
+奖励；外部支付验签后只能调用受控的服务端充值接口。
 
 `capabilities` 是**本机实际具备**的能力，不是模块清单的简单投影：需要外部依赖的能力只有
 依赖真的存在时才出现（例如没装 `dossier-inpaint` 时不会出现 `video_inpaint`；

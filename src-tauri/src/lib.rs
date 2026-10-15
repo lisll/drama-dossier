@@ -299,7 +299,12 @@ pub fn run() {
             toolbox::probe_bitrate,
             toolbox::fix_bitrate,
             toolbox::transcode_execute,
-            toolbox::install_runtime
+            toolbox::install_runtime,
+            dossier::generate_mount_copy_csv,
+            dossier::load_mount_copy,
+            dossier::save_mount_copy,
+            dossier::transition_mount_copy_row,
+            dossier::preview_mount_copy_publish
         ])
         .run(tauri::generate_context!())
         .expect("failed to run DramaDossier");

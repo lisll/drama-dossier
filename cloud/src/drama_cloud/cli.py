@@ -20,6 +20,7 @@ from .errors import WorkError
 from .recipes.schema import validate_recipe
 from .storage import LocalStorage
 from .toolchain import resolve_binary
+from .runtime import RuntimeManager, RuntimeManifest, local_target
 from .tasks import review as review_service
 from .tasks import service
 from .tasks.queue import TaskQueue
@@ -500,6 +501,46 @@ def cmd_status(args) -> int:
         conn.close()
     print(f"ffmpeg      {ffmpeg_version(settings)}")
     print(f"能力        {', '.join(service.cluster_capabilities(settings))}")
+    runtime_root = settings.runtime_root or (settings.home / "runtime")
+    print(f"运行时      {json.dumps(RuntimeManager(runtime_root).status(), ensure_ascii=False)}")
+    return 0
+
+
+def _runtime_manifest(settings: Settings) -> RuntimeManifest:
+    if settings.runtime_manifest is None:
+        raise ValueError("未配置 DRAMA_CLOUD_RUNTIME_MANIFEST")
+    return RuntimeManifest.load(Path(settings.runtime_manifest))
+
+
+def cmd_runtime_status(args) -> int:
+    settings = _settings(args)
+    manifest = _runtime_manifest(settings)
+    platform, arch = local_target()
+    result = {
+        "target": {"platform": platform, "arch": arch},
+        "available_roles": [r.name for r in manifest.for_target(platform, arch)],
+        **RuntimeManager(settings.runtime_root or (settings.home / "runtime")).status(),
+    }
+    _print(result)
+    return 0
+
+
+def cmd_runtime_install(args) -> int:
+    settings = _settings(args)
+    manifest = _runtime_manifest(settings)
+    platform, arch = local_target()
+    role = next((r for r in manifest.for_target(platform, arch) if r.name == args.role), None)
+    if role is None:
+        raise ValueError(f"manifest 中没有适配本机的角色：{args.role}")
+    result = RuntimeManager(settings.runtime_root or (settings.home / "runtime")).install(role)
+    _print(result)
+    return 0
+
+
+def cmd_runtime_rollback(args) -> int:
+    settings = _settings(args)
+    result = RuntimeManager(settings.runtime_root or (settings.home / "runtime")).rollback(args.role)
+    _print(result)
     return 0
 
 
@@ -673,6 +714,17 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("status", help="环境与队列概览")
     p.set_defaults(func=cmd_status)
 
+    p = sub.add_parser("runtime-status", help="查看 RuntimeRoles 清单与本地激活状态")
+    p.set_defaults(func=cmd_runtime_status)
+
+    p = sub.add_parser("runtime-install", help="按清单安装并激活一个 RuntimeRole")
+    p.add_argument("role")
+    p.set_defaults(func=cmd_runtime_install)
+
+    p = sub.add_parser("runtime-rollback", help="回滚一个 RuntimeRole 到上一个版本")
+    p.add_argument("role")
+    p.set_defaults(func=cmd_runtime_rollback)
+
     p = sub.add_parser("reviews", help="列出人工复核队列")
     p.add_argument("--status", default="pending",
                    choices=["pending", "approved", "rejected", "superseded"])
@@ -747,6 +799,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         return args.func(args)
     except WorkError as error:
         print(f"错误[{error.error_class}] {error.message}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError) as error:
+        print(f"错误：{error}", file=sys.stderr)
         return 1
 
 

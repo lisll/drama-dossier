@@ -233,6 +233,7 @@ class Worker:
                 (now_iso(), task_id, attempt),
             )
             set_progress(conn, task_id, {"stage": "succeeded", "steps": [s.__dict__ for s in steps]})
+            service.settle_task_billing(conn, task_id, True, actor=self.worker_id)
             self._cleanup(work_dir, keep=False)
         except LeaseLost as lost:
             # 任务已不属于本 Worker，什么都不改，避免覆盖新 Worker 的状态。
@@ -577,6 +578,7 @@ class Worker:
             },
         )
         set_progress(conn, task_id, {"stage": "cancelled"})
+        service.settle_task_billing(conn, task_id, False, actor=self.worker_id)
         self._cleanup(context.work_dir, keep=False)
 
     def _fail(self, conn, task_id: str, attempt: int, error_class: ErrorClass,
@@ -613,6 +615,8 @@ class Worker:
                 self._enqueue_exhausted_review(conn, task_id, attempt, detail, steps, context)
             # 不再重试时清理工作目录；重试则保留，供阶段级复用。
             self._cleanup(work_dir, keep=False)
+            if target in (str(TaskState.FAILED), str(TaskState.CANCELLED)):
+                service.settle_task_billing(conn, task_id, False, actor=self.worker_id)
 
     # ---------- 人工复核队列 ----------
 

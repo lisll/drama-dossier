@@ -84,6 +84,30 @@ cloud/
 └── var/                 # 运行目录（数据库/存储/工作目录，可整体删除）
 ```
 
+## 发布素材、RuntimeRoles 与本地账本
+
+桌面端的「发布素材文案」工作台只生成/编辑 `挂载文案.csv`，并可生成本地 dry-run
+预览。预览不会连接第三方平台、读取持久会话或伪造发布单号；CSV 状态迁移由 Rust
+核心校验，不能从 `draft` 直接改成 `confirmed`。
+
+云端 RuntimeRoles 由 `DRAMA_CLOUD_RUNTIME_MANIFEST` 清单驱动，示例：
+
+```bash
+export DRAMA_CLOUD_RUNTIME_ROOT="$DRAMA_CLOUD_HOME/runtime"
+export DRAMA_CLOUD_RUNTIME_MANIFEST=/path/to/runtime-manifest.json
+drama-cloud runtime-status
+drama-cloud runtime-install ffmpeg
+drama-cloud runtime-rollback ffmpeg
+```
+
+清单的远程 `source` 必须是绝对 HTTPS URL，并声明 `size_bytes` 与 SHA-256；安装器只
+处理单文件 artifact，不执行脚本、不解压不受信任包。激活指针采用临时文件替换，指针
+路径越出 runtime root 或完整性校验失败时会拒绝解析。
+
+本地积分账本提供 `quote → task → settle` 的服务端边界：创建任务时附带
+`billing_quote_id`，报价保留与任务入队在同一 SQLite 事务内完成；任务成功结算，失败/取消
+释放积分。该原型不接 Z-Pay、卡密/keyring、SMBIOS/注册表设备指纹或邀请奖励。
+
 ## 文档索引
 
 | 文档 | 内容 |

@@ -27,6 +27,7 @@ pub mod pipeline_version;
 pub mod platforms;
 pub mod probe;
 pub mod progress;
+pub mod publish;
 pub mod scanner;
 pub mod settings;
 pub mod tools;
@@ -62,6 +63,11 @@ pub use probe::{probe_episode, probe_episodes, FfprobeConfig};
 pub use progress::{
     load_progress_log, parse_progress_log, ProgressError, ProgressEvent, ProgressEventKind,
     ProgressLog, ProgressRecorder, TaskProgress,
+};
+pub use publish::{
+    build_mount_copy_rows, load_mount_copy_csv, make_publish_batch, write_mount_copy_csv,
+    preview_publish_batch, transition_publish_row, validate_publish_update, MountCopyRow,
+    MountCopyWriteResult, PublishBatch, PublishPreview, PublishPreviewRow,
 };
 pub use scanner::{
     scan_drama_dir, scan_library, validate_drama_dir, validate_drama_name, validate_library_root,

@@ -49,6 +49,9 @@ class Settings:
     runtime_bin: Optional[str] = None
     #: 运行时组件清单（Tier 1 的 `RuntimeManifest`）。给了它，能力路由就会去核对
     #: 「模型/权重到底装齐了没有」，而不是只看 `inpaint_worker_program` 有没有配。
+    #: RuntimeRoles 的本地安装根目录与可选 manifest。组件只从 manifest 声明的 HTTPS 地址下载。
+    runtime_root: Optional[Path] = None
+    #: 运行时清单路径同时供工具链能力探测与 RuntimeManager 使用。
     runtime_manifest: Optional[str] = None
 
     @property
@@ -96,6 +99,7 @@ def load_settings(**overrides) -> Settings:
         "runtime_manifest": os.environ.get("DRAMA_CLOUD_RUNTIME_MANIFEST") or None,
         # shlex 而不是 split：worker 脚本路径可能带空格，配引号即可。
         "inpaint_worker_args": tuple(shlex.split(raw_worker_args)) if raw_worker_args else (),
+        "runtime_root": Path(os.environ.get("DRAMA_CLOUD_RUNTIME_ROOT") or (home / "runtime")),
         # 部署方额外声明的能力（如只有 GPU 机器才有的 `video_inpaint_model`）。
         "capabilities": tuple(
             item for item in shlex.split(raw_capabilities.replace(",", " ")) if item

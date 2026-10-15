@@ -16,6 +16,7 @@ users ──┬─ projects ──┬─ assets                 （输入素材�
         │                        └─ review_queue      （人工复核队列，确认流分支B）
         └─ audit_events
 recipes ── recipe_versions     （配方与不可变版本）
+users ── billing_accounts ── billing_quotes ── billing_ledger（本地积分账本）
 ```
 
 | 表 | 作用 | 增长方式 |
@@ -31,6 +32,9 @@ recipes ── recipe_versions     （配方与不可变版本）
 | `artifacts` | 产物登记与保留期 | 每次登记 |
 | `review_queue` | 擦除确认流的人工复核队列 | 每次需要人工确认 |
 | `audit_events` | 关键操作审计 | 每次关键操作 |
+| `billing_accounts` | 用户积分余额 | 仅本地学习账本 |
+| `billing_quotes` | quote→task→settle 状态 | 报价、保留、结算/释放 |
+| `billing_ledger` | 积分变更流水 | grant/hold/release 幂等记录 |
 
 主键统一用带前缀的不透明 id（`usr_` / `prj_` / `ast_` / `tsk_` / `art_` / `up_`），
 由 `service.new_id()` 生成，客户端不应该解析它的含义。

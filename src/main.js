@@ -38,6 +38,7 @@ const state = {
   account: null, // 最近一次 account_* 命令回包（含 loggedIn / email / path）。
   mountStep: 1,
   mountPlan: null,
+  publishRows: [],
 };
 
 let renamePlan = null;
@@ -1166,6 +1167,105 @@ async function importDraft() {
     reportError(error);
   } finally {
     endTask();
+  }
+}
+
+async function generatePublishCopy() {
+  try {
+    const path = $("#publish-copy-path").value.trim();
+    if (!path) throw new Error("请填写挂载文案 CSV 输出路径。");
+    const drama = selectedDrama();
+    const result = await call("generate_mount_copy_csv", {
+      root: state.root,
+      name: drama.name,
+      outputPath: path,
+      ffprobePath: $("#ffprobe-path").value.trim() || null,
+    });
+    $("#publish-copy-path").value = result.path;
+    state.publishRows = await call("load_mount_copy", { path: result.path });
+    renderPublishCopy(`<strong>模板已生成</strong><br />行数：${result.rowCount} · SHA-256：<code>${esc(result.sha256)}</code>`);
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+async function loadPublishCopy() {
+  try {
+    const path = $("#publish-copy-path").value.trim();
+    if (!path) throw new Error("请填写挂载文案 CSV 路径。");
+    state.publishRows = await call("load_mount_copy", { path });
+    renderPublishCopy();
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+function renderPublishCopy(message = "") {
+  const rows = state.publishRows;
+  const body = rows.map((row, index) => `
+    <tr>
+      <td>${esc(row.episodeNumber ?? "—")}</td>
+      <td>${esc(row.sourceFile)}</td>
+      <td><input data-publish-index="${index}" data-publish-field="shortTitle" value="${esc(row.shortTitle)}" /></td>
+      <td><textarea data-publish-index="${index}" data-publish-field="description">${esc(row.description)}</textarea></td>
+      <td><textarea data-publish-index="${index}" data-publish-field="mountCopy">${esc(row.mountCopy)}</textarea></td>
+      <td><input data-publish-index="${index}" data-publish-field="dramaSearchName" value="${esc(row.dramaSearchName)}" /></td>
+      <td><select data-publish-index="${index}" data-publish-field="status">
+        ${["draft", "ready", "submitted", "confirmed", "failed"].map((status) => `<option value="${status}" ${row.status === status ? "selected" : ""}>${status}</option>`).join("")}
+      </select></td>
+      <td><input data-publish-index="${index}" data-publish-field="resultNote" value="${esc(row.resultNote)}" /></td>
+    </tr>`).join("");
+  $("#publish-copy-result").innerHTML = `
+    ${message}
+    <strong>文案表：${rows.length} 行</strong>
+    <div class="table-scroll"><table><thead><tr><th>集号</th><th>成片</th><th>短标题</th><th>描述</th><th>挂载文案</th><th>剧集检索名</th><th>本地状态</th><th>结果备注</th></tr></thead><tbody>${body}</tbody></table></div>
+    <div class="option-row"><button id="publish-copy-save" class="success">保存 CSV</button></div>
+    <p class="hint">状态只用于本地学习记录；本项目没有外部平台发布器。</p>`;
+  $("#publish-copy-result").classList.remove("hidden");
+  $("#publish-copy-result").querySelectorAll("[data-publish-index]").forEach((input) => {
+    input.addEventListener("input", () => {
+      const index = Number(input.dataset.publishIndex);
+      state.publishRows[index][input.dataset.publishField] = input.value;
+    });
+    input.addEventListener("change", () => {
+      const index = Number(input.dataset.publishIndex);
+      state.publishRows[index][input.dataset.publishField] = input.value;
+    });
+  });
+  $("#publish-copy-save").addEventListener("click", savePublishCopy);
+}
+
+async function previewPublishCopy() {
+  try {
+    const path = $("#publish-copy-path").value.trim();
+    if (!path) throw new Error("请先填写并读取挂载文案 CSV 路径。");
+    const drama = selectedDrama();
+    const preview = await call("preview_mount_copy_publish", {
+      path,
+      batchId: `${Date.now()}`,
+      dramaName: drama.name,
+    });
+    const rows = preview.rows.map((row) => `<tr>
+      <td>${esc(row.sourceFile)}</td><td>${esc(row.status)}</td>
+      <td>${row.eligible ? "满足" : "待补齐"}</td><td>${esc(row.reason)}</td>
+    </tr>`).join("");
+    const result = `<h4>本地 dry-run：${preview.canSubmit ? "前置条件满足" : "存在待处理项"}</h4>
+      <p>可提交 ${preview.eligibleCount}/${preview.rowCount}；实际提交：否（wouldSubmit=false）。</p>
+      <div class="table-scroll"><table><thead><tr><th>成片</th><th>状态</th><th>校验</th><th>原因</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    renderPublishCopy(result);
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+async function savePublishCopy() {
+  try {
+    const path = $("#publish-copy-path").value.trim();
+    if (!path) throw new Error("请填写挂载文案 CSV 路径。");
+    const result = await call("save_mount_copy", { path, rows: state.publishRows });
+    toast(`已保存 ${result.rowCount} 行文案，SHA-256 ${result.sha256.slice(0, 12)}…`);
+  } catch (error) {
+    toast(String(error), true);
   }
 }
 
@@ -2360,6 +2460,9 @@ $("#platform-run").addEventListener("click", platformReview);
 $("#draft-pick").addEventListener("click", () => browse("#draft-dir"));
 $("#draft-export").addEventListener("click", exportDraft);
 $("#draft-import").addEventListener("click", importDraft);
+$("#publish-copy-generate").addEventListener("click", generatePublishCopy);
+$("#publish-copy-load").addEventListener("click", loadPublishCopy);
+$("#publish-copy-preview").addEventListener("click", previewPublishCopy);
 $("#browse-output").addEventListener("click", () => browse("#output-dir"));
 $("#scan").addEventListener("click", scan);
 $("#analyze").addEventListener("click", analyze);

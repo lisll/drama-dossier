@@ -411,6 +411,8 @@ def create_task(
     priority: int = 100,
     idempotency_key: Optional[str] = None,
     actor: str = "system",
+    billing_quote_id: Optional[str] = None,
+    billing_user_id: Optional[str] = None,
 ) -> dict:
     """创建任务：锁定配方快照 → 构造计划 → 入队（幂等键保证不重复创建）。"""
     if not asset_ids:
@@ -421,6 +423,16 @@ def create_task(
             "SELECT id FROM tasks WHERE idempotency_key = ?", (idempotency_key,)
         ).fetchone()
         if row is not None:
+            if billing_quote_id:
+                quote = conn.execute(
+                    "SELECT status, task_id, user_id FROM billing_quotes WHERE id = ?",
+                    (billing_quote_id,),
+                ).fetchone()
+                if (quote is None or quote["task_id"] != row["id"]
+                        or quote["user_id"] != billing_user_id
+                        or quote["status"] not in ("reserved", "settled", "released")):
+                    raise WorkError(ErrorClass.PARAM_OUT_OF_RANGE,
+                                    "幂等任务已存在，但报价未绑定该任务")
             # 幂等命中：返回既有任务，不新建。
             return get_task(conn, row["id"], include_plan=True)
 
@@ -436,11 +448,11 @@ def create_task(
     with transaction(conn):
         conn.execute(
             """
-            INSERT INTO tasks (id, project_id, state, priority, idempotency_key, input_asset_ids,
+            INSERT INTO tasks (id, project_id, state, priority, idempotency_key, billing_quote_id, input_asset_ids,
                                recipe_id, recipe_version, recipe_sha256, recipe_snapshot_json,
                                plan_json, required_capabilities, target_json, user_params_json,
                                progress_json, created_at, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 task_id,
@@ -448,6 +460,7 @@ def create_task(
                 str(TaskState.PENDING),
                 int(priority),
                 idempotency_key,
+                billing_quote_id,
                 json_dump(list(asset_ids)),
                 recipe.recipe_id,
                 recipe.version,
@@ -462,10 +475,29 @@ def create_task(
                 now_iso(),
             ),
         )
+        if billing_quote_id:
+            if not billing_user_id:
+                raise WorkError(ErrorClass.PARAM_OUT_OF_RANGE, "使用报价创建任务需要 billing_user_id")
+            from ..billing import _reserve_quote_locked
+
+            _reserve_quote_locked(conn, billing_quote_id, billing_user_id, task_id, actor)
         queue.enqueue(conn, task_id)
         audit(conn, actor, "task.create", task_id, {"recipe_id": recipe.recipe_id,
                                                     "version": recipe.version})
     return get_task(conn, task_id, include_plan=True)
+
+
+def settle_task_billing(conn, task_id: str, success: bool, actor: str = "system") -> Optional[dict]:
+    """按任务终态自动结算已保留报价；无报价的老任务保持兼容。"""
+    row = conn.execute(
+        "SELECT t.billing_quote_id, t.project_id, p.owner_id FROM tasks t "
+        "JOIN projects p ON p.id = t.project_id WHERE t.id = ?", (task_id,)
+    ).fetchone()
+    if row is None or not row["billing_quote_id"]:
+        return None
+    from ..billing import settle_quote
+
+    return settle_quote(conn, row["billing_quote_id"], row["owner_id"], task_id, success, actor=actor)
 
 
 def request_cancel(conn, task_id: str, actor: str = "system") -> dict:
@@ -488,6 +520,11 @@ def request_cancel(conn, task_id: str, actor: str = "system") -> dict:
                        "error_message": "用户取消"})
     transition(conn, task_id, target, fields=fields)
     audit(conn, actor, "task.cancel", task_id, {"to": str(target)})
+    # PENDING/QUEUED 任务没有 Worker 会替它走 `_cancel`，因此必须在这里释放
+    # 已保留的报价。结算放在状态迁移提交后执行，避免在同一 SQLite 连接里嵌套
+    # `BEGIN IMMEDIATE`；`settle_quote` 本身是幂等的。
+    if target is TaskState.CANCELLED:
+        settle_task_billing(conn, task_id, False, actor=actor)
     return get_task(conn, task_id)
 
 
