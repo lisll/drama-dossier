@@ -78,7 +78,7 @@ fn mount_plan_save_inner(
         csv_path: csv.display().to_string(),
         saved_at: now_timestamp(),
     };
-    let path = plan_path(&app)?;
+    let path = plan_path(app)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| format!("创建数据目录失败：{error}"))?;
     }
