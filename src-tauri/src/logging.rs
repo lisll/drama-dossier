@@ -24,7 +24,10 @@ pub fn init(fallback_dir: PathBuf) {
     let _ = LOG_PATH.set(dir.join("dossier.log"));
     log_event(
         "启动",
-        format!("日志初始化完成，文件位置 {}", log_file().unwrap_or_default()),
+        format!(
+            "日志初始化完成，文件位置 {}",
+            log_file().unwrap_or_default()
+        ),
     );
 }
 
@@ -38,7 +41,11 @@ pub fn log_event(op: &str, message: impl AsRef<str>) {
     let line = format!("[{}] [{}] {}", now_timestamp(), op, message.as_ref());
     eprintln!("{line}");
     if let Some(path) = LOG_PATH.get() {
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
             let _ = writeln!(file, "{line}");
         }
     }

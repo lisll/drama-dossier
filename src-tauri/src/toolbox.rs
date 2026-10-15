@@ -131,7 +131,10 @@ pub fn runtime_status(
     result
 }
 
-fn runtime_status_inner(app: &AppHandle, ffprobe_path: Option<&str>) -> Result<RuntimeStatus, String> {
+fn runtime_status_inner(
+    app: &AppHandle,
+    ffprobe_path: Option<&str>,
+) -> Result<RuntimeStatus, String> {
     let ffmpeg = resolve_ffmpeg(app)?;
     let ffprobe = resolve_ffprobe(app, ffprobe_path)?;
     let runner = SystemRunner::new();
@@ -449,10 +452,7 @@ pub async fn fix_bitrate(
     ffprobe_path: Option<String>,
 ) -> Result<FixBitrateReport, String> {
     // 测试期关键日志：码率修复同样是长任务，入口与结果留痕。
-    crate::logging::log_event(
-        "码率",
-        format!("开始：{name}（阈值 {:?} kbps）", min_kbps),
-    );
+    crate::logging::log_event("码率", format!("开始：{name}（阈值 {:?} kbps）", min_kbps));
     let result = tauri::async_runtime::spawn_blocking(move || {
         fix_bitrate_blocking(&app, root, name, min_kbps, ffprobe_path)
     })
@@ -1090,9 +1090,7 @@ pub async fn install_runtime(app: AppHandle) -> Result<InstallRuntimeReport, Str
         crate::logging::result_text(&result, |report| {
             format!(
                 "安装完成：{} / {}（已存在跳过：{:?}）",
-                report.ffmpeg_path,
-                report.ffprobe_path,
-                report.skipped_existing
+                report.ffmpeg_path, report.ffprobe_path, report.skipped_existing
             )
         }),
     );

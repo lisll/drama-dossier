@@ -59,9 +59,7 @@ pub fn jianying_detect(app: AppHandle) -> Result<JianyingDetect, String> {
             if detect.installed {
                 format!(
                     "已安装：{}（版本 {:?}，草稿目录 {}）",
-                    detect.install_dir,
-                    detect.version,
-                    detect.draft_dir
+                    detect.install_dir, detect.version, detect.draft_dir
                 )
             } else {
                 format!("未安装（探测路径 {}）", detect.install_dir)
