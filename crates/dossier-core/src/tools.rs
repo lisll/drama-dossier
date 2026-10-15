@@ -209,6 +209,166 @@ pub fn output_dir_hits_sources<'a>(
         .map(PathBuf::as_path)
 }
 
+// ============ 挂载文案 CSV 校验 ============
+
+/// 挂载文案 CSV 的单条问题（行号从 1 起，0 表示表头）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MountCsvIssue {
+    pub row: usize,
+    pub message: String,
+}
+
+/// 挂载文案 CSV 校验结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MountCsvCheck {
+    pub ok: bool,
+    /// 解析出的表头列名（已去除 BOM 与首尾空白）。
+    pub header: Vec<String>,
+    /// 数据行数（不含表头）。
+    pub rows: usize,
+    pub issues: Vec<MountCsvIssue>,
+}
+
+/// 校验「挂载文案.csv」内容：
+/// - 必填列「集号」「文案」；
+/// - 每行集号必须是数字、落在剧目分集内且不重复；
+/// - 文案非空。
+/// 与其他纯逻辑一致：只做校验，不写文件。
+pub fn validate_mount_csv(content: &str, episode_numbers: &[u32]) -> MountCsvCheck {
+    let mut issues = Vec::new();
+
+    // 统一去掉 UTF-8 BOM，按行切（容忍 \r\n）。
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let lines: Vec<&str> = content
+        .lines()
+        .skip_while(|line| line.trim().is_empty())
+        .collect();
+
+    let header: Vec<String> = lines
+        .first()
+        .map(|line| split_csv_line(line).iter().map(|c| c.trim().to_string()).collect())
+        .unwrap_or_default();
+
+    let idx_of = |name: &str| header.iter().position(|c| c == name);
+    let episode_col = idx_of("集号");
+    let copy_col = idx_of("文案");
+    if episode_col.is_none() {
+        issues.push(MountCsvIssue {
+            row: 0,
+            message: "缺少必填列「集号」".to_string(),
+        });
+    }
+    if copy_col.is_none() {
+        issues.push(MountCsvIssue {
+            row: 0,
+            message: "缺少必填列「文案」".to_string(),
+        });
+    }
+
+    let rows = lines.len().saturating_sub(1);
+    let (episode_col, copy_col) = match (episode_col, copy_col) {
+        (Some(e), Some(c)) => (e, c),
+        _ => {
+            return MountCsvCheck {
+                ok: false,
+                header,
+                rows,
+                issues,
+            }
+        }
+    };
+
+    let valid: std::collections::HashSet<u32> = episode_numbers.iter().copied().collect();
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
+    for (offset, line) in lines.iter().skip(1).enumerate() {
+        let row = offset + 2; // 1 起行号：表头占第 1 行。
+        if line.trim().is_empty() {
+            issues.push(MountCsvIssue {
+                row,
+                message: "空行".to_string(),
+            });
+            continue;
+        }
+        let cells = split_csv_line(line);
+        let episode_raw = cells.get(episode_col).map(|c| c.trim()).unwrap_or("");
+        let copy_text = cells.get(copy_col).map(|c| c.trim()).unwrap_or("");
+
+        let number: u32 = match episode_raw.parse() {
+            Ok(value) => value,
+            Err(_) => {
+                issues.push(MountCsvIssue {
+                    row,
+                    message: format!("集号「{episode_raw}」不是有效数字"),
+                });
+                continue;
+            }
+        };
+        if !valid.contains(&number) {
+            let max = episode_numbers.iter().max().copied().unwrap_or(0);
+            issues.push(MountCsvIssue {
+                row,
+                message: format!("集号 {number} 不在剧目分集内（1~{max}）"),
+            });
+            continue;
+        }
+        if !seen.insert(number) {
+            issues.push(MountCsvIssue {
+                row,
+                message: format!("集号 {number} 重复出现"),
+            });
+        }
+        if copy_text.is_empty() {
+            issues.push(MountCsvIssue {
+                row,
+                message: "文案为空".to_string(),
+            });
+        }
+    }
+
+    MountCsvCheck {
+        ok: issues.is_empty(),
+        header,
+        rows,
+        issues,
+    }
+}
+
+/// 单行 CSV 切分：支持双引号包裹字段（字段内可含逗号与 `""` 转义引号）。
+fn split_csv_line(line: &str) -> Vec<String> {
+    let mut cells = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if in_quotes {
+            if ch == '"' {
+                if chars.peek() == Some(&'"') {
+                    current.push('"');
+                    chars.next();
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                current.push(ch);
+            }
+        } else {
+            match ch {
+                '"' if current.is_empty() => in_quotes = true,
+                ',' => {
+                    cells.push(std::mem::take(&mut current));
+                }
+                _ => current.push(ch),
+            }
+        }
+    }
+    cells.push(current);
+    cells
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,5 +529,55 @@ mod tests {
                 bitrate_bps: Some(4_000_000),
             },
         }
+    }
+
+    #[test]
+    fn mount_csv_accepts_valid_content() {
+        let csv = "\u{feff}集号,文案\r\n1,\"第一集文案，含逗号\"\r\n2,第二集文案\r\n";
+        let check = validate_mount_csv(csv, &[1, 2, 3]);
+        assert!(check.ok, "issues: {:?}", check.issues);
+        assert_eq!(check.rows, 2);
+        assert_eq!(check.header, vec!["集号", "文案"]);
+    }
+
+    #[test]
+    fn mount_csv_flags_missing_columns() {
+        let check = validate_mount_csv("编号,内容\n1,文案\n", &[1]);
+        assert!(!check.ok);
+        assert!(check.issues.iter().any(|i| i.row == 0 && i.message.contains("集号")));
+        assert!(check.issues.iter().any(|i| i.row == 0 && i.message.contains("文案")));
+    }
+
+    #[test]
+    fn mount_csv_flags_bad_rows() {
+        // 第 2 行文案为空；第 3 行集号越界；第 4 行集号重复且非数字其一。
+        let csv = "集号,文案\n1,\n9,越界\nabc,非法\n2,正常\n";
+        let check = validate_mount_csv(csv, &[1, 2]);
+        assert!(!check.ok);
+        let messages: Vec<&str> = check.issues.iter().map(|i| i.message.as_str()).collect();
+        assert!(messages.iter().any(|m| m.contains("文案为空")));
+        assert!(messages.iter().any(|m| m.contains("不在剧目分集内")));
+        assert!(messages.iter().any(|m| m.contains("不是有效数字")));
+        // 正常行不该报问题。
+        assert!(check.issues.iter().all(|i| i.row != 5));
+    }
+
+    #[test]
+    fn mount_csv_flags_duplicate_episode() {
+        let csv = "集号,文案\n1,第一条\n1,第二条\n";
+        let check = validate_mount_csv(csv, &[1]);
+        assert!(!check.ok);
+        assert!(check
+            .issues
+            .iter()
+            .any(|i| i.row == 3 && i.message.contains("重复")));
+    }
+
+    #[test]
+    fn mount_csv_requires_all_episodes_covered_is_not_forced_here() {
+        // 校验器只管「行的合法性」，不强制覆盖全部分集（模板补全由上层负责）。
+        let csv = "集号,文案\n1,只有一集\n";
+        let check = validate_mount_csv(csv, &[1, 2, 3]);
+        assert!(check.ok);
     }
 }

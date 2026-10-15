@@ -43,7 +43,7 @@ fn app_bin_dir(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 /// 读取当前设置（缺失/损坏回退默认，与 `load_app_settings` 同语义）。
-fn read_settings(app: &AppHandle) -> Result<dossier_core::AppSettings, String> {
+pub(crate) fn read_settings(app: &AppHandle) -> Result<dossier_core::AppSettings, String> {
     let path = crate::settings_path(app)?;
     Ok(load_settings(&path).settings)
 }

@@ -1026,7 +1026,7 @@ dependencies = [
 
 [[package]]
 name = "drama-dossier"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "dossier-core",
  "dossier-inpaint",
@@ -1034,6 +1034,7 @@ dependencies = [
  "dossier-runtime",
  "rfd",
  "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
 ]

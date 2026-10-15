@@ -35,11 +35,16 @@ const state = {
   busyButtons: [],
   // 结果区按钮引用的路径（键 → 绝对路径），避免把路径拼进 HTML 属性。
   paths: {},
+  account: null, // 最近一次 account_* 命令回包（含 loggedIn / email / path）。
+  mountStep: 1,
+  mountPlan: null,
 };
 
 let renamePlan = null;
 let bitrateItems = null;
 let bitratePending = null;
+// 本地演示验证码：前端生成、toast 回显（云端版改为服务端下发）。
+let demoVerifyCode = "";
 // 最近一次从配置文件读到的设置：保存时用它带回 ffmpegPath（界面上没有对应输入框）。
 let loadedSettings = null;
 
@@ -388,6 +393,12 @@ async function loadSettings() {
     $("#ffprobe-path").value = settings.ffprobePath ?? "";
     $("#settings-output").value = settings.outputDir ?? "";
     if (settings.libraryRoot) $("#library-root").value = settings.libraryRoot;
+    // 新增设置字段：剪映 / AI 模板 / 工作目录（设置独立视图子页）。
+    if (settings.jianyingDir) $("#jianying-dir").value = settings.jianyingDir;
+    if (settings.jianyingDraftDir)
+      $("#jianying-draft-dir").value = settings.jianyingDraftDir;
+    if (settings.aiTemplate) $("#ai-template").value = settings.aiTemplate;
+    if (state.root) $("#env-workdir").value = state.root;
     renderDefaultHints();
     refreshDirtyBadge();
     if (payload.warning) toast(payload.warning, true);
@@ -412,6 +423,10 @@ async function saveSettings() {
       ffprobePath: $("#ffprobe-path").value.trim() || null,
       outputDir: $("#settings-output").value.trim() || null,
       libraryRoot: state.settings?.libraryRoot ?? null,
+      // 设置独立视图新增的三项。
+      aiTemplate: $("#ai-template").value.trim() || null,
+      jianyingDir: $("#jianying-dir").value.trim() || null,
+      jianyingDraftDir: $("#jianying-draft-dir").value.trim() || null,
     };
     const path = await call("save_app_settings", { settings });
     state.settings = settings;
@@ -436,6 +451,10 @@ async function rememberRoot(root) {
     ffmpegPath: state.settings?.ffmpegPath ?? null,
     ffprobePath: state.settings?.ffprobePath ?? null,
     outputDir: state.settings?.outputDir ?? null,
+    // 设置独立视图新增的三项原样带回，避免记目录时把它们抹掉。
+    aiTemplate: state.settings?.aiTemplate ?? null,
+    jianyingDir: state.settings?.jianyingDir ?? null,
+    jianyingDraftDir: state.settings?.jianyingDraftDir ?? null,
     libraryRoot: root,
   };
   state.settings = settings;
@@ -534,6 +553,12 @@ function selectDrama(index) {
 // ============ 模块导航 ============
 
 function switchModule(name) {
+  // 设置是独立视图：替换整个工作区，对照竞品「← 返回应用」布局。
+  if (name === "settings") {
+    openSettingsView();
+    return;
+  }
+  closeSettingsView();
   state.module = name;
   document.querySelectorAll(".nav-item").forEach((node) => {
     node.classList.toggle("active", node.dataset.module === name);
@@ -541,6 +566,9 @@ function switchModule(name) {
   document.querySelectorAll(".module").forEach((node) => {
     node.classList.toggle("hidden", node.id !== `module-${name}`);
   });
+  // 转码模块需要运行环境；切进去时按当前状态刷新阻断层。
+  if (name === "transcode") renderTranscodeGate();
+  if (name === "mount") refreshMountContext();
 }
 
 function renderContexts() {
@@ -550,19 +578,22 @@ function renderContexts() {
     chip.classList.add("hidden");
     const emptyText =
       "尚未选择剧目——请先到「剧目库」扫描并点选一部剧。";
-    $("#generate-context").textContent = emptyText;
-    $("#toolbox-context").textContent = emptyText;
-    $("#generate-context").classList.add("empty");
-    $("#toolbox-context").classList.add("empty");
+    for (const id of ["#generate-context", "#toolbox-context", "#transcode-context", "#mount-context"]) {
+      const node = $(id);
+      node.textContent = emptyText;
+      node.classList.add("empty");
+    }
+    refreshMountContext();
     return;
   }
   chip.textContent = `当前剧目：${selected.name}`;
   chip.classList.remove("hidden");
-  for (const id of ["#generate-context", "#toolbox-context"]) {
+  for (const id of ["#generate-context", "#toolbox-context", "#transcode-context", "#mount-context"]) {
     const node = $(id);
     node.textContent = `当前剧目：${selected.name}（${selected.episodes.length} 集）`;
     node.classList.remove("empty");
   }
+  refreshMountContext();
 }
 
 function renderChecklist(report) {
@@ -617,6 +648,8 @@ async function scan() {
     clearToolResults();
     renderDramas();
     renderContexts();
+    // 工作目录与剧目库根目录同步（设置-本机环境回显）。
+    $("#env-workdir").value = root;
     toast(`已发现 ${state.dramas.length} 个剧目`);
     // 记住素材根目录：下次启动直接回填，不用每次重新找。
     await rememberRoot(root);
@@ -1462,7 +1495,9 @@ function renderEnvBanner(status) {
 // 一键配置运行环境：后台自动下载安装 ffmpeg/ffprobe 并写回设置，无需手动配置。
 // evermeet.cx 单连接限流，全剧下载可能需要几分钟，期间按钮保持禁用。
 async function runtimeInstall() {
-  const buttons = [$("#env-install"), $("#runtime-install")].filter(Boolean);
+  // 横幅 / 设置页按钮文案不同（一键配置运行环境 / 下载运行环境），各自保存原文案。
+  const buttons = [$("#env-install"), $("#runtime-install"), $("#gate-install")].filter(Boolean);
+  const original = new Map(buttons.map((button) => [button, button.textContent]));
   for (const button of buttons) {
     button.disabled = true;
     button.textContent = "正在配置…（下载安装中，请稍候）";
@@ -1475,7 +1510,7 @@ async function runtimeInstall() {
   } finally {
     for (const button of buttons) {
       button.disabled = false;
-      button.textContent = "一键配置运行环境";
+      button.textContent = original.get(button);
     }
     // 无论成败都刷新：成功后回填自动写入的路径并重测，失败时也展示最新状态。
     await loadSettings();
@@ -1484,6 +1519,8 @@ async function runtimeInstall() {
 }
 
 function renderRuntimeList(status) {
+  const tools = [status.ffmpeg, status.ffprobe];
+  const missing = tools.filter((tool) => !tool.found || !tool.ok);
   const rows = [status.ffmpeg, status.ffprobe, status.python]
     .map((tool) => {
       const stateClass = tool.found ? (tool.ok ? "pass" : "warn") : "fail";
@@ -1497,6 +1534,458 @@ function renderRuntimeList(status) {
   $("#runtime-list").innerHTML = `
     <table><thead><tr><th>组件</th><th>状态</th><th>版本 / 说明</th></tr></thead><tbody>${rows}</tbody></table>
   `;
+  // 竞品样式：引擎未就绪时显示红色错误行（错误码 RUNTIME_NOT_INSTALLED）。
+  const errorNode = $("#runtime-error");
+  if (missing.length) {
+    errorNode.textContent = `RUNTIME_NOT_INSTALLED：缺少 ${missing
+      .map((tool) => tool.name)
+      .join("、")}。点击「下载运行环境」自动安装（约 25 MB，需要网络）。`;
+    errorNode.classList.remove("hidden");
+  } else {
+    errorNode.classList.add("hidden");
+    errorNode.textContent = "";
+  }
+  // 关于页的引擎徽章与转码模块的整页阻断都跟随运行环境状态。
+  const engineBadge = $("#about-engine");
+  if (engineBadge) {
+    engineBadge.textContent = missing.length ? "未就绪" : "已是最新版";
+    engineBadge.className = `badge ${missing.length ? "status-fail" : "status-ready"}`;
+  }
+  renderTranscodeGate();
+}
+
+// ============ 登录 / 注册（本地演示版，接口与云端版一致） ============
+
+function showAuthView() {
+  $("#auth-view").classList.remove("hidden");
+  document.querySelector(".app").classList.add("hidden");
+  closeSettingsView();
+}
+
+function showApp() {
+  $("#auth-view").classList.add("hidden");
+  document.querySelector(".app").classList.remove("hidden");
+}
+
+function switchAuthCard(showRegister) {
+  $("#auth-login-form").classList.toggle("hidden", showRegister);
+  $("#auth-register-form").classList.toggle("hidden", !showRegister);
+}
+
+function renderAccountChip() {
+  const account = state.account;
+  const loggedIn = Boolean(account?.loggedIn);
+  $("#chip-email").textContent = loggedIn ? account.email : "未登录";
+  $("#chip-badge").textContent = loggedIn ? "已登录" : "离线";
+  $("#chip-badge").className = `badge ${loggedIn ? "status-ready" : ""}`;
+}
+
+function applyAccount(payload) {
+  state.account = payload;
+  renderAccountChip();
+  // 设置-账号子页同步。
+  const emailNode = $("#account-email");
+  if (emailNode) emailNode.textContent = payload?.loggedIn ? payload.email : "—";
+  if (payload?.path) $("#account-path").textContent = payload.path;
+}
+
+async function sendVerifyCode() {
+  const email = $("#register-email").value.trim();
+  if (!email) {
+    toast("请先填写邮箱", true);
+    return;
+  }
+  // 本地演示：随机 6 位、toast 回显；云端版改为调用服务端发送。
+  demoVerifyCode = String(Math.floor(100000 + Math.random() * 900000));
+  toast(`演示验证码：${demoVerifyCode}（本地演示，未发送邮件）`);
+}
+
+async function registerAccount(event) {
+  event.preventDefault();
+  const email = $("#register-email").value.trim();
+  const password = $("#register-password").value;
+  const code = $("#register-code").value.trim();
+  if (!/^\d{6}$/.test(code)) {
+    toast("验证码应为 6 位数字", true);
+    return;
+  }
+  if (demoVerifyCode && code !== demoVerifyCode) {
+    toast("验证码不正确（演示验证码见 toast 提示）", true);
+    return;
+  }
+  try {
+    const payload = await call("account_register", {
+      args: { email, password, code },
+    });
+    applyAccount(payload);
+    showApp();
+    toast(`注册成功，已登录：${payload.email}`);
+    await afterLoginInit();
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+async function loginAccount(event) {
+  event.preventDefault();
+  const email = $("#login-email").value.trim();
+  const password = $("#login-password").value;
+  try {
+    const payload = await call("account_login", { email, password });
+    applyAccount(payload);
+    showApp();
+    toast(`欢迎回来，${payload.email}`);
+    await afterLoginInit();
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+async function logoutAccount() {
+  try {
+    applyAccount(await call("account_logout"));
+    switchAuthCard(false);
+    showAuthView();
+    toast("已退出登录");
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+// 登录后（含注册即登录）需要初始化的数据。
+async function afterLoginInit() {
+  await loadSettings();
+  await checkRuntime(true);
+}
+
+// 启动分流：未登录 → 登录卡；已登录 / 浏览器预览 → 主应用。
+async function boot() {
+  if (!invoke) {
+    // 浏览器静态预览（无 Tauri IPC）：跳过登录直接展示主界面，便于布局验证。
+    showApp();
+    return;
+  }
+  try {
+    applyAccount(await call("account_status"));
+    if (state.account?.loggedIn) {
+      showApp();
+    } else {
+      switchAuthCard(false);
+      showAuthView();
+    }
+  } catch (error) {
+    toast(String(error), true);
+    showAuthView();
+  }
+}
+
+// ============ 设置：独立视图（七子页） ============
+
+function openSettingsView() {
+  document.querySelector(".app").classList.add("hidden");
+  $("#settings-view").classList.remove("hidden");
+  switchSettingsSub(state.settingsSub ?? "account");
+  refreshSettingsData();
+}
+
+function closeSettingsView() {
+  $("#settings-view")?.classList.add("hidden");
+  document.querySelector(".app")?.classList.remove("hidden");
+}
+
+function switchSettingsSub(name) {
+  state.settingsSub = name;
+  document.querySelectorAll(".settings-nav").forEach((node) => {
+    node.classList.toggle("active", node.dataset.sub === name);
+  });
+  document.querySelectorAll(".settings-page").forEach((node) => {
+    node.classList.toggle("hidden", node.id !== `sub-${name}`);
+  });
+}
+
+// 打开设置视图时刷新各子页数据（账单流水、账号状态、工作目录回显等）。
+async function refreshSettingsData() {
+  if (state.root) $("#env-workdir").value = state.root;
+  if (invoke) {
+    try {
+      applyAccount(await call("account_status"));
+    } catch {
+      /* 未登录时保持占位文案 */
+    }
+    await loadLedger();
+  }
+}
+
+async function switchToSubAnd(name) {
+  switchSettingsSub(name);
+  if (name === "billing") await loadLedger();
+}
+
+// ---- 设置：账单（生成流水） ----
+
+async function loadLedger() {
+  if (!invoke) return;
+  try {
+    const payload = await call("ledger_list");
+    $("#billing-month-count").textContent = String(payload.monthCount);
+    $("#ledger-path").textContent = payload.path;
+    const rows = payload.records
+      .slice(0, 50)
+      .map(
+        (record) => `<tr>
+          <td>${esc(record.ts.replace("T", " "))}</td>
+          <td>${esc(record.dramaName)}</td>
+          <td>${record.episodeCount}</td>
+          <td>${formatBytes(Number(record.sizeBytes))}</td>
+          <td class="mono">${esc(record.packagePath)}</td>
+        </tr>`,
+      )
+      .join("");
+    $("#ledger-body").innerHTML = rows ||
+      '<tr><td colspan="5" class="empty">暂无生成记录。</td></tr>';
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+// ---- 设置：修改密码 / 退出登录 ----
+
+async function changePassword(event) {
+  event.preventDefault();
+  const oldPassword = $("#old-password").value;
+  const newPassword = $("#new-password").value;
+  try {
+    const payload = await call("account_change_password", {
+      args: { oldPassword, newPassword },
+    });
+    applyAccount(payload);
+    $("#password-change-form").classList.add("hidden");
+    $("#old-password").value = "";
+    $("#new-password").value = "";
+    toast("密码已修改");
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+// ---- 设置：剪映 ----
+
+async function jianyingDetect() {
+  try {
+    const result = await call("jianying_detect");
+    const badge = $("#jianying-status");
+    badge.textContent = result.installed ? "已安装" : "未安装";
+    badge.className = `badge ${result.installed ? "status-ready" : "status-fail"}`;
+    if (result.installed) {
+      $("#jianying-dir").value = result.installDir;
+      $("#jianying-version").value = result.version ?? "未知";
+    } else {
+      $("#jianying-version").value = "";
+      toast(`未在 ${result.installDir} 找到剪映专业版`, true);
+    }
+    if (result.draftDir) $("#jianying-draft-dir").placeholder = result.draftDir;
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+async function jianyingSave() {
+  // 目录字段复用 saveSettings 的带回链路（jianyingDir / jianyingDraftDir）。
+  await saveSettings();
+}
+
+// ---- 设置：AI 模板 ----
+
+async function aiSave() {
+  await saveSettings();
+}
+
+// ---- 设置：本机环境（工作目录） ----
+
+async function envWorkdirPick() {
+  try {
+    const folder = await call("pick_folder");
+    if (!folder) return;
+    $("#env-workdir").value = folder;
+    // 工作目录与「剧目库」根目录是同一个概念，同步后提示重新扫描。
+    $("#library-root").value = folder;
+    toast("工作目录已同步到剧目库，请回「剧目库」重新扫描");
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+function envWorkdirApply() {
+  const folder = $("#env-workdir").value.trim();
+  if (!folder) return;
+  $("#library-root").value = folder;
+  toast("工作目录已同步到剧目库，请回「剧目库」重新扫描");
+}
+
+// ============ 挂载：四步流程 ============
+
+function switchMountStep(step) {
+  state.mountStep = step;
+  document.querySelectorAll("#mount-steps .step").forEach((node) => {
+    node.classList.toggle("active", Number(node.dataset.step) === step);
+  });
+  for (let index = 1; index <= 4; index += 1) {
+    $(`#mount-step-${index}`).classList.toggle("hidden", index !== step);
+  }
+  // 到执行步时展示当前计划摘要。
+  if (step === 4) renderMountPlanSummary();
+}
+
+// 步骤 1 的剧目展示与上下文 chip 同步。
+function refreshMountContext() {
+  const selected = state.selected == null ? null : state.dramas[state.selected];
+  const node = $("#mount-drama");
+  if (!node || !selected) {
+    if (node) {
+      node.textContent = "尚未选择剧目。";
+      node.classList.add("empty");
+    }
+    return;
+  }
+  node.textContent = `当前剧目：${selected.name}（${selected.episodes.length} 集）`;
+  node.classList.remove("empty");
+}
+
+function requireMountDrama() {
+  if (state.selected == null) {
+    toast("请先到「剧目库」选择剧目", true);
+    return null;
+  }
+  return state.dramas[state.selected];
+}
+
+// 绑定当前剧目：后端在剧目目录创建/复用挂载文案.csv，并保存挂载计划。
+async function mountBind() {
+  const drama = requireMountDrama();
+  if (!drama) return;
+  try {
+    const check = await call("mount_csv_template", {
+      root: state.root,
+      dramaName: drama.name,
+    });
+    renderMountCsvCheck(check);
+    $("#mount-csv-content").value = check.content ?? "";
+    $("#mount-csv-path").textContent = check.csvPath;
+    $("#mount-csv-save").disabled = false;
+    state.mountPlan = await call("mount_plan_save", {
+      root: state.root,
+      dramaName: drama.name,
+    });
+    toast("已绑定当前剧目，文案模板就绪");
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+// 步骤 2：生成 / 打开模板（已存在则复用）。
+async function mountCsvGenerate() {
+  const drama = requireMountDrama();
+  if (!drama) return;
+  try {
+    const check = await call("mount_csv_template", {
+      root: state.root,
+      dramaName: drama.name,
+    });
+    $("#mount-csv-content").value = check.content ?? "";
+    renderMountCsvCheck(check);
+    $("#mount-csv-path").textContent = check.csvPath;
+    $("#mount-csv-save").disabled = false;
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+// 步骤 2：保存编辑内容并校验。
+async function mountCsvSave() {
+  const drama = requireMountDrama();
+  if (!drama) return;
+  try {
+    const check = await call("mount_csv_save", {
+      root: state.root,
+      dramaName: drama.name,
+      content: $("#mount-csv-content").value,
+    });
+    renderMountCsvCheck(check);
+    $("#mount-csv-path").textContent = check.csvPath;
+    $("#mount-csv-save").disabled = false;
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+function renderMountCsvCheck(payload) {
+  const check = payload.check;
+  const node = $("#mount-csv-result");
+  const issues = (check.issues ?? [])
+    .map((issue) => `<li>第 ${issue.row} 行：${esc(issue.message)}</li>`)
+    .join("");
+  node.innerHTML = `
+    <strong class="${check.ok ? "status-pass" : "status-fail"}">
+      ${check.ok ? "校验通过" : `发现 ${check.issues.length} 个问题`}
+    </strong>（${check.rows} 行）<br />
+    位置：${esc(payload.csvPath)}
+    ${issues ? `<ul class="issue-list">${issues}</ul>` : ""}
+  `;
+  node.classList.remove("hidden");
+}
+
+function renderMountPlanSummary() {
+  const drama = state.selected == null ? null : state.dramas[state.selected];
+  const node = $("#mount-plan-summary");
+  if (!drama && !state.mountPlan) {
+    node.classList.add("hidden");
+    return;
+  }
+  const plan = state.mountPlan;
+  node.innerHTML = `
+    <strong>挂载计划</strong><br />
+    剧目：${esc(plan?.dramaName ?? drama?.name ?? "—")}<br />
+    文案：${esc(plan?.csvPath ?? "尚未绑定")}<br />
+    ${plan?.savedAt ? `保存时间：${esc(plan.savedAt)}` : ""}
+  `;
+  node.classList.remove("hidden");
+}
+
+// 步骤 4：保存计划（云端版接入后在此触发上传）。
+async function mountPlanSave() {
+  const drama = requireMountDrama();
+  if (!drama) return;
+  try {
+    state.mountPlan = await call("mount_plan_save", {
+      root: state.root,
+      dramaName: drama.name,
+    });
+    renderMountPlanSummary();
+    toast("挂载计划已保存到本机");
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+// ============ 转码：模式卡片与整页阻断 ============
+
+function selectTranscodeMode(mode) {
+  $("#exec-mode").value = mode;
+  $("#mode-nudge").classList.toggle("active", mode === "nudge");
+  $("#mode-recut").classList.toggle("active", mode === "recut");
+  // 目标集数只对分集重组有意义。
+  $("#exec-target-wrap").classList.toggle("hidden", mode !== "recut");
+}
+
+// 运行环境未就绪时整页阻断（竞品行为）。
+function renderTranscodeGate() {
+  const gate = $("#transcode-gate");
+  const body = $("#transcode-body");
+  if (!gate || !body) return;
+  const tools = state.runtime ? [state.runtime.ffmpeg, state.runtime.ffprobe] : [];
+  const ready = tools.length > 0 && tools.every((tool) => tool.found && tool.ok);
+  gate.classList.toggle("hidden", ready);
+  body.classList.toggle("hidden", !ready);
 }
 
 // ============ 关于 ============
@@ -1517,9 +2006,57 @@ document.querySelectorAll(".nav-item").forEach((node) => {
   node.addEventListener("click", () => switchModule(node.dataset.module));
 });
 $("#env-chip").addEventListener("click", () => {
+  // 设置是独立视图：打开后直接跳到「本机环境」子页看检测详情。
   switchModule("settings");
-  $("#runtime-list").closest(".panel")?.scrollIntoView({ behavior: "smooth", block: "center" });
+  switchToSubAnd("env");
 });
+// ============ 登录 / 注册 ============
+$("#goto-register").addEventListener("click", () => switchAuthCard(true));
+$("#goto-login").addEventListener("click", () => switchAuthCard(false));
+$("#forgot-password").addEventListener("click", () =>
+  toast("找回密码需要邮件服务，云端版开放后可用", true),
+);
+$("#send-code").addEventListener("click", sendVerifyCode);
+$("#auth-login-form").addEventListener("submit", loginAccount);
+$("#auth-register-form").addEventListener("submit", registerAccount);
+// ============ 设置独立视图 ============
+$("#settings-back").addEventListener("click", () => {
+  switchModule("library");
+});
+document.querySelectorAll(".settings-nav").forEach((node) => {
+  node.addEventListener("click", () => switchToSubAnd(node.dataset.sub));
+});
+$("#password-change-form").addEventListener("submit", changePassword);
+$("#open-change-password").addEventListener("click", () => {
+  $("#password-change-form").classList.toggle("hidden");
+});
+$("#cancel-change-password").addEventListener("click", () => {
+  $("#password-change-form").classList.add("hidden");
+  $("#old-password").value = "";
+  $("#new-password").value = "";
+});
+$("#logout").addEventListener("click", logoutAccount);
+$("#ledger-refresh").addEventListener("click", () => loadLedger());
+$("#jianying-detect").addEventListener("click", jianyingDetect);
+$("#jianying-save").addEventListener("click", jianyingSave);
+$("#ai-save").addEventListener("click", aiSave);
+$("#env-workdir-pick").addEventListener("click", envWorkdirPick);
+$("#env-workdir").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") envWorkdirApply();
+});
+// ============ 挂载 ============
+document.querySelectorAll("#mount-steps .step").forEach((node) => {
+  node.addEventListener("click", () => switchMountStep(Number(node.dataset.step)));
+});
+$("#mount-bind").addEventListener("click", mountBind);
+$("#mount-csv-generate").addEventListener("click", mountCsvGenerate);
+$("#mount-csv-save").addEventListener("click", mountCsvSave);
+$("#mount-plan-save").addEventListener("click", mountPlanSave);
+// ============ 转码 ============
+$("#mode-nudge").addEventListener("click", () => selectTranscodeMode("nudge"));
+$("#mode-recut").addEventListener("click", () => selectTranscodeMode("recut"));
+$("#gate-install").addEventListener("click", runtimeInstall);
+// ============ 原有模块 ============
 $("#rename-plan").addEventListener("click", buildRenamePlan);
 $("#rename-apply").addEventListener("click", applyRename);
 $("#bitrate-probe").addEventListener("click", probeBitrate);
@@ -1606,8 +2143,10 @@ if (tauriEvent?.listen) {
   tauriEvent.listen("probe-progress", (event) => handleProbeProgress(event.payload));
 }
 
+// 启动：决定显示登录卡还是主应用（浏览器预览无 IPC 时直接进主应用便于布局验证）。
+boot();
 if (invoke) {
   loadSettings().then(() => checkRuntime());
   loadPlatformProfiles();
-  loadVersion();
 }
+loadVersion();

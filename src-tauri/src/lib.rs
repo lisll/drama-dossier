@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use dossier_core::{
     generate_report_package, load_settings, probe_episode, run_checks, save_settings,
@@ -9,9 +9,12 @@ use dossier_core::{
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
+mod account;
 mod dossier;
 mod erase;
 mod paths;
+mod jianying;
+mod mount;
 mod toolbox;
 
 #[derive(Debug, Serialize)]
@@ -182,6 +185,7 @@ fn analyze_drama(
 #[allow(clippy::too_many_arguments)]
 fn generate_package(
     window: tauri::Window,
+    app: AppHandle,
     root: String,
     name: String,
     output_dir: Option<String>,
@@ -219,7 +223,7 @@ fn generate_package(
         ai_generated,
     };
 
-    generate_report_package(
+    let result = generate_report_package(
         &drama.name,
         &drama.dir,
         drama.cover.as_deref(),
@@ -227,7 +231,12 @@ fn generate_package(
         &episodes,
         &opts,
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+
+    // 成功后记入本机生成流水（设置-账单页展示；失败不影响生成结果本身）。
+    mount::record_generation(&app, &drama.name, episodes.len(), Path::new(&result.package_dir))
+        .unwrap_or_else(|error| eprintln!("{error}"));
+    Ok(result)
 }
 
 /// 在系统文件管理器里打开目录（或文件所在目录），供界面「打开目录」按钮调用。
@@ -246,6 +255,18 @@ pub fn run() {
             analyze_drama,
             generate_package,
             open_path,
+            account::account_register,
+            account::account_login,
+            account::account_logout,
+            account::account_status,
+            account::account_change_password,
+            jianying::jianying_detect,
+            mount::mount_plan_save,
+            mount::mount_plan_load,
+            mount::mount_csv_template,
+            mount::mount_csv_save,
+            mount::mount_csv_check,
+            mount::ledger_list,
             erase::pick_video,
             erase::erase_status,
             erase::plan_erase,

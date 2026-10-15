@@ -16,10 +16,12 @@
 //! 合规边界：本 crate 不提供、也不应加入任何内容指纹规避、
 //! 版权保护绕过或材料伪造能力。报审包内置于权属声明模板。
 
+pub mod account;
 pub mod checklist;
 pub mod checkpoint;
 pub mod diff;
 pub mod draft;
+pub mod ledger;
 pub mod package;
 pub mod pipeline_version;
 pub mod platforms;
@@ -31,6 +33,10 @@ pub mod tools;
 pub mod transcode;
 pub mod types;
 
+pub use account::{
+    change_password, generate_salt, hash_password, login, logout, register, status,
+    validate_email, validate_password, AccountError, AccountRecord, AccountStatus, AccountStore,
+};
 pub use checklist::{run_checks, ChecklistReport, ChecklistRules};
 pub use checkpoint::{
     load_checkpoint, save_checkpoint, ArtifactRef, Checkpoint, CheckpointError, StepState,
@@ -42,6 +48,7 @@ pub use diff::{
 pub use draft::{
     export_capcut_draft, import_capcut_draft, CapcutDraft, DraftExportOptions, DraftExportResult,
 };
+pub use ledger::{append_record, list_records, now_timestamp, LedgerRecord};
 pub use package::{generate_report_package, CostSheetForm, PackageOptions, PackageResult};
 pub use pipeline_version::{
     check_consistency, load_and_check, pipeline_version, ArtifactStamp, ConsistencyIssue,
@@ -62,7 +69,8 @@ pub use scanner::{
 pub use settings::{load_settings, save_settings, AppSettings, LoadedSettings};
 pub use tools::{
     bitrate_report, episode_target_name, nudge_frames, output_dir_hits_sources,
-    plan_recut_segments, plan_rename, same_path, BitrateItem, RenameItem, RenamePlan,
+    plan_recut_segments, plan_rename, same_path, validate_mount_csv, BitrateItem, MountCsvCheck,
+    MountCsvIssue, RenameItem, RenamePlan,
 };
 pub use transcode::{advise_episode, plan_normalization, NormalizationPlan, TranscodeTarget};
 pub use types::{CheckStatus, Drama, EpisodeFile, EpisodeSpec, ProbedEpisode};

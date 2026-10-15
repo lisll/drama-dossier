@@ -25,6 +25,12 @@ pub struct AppSettings {
     pub output_dir: Option<PathBuf>,
     /// 上次使用的素材根目录；`None` 表示还没有扫描过，界面需要重新选择。
     pub library_root: Option<PathBuf>,
+    /// AI 提示词模板（设置-AI 子页编辑；后续云端拉取后也缓存在这里）。
+    pub ai_template: Option<String>,
+    /// 剪映安装目录；`None` 表示使用自动探测结果。
+    pub jianying_dir: Option<PathBuf>,
+    /// 剪映草稿目录；`None` 表示使用剪映默认路径。
+    pub jianying_draft_dir: Option<PathBuf>,
 }
 
 impl AppSettings {
@@ -130,6 +136,9 @@ mod tests {
             ffmpeg_path: Some(PathBuf::from("/opt/ffmpeg/bin/ffmpeg")),
             output_dir: Some(PathBuf::from("/tmp/报审输出")),
             library_root: Some(PathBuf::from("/tmp/素材库")),
+            ai_template: Some("你是短剧报审材料撰写助手…".to_string()),
+            jianying_dir: Some(PathBuf::from("/Applications/JianyingPro.app")),
+            jianying_draft_dir: None,
         };
         save_settings(&path, &settings).unwrap();
 
@@ -150,6 +159,15 @@ mod tests {
             loaded.settings.library_root,
             Some(PathBuf::from("/tmp/素材库"))
         );
+        assert_eq!(
+            loaded.settings.ai_template.as_deref(),
+            Some("你是短剧报审材料撰写助手…")
+        );
+        assert_eq!(
+            loaded.settings.jianying_dir,
+            Some(PathBuf::from("/Applications/JianyingPro.app"))
+        );
+        assert!(loaded.settings.jianying_draft_dir.is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 
