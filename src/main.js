@@ -1381,6 +1381,7 @@ async function planErase() {
     const plan = await call("plan_erase", {
       request,
       toolPath: $("#erase-tool-path").value.trim() || null,
+      ffprobePath: effectiveFfprobe(),
     });
     renderErasePlan(plan);
   } catch (error) {
@@ -1396,6 +1397,7 @@ async function runErase() {
     const run = await call("run_erase", {
       request,
       toolPath: $("#erase-tool-path").value.trim() || null,
+      ffprobePath: effectiveFfprobe(),
       timeoutSeconds: 1800,
     });
     const report = run.report ?? {};
@@ -1697,6 +1699,10 @@ async function executeTranscode() {
   }
   const modeLabel = mode === "recut" ? "分集重组" : "智能微调";
   if (!beginTask(`正在执行${modeLabel}（全剧重编码，可能需要几分钟）`)) return;
+  const stopButton = $("#exec-stop");
+  stopButton.classList.remove("hidden");
+  stopButton.disabled = false;
+  stopButton.textContent = "停止转码";
   try {
     const drama = selectedDrama();
     const report = await call("transcode_execute", {
@@ -1733,12 +1739,21 @@ async function executeTranscode() {
     });
     toast("转码完成");
   } catch (error) {
+    const message = String(error);
+    const stopped = message.includes("停止");
     renderResult("#exec-result", {
-      tone: "error",
-      html: `<strong>转码失败</strong><br />${esc(String(error))}`,
+      tone: stopped ? "warn" : "error",
+      html: `<strong>${stopped ? "已停止转码" : "转码失败"}</strong><br />${esc(message)}`,
     });
-    reportError(error);
+    if (stopped) {
+      toast("转码已停止，本次输出目录已删除");
+    } else {
+      reportError(error);
+    }
   } finally {
+    stopButton.classList.add("hidden");
+    stopButton.disabled = false;
+    stopButton.textContent = "停止转码";
     endTask();
   }
 }
@@ -1841,8 +1856,78 @@ function renderEnvBanner(status) {
 }
 
 // 一键配置运行环境：后台自动下载安装 ffmpeg/ffprobe 并写回设置，无需手动配置。
-// evermeet.cx 单连接限流，全剧下载可能需要几分钟，期间按钮保持禁用。
+// evermeet.cx 单连接限流，全剧下载可能需要几分钟；期间用弹窗展示进度（竞品同款交互）。
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "待计算";
+  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
+// 把弹窗切成「进行中」初始态：标题/副标题/统计/进度条全部复位。
+function openInstallModal() {
+  $("#install-overlay").classList.remove("hidden");
+  const modal = document.querySelector(".install-modal");
+  modal.classList.remove("failed");
+  $("#install-icon").textContent = "⬇";
+  $("#install-title").textContent = "正在安装本机引擎";
+  $("#install-subtitle").textContent = "正在连接下载源。";
+  $("#install-total").textContent = "待计算";
+  $("#install-downloaded").textContent = "待计算";
+  $("#install-component").textContent = "准备中";
+  $("#install-percent").textContent = "—";
+  const bar = $("#install-bar");
+  bar.classList.add("indeterminate");
+  bar.style.width = "";
+  $("#install-error").classList.add("hidden");
+  $("#install-retry").classList.add("hidden");
+  $("#install-close").classList.add("hidden");
+}
+
+// 进度事件驱动：需要下载 / 已下载 / 组件 + 百分比。
+function handleInstallProgress(payload) {
+  $("#install-component").textContent =
+    `${payload.component} · ${payload.stageLabel}`;
+  $("#install-subtitle").textContent =
+    payload.stage === "finished"
+      ? "安装完成。"
+      : payload.stage === "verifying"
+        ? "正在检查安装结果。"
+        : payload.stage === "extracting"
+          ? "正在解压安装。"
+          : `正在${payload.stageLabel}。`;
+  if (payload.stage === "downloading" || payload.stage === "connecting") {
+    const total = payload.totalBytes;
+    const done = payload.downloadedBytes ?? 0;
+    $("#install-total").textContent = total ? formatBytes(total) : "待计算";
+    $("#install-downloaded").textContent = done ? formatBytes(done) : "待计算";
+    const bar = $("#install-bar");
+    if (total) {
+      bar.classList.remove("indeterminate");
+      const ratio = Math.min(100, (done / total) * 100);
+      bar.style.width = `${ratio.toFixed(1)}%`;
+      $("#install-percent").textContent = `${Math.round(ratio)}%`;
+    }
+  }
+}
+
+// 失败态：红图标 + 错误详情 + 「重新下载」/关闭。
+function failInstallModal(message) {
+  const modal = document.querySelector(".install-modal");
+  modal.classList.add("failed");
+  $("#install-icon").textContent = "✕";
+  $("#install-title").textContent = "引擎安装未完成";
+  const firstLine = String(message).split("\n").find(Boolean) ?? "安装失败。";
+  $("#install-subtitle").textContent = firstLine;
+  $("#install-error").textContent = String(message);
+  $("#install-error").classList.remove("hidden");
+  $("#install-retry").classList.remove("hidden");
+  $("#install-close").classList.remove("hidden");
+  const bar = $("#install-bar");
+  bar.classList.remove("indeterminate");
+}
+
 async function runtimeInstall() {
+  openInstallModal();
   // 横幅 / 设置页按钮文案不同（一键配置运行环境 / 下载运行环境），各自保存原文案。
   const buttons = [$("#env-install"), $("#runtime-install"), $("#gate-install")].filter(Boolean);
   const original = new Map(buttons.map((button) => [button, button.textContent]));
@@ -1850,12 +1935,26 @@ async function runtimeInstall() {
     button.disabled = true;
     button.textContent = "正在配置…（下载安装中，请稍候）";
   }
+  const unlisten = await tauriEvent.listen("install-progress", (event) =>
+    handleInstallProgress(event.payload),
+  );
   try {
     const report = await call("install_runtime");
+    // 成功：进度条推满，短暂展示后自动收起。
+    const bar = $("#install-bar");
+    bar.classList.remove("indeterminate");
+    bar.style.width = "100%";
+    $("#install-percent").textContent = "100%";
+    $("#install-component").textContent = "完成";
+    $("#install-subtitle").textContent = "安装完成。";
     toast(report.note);
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    $("#install-overlay").classList.add("hidden");
   } catch (error) {
-    reportError(error);
+    // 失败：弹窗保持打开（错误态 + 重新下载按钮），由用户手动关闭。
+    failInstallModal(error);
   } finally {
+    unlisten();
     for (const button of buttons) {
       button.disabled = false;
       button.textContent = original.get(button);
@@ -1865,6 +1964,12 @@ async function runtimeInstall() {
     await checkRuntime(true);
   }
 }
+
+// 失败弹窗上的「重新下载」= 原样再跑一次；「关闭」只收起弹窗。
+$("#install-retry").addEventListener("click", () => runtimeInstall());
+$("#install-close").addEventListener("click", () =>
+  $("#install-overlay").classList.add("hidden"),
+);
 
 function renderRuntimeList(status) {
   const tools = [status.ffmpeg, status.ffprobe];
@@ -2437,6 +2542,20 @@ function handleConfirmKeys(event) {
 
 document.addEventListener("keydown", handleConfirmKeys);
 $("#exec-run").addEventListener("click", executeTranscode);
+// 停止转码：后端杀掉正在跑的 ffmpeg、清理本次输出目录，执行中的 transcode_execute 会随之返回。
+$("#exec-stop").addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  button.textContent = "正在停止…";
+  try {
+    await invoke("transcode_stop");
+    toast("已发送停止指令，正在终止 ffmpeg 并清理输出目录");
+  } catch (error) {
+    toast(error, true);
+    button.disabled = false;
+    button.textContent = "停止转码";
+  }
+});
 // 「重新检测」要有可感知反馈：环境正常时结果不变，不加状态会像点了没反应。
 $("#runtime-recheck").addEventListener("click", async (event) => {
   const button = event.currentTarget;

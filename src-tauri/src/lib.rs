@@ -19,6 +19,7 @@ mod paths;
 mod toolbox;
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ProbeOutcome {
     file_name: String,
     episode_number: Option<u32>,
@@ -387,6 +388,7 @@ pub fn run() {
             toolbox::probe_bitrate,
             toolbox::fix_bitrate,
             toolbox::transcode_execute,
+            toolbox::transcode_stop,
             toolbox::install_runtime,
             dossier::generate_mount_copy_csv,
             dossier::load_mount_copy,

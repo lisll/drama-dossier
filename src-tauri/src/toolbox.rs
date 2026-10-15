@@ -10,6 +10,7 @@
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dossier_core::{
@@ -30,6 +31,24 @@ use crate::paths::normalize;
 pub const DEFAULT_MIN_BITRATE_KBPS: u64 = 4000;
 /// 单条 ffmpeg 命令的超时：短剧分集都在几分钟量级，10 分钟足够。
 const FFMPEG_TIMEOUT_SECS: u64 = 600;
+
+/// 转码停止开关：`transcode_stop` 置位后，正在跑的 ffmpeg 会被立刻杀掉，
+/// 主流程在每一步之间也会检查，发现置位就收尾清理输出目录。
+/// 每次转码开始时复位；没有转码在跑时置位无副作用。
+static TRANSCODE_CANCEL: AtomicBool = AtomicBool::new(false);
+
+fn transcode_cancelled() -> bool {
+    TRANSCODE_CANCEL.load(Ordering::SeqCst)
+}
+
+/// 用户请求停止转码。真正杀进程、清理输出在转码主流程里完成，
+/// 这里的返回只代表「停止指令已受理」。
+#[tauri::command]
+pub fn transcode_stop() -> Result<bool, String> {
+    TRANSCODE_CANCEL.store(true, Ordering::SeqCst);
+    crate::logging::log_event("转码", "收到停止指令，正在终止并清理输出");
+    Ok(true)
+}
 
 // ---------------------------------------------------------------------------
 // 运行环境解析与一键安装
@@ -66,7 +85,8 @@ fn resolve_ffmpeg(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 /// ffprobe 解析顺序：界面显式提示（填了就用，错误让它自然暴露）→ 设置 → 一键安装目录 → `PATH`。
-fn resolve_ffprobe(app: &AppHandle, hint: Option<&str>) -> Result<PathBuf, String> {
+/// GUI 进程 PATH 很干净，`Ok(PathBuf::from("ffprobe"))` 只是最后的兜底。
+pub(crate) fn resolve_ffprobe(app: &AppHandle, hint: Option<&str>) -> Result<PathBuf, String> {
     if let Some(hint) = hint.map(str::trim).filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(hint));
     }
@@ -173,6 +193,41 @@ fn emit_task_progress(app: &AppHandle, task: &str, done: u64, total: u64, label:
         label: label.to_string(),
     };
     let _ = app.emit("task-progress", payload);
+}
+
+/// 一键安装的进度事件：弹窗据此渲染「需要下载 / 已下载 / 组件」和进度条。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallProgress {
+    /// 正在处理的组件：ffmpeg / ffprobe。
+    pub component: String,
+    /// 机器可读阶段：connecting / downloading / extracting / verifying / finished。
+    pub stage: String,
+    /// 直接可展示的中文阶段名。
+    pub stage_label: String,
+    /// 下载总大小（HEAD 探测不到时为空，进度条退化为不定进度）。
+    pub total_bytes: Option<u64>,
+    pub downloaded_bytes: u64,
+}
+
+fn emit_install_progress(
+    app: &AppHandle,
+    component: &str,
+    stage: &str,
+    stage_label: &str,
+    total_bytes: Option<u64>,
+    downloaded_bytes: u64,
+) {
+    let _ = app.emit(
+        "install-progress",
+        InstallProgress {
+            component: component.to_string(),
+            stage: stage.to_string(),
+            stage_label: stage_label.to_string(),
+            total_bytes,
+            downloaded_bytes,
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -304,9 +359,16 @@ fn run_ffmpeg(program: &Path, args: &[&str]) -> Result<(), String> {
     }
     spec = spec.timeout(std::time::Duration::from_secs(FFMPEG_TIMEOUT_SECS));
     let runner = SystemRunner::new();
-    let output = runner
-        .run(&spec)
-        .map_err(|error| format!("ffmpeg 启动失败（{}）：{error}", program.display()))?;
+    // 传入转码停止开关：点「停止」时当前这条 ffmpeg 会被立刻杀掉（其他任务未置位时行为不变）。
+    let output = match runner.run_cancellable(&spec, &|| transcode_cancelled()) {
+        Ok(output) => output,
+        Err(dossier_runtime::CommandError::Cancelled { .. }) => {
+            return Err("ffmpeg 已被停止".into());
+        }
+        Err(error) => {
+            return Err(format!("ffmpeg 启动失败（{}）：{error}", program.display()))
+        }
+    };
     if output.success() {
         return Ok(());
     }
@@ -537,12 +599,17 @@ fn transcode_nudge_blocking(
     episodes: &[ProbedEpisode],
     output_dir: &Path,
     on_step: &mut dyn FnMut(u64, u64, &str),
+    produced: &mut Vec<PathBuf>,
 ) -> Result<TranscodeRunReport, String> {
     std::fs::create_dir_all(output_dir)
         .map_err(|error| format!("创建输出目录失败（{}）：{error}", output_dir.display()))?;
     let mut items = Vec::new();
     let total = episodes.len() as u64;
     for (index, episode) in episodes.iter().enumerate() {
+        // 用户点了停止就不再开下一步 ffmpeg；正在跑的那条由 run_ffmpeg 内部杀掉。
+        if transcode_cancelled() {
+            return Err("已停止".into());
+        }
         // 全剧重编码动辄几分钟，逐集上报让进度条能真的动起来（done = 已完成集数）。
         on_step(
             index as u64,
@@ -572,6 +639,7 @@ fn transcode_nudge_blocking(
             let _ = std::fs::remove_file(&output);
             format!("{}：{error}", episode.file.file_name)
         })?;
+        produced.push(output.clone());
         items.push(TranscodeItemReport {
             source: input_str,
             output: output.display().to_string(),
@@ -627,6 +695,7 @@ fn transcode_recut_blocking(
     target_count: usize,
     output_dir: &Path,
     on_step: &mut dyn FnMut(u64, u64, &str),
+    produced: &mut Vec<PathBuf>,
 ) -> Result<TranscodeRunReport, String> {
     std::fs::create_dir_all(output_dir)
         .map_err(|error| format!("创建输出目录失败（{}）：{error}", output_dir.display()))?;
@@ -638,6 +707,10 @@ fn transcode_recut_blocking(
     let ffmpeg_str = ffmpeg.display().to_string();
     let detect_total = episodes.len() as u64;
     for (index, episode) in episodes.iter().enumerate() {
+        // 用户点了停止就不再开下一步 ffmpeg；正在跑的那条由 run_ffmpeg 内部杀掉。
+        if transcode_cancelled() {
+            return Err("已停止".into());
+        }
         on_step(
             index as u64,
             detect_total,
@@ -668,6 +741,9 @@ fn transcode_recut_blocking(
     let mut items = Vec::new();
     let segment_total = segments.len() as u64;
     for (index, segment) in segments.iter().enumerate() {
+        if transcode_cancelled() {
+            return Err("已停止".into());
+        }
         on_step(
             index as u64,
             segment_total,
@@ -766,6 +842,7 @@ fn transcode_recut_blocking(
             })?;
         }
 
+        produced.push(output.clone());
         items.push(TranscodeItemReport {
             source: spans
                 .iter()
@@ -801,6 +878,8 @@ fn transcode_blocking(
     ffprobe_path: Option<String>,
     output_root: Option<String>,
 ) -> Result<TranscodeRunReport, String> {
+    // 每次转码都是全新一次运行，先复位停止开关（上一轮的停止指令不残留）。
+    TRANSCODE_CANCEL.store(false, Ordering::SeqCst);
     let ffmpeg = resolve_ffmpeg(app)?;
     let ffprobe = resolve_ffprobe(app, ffprobe_path.as_deref())?;
     let drama = load_drama(&root, &name)?;
@@ -827,20 +906,65 @@ fn transcode_blocking(
         subdir,
     );
     reject_source_dir(&output_dir, &episodes)?;
+    // 停止时的清理策略依赖「目录是不是本次新建的」：新建的整目录删除，
+    // 已存在的只删本次写出的文件，避免误删用户目录里的其他内容。
+    let dir_existed = output_dir.exists();
+    let mut produced: Vec<PathBuf> = Vec::new();
 
     let mut on_step = |done: u64, total: u64, label: &str| {
         emit_task_progress(app, "transcode", done, total, label);
     };
-    match mode {
+    let result = match mode {
         "recut" => {
             let target = request
                 .target_count
                 .unwrap_or(episodes.len())
                 .clamp(1, episodes.len().max(1) * 10);
-            transcode_recut_blocking(&ffmpeg, &episodes, target, &output_dir, &mut on_step)
+            transcode_recut_blocking(
+                &ffmpeg,
+                &episodes,
+                target,
+                &output_dir,
+                &mut on_step,
+                &mut produced,
+            )
         }
-        _ => transcode_nudge_blocking(&ffmpeg, &drama.name, &episodes, &output_dir, &mut on_step),
+        _ => transcode_nudge_blocking(
+            &ffmpeg,
+            &drama.name,
+            &episodes,
+            &output_dir,
+            &mut on_step,
+            &mut produced,
+        ),
+    };
+    match result {
+        Ok(report) => Ok(report),
+        Err(error) => {
+            if transcode_cancelled() {
+                cleanup_transcode_output(&output_dir, dir_existed, &produced);
+                crate::logging::log_event(
+                    "转码",
+                    format!("已停止：删除输出 {}（{} 个本次产物）", output_dir.display(), produced.len()),
+                );
+                return Err("已按要求停止转码，正在输出的目录已删除。".into());
+            }
+            Err(error)
+        }
     }
+}
+
+/// 停止后清理本次转码产物：目录是本次新建的 → 整目录删除；
+/// 目录早已存在 → 只删本次写出的文件，再尝试删掉空目录（删不掉说明还有别的内容，留着不动）。
+fn cleanup_transcode_output(output_dir: &Path, dir_existed: bool, produced: &[PathBuf]) {
+    if !dir_existed {
+        let _ = std::fs::remove_dir_all(output_dir);
+        return;
+    }
+    for path in produced {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = std::fs::remove_dir(output_dir);
 }
 
 /// 拒绝把输出写回素材目录。
@@ -921,52 +1045,113 @@ pub struct InstallRuntimeReport {
 }
 
 /// 用系统 curl 下载（macOS 自带，支持重试与断点续传）。
-// 只被上面 macOS 专属的 install_one 调用；不按平台门控会在 Linux/Windows
-// 上成为死代码，被 CI 的 -D warnings 拦下。
+/// 期间每 0.4 秒轮询一次落盘大小并上报 `install-progress`；
+/// 总大小先用 HEAD 请求探测 content-length，探测不到就只报已下载量。
 #[cfg(target_os = "macos")]
-fn download_file(url: &str, target: &Path) -> Result<(), String> {
-    let spec = CommandSpec::new("/usr/bin/curl")
-        .arg("-fL")
-        .arg("-sS")
-        .arg("--retry")
-        .arg("4")
-        .arg("--retry-delay")
-        .arg("10")
-        .arg("--retry-all-errors")
-        .arg("--max-time")
-        .arg("1800")
-        .arg("-o")
+fn download_file(
+    app: &AppHandle,
+    component: &str,
+    url: &str,
+    target: &Path,
+) -> Result<(), String> {
+    let total = probe_content_length(url);
+    emit_install_progress(app, component, "connecting", "连接下载源", total, 0);
+    let mut command = std::process::Command::new("/usr/bin/curl");
+    command
+        .args([
+            "-fL",
+            "-sS",
+            "--retry",
+            "4",
+            "--retry-delay",
+            "10",
+            "--retry-all-errors",
+            "--max-time",
+            "1800",
+            "-o",
+        ])
         .arg(target.display().to_string())
-        .arg(url);
-    let runner = SystemRunner::new();
-    let output = runner
-        .run(&spec)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command
+        .spawn()
         .map_err(|error| format!("curl 启动失败：{error}"))?;
-    if output.success() {
-        return Ok(());
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    return Ok(());
+                }
+                // curl 的报错都很短（-sS 只打一行），等它退出后一次性读走不会堵管道。
+                let mut detail = String::new();
+                if let Some(mut stderr) = child.stderr.take() {
+                    use std::io::Read;
+                    let _ = stderr.read_to_string(&mut detail);
+                }
+                let first = detail
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .unwrap_or("（无输出）");
+                return Err(format!(
+                    "下载失败（退出码 {}）：{first}",
+                    status.code().unwrap_or(-1)
+                ));
+            }
+            Ok(None) => {
+                let downloaded = std::fs::metadata(target)
+                    .map(|meta| meta.len())
+                    .unwrap_or(0);
+                emit_install_progress(app, component, "downloading", "下载中", total, downloaded);
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("curl 运行失败：{error}"));
+            }
+        }
     }
-    let detail = output.combined();
-    let first = detail
+}
+
+/// HEAD 请求探测下载总大小；失败不影响安装，只是进度条没有百分比。
+#[cfg(target_os = "macos")]
+fn probe_content_length(url: &str) -> Option<u64> {
+    let spec = CommandSpec::new("/usr/bin/curl")
+        .arg("-sIL")
+        .arg("--max-time")
+        .arg("20")
+        .arg(url);
+    let output = SystemRunner::new().run(&spec).ok()?;
+    if !output.success() {
+        return None;
+    }
+    output
+        .combined()
         .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("（无输出）");
-    Err(format!("下载失败（{}）：{first}", output.code_label()))
+        .rev()
+        .find_map(|line| {
+            let value = line.strip_prefix("content-length:")?;
+            value.trim().parse::<u64>().ok()
+        })
 }
 
 /// 安装单个工具：下载 zip → 解压到临时目录 → 授权 → 移到目标位置。
 /// 返回 `Ok(true)` 表示目标已存在、本次跳过。
 #[cfg(target_os = "macos")]
-fn install_one(bin_dir: &Path, name: &str, url: &str) -> Result<bool, String> {
+fn install_one(app: &AppHandle, bin_dir: &Path, name: &str, url: &str) -> Result<bool, String> {
     let target = bin_dir.join(name);
     if target.is_file() {
+        emit_install_progress(app, name, "finished", "已存在，跳过", Some(0), 0);
         return Ok(true);
     }
     let zip_path = bin_dir.join(format!("{name}.download.zip"));
     let staging = bin_dir.join(format!("{name}.staging"));
     let _ = std::fs::remove_dir_all(&staging);
     let result = (|| -> Result<(), String> {
-        download_file(url, &zip_path)?;
+        download_file(app, name, url, &zip_path)?;
+        emit_install_progress(app, name, "extracting", "解压中", None, 0);
         std::fs::create_dir_all(&staging).map_err(|error| format!("创建解压目录失败：{error}"))?;
         let spec = CommandSpec::new("/usr/bin/unzip")
             .arg("-o")
@@ -999,6 +1184,7 @@ fn install_one(bin_dir: &Path, name: &str, url: &str) -> Result<bool, String> {
         }
         std::fs::rename(&extracted, &target)
             .map_err(|error| format!("安装 {name} 失败：{error}"))?;
+        emit_install_progress(app, name, "finished", "完成", Some(0), 0);
         Ok(())
     })();
     let _ = std::fs::remove_dir_all(&staging);
@@ -1012,10 +1198,10 @@ fn install_runtime_blocking(app: &AppHandle) -> Result<InstallRuntimeReport, Str
     std::fs::create_dir_all(&bin_dir).map_err(|error| format!("创建运行环境目录失败：{error}"))?;
 
     let mut skipped_existing = Vec::new();
-    if install_one(&bin_dir, "ffmpeg", EVERMEET_FFMPEG_URL)? {
+    if install_one(app, &bin_dir, "ffmpeg", EVERMEET_FFMPEG_URL)? {
         skipped_existing.push("ffmpeg".into());
     }
-    if install_one(&bin_dir, "ffprobe", EVERMEET_FFPROBE_URL)? {
+    if install_one(app, &bin_dir, "ffprobe", EVERMEET_FFPROBE_URL)? {
         skipped_existing.push("ffprobe".into());
     }
 
@@ -1023,6 +1209,7 @@ fn install_runtime_blocking(app: &AppHandle) -> Result<InstallRuntimeReport, Str
     let ffprobe_path = bin_dir.join("ffprobe");
 
     // 安装后自检，把「下载成功但跑不起来」拦在报告给用户之前。
+    emit_install_progress(app, "自检", "verifying", "检查安装结果", None, 0);
     {
         let runner = SystemRunner::new();
         let report = probe_tool(

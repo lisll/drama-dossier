@@ -303,8 +303,10 @@
                 </div>
                 <div class="option-row">
                   <button id="exec-run" class="success">执行转码</button>
+                  <!-- 转码进行中才显示；不带 data-long-task，任务期间必须保持可点 -->
+                  <button id="exec-stop" class="danger hidden">停止转码</button>
                 </div>
-                <p class="hint">两种模式都输出到新目录，绝不改动原素材；全剧重编码，耗时较长。</p>
+                <p class="hint">两种模式都输出到新目录，绝不改动原素材；全剧重编码，耗时较长。点「停止转码」会立刻终止并删除本次输出目录。</p>
                 <div id="exec-result" class="result hidden"></div>
               </section>
 
@@ -741,6 +743,34 @@
       </div>
     </div>
     <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+    <!-- 一键安装运行环境的进度 / 失败弹窗（竞品同款：标题 + 统计 + 进度条，失败时给重新下载） -->
+    <div id="install-overlay" class="install-overlay hidden" role="dialog" aria-modal="true">
+      <div class="install-modal">
+        <header class="install-modal-head">
+          <span id="install-icon" class="install-icon">⬇</span>
+          <div class="install-titles">
+            <h3 id="install-title">正在安装本机引擎</h3>
+            <p id="install-subtitle">正在连接下载源。</p>
+          </div>
+          <button id="install-close" class="install-close hidden" title="关闭" aria-label="关闭">×</button>
+        </header>
+        <dl class="install-stats">
+          <div><dt>需要下载</dt><dd id="install-total">待计算</dd></div>
+          <div><dt>已下载</dt><dd id="install-downloaded">待计算</dd></div>
+          <div><dt>组件</dt><dd id="install-component">准备中</dd></div>
+        </dl>
+        <div class="install-track-row">
+          <span class="install-track-name">本机引擎</span>
+          <span id="install-percent">—</span>
+        </div>
+        <div class="install-track"><div id="install-bar" class="install-bar indeterminate"></div></div>
+        <p id="install-error" class="install-error hidden"></p>
+        <footer class="install-actions">
+          <button id="install-retry" class="success hidden">重新下载</button>
+        </footer>
+      </div>
+    </div>
     <script src="./main.js"></script>
   </body>
 </html>

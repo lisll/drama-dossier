@@ -172,11 +172,24 @@ pub enum CommandError {
     Spawn { program: String, message: String },
     #[error("命令 {program} 超时（{} 秒）", .after.as_secs_f64())]
     Timeout { program: String, after: Duration },
+    #[error("{program} 已被用户停止")]
+    Cancelled { program: String },
 }
 
 /// 「执行一条命令」的能力。生产实现是 [`SystemRunner`]，测试实现是 [`FakeRunner`]。
 pub trait CommandRunner {
     fn run(&self, spec: &CommandSpec) -> Result<CommandOutput, CommandError>;
+
+    /// 同 [`CommandRunner::run`]，但 `cancelled()` 返回 true 时立刻杀掉子进程并返回
+    /// [`CommandError::Cancelled`]。默认实现忽略取消标志，直接走 `run`。
+    fn run_cancellable(
+        &self,
+        spec: &CommandSpec,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<CommandOutput, CommandError> {
+        let _ = cancelled;
+        self.run(spec)
+    }
 }
 
 /// 真跑进程的实现。
@@ -191,6 +204,14 @@ impl SystemRunner {
 
 impl CommandRunner for SystemRunner {
     fn run(&self, spec: &CommandSpec) -> Result<CommandOutput, CommandError> {
+        self.run_cancellable(spec, &|| false)
+    }
+
+    fn run_cancellable(
+        &self,
+        spec: &CommandSpec,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<CommandOutput, CommandError> {
         let mut command = Command::new(&spec.program);
         command
             .args(&spec.args)
@@ -232,6 +253,14 @@ impl CommandRunner for SystemRunner {
 
         let deadline = spec.timeout.map(|timeout| Instant::now() + timeout);
         let status = loop {
+            // 用户点「停止」时立刻终止子进程，不等它自然跑完。
+            if cancelled() {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CommandError::Cancelled {
+                    program: spec.program.clone(),
+                });
+            }
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) => {}

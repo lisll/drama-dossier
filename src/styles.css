@@ -817,6 +817,145 @@ table {
   margin: 10px 0 0 auto;
 }
 
+/* ============ 一键安装运行环境：进度 / 失败弹窗 ============ */
+.install-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+}
+
+.install-modal {
+  width: min(460px, 88vw);
+  padding: 20px 22px 18px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-lg);
+  background: var(--surface-2);
+  box-shadow: var(--shadow-3), var(--edge);
+}
+
+.install-modal-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.install-icon {
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  flex: none;
+  border-radius: var(--r-lg);
+  background: var(--accent-tint);
+  border: 1px solid var(--accent-line);
+  color: var(--accent-text);
+  font-size: 17px;
+}
+
+/* 失败时换红色系，与竞品的错误态一致。 */
+.install-modal.failed .install-icon {
+  background: var(--err-soft);
+  border-color: var(--err-line);
+  color: var(--err-text);
+}
+
+.install-titles {
+  flex: 1;
+  min-width: 0;
+}
+
+.install-titles h3 {
+  margin: 0;
+  font-size: 15px;
+  color: var(--text);
+}
+
+.install-titles p {
+  margin: 3px 0 0;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.install-close {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 50%;
+}
+
+.install-stats {
+  display: flex;
+  gap: 36px;
+  margin: 18px 0 14px;
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.install-stats dt {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.install-stats dd {
+  margin: 5px 0 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.install-track-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.install-track {
+  margin-top: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  border: 1px solid var(--line);
+  overflow: hidden;
+}
+
+.install-bar {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: var(--ok-fill);
+  transition: width 0.25s ease;
+}
+
+/* 总大小未知时走不定进度动画。 */
+.install-bar.indeterminate {
+  width: 36%;
+  animation: install-slide 1.2s ease-in-out infinite alternate;
+}
+
+@keyframes install-slide {
+  from { margin-left: 0; }
+  to { margin-left: 64%; }
+}
+
+.install-error {
+  margin: 12px 0 0;
+  font-size: 12px;
+  color: var(--err-text);
+}
+
+.install-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 14px;
+}
+
 code {
   padding: 2px 5px;
   border-radius: 6px;

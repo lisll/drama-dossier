@@ -8,6 +8,12 @@ const VIDEO_EXTS: &[&str] = &["mp4", "mov", "mkv", "flv", "ts", "m4v", "webm"];
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp"];
 const TEXT_EXTS: &[&str] = &["txt", "md"];
 
+/// 应用自己会在剧目录里生成的产物子目录，扫描分集时必须跳过：
+/// 否则转码输出（同名文件）会被当成新一集，转码一次集数就翻倍，
+/// 下次转码还会把旧产物当素材重新处理。
+/// 「报审包」对应 `package.rs`，「微调输出 / 重组输出」对应桌面端转码落点。
+const PRODUCT_SUBDIRS: &[&str] = &["报审包", "微调输出", "重组输出"];
+
 /// 扫描素材根目录，返回按名称排序的剧目列表。
 pub fn scan_library(root: &Path) -> std::io::Result<Vec<Drama>> {
     validate_library_root(root)?;
@@ -82,7 +88,10 @@ pub fn scan_drama_dir(name: &str, dir: &Path) -> Drama {
             let p = e.path();
             if p.is_file() {
                 visit(&p, &mut episodes, &mut cover, &mut synopsis);
-            } else if p.is_dir() && !e.file_name().to_string_lossy().starts_with('.') {
+            } else if p.is_dir()
+                && !e.file_name().to_string_lossy().starts_with('.')
+                && !PRODUCT_SUBDIRS.contains(&e.file_name().to_string_lossy().as_ref())
+            {
                 if let Ok(sub) = std::fs::read_dir(&p) {
                     for se in sub.flatten() {
                         if se.path().is_file() {
@@ -258,6 +267,26 @@ mod tests {
         assert_eq!(drama.episodes[0].episode_number, Some(1));
         assert!(drama.cover.is_some());
         assert!(drama.synopsis.is_some());
+        std::fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn scan_skips_product_subdirs() {
+        // 转码输出 / 报审包里的视频不能算新一集，否则集数翻倍、产物被当素材。
+        let base = std::env::temp_dir();
+        let p = base.join(format!("dossier-product-{}", std::process::id()));
+        std::fs::create_dir_all(p.join("剧A").join("微调输出")).unwrap();
+        std::fs::create_dir_all(p.join("剧A").join("报审包").join("06_分集视频")).unwrap();
+        std::fs::write(p.join("剧A").join("第1集.mp4"), b"x").unwrap();
+        std::fs::write(p.join("剧A").join("微调输出").join("第1集.mp4"), b"x").unwrap();
+        std::fs::write(
+            p.join("剧A").join("报审包").join("06_分集视频").join("第1集.mp4"),
+            b"x",
+        )
+        .unwrap();
+
+        let drama = scan_drama_dir("剧A", &p.join("剧A"));
+        assert_eq!(drama.episodes.len(), 1);
         std::fs::remove_dir_all(&p).ok();
     }
 

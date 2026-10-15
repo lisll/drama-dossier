@@ -70,6 +70,9 @@ pub struct EraseRequest {
     pub worker_args: Vec<String>,
     /// 关闭自动校验（默认开启）。
     pub no_verify: bool,
+    /// ffprobe 可执行文件；缺省时管线自己从 PATH 找。
+    /// 桌面端必须传：GUI 进程的 PATH 很干净，找到 ffprobe 全靠应用自己解析好的路径。
+    pub ffprobe: Option<String>,
 }
 
 impl Default for EraseRequest {
@@ -92,6 +95,7 @@ impl Default for EraseRequest {
             worker_program: None,
             worker_args: Vec::new(),
             no_verify: false,
+            ffprobe: None,
         }
     }
 }
@@ -231,6 +235,12 @@ pub fn build_plan(request: &EraseRequest, tool: &Path) -> Result<ErasePlan, Stri
     if let Some(progress) = &request.progress_json {
         args.push("--progress-json".into());
         args.push(progress.display().to_string());
+    }
+    // CLI 缺省会从 PATH 找 ffprobe，而 GUI 子进程的 PATH 几乎是空的；
+    // 桌面端把应用解析好的 ffprobe 路径显式传进来，行为才与「本机环境就绪」一致。
+    if let Some(ffprobe) = request.ffprobe.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        args.push("--ffprobe".into());
+        args.push(ffprobe.to_string());
     }
     args.extend([
         "--detector".into(),
@@ -539,6 +549,25 @@ mod tests {
         assert!(plan
             .command_line
             .starts_with("/usr/local/bin/dossier-inpaint --input"));
+    }
+
+    #[test]
+    fn ffprobe_path_lands_in_plan_args() {
+        // GUI 子进程 PATH 很干净：桌面端解析好的 ffprobe 必须原样进命令行。
+        let mut req = request();
+        req.ffprobe = Some("/opt/homebrew/bin/ffprobe".into());
+        let args = build_plan(&req, Path::new("/bin/tool"))
+            .unwrap()
+            .args
+            .join(" ");
+        assert!(args.contains("--ffprobe /opt/homebrew/bin/ffprobe"), "{args}");
+
+        // 缺省时不加 --ffprobe，交给 CLI 自己从 PATH 找。
+        let args = build_plan(&request(), Path::new("/bin/tool"))
+            .unwrap()
+            .args
+            .join(" ");
+        assert!(!args.contains("--ffprobe"), "{args}");
     }
 
     #[test]

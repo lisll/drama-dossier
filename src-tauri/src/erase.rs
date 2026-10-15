@@ -131,11 +131,15 @@ fn ensure_distinct_io(request: &EraseRequest) -> Result<(), String> {
 /// 少一个参数就不是同一条了。
 #[tauri::command]
 pub fn plan_erase(
+    app: AppHandle,
     mut request: EraseRequest,
     tool_path: Option<String>,
+    ffprobe_path: Option<String>,
 ) -> Result<ErasePlan, String> {
     ensure_distinct_io(&request)?;
     request.progress_json = Some(erase_progress_path(&request.output));
+    // 预览里的命令必须和真正执行的同一条：ffprobe 也在这一步解析好填进去。
+    request.ffprobe = Some(crate::toolbox::resolve_ffprobe(&app, ffprobe_path.as_deref())?.display().to_string());
     let tool = locate(tool_path.as_deref())?;
     build_plan(&request, &tool)
 }
@@ -150,10 +154,11 @@ pub async fn run_erase(
     app: AppHandle,
     request: EraseRequest,
     tool_path: Option<String>,
+    ffprobe_path: Option<String>,
     timeout_seconds: Option<u64>,
 ) -> Result<EraseRun, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        run_erase_blocking(&app, request, tool_path, timeout_seconds)
+        run_erase_blocking(&app, request, tool_path, ffprobe_path, timeout_seconds)
     })
     .await
     .map_err(|error| format!("擦除任务失败：{error}"))?
@@ -165,6 +170,7 @@ fn run_erase_blocking(
     app: &AppHandle,
     mut request: EraseRequest,
     tool_path: Option<String>,
+    ffprobe_path: Option<String>,
     timeout_seconds: Option<u64>,
 ) -> Result<EraseRun, String> {
     if !request.input.is_file() {
@@ -178,6 +184,13 @@ fn run_erase_blocking(
     }
     let progress_path = erase_progress_path(&request.output);
     request.progress_json = Some(progress_path.clone());
+    // GUI 子进程的 PATH 里几乎肯定没有 ffprobe（用户环境里的 9.0.2-tessus 也是这么被
+    // 探测到的），所以必须把应用解析好的绝对路径显式交给管线。
+    request.ffprobe = Some(
+        crate::toolbox::resolve_ffprobe(app, ffprobe_path.as_deref())?
+            .display()
+            .to_string(),
+    );
 
     let tool = locate(tool_path.as_deref())?;
     let plan = build_plan(&request, &tool)?;
