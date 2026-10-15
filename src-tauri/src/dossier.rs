@@ -10,14 +10,14 @@
 use std::path::PathBuf;
 
 use dossier_core::{
-    builtin_profiles, diff_packages as diff_packages_core, export_capcut_draft, find_profile,
-    import_capcut_draft, build_mount_copy_rows, load_mount_copy_csv, plan_normalization,
-    make_publish_batch, preview_publish_batch, probe_episode, review_drama, scan_drama_dir,
-    transition_publish_row, validate_publish_update, write_mount_copy_csv,
-    validate_drama_dir, validate_drama_name, validate_library_root, CapcutDraft,
-    DraftExportOptions, DraftExportResult, Drama, FfprobeConfig, MountCopyRow, MountCopyWriteResult,
-    NormalizationPlan, PackageDiff, PlatformProfile, ProbedEpisode, ProfileReview, PublishPreview,
-    TranscodeTarget,
+    build_mount_copy_rows, builtin_profiles, diff_packages as diff_packages_core,
+    export_capcut_draft, find_profile, import_capcut_draft, load_mount_copy_csv,
+    make_publish_batch, plan_normalization, preview_publish_batch, probe_episode, review_drama,
+    scan_drama_dir, transition_publish_row, validate_drama_dir, validate_drama_name,
+    validate_library_root, validate_publish_update, write_mount_copy_csv, CapcutDraft,
+    DraftExportOptions, DraftExportResult, Drama, FfprobeConfig, MountCopyRow,
+    MountCopyWriteResult, NormalizationPlan, PackageDiff, PlatformProfile, ProbedEpisode,
+    ProfileReview, PublishPreview, TranscodeTarget,
 };
 use serde::Serialize;
 
@@ -159,7 +159,10 @@ pub fn load_mount_copy(path: String) -> Result<Vec<MountCopyRow>, String> {
 
 /// 保存人工编辑后的挂载文案 CSV。不会触发外部发布。
 #[tauri::command]
-pub fn save_mount_copy(path: String, rows: Vec<MountCopyRow>) -> Result<MountCopyWriteResult, String> {
+pub fn save_mount_copy(
+    path: String,
+    rows: Vec<MountCopyRow>,
+) -> Result<MountCopyWriteResult, String> {
     let path = PathBuf::from(path);
     if path.exists() {
         let previous = load_mount_copy_csv(&path).map_err(|error| error.to_string())?;

@@ -65,8 +65,8 @@ pub use progress::{
     ProgressLog, ProgressRecorder, TaskProgress,
 };
 pub use publish::{
-    build_mount_copy_rows, load_mount_copy_csv, make_publish_batch, write_mount_copy_csv,
-    preview_publish_batch, transition_publish_row, validate_publish_update, MountCopyRow,
+    build_mount_copy_rows, load_mount_copy_csv, make_publish_batch, preview_publish_batch,
+    transition_publish_row, validate_publish_update, write_mount_copy_csv, MountCopyRow,
     MountCopyWriteResult, PublishBatch, PublishPreview, PublishPreviewRow,
 };
 pub use scanner::{

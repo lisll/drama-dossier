@@ -12,8 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::types::ProbedEpisode;
 
-pub const MOUNT_COPY_HEADER: &str =
-    "集号,成片文件,短标题,描述,挂载文案,剧集检索名,状态,结果备注";
+pub const MOUNT_COPY_HEADER: &str = "集号,成片文件,短标题,描述,挂载文案,剧集检索名,状态,结果备注";
 
 /// 单条发布素材元数据。字段故意与媒体文件分离，便于改文案而不重新处理视频。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -140,7 +139,10 @@ pub fn build_mount_copy_rows(drama_name: &str, episodes: &[ProbedEpisode]) -> Ve
 }
 
 /// 写入 UTF-8 CSV。写入采用临时文件替换，避免中途崩溃留下半份文案。
-pub fn write_mount_copy_csv(path: &Path, rows: &[MountCopyRow]) -> std::io::Result<MountCopyWriteResult> {
+pub fn write_mount_copy_csv(
+    path: &Path,
+    rows: &[MountCopyRow],
+) -> std::io::Result<MountCopyWriteResult> {
     validate_rows(rows)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -182,9 +184,12 @@ pub fn load_mount_copy_csv(path: &Path) -> std::io::Result<Vec<MountCopyRow>> {
         let episode_number = if record[0].trim().is_empty() {
             None
         } else {
-            Some(record[0].trim().parse::<u32>().map_err(|_| {
-                invalid_csv("集号必须是非负整数")
-            })?)
+            Some(
+                record[0]
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| invalid_csv("集号必须是非负整数"))?,
+            )
         };
         rows.push(MountCopyRow {
             episode_number,
@@ -202,7 +207,11 @@ pub fn load_mount_copy_csv(path: &Path) -> std::io::Result<Vec<MountCopyRow>> {
 }
 
 /// 构造一份本地发布批次描述。发布器应在真正提交前重新读取 CSV 并人工确认。
-pub fn make_publish_batch(batch_id: &str, drama_name: &str, csv_path: &Path) -> std::io::Result<PublishBatch> {
+pub fn make_publish_batch(
+    batch_id: &str,
+    drama_name: &str,
+    csv_path: &Path,
+) -> std::io::Result<PublishBatch> {
     if batch_id.trim().is_empty() || drama_name.trim().is_empty() {
         return Err(invalid_csv("批次 ID 和剧名不能为空"));
     }
@@ -243,7 +252,11 @@ pub fn preview_publish_batch(batch_id: &str, batch: &PublishBatch) -> PublishPre
                 source_file: row.source_file.clone(),
                 status: row.status.clone(),
                 eligible,
-                reason: if eligible { "本地前置条件满足".to_string() } else { missing.join("；") },
+                reason: if eligible {
+                    "本地前置条件满足".to_string()
+                } else {
+                    missing.join("；")
+                },
             }
         })
         .collect::<Vec<_>>();
@@ -268,8 +281,13 @@ fn validate_rows(rows: &[MountCopyRow]) -> std::io::Result<()> {
         if !seen_files.insert(row.source_file.clone()) {
             return Err(invalid_csv("成片文件不能重复"));
         }
-        if !matches!(row.status.as_str(), "draft" | "ready" | "submitted" | "confirmed" | "failed") {
-            return Err(invalid_csv("状态必须是 draft/ready/submitted/confirmed/failed"));
+        if !matches!(
+            row.status.as_str(),
+            "draft" | "ready" | "submitted" | "confirmed" | "failed"
+        ) {
+            return Err(invalid_csv(
+                "状态必须是 draft/ready/submitted/confirmed/failed",
+            ));
         }
         for (label, value) in [
             ("短标题", &row.short_title),
@@ -288,7 +306,9 @@ fn validate_rows(rows: &[MountCopyRow]) -> std::io::Result<()> {
 
 fn row_to_csv(row: &MountCopyRow) -> String {
     [
-        row.episode_number.map(|value| value.to_string()).unwrap_or_default(),
+        row.episode_number
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
         row.source_file.clone(),
         row.short_title.clone(),
         row.description.clone(),
@@ -401,8 +421,16 @@ mod tests {
     #[test]
     fn duplicate_source_file_is_rejected() {
         let rows = vec![
-            MountCopyRow { source_file: "a.mp4".into(), status: "draft".into(), ..Default::default() },
-            MountCopyRow { source_file: "a.mp4".into(), status: "draft".into(), ..Default::default() },
+            MountCopyRow {
+                source_file: "a.mp4".into(),
+                status: "draft".into(),
+                ..Default::default()
+            },
+            MountCopyRow {
+                source_file: "a.mp4".into(),
+                status: "draft".into(),
+                ..Default::default()
+            },
         ];
         assert!(write_mount_copy_csv(&std::env::temp_dir().join("bad.csv"), &rows).is_err());
     }
@@ -423,8 +451,16 @@ mod tests {
 
     #[test]
     fn saving_cannot_skip_status_machine() {
-        let previous = MountCopyRow { source_file: "a.mp4".into(), status: "draft".into(), ..Default::default() };
-        let next = MountCopyRow { source_file: "a.mp4".into(), status: "confirmed".into(), ..Default::default() };
+        let previous = MountCopyRow {
+            source_file: "a.mp4".into(),
+            status: "draft".into(),
+            ..Default::default()
+        };
+        let next = MountCopyRow {
+            source_file: "a.mp4".into(),
+            status: "confirmed".into(),
+            ..Default::default()
+        };
         assert!(validate_publish_update(&previous, &next).is_err());
     }
 }
