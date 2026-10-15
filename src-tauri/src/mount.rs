@@ -46,7 +46,7 @@ fn plan_path(app: &AppHandle) -> Result<PathBuf, String> {
 /// 剧目目录下的挂载文案 CSV 路径。
 fn drama_csv_path(root: &str, name: &str) -> Result<PathBuf, String> {
     let drama = load_drama(root, name)?;
-    Ok(PathBuf::from(drama.dir).join(MOUNT_CSV_NAME))
+    Ok(drama.dir.join(MOUNT_CSV_NAME))
 }
 
 /// 保存挂载计划（前端四步流程点「保存计划」时调用）。
@@ -68,7 +68,8 @@ pub fn mount_plan_save(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| format!("创建数据目录失败：{error}"))?;
     }
-    let data = serde_json::to_vec_pretty(&plan).map_err(|error| format!("序列化计划失败：{error}"))?;
+    let data =
+        serde_json::to_vec_pretty(&plan).map_err(|error| format!("序列化计划失败：{error}"))?;
     let temp = path.with_extension("json.tmp");
     std::fs::write(&temp, data).map_err(|error| format!("写入计划失败：{error}"))?;
     std::fs::rename(&temp, &path).map_err(|error| format!("替换计划失败：{error}"))?;
@@ -91,7 +92,10 @@ pub fn mount_plan_load(app: AppHandle) -> Result<Option<MountPlan>, String> {
 /// 生成「挂载文案.csv」模板到剧目目录：已存在则直接复用并返回现有内容路径。
 /// 模板为每集一行「集号,文案」，文案留空待填。
 #[tauri::command]
-pub fn mount_csv_template(root: String, drama_name: String) -> Result<MountCsvCheckPayload, String> {
+pub fn mount_csv_template(
+    root: String,
+    drama_name: String,
+) -> Result<MountCsvCheckPayload, String> {
     let drama = load_drama(&root, &drama_name)?;
     let csv_path = PathBuf::from(&drama.dir).join(MOUNT_CSV_NAME);
 
@@ -110,7 +114,11 @@ pub fn mount_csv_template(root: String, drama_name: String) -> Result<MountCsvCh
 
     let content =
         std::fs::read_to_string(&csv_path).map_err(|error| format!("读取挂载文案失败：{error}"))?;
-    let numbers: Vec<u32> = drama.episodes.iter().filter_map(|e| e.episode_number).collect();
+    let numbers: Vec<u32> = drama
+        .episodes
+        .iter()
+        .filter_map(|e| e.episode_number)
+        .collect();
     Ok(MountCsvCheckPayload {
         check: validate_mount_csv(&content, &numbers),
         csv_path: csv_path.display().to_string(),
@@ -129,7 +137,11 @@ pub fn mount_csv_save(
     let csv_path = PathBuf::from(&drama.dir).join(MOUNT_CSV_NAME);
     std::fs::write(&csv_path, &content)
         .map_err(|error| format!("保存挂载文案失败（{}）：{error}", csv_path.display()))?;
-    let numbers: Vec<u32> = drama.episodes.iter().filter_map(|e| e.episode_number).collect();
+    let numbers: Vec<u32> = drama
+        .episodes
+        .iter()
+        .filter_map(|e| e.episode_number)
+        .collect();
     Ok(MountCsvCheckPayload {
         check: validate_mount_csv(&content, &numbers),
         csv_path: csv_path.display().to_string(),
@@ -143,11 +155,18 @@ pub fn mount_csv_check(root: String, drama_name: String) -> Result<MountCsvCheck
     let drama = load_drama(&root, &drama_name)?;
     let csv_path = PathBuf::from(&drama.dir).join(MOUNT_CSV_NAME);
     if !csv_path.exists() {
-        return Err(format!("{} 尚未生成，请先点击「生成模板」。", csv_path.display()));
+        return Err(format!(
+            "{} 尚未生成，请先点击「生成模板」。",
+            csv_path.display()
+        ));
     }
     let content =
         std::fs::read_to_string(&csv_path).map_err(|error| format!("读取挂载文案失败：{error}"))?;
-    let numbers: Vec<u32> = drama.episodes.iter().filter_map(|e| e.episode_number).collect();
+    let numbers: Vec<u32> = drama
+        .episodes
+        .iter()
+        .filter_map(|e| e.episode_number)
+        .collect();
     Ok(MountCsvCheckPayload {
         check: validate_mount_csv(&content, &numbers),
         csv_path: csv_path.display().to_string(),
@@ -213,7 +232,9 @@ fn dir_size(path: &Path) -> u64 {
         return total;
     };
     for entry in entries.flatten() {
-        let Ok(metadata) = entry.metadata() else { continue };
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
         if metadata.is_file() {
             total += metadata.len();
         } else if metadata.is_dir() {

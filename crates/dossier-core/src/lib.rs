@@ -34,8 +34,8 @@ pub mod transcode;
 pub mod types;
 
 pub use account::{
-    change_password, generate_salt, hash_password, login, logout, register, status,
-    validate_email, validate_password, AccountError, AccountRecord, AccountStatus, AccountStore,
+    change_password, generate_salt, hash_password, login, logout, register, status, validate_email,
+    validate_password, AccountError, AccountRecord, AccountStatus, AccountStore,
 };
 pub use checklist::{run_checks, ChecklistReport, ChecklistRules};
 pub use checkpoint::{

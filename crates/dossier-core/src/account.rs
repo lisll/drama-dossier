@@ -47,7 +47,7 @@ impl std::fmt::Display for AccountError {
 impl std::error::Error for AccountError {}
 
 /// 单个账号记录（持久化在账号文件中）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AccountRecord {
     pub email: String,
@@ -56,17 +56,6 @@ pub struct AccountRecord {
     /// `SHA256(salt + password)` 的十六进制串。
     pub password_hash: String,
     pub created_at: String,
-}
-
-impl Default for AccountRecord {
-    fn default() -> Self {
-        Self {
-            email: String::new(),
-            salt: String::new(),
-            password_hash: String::new(),
-            created_at: String::new(),
-        }
-    }
 }
 
 /// 账号文件整体结构（桌面层读写 JSON）。
@@ -113,7 +102,11 @@ pub fn validate_email(email: &str) -> Result<(), AccountError> {
             && !domain.ends_with('.')
             && !email.contains(char::is_whitespace)
     };
-    if ok { Ok(()) } else { Err(AccountError::InvalidEmail) }
+    if ok {
+        Ok(())
+    } else {
+        Err(AccountError::InvalidEmail)
+    }
 }
 
 /// 密码规则：≥8 位且同时含字母与数字（与竞品一致）。
@@ -121,7 +114,11 @@ pub fn validate_password(password: &str) -> Result<(), AccountError> {
     let ok = password.len() >= 8
         && password.chars().any(|c| c.is_ascii_alphabetic())
         && password.chars().any(|c| c.is_ascii_digit());
-    if ok { Ok(()) } else { Err(AccountError::WeakPassword) }
+    if ok {
+        Ok(())
+    } else {
+        Err(AccountError::WeakPassword)
+    }
 }
 
 /// `SHA256(salt + password)` 的十六进制串。
@@ -300,13 +297,13 @@ mod tests {
     #[test]
     fn weak_and_invalid_inputs_rejected() {
         let mut store = fresh_store();
-        assert_eq!(validate_email("no-at-sign"), Err(AccountError::InvalidEmail));
+        assert_eq!(
+            validate_email("no-at-sign"),
+            Err(AccountError::InvalidEmail)
+        );
         assert_eq!(validate_email("a@b"), Err(AccountError::InvalidEmail));
         assert_eq!(validate_email("a b@c.d"), Err(AccountError::InvalidEmail));
-        assert_eq!(
-            validate_password("short1"),
-            Err(AccountError::WeakPassword)
-        );
+        assert_eq!(validate_password("short1"), Err(AccountError::WeakPassword));
         assert_eq!(
             validate_password("nodigitslong"),
             Err(AccountError::WeakPassword)

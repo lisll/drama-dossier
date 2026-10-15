@@ -12,9 +12,9 @@ use tauri::{AppHandle, Emitter, Manager};
 mod account;
 mod dossier;
 mod erase;
-mod paths;
 mod jianying;
 mod mount;
+mod paths;
 mod toolbox;
 
 #[derive(Debug, Serialize)]
@@ -234,8 +234,13 @@ fn generate_package(
     .map_err(|error| error.to_string())?;
 
     // 成功后记入本机生成流水（设置-账单页展示；失败不影响生成结果本身）。
-    mount::record_generation(&app, &drama.name, episodes.len(), Path::new(&result.package_dir))
-        .unwrap_or_else(|error| eprintln!("{error}"));
+    mount::record_generation(
+        &app,
+        &drama.name,
+        episodes.len(),
+        Path::new(&result.package_dir),
+    )
+    .unwrap_or_else(|error| eprintln!("{error}"));
     Ok(result)
 }
 

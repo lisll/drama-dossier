@@ -122,7 +122,10 @@ mod tests {
         let path = temp_path("corrupt");
         append_record(&path, &record("2026-10-14T10:00:00+08:00", "剧A")).unwrap();
         // 模拟断电产生的半行。
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         std::io::Write::write_all(&mut file, b"{\"ts\":\"2026-10-14T1").unwrap();
         drop(file);
         append_record(&path, &record("2026-10-14T12:00:00+08:00", "剧B")).unwrap();

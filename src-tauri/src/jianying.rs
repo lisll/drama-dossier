@@ -27,16 +27,25 @@ const DEFAULT_APP: &str = "/Applications/JianyingPro.app";
 const DEFAULT_DRAFT_DIR: &str = "Movies/JianyingPro/User Data/Projects/com.lveditor.draft";
 
 /// 从 Info.plist 文本中提取 `CFBundleShortVersionString` 的值（std only，不引 plist 库）。
+///
+/// 形如 `<key>CFBundleShortVersionString</key>\n<string>5.9.0</string>`：
+/// 找到键名后要**依次跳过两对标签**——`</key>` 与 `<string>`——才能取到值。
 fn version_from_plist(text: &str) -> Option<String> {
     let key = "CFBundleShortVersionString";
     let start = text.find(key)? + key.len();
     let rest = &text[start..];
-    let open = rest.find('<')?;
-    let close = rest[open..].find('>')? + open + 1;
-    let tail = &rest[close..];
-    let end = tail.find('<')?;
-    let value = tail[..end].trim();
+    let after_key = skip_tag(rest)?;
+    let after_value_open = skip_tag(after_key)?;
+    let end = after_value_open.find('<')?;
+    let value = after_value_open[..end].trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+/// 跳过文本中下一对 `<...>` 标签，返回其后剩余部分。
+fn skip_tag(text: &str) -> Option<&str> {
+    let open = text.find('<')?;
+    let close = text[open..].find('>')? + open + 1;
+    Some(&text[close..])
 }
 
 /// 探测剪映：设置里手动指定的目录优先，其次默认安装位置。
@@ -45,7 +54,6 @@ pub fn jianying_detect(app: AppHandle) -> Result<JianyingDetect, String> {
     let settings = read_settings(&app)?;
     let configured = settings
         .jianying_dir
-        .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_APP));
     let install_dir = if configured.exists() {
         configured
@@ -62,7 +70,6 @@ pub fn jianying_detect(app: AppHandle) -> Result<JianyingDetect, String> {
 
     let draft_dir = settings
         .jianying_draft_dir
-        .map(PathBuf::from)
         .unwrap_or_else(default_draft_dir);
     let draft_dir_exists = draft_dir.is_dir();
 

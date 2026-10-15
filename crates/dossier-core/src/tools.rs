@@ -235,6 +235,7 @@ pub struct MountCsvCheck {
 /// - 必填列「集号」「文案」；
 /// - 每行集号必须是数字、落在剧目分集内且不重复；
 /// - 文案非空。
+///
 /// 与其他纯逻辑一致：只做校验，不写文件。
 pub fn validate_mount_csv(content: &str, episode_numbers: &[u32]) -> MountCsvCheck {
     let mut issues = Vec::new();
@@ -248,7 +249,12 @@ pub fn validate_mount_csv(content: &str, episode_numbers: &[u32]) -> MountCsvChe
 
     let header: Vec<String> = lines
         .first()
-        .map(|line| split_csv_line(line).iter().map(|c| c.trim().to_string()).collect())
+        .map(|line| {
+            split_csv_line(line)
+                .iter()
+                .map(|c| c.trim().to_string())
+                .collect()
+        })
         .unwrap_or_default();
 
     let idx_of = |name: &str| header.iter().position(|c| c == name);
@@ -544,8 +550,14 @@ mod tests {
     fn mount_csv_flags_missing_columns() {
         let check = validate_mount_csv("编号,内容\n1,文案\n", &[1]);
         assert!(!check.ok);
-        assert!(check.issues.iter().any(|i| i.row == 0 && i.message.contains("集号")));
-        assert!(check.issues.iter().any(|i| i.row == 0 && i.message.contains("文案")));
+        assert!(check
+            .issues
+            .iter()
+            .any(|i| i.row == 0 && i.message.contains("集号")));
+        assert!(check
+            .issues
+            .iter()
+            .any(|i| i.row == 0 && i.message.contains("文案")));
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! 云端版落地时：替换本文件内的读写为 HTTP 调用，core 的函数签名保持不变。
 
 use dossier_core::{
-    change_password, login, logout, register, status, AccountError, AccountStore, AccountStatus,
+    change_password, login, logout, register, status, AccountError, AccountStatus, AccountStore,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
@@ -24,8 +24,7 @@ fn read_store(app: &AppHandle) -> Result<AccountStore, String> {
     if !path.exists() {
         return Ok(AccountStore::default());
     }
-    let bytes = std::fs::read(&path)
-        .map_err(|error| format!("读取账号文件失败：{error}"))?;
+    let bytes = std::fs::read(&path).map_err(|error| format!("读取账号文件失败：{error}"))?;
     serde_json::from_slice::<AccountStore>(&bytes)
         .map_err(|error| format!("账号文件损坏（{}）：{error}", path.display()))
 }
@@ -92,7 +91,11 @@ pub fn account_register(app: AppHandle, args: RegisterArgs) -> Result<AccountPay
 }
 
 #[tauri::command]
-pub fn account_login(app: AppHandle, email: String, password: String) -> Result<AccountPayload, String> {
+pub fn account_login(
+    app: AppHandle,
+    email: String,
+    password: String,
+) -> Result<AccountPayload, String> {
     let mut store = read_store(&app)?;
     flatten(login(&mut store, &email, &password))?;
     write_store(&app, &store)?;
