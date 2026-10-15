@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+#
+# 只跑与本次暂存改动相关的检查，避免文档改动被 Rust 编译卡住。
+# 推送前的全量检查在 pre-push，与 CI 一致。
+
+set -uo pipefail
+
+if [ "${SKIP_CHECKS:-}" = "1" ]; then
+  echo "pre-commit: SKIP_CHECKS=1，跳过质量门槛。"
+  exit 0
+fi
+
+root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+staged=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null) || exit 0
+[ -n "$staged" ] || exit 0
+
+args=""
+printf '%s\n' "$staged" | grep -qE '\.rs$' && args="$args --rust"
+printf '%s\n' "$staged" | grep -qE '\.toml$' && args="$args --rust"
+printf '%s\n' "$staged" | grep -qE '^src/.*\.js$' && args="$args --web"
+printf '%s\n' "$staged" | grep -qE '\.json$' && args="$args --json"
+[ -n "$args" ] || exit 0
+
+# shellcheck disable=SC2086
+exec "$root/scripts/check.sh" --fast $args

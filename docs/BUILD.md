@@ -10,6 +10,20 @@ cargo tauri dev
 cargo tauri build
 ```
 
+**Linux 系统依赖**（与 CI 一致，缺了会在编译 `src-tauri` 时失败，而不是 lint 报错）：
+
+```bash
+sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+  libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev ffmpeg
+```
+
+提交前可一键跑与 CI 等价的门槛，并建议启用仓库自带的 Git hooks：
+
+```bash
+scripts/check.sh            # 全量：fmt + clippy + test + JSON + node --check
+scripts/install-hooks.sh    # 启用 .githooks（pre-commit 快检 / pre-push 全量）
+```
+
 前端是静态 HTML/CSS/JS，由 Tauri 直接打包；没有网页服务器和浏览器入口。`src/main.js` 只能在桌面 WebView 中调用 `window.__TAURI__.core.invoke`。
 
 ## 构建矩阵

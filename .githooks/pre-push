@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+#
+# 推送前跑与 CI 完全一致的全量门槛，避免把红着的 commit 推上去。
+
+set -uo pipefail
+
+if [ "${SKIP_CHECKS:-}" = "1" ]; then
+  echo "pre-push: SKIP_CHECKS=1，跳过质量门槛。"
+  exit 0
+fi
+
+root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+exec "$root/scripts/check.sh"

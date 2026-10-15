@@ -111,11 +111,23 @@ fn load_app_settings(app: AppHandle) -> Result<SettingsPayload, String> {
 #[tauri::command]
 fn save_app_settings(app: AppHandle, settings: AppSettings) -> Result<String, String> {
     // 测试期关键日志：设置保存直接影响「默认输出目录」「一键安装路径」等链路。
-    logging::log_event("设置", format!("保存：输出目录={}，含规则覆盖={}，剪映目录={}",
-        settings.output_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "留空".into()),
-        settings.rules.is_some(),
-        settings.jianying_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "自动探测".into()),
-    ));
+    logging::log_event(
+        "设置",
+        format!(
+            "保存：输出目录={}，含规则覆盖={}，剪映目录={}",
+            settings
+                .output_dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "留空".into()),
+            settings.rules.is_some(),
+            settings
+                .jianying_dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "自动探测".into()),
+        ),
+    );
     if let Some(rules) = &settings.rules {
         rules.validate()?;
     }

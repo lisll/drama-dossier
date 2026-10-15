@@ -121,7 +121,11 @@ pub fn account_login(
     result
 }
 
-fn account_login_inner(app: &AppHandle, email: &str, password: &str) -> Result<AccountPayload, String> {
+fn account_login_inner(
+    app: &AppHandle,
+    email: &str,
+    password: &str,
+) -> Result<AccountPayload, String> {
     let mut store = read_store(app)?;
     flatten(login(&mut store, email, password))?;
     write_store(app, &store)?;

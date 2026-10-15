@@ -572,6 +572,24 @@ cargo test
 cargo tauri build
 ```
 
+上面这一串等价于一条命令（与 CI 的 Format / Clippy / Test 三步一一对应）：
+
+```bash
+scripts/check.sh            # 全量，等同于 CI
+scripts/check.sh --fast     # 跳过 cargo test
+```
+
+建议启用仓库自带的 Git hooks，把「推上去才发现 CI 红」挡在本地：
+
+```bash
+scripts/install-hooks.sh    # 设置 core.hooksPath=.githooks，只影响本仓库
+```
+
+`pre-commit` 只跑本次改动涉及的部分（Rust 改动跑 fmt/clippy，JS 改动跑 `node --check`，
+JSON 改动做格式校验），`pre-push` 跑与 CI 一致的全量检查。急用时可临时
+`SKIP_CHECKS=1 git commit`。Linux 缺少 `webkit2gtk-4.1` / `libsoup-3.0` 时
+脚本会明确跳过 clippy/test 而不是报假失败（依赖见 [`docs/BUILD.md`](docs/BUILD.md)）。
+
 ### 代码风格
 
 - 领域模型使用 Serde 的 camelCase JSON 表示；
@@ -786,7 +804,7 @@ DramaDossier 使用 `ffprobe` 读取媒体元数据。应用本身不解析视�
 1. 阅读 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)；
 2. 保持模块边界清晰；
 3. 补充必要测试；
-4. 运行完整质量门槛；
+4. 运行完整质量门槛（`scripts/check.sh`，或启用 `scripts/install-hooks.sh` 后由 hook 代跑）；
 5. 说明对数据和兼容性的影响。
 
 文档类 PR 也欢迎，包括平台差异、报审实践、构建排错和术语校对。

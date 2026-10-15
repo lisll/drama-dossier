@@ -60,9 +60,7 @@ pub fn mount_plan_save(
     let result = mount_plan_save_inner(&app, root, drama_name);
     crate::logging::log_event(
         "挂载",
-        crate::logging::result_text(&result, |plan| {
-            format!("计划已保存：{}", plan.csv_path)
-        }),
+        crate::logging::result_text(&result, |plan| format!("计划已保存：{}", plan.csv_path)),
     );
     result
 }
@@ -80,7 +78,7 @@ fn mount_plan_save_inner(
         csv_path: csv.display().to_string(),
         saved_at: now_timestamp(),
     };
-    let path = plan_path(&app)?;
+    let path = plan_path(app)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| format!("创建数据目录失败：{error}"))?;
     }
@@ -124,7 +122,10 @@ pub fn mount_csv_template(
 /// 挂载校验结果摘要（成功 / 问题数复用给模板 / 保存 / 校验三处日志）。
 fn csv_check_text(payload: &MountCsvCheckPayload, prefix: &str) -> String {
     if payload.check.ok {
-        format!("{prefix}：{}（校验通过，{} 行）", payload.csv_path, payload.check.rows)
+        format!(
+            "{prefix}：{}（校验通过，{} 行）",
+            payload.csv_path, payload.check.rows
+        )
     } else {
         format!(
             "{prefix}：{}（{} 处问题）",
@@ -172,7 +173,10 @@ pub fn mount_csv_save(
     drama_name: String,
     content: String,
 ) -> Result<MountCsvCheckPayload, String> {
-    crate::logging::log_event("挂载", format!("保存文案：{drama_name}（{} 字符）", content.chars().count()));
+    crate::logging::log_event(
+        "挂载",
+        format!("保存文案：{drama_name}（{} 字符）", content.chars().count()),
+    );
     let result = mount_csv_save_inner(&root, &drama_name, &content);
     crate::logging::log_event(
         "挂载",
