@@ -1,0 +1,42 @@
+# Windows 安装包构建：在 GitHub 的 windows-latest 云端编译（Tauri 不支持从 macOS
+# 交叉编译 Windows 包，本地 Mac 只能出 DMG）。手动触发，或推送 v* 标签时自动构建。
+# 产物在 Actions 运行页底部 Artifacts 下载：DramaDossier_x.y.z_x64-setup.exe（NSIS 安装器）。
+name: Build Windows
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      # 按 Cargo.lock 缓存编译产物；整个仓库是一个 cargo workspace（crates/ + src-tauri/）。
+      - name: 缓存编译产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+
+      - name: 安装 tauri-cli
+        shell: bash
+        run: cargo install tauri-cli --locked
+
+      - name: 构建 NSIS 安装包
+        shell: bash
+        run: cargo tauri build
+
+      - name: 上传安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: DramaDossier-windows-installer
+          path: |
+            target/release/bundle/nsis/*.exe
+          if-no-files-found: error
