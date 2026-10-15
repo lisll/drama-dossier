@@ -1,4 +1,4 @@
-"""账号业务：发验证码、注册、登录、刷新令牌、退出、重设密码、修改密码。
+"""账号业务：发验证码、注册、登录、刷新令牌、退出、重设密码、修改密码、导出个人数据、注销。
 
 时间判断一律用数据库的 now()，不依赖应用服务器的时钟。
 """
@@ -13,10 +13,11 @@ from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 from psycopg import errors as pg_errors
 
-from . import codes, sessions
+from . import codes, entitlements, sessions
 from .config import CommerceSettings
 from .db import audit
 from .errors import CommerceError, unauthorized
+from .license_service import device_code
 from .mailer import MailError, Mailer
 from .sessions import AuthContext
 
@@ -210,6 +211,130 @@ class AccountService:
             )
             revoked = sessions.revoke_all(conn, ctx.user_id, "password_changed", keep_session=ctx.session_id)
             audit(conn, ctx.user_id, "user.password_change", ctx.user_id, {"revoked_sessions": revoked})
+
+    # ---------- 个人数据：导出与注销 ----------
+
+    def export(self, conn, ctx: AuthContext) -> dict:
+        """导出这个账号的个人数据。不含任何摘要、令牌和密码哈希（IP 本来就不存）。"""
+        with conn.transaction():
+            # 同一个事务里读，各部分看到的是同一时刻的数据。
+            user = conn.execute(
+                "SELECT id, email, created_at, terms_version, terms_accepted_at, now() AS exported_at"
+                " FROM users WHERE id = %s::uuid AND deleted_at IS NULL",
+                (ctx.user_id,),
+            ).fetchone()
+            if user is None:
+                raise unauthorized()
+            devices = conn.execute(
+                "SELECT device_id, name, platform, app_version, bound_at, last_seen_at, unbound_at, unbind_reason"
+                " FROM devices WHERE user_id = %s::uuid ORDER BY bound_at",
+                (ctx.user_id,),
+            ).fetchall()
+            redemptions = conn.execute(
+                "SELECT b.kind, b.days, c.redeemed_at FROM cards c JOIN card_batches b ON b.id = c.batch_id"
+                " WHERE c.redeemed_by = %s::uuid ORDER BY c.redeemed_at",
+                (ctx.user_id,),
+            ).fetchall()
+            session_rows = conn.execute(
+                "SELECT created_at, expires_at, revoked_at, revoke_reason FROM sessions"
+                " WHERE user_id = %s::uuid ORDER BY created_at",
+                (ctx.user_id,),
+            ).fetchall()
+            audit_rows = conn.execute(
+                "SELECT at, action, subject, detail FROM audit_log WHERE actor = %s ORDER BY at, id",
+                (ctx.user_id,),
+            ).fetchall()
+            entitlement = entitlements.current(conn, ctx.user_id).view()
+        return {
+            "format": EXPORT_FORMAT,
+            "exported_at": _iso(user["exported_at"]),
+            "account": {
+                "id": str(user["id"]),
+                "email": user["email"],
+                "created_at": _iso(user["created_at"]),
+                "terms_version": user["terms_version"],
+                "terms_accepted_at": _iso(user["terms_accepted_at"]),
+            },
+            "entitlement": entitlement,
+            "devices": [
+                {
+                    # 只给 4 位一组的展示形式，不给机器码摘要本身。
+                    "code": device_code(row["device_id"]),
+                    "name": row["name"],
+                    "platform": row["platform"],
+                    "app_version": row["app_version"],
+                    "bound_at": _iso(row["bound_at"]),
+                    "last_seen_at": _iso(row["last_seen_at"]),
+                    "unbound_at": _iso(row["unbound_at"]),
+                    "unbind_reason": row["unbind_reason"],
+                }
+                for row in devices
+            ],
+            "redemptions": [
+                {"kind": row["kind"], "days": row["days"], "redeemed_at": _iso(row["redeemed_at"])}
+                for row in redemptions
+            ],
+            "sessions": [
+                {
+                    "created_at": _iso(row["created_at"]),
+                    "expires_at": _iso(row["expires_at"]),
+                    "revoked_at": _iso(row["revoked_at"]),
+                    "revoke_reason": row["revoke_reason"],
+                }
+                for row in session_rows
+            ],
+            "audit_log": [
+                {"at": _iso(row["at"]), "action": row["action"], "subject": row["subject"], "detail": row["detail"]}
+                for row in audit_rows
+            ],
+        }
+
+    def delete_account(self, conn, ctx: AuthContext, password: str) -> None:
+        """注销账号：立即匿名化，不可撤销。
+
+        清空邮箱和密码哈希、记下注销时间；删除会话（令牌随之级联删除）、使用权、设备绑定、
+        这个邮箱的验证码。用户行本身保留：兑换过的卡仍然指向它，不会被别人再兑换一次；
+        审计日志只记 ID，邮箱删掉以后对不上具体的人。
+        """
+        with conn.transaction():
+            # 先锁住用户行再校验密码：校验和注销之间，密码不会被别的请求改掉；
+            # 同一账号同时来两个注销请求，后一个等前一个提交后读到 deleted_at，按未登录处理。
+            row = conn.execute(
+                "SELECT email, password_hash FROM users WHERE id = %s::uuid AND deleted_at IS NULL FOR UPDATE",
+                (ctx.user_id,),
+            ).fetchone()
+            if row is None:
+                raise unauthorized()
+            if not self._verify(row["password_hash"], password):
+                raise CommerceError(400, "wrong_password", "密码不正确")
+            counts = {
+                # 先删设备再删会话：设备上的 session_id 是 ON DELETE SET NULL，顺序反过来会多做一轮更新。
+                "devices": conn.execute(
+                    "DELETE FROM devices WHERE user_id = %s::uuid", (ctx.user_id,)
+                ).rowcount,
+                "sessions": conn.execute(
+                    "DELETE FROM sessions WHERE user_id = %s::uuid", (ctx.user_id,)
+                ).rowcount,
+                "entitlements": conn.execute(
+                    "DELETE FROM entitlements WHERE user_id = %s::uuid", (ctx.user_id,)
+                ).rowcount,
+                "email_codes": conn.execute(
+                    "DELETE FROM email_codes WHERE email = %s", (row["email"],)
+                ).rowcount,
+            }
+            conn.execute(
+                "UPDATE users SET email = NULL, password_hash = NULL, deleted_at = now() WHERE id = %s::uuid",
+                (ctx.user_id,),
+            )
+            audit(conn, ctx.user_id, "user.delete", ctx.user_id, counts)
+
+
+#: 导出文件的格式版本；字段有不兼容的变化时加 1。
+EXPORT_FORMAT = "drama-dossier/account-export/v1"
+
+
+def _iso(value) -> Optional[str]:
+    return value.isoformat() if value is not None else None
 
 
 def purge_expired(conn) -> dict:

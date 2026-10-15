@@ -76,6 +76,8 @@ export DRAMA_COMMERCE_LICENSE_KEY_FILE="$HOME/.config/drama-commerce/license-dev
 | POST | `/auth/password/reset` | 无 | `email`、`code`、`new_password` | 204，吊销该账号全部会话 |
 | POST | `/auth/password/change` | Bearer | `current_password`、`new_password` | 204，只保留当前会话 |
 | GET | `/me` | Bearer | — | 200 `{"user": {"id", "email", "created_at"}}` |
+| GET | `/me/export` | Bearer | — | 200，个人数据 JSON（见下） |
+| POST | `/me/delete` | Bearer | `password` | 204，立即注销并匿名化，不可撤销 |
 
 `tokens` 的结构：
 
@@ -87,6 +89,30 @@ export DRAMA_COMMERCE_LICENSE_KEY_FILE="$HOME/.config/drama-commerce/license-dev
 - 邮箱会去掉首尾空格并转成小写，只接受 ASCII 邮箱。密码 8..128 个字符；登录时不检查长度下限。
 - `accept_terms` 必须是 JSON 的 `true`，`"true"`、`1` 都不算。
 - 请求体里多出来的字段一律拒绝。
+
+导出（`/me/export`）的结构，`format` 是 `drama-dossier/account-export/v1`：
+
+| 字段 | 内容 |
+| --- | --- |
+| `account` | `id`、`email`、`created_at`、`terms_version`、`terms_accepted_at` |
+| `entitlement` | 同 `/me` 里的使用权 |
+| `devices` | 全部绑定记录，含已解绑的：`code`（4 位一组的展示形式）、`name`、`platform`、`app_version`、`bound_at`、`last_seen_at`、`unbound_at`、`unbind_reason` |
+| `redemptions` | 兑换记录：卡的 `kind`、`days`、`redeemed_at`，不含卡密 |
+| `sessions` | 登录会话：`created_at`、`expires_at`、`revoked_at`、`revoke_reason` |
+| `audit_log` | 本账号发起的操作：`at`、`action`、`subject`、`detail` |
+| `exported_at` | 导出时间（数据库时间） |
+
+导出里没有任何摘要、令牌、密码哈希；IP 本来就不存。
+
+注销（`/me/delete`）必须重新输入密码，在一个事务里完成：
+
+- 清空邮箱和密码哈希，记下 `deleted_at`；
+- 删除会话（访问令牌、刷新令牌随之删除）、使用权、全部设备绑定、这个邮箱的验证码；
+- 审计日志记一条 `user.delete`，只记各项删除的数量。
+
+用户行本身保留：兑换过的卡仍然指向它，不会被别人再兑换一次；审计日志只记账号 ID，邮箱删掉以后对不上具体的人。
+注销后同一个邮箱可以重新注册，得到的是一个全新的账号，拿不到旧账号的使用权。
+注销过的账号登录返回 `invalid_credentials`，重设密码返回 `email_not_registered`，和邮箱从没注册过一样。
 
 ### 3.2 卡密与授权
 
@@ -185,7 +211,7 @@ export DRAMA_COMMERCE_LICENSE_KEY_FILE="$HOME/.config/drama-commerce/license-dev
 | HTTP | `error` | 含义 |
 | --- | --- | --- |
 | 400 | `code_invalid` / `code_expired` / `code_exhausted` | 验证码不对 / 过期 / 输错 5 次已锁定（要重新获取） |
-| 400 | `wrong_password` | 修改密码时当前密码不对 |
+| 400 | `wrong_password` | 修改密码时当前密码不对；注销时密码不对 |
 | 401 | `invalid_credentials` | 邮箱或密码不正确（两种情况不区分） |
 | 401 | `unauthorized` | 没带令牌、令牌无效或已过期、会话已吊销（包括这台电脑被解绑） |
 | 403 | `device_not_bound` | 刷新凭证：这台电脑没绑定到当前账号，或已被解绑 |
@@ -224,6 +250,8 @@ export DRAMA_COMMERCE_LICENSE_KEY_FILE="$HOME/.config/drama-commerce/license-dev
   | 登录 | 每 IP 每 10 分钟 30 次；每邮箱每 10 分钟 10 次 |
   | 重设密码 | 每 IP 每小时 20 次 |
   | 修改密码 | 每账号每小时 10 次 |
+  | 注销账号 | 每账号每小时 5 次（要校验密码，限住次数，偷来的访问令牌也没法靠它猜密码） |
+  | 导出个人数据 | 每账号每小时 10 次 |
   | 兑换卡密 | 每 IP 每小时 60 次；每账号每小时 20 次 |
   | 绑定电脑 | 每账号每小时 20 次 |
   | 刷新凭证 | 每账号每小时 120 次 |
@@ -242,7 +270,7 @@ export DRAMA_COMMERCE_LICENSE_KEY_FILE="$HOME/.config/drama-commerce/license-dev
 - **机器码**：桌面端只上传摘要，接口也只收 64 位十六进制，服务端拿不到硬件原始信息。
   机器码是桌面端自己算的，改过的客户端可以冒用别的机器码，服务端分辨不出来：
   名额限制挡的是随手共享账号，挡不住有意破解；解绑次数上限和审计日志用来限制、发现「轮流换电脑」。
-- **审计日志**：注册、登录、退出、重设密码、修改密码、刷新令牌重放，以及生成和作废卡密批次、兑换卡密、
+- **审计日志**：注册、登录、退出、重设密码、修改密码、注销、刷新令牌重放，以及生成和作废卡密批次、兑换卡密、
   绑定和解绑电脑都会记录。只记 ID、计数、卡的类型和天数、电脑平台、使用权的前后变化，
   不记邮箱、令牌、验证码、卡密、授权凭证和 IP。
   卡密批次的操作人记 `--by`，没给就记当前系统用户名。

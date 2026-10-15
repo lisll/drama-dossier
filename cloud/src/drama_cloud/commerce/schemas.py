@@ -96,6 +96,11 @@ class ChangePasswordRequest(StrictModel):
     new_password: NewPassword
 
 
+class DeleteAccountRequest(StrictModel):
+    #: 注销前必须重新输入密码：被偷的访问令牌不能直接拿来注销账号。
+    password: AnyPassword
+
+
 # ---------- 卡密与授权 ----------
 
 #: 机器码：桌面端算出的 SHA-256 摘要，64 位小写十六进制。只认这一种写法，免得同一台电脑被当成两台。

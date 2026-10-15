@@ -181,12 +181,16 @@ def _iso(epoch: int) -> str:
     return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
 
 
+def device_code(device_id: str) -> str:
+    """给人看的机器码：机器码摘要的前 16 位，转大写、4 位一组。联系发卡方时报这个。"""
+    code = device_id[:16].upper()
+    return "-".join(code[index:index + 4] for index in range(0, 16, 4))
+
+
 def _device_view(row, current_device: Optional[str]) -> dict:
-    code = row["device_id"][:16].upper()
     return {
         "id": str(row["id"]),
-        # 给人看的机器码：机器码摘要的前 16 位，联系发卡方时报这个。
-        "code": "-".join(code[index:index + 4] for index in range(0, 16, 4)),
+        "code": device_code(row["device_id"]),
         "name": row["name"],
         "platform": row["platform"],
         "app_version": row["app_version"],

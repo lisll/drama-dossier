@@ -1,4 +1,4 @@
-"""账号接口：验证码、注册、登录、令牌刷新、退出、改密码、当前账号。"""
+"""账号接口：验证码、注册、登录、令牌刷新、退出、改密码、当前账号、导出个人数据、注销。"""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from .deps import client_key, email_key, get_conn, require_auth
 from .ratelimit import Rule
 from .schemas import (
     ChangePasswordRequest,
+    DeleteAccountRequest,
     LoginRequest,
     RefreshRequest,
     RegisterRequest,
@@ -25,6 +26,9 @@ LOGIN_PER_IP = Rule("login:ip", 30, 600)
 LOGIN_PER_EMAIL = Rule("login:email", 10, 600)
 RESET_PER_IP = Rule("reset:ip", 20, 3600)
 CHANGE_PASSWORD_PER_USER = Rule("change_password:user", 10, 3600)
+# 注销要校验密码：限住次数，拿着偷来的访问令牌也没法靠它猜密码。
+DELETE_PER_USER = Rule("delete_account:user", 5, 3600)
+EXPORT_PER_USER = Rule("export:user", 10, 3600)
 
 router = APIRouter(prefix="/api/v1")
 
@@ -88,3 +92,21 @@ def me(request: Request, ctx: AuthContext = Depends(require_auth), conn=Depends(
     body = _service(request).me(conn, ctx)
     body["entitlement"] = entitlements.current(conn, ctx.user_id).view()
     return body
+
+
+@router.get("/me/export")
+def export_me(request: Request, ctx: AuthContext = Depends(require_auth), conn=Depends(get_conn)):
+    ratelimit.hit(conn, EXPORT_PER_USER, ctx.user_id)
+    return _service(request).export(conn, ctx)
+
+
+@router.post("/me/delete", status_code=204)
+def delete_me(
+    payload: DeleteAccountRequest,
+    request: Request,
+    ctx: AuthContext = Depends(require_auth),
+    conn=Depends(get_conn),
+):
+    ratelimit.hit(conn, DELETE_PER_USER, ctx.user_id)
+    _service(request).delete_account(conn, ctx, payload.password)
+    return Response(status_code=204)
