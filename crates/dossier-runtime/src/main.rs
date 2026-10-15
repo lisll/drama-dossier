@@ -832,8 +832,13 @@ fn secret_store(root: Option<PathBuf>) -> Result<SecretStore, String> {
 }
 
 /// 默认 Python：优先 `python3.9`（本仓库实测可用的版本），退回 `python3`。
+/// Windows 的解释器名不同：官方安装器注册的是 `python`，`py` 是启动器兜底。
 fn default_python() -> String {
-    for candidate in ["python3.9", "python3"] {
+    #[cfg(windows)]
+    let candidates = ["python", "py"];
+    #[cfg(not(windows))]
+    let candidates = ["python3.9", "python3"];
+    for candidate in candidates {
         if let Ok(output) = std::process::Command::new(candidate)
             .arg("--version")
             .output()
@@ -843,7 +848,7 @@ fn default_python() -> String {
             }
         }
     }
-    "python3".to_string()
+    candidates[0].to_string()
 }
 
 fn default_platform() -> String {

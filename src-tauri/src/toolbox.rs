@@ -69,23 +69,25 @@ pub(crate) fn read_settings(app: &AppHandle) -> Result<dossier_core::AppSettings
 }
 
 /// ffmpeg 解析顺序：设置里显式路径 → 一键安装目录 → `PATH`。
+/// Windows 上文件名带 `.exe` 后缀。
 fn resolve_ffmpeg(app: &AppHandle) -> Result<PathBuf, String> {
     if let Some(path) = read_settings(app)?.ffmpeg_path {
         if path.is_file() {
             return Ok(path);
         }
     }
+    let exe_name = dossier_inpaint::erase::binary_name("ffmpeg");
     if let Ok(bin) = app_bin_dir(app) {
-        let candidate = bin.join("ffmpeg");
+        let candidate = bin.join(&exe_name);
         if candidate.is_file() {
             return Ok(candidate);
         }
     }
-    Ok(PathBuf::from("ffmpeg"))
+    Ok(PathBuf::from(exe_name))
 }
 
 /// ffprobe 解析顺序：界面显式提示（填了就用，错误让它自然暴露）→ 设置 → 一键安装目录 → `PATH`。
-/// GUI 进程 PATH 很干净，`Ok(PathBuf::from("ffprobe"))` 只是最后的兜底。
+/// GUI 进程 PATH 很干净，按名兜底只是最后的退路。Windows 上文件名带 `.exe` 后缀。
 pub(crate) fn resolve_ffprobe(app: &AppHandle, hint: Option<&str>) -> Result<PathBuf, String> {
     if let Some(hint) = hint.map(str::trim).filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(hint));
@@ -95,13 +97,14 @@ pub(crate) fn resolve_ffprobe(app: &AppHandle, hint: Option<&str>) -> Result<Pat
             return Ok(path);
         }
     }
+    let exe_name = dossier_inpaint::erase::binary_name("ffprobe");
     if let Ok(bin) = app_bin_dir(app) {
-        let candidate = bin.join("ffprobe");
+        let candidate = bin.join(&exe_name);
         if candidate.is_file() {
             return Ok(candidate);
         }
     }
-    Ok(PathBuf::from("ffprobe"))
+    Ok(PathBuf::from(exe_name))
 }
 
 // ---------------------------------------------------------------------------
@@ -115,7 +118,7 @@ pub struct RuntimeStatus {
     pub ffmpeg: ToolReport,
     pub ffprobe: ToolReport,
     pub python: ToolReport,
-    /// 运行环境自动安装只有 macOS 有可用下载源；其余平台前端据此隐藏入口，
+    /// 运行环境自动安装在 macOS / Windows 都有可用下载源；其余平台前端据此隐藏入口，
     /// 避免给出「点了必然报错」的按钮。
     pub install_supported: bool,
     /// 平台标识（macos / windows / linux），前端据此给出对应平台的手动安装指引。
@@ -158,12 +161,14 @@ fn runtime_status_inner(
     let ffmpeg = resolve_ffmpeg(app)?;
     let ffprobe = resolve_ffprobe(app, ffprobe_path)?;
     let runner = SystemRunner::new();
+    // Windows 的解释器名是 python（py 是启动器兜底），macOS/Linux 是 python3。
+    let python_program = if cfg!(windows) { "python" } else { "python3" };
     Ok(RuntimeStatus {
         // 只探解释器版本（秒级）；torch/onnxruntime 导入太慢，留给擦除页自查。
         ffmpeg: probe_tool(&runner, "ffmpeg", &ffmpeg, &["-hide_banner", "-version"]),
         ffprobe: probe_tool(&runner, "ffprobe", &ffprobe, &["-hide_banner", "-version"]),
-        python: probe_tool(&runner, "python", Path::new("python3"), &["--version"]),
-        install_supported: cfg!(target_os = "macos"),
+        python: probe_tool(&runner, "python", Path::new(python_program), &["--version"]),
+        install_supported: cfg!(any(target_os = "macos", target_os = "windows")),
         platform: std::env::consts::OS.to_string(),
     })
 }
@@ -1027,6 +1032,13 @@ pub async fn transcode_execute(
 // 一键安装运行环境
 // ---------------------------------------------------------------------------
 
+/// 平台 curl：macOS 的 GUI 进程 PATH 干净，必须绝对路径；Windows 10+ 系统自带
+/// `curl.exe`（System32），按名即可解析。
+#[cfg(target_os = "macos")]
+const CURL_PROGRAM: &str = "/usr/bin/curl";
+#[cfg(target_os = "windows")]
+const CURL_PROGRAM: &str = "curl";
+
 /// macOS 静态 ffmpeg 发行源：evermeet.cx。版本钉死保证可复现；
 /// 该站单连接限流（HTTP 429 / 带宽限速），因此**顺序**下载并交给 curl 重试。
 /// 注意：该站只提供 Intel（x86_64）构建（官方明确不提供 ARM 原生版），
@@ -1035,6 +1047,12 @@ pub async fn transcode_execute(
 const EVERMEET_FFMPEG_URL: &str = "https://evermeet.cx/ffmpeg/ffmpeg-9.0.2.zip";
 #[cfg(target_os = "macos")]
 const EVERMEET_FFPROBE_URL: &str = "https://evermeet.cx/ffmpeg/ffprobe-9.0.2.zip";
+
+/// Windows 发行源：gyan.dev 的 essentials 构建（官方推荐分发包），一个 zip 同时
+/// 含 ffmpeg.exe 与 ffprobe.exe，因此 Windows 只需下载一次。版本钉死保证可复现。
+#[cfg(target_os = "windows")]
+const GYAN_FFMPEG_URL: &str =
+    "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-7.1.1-essentials_build.zip";
 
 /// 一键安装结果。
 #[derive(Debug, Serialize)]
@@ -1046,14 +1064,13 @@ pub struct InstallRuntimeReport {
     pub note: String,
 }
 
-/// 用系统 curl 下载（macOS 自带，支持重试与断点续传）。
+/// 用系统 curl 下载（macOS / Windows 10+ 均自带，支持重试与断点续传）。
 /// 期间每 0.4 秒轮询一次落盘大小并上报 `install-progress`；
 /// 总大小先用 HEAD 请求探测 content-length，探测不到就只报已下载量。
-#[cfg(target_os = "macos")]
 fn download_file(app: &AppHandle, component: &str, url: &str, target: &Path) -> Result<(), String> {
     let total = probe_content_length(url);
     emit_install_progress(app, component, "connecting", "连接下载源", total, 0);
-    let mut command = std::process::Command::new("/usr/bin/curl");
+    let mut command = std::process::Command::new(CURL_PROGRAM);
     command
         .args([
             "-fL",
@@ -1113,9 +1130,8 @@ fn download_file(app: &AppHandle, component: &str, url: &str, target: &Path) -> 
 }
 
 /// HEAD 请求探测下载总大小；失败不影响安装，只是进度条没有百分比。
-#[cfg(target_os = "macos")]
 fn probe_content_length(url: &str) -> Option<u64> {
-    let spec = CommandSpec::new("/usr/bin/curl")
+    let spec = CommandSpec::new(CURL_PROGRAM)
         .arg("-sIL")
         .arg("--max-time")
         .arg("20")
@@ -1130,11 +1146,76 @@ fn probe_content_length(url: &str) -> Option<u64> {
     })
 }
 
+/// 把 zip 解压到 staging：macOS 用系统 unzip；Windows 用系统自带 bsdtar
+/// （`tar.exe` 能直接识别 zip 格式，Windows 10 1803+ 都有）。
+#[cfg(target_os = "macos")]
+fn extract_zip(zip_path: &Path, staging: &Path) -> Result<(), String> {
+    let spec = CommandSpec::new("/usr/bin/unzip")
+        .arg("-o")
+        .arg("-q")
+        .arg(zip_path.display().to_string())
+        .arg("-d")
+        .arg(staging.display().to_string());
+    run_extraction(&spec)
+}
+
+#[cfg(target_os = "windows")]
+fn extract_zip(zip_path: &Path, staging: &Path) -> Result<(), String> {
+    let spec = CommandSpec::new("tar")
+        .arg("-xf")
+        .arg(zip_path.display().to_string())
+        .arg("-C")
+        .arg(staging.display().to_string());
+    run_extraction(&spec)
+}
+
+/// 执行解压命令并把失败原因的第一行带回给界面。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn run_extraction(spec: &CommandSpec) -> Result<(), String> {
+    let runner = SystemRunner::new();
+    let output = runner
+        .run(spec)
+        .map_err(|error| format!("解压器启动失败：{error}"))?;
+    if output.success() {
+        return Ok(());
+    }
+    let detail = output.combined();
+    let first = detail
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("（无输出）");
+    Err(format!("解压失败（{}）：{first}", output.code_label()))
+}
+
+/// 在解压目录里找目标可执行文件：macOS 的 zip 是平铺的；gyan 的 zip 多套一层
+/// 版本目录（`ffmpeg-x.y.z-essentials_build/bin/ffmpeg.exe`），所以要向下找几层。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn find_extracted(dir: &Path, file_name: &str, depth: u8) -> Option<PathBuf> {
+    let direct = dir.join(file_name);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    if depth == 0 {
+        return None;
+    }
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_extracted(&path, file_name, depth - 1) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
 /// 安装单个工具：下载 zip → 解压到临时目录 → 授权 → 移到目标位置。
 /// 返回 `Ok(true)` 表示目标已存在、本次跳过。
-#[cfg(target_os = "macos")]
 fn install_one(app: &AppHandle, bin_dir: &Path, name: &str, url: &str) -> Result<bool, String> {
-    let target = bin_dir.join(name);
+    let exe_name = dossier_inpaint::erase::binary_name(name);
+    let target = bin_dir.join(&exe_name);
     if target.is_file() {
         emit_install_progress(app, name, "finished", "已存在，跳过", Some(0), 0);
         return Ok(true);
@@ -1146,29 +1227,9 @@ fn install_one(app: &AppHandle, bin_dir: &Path, name: &str, url: &str) -> Result
         download_file(app, name, url, &zip_path)?;
         emit_install_progress(app, name, "extracting", "解压中", None, 0);
         std::fs::create_dir_all(&staging).map_err(|error| format!("创建解压目录失败：{error}"))?;
-        let spec = CommandSpec::new("/usr/bin/unzip")
-            .arg("-o")
-            .arg("-q")
-            .arg(zip_path.display().to_string())
-            .arg("-d")
-            .arg(staging.display().to_string());
-        let runner = SystemRunner::new();
-        let output = runner
-            .run(&spec)
-            .map_err(|error| format!("unzip 启动失败：{error}"))?;
-        if !output.success() {
-            let detail = output.combined();
-            let first = detail
-                .lines()
-                .map(str::trim)
-                .find(|line| !line.is_empty())
-                .unwrap_or("（无输出）");
-            return Err(format!("解压失败（{}）：{first}", output.code_label()));
-        }
-        let extracted = staging.join(name);
-        if !extracted.is_file() {
-            return Err(format!("压缩包里没有找到 {name} 可执行文件"));
-        }
+        extract_zip(&zip_path, &staging)?;
+        let extracted = find_extracted(&staging, &exe_name, 3)
+            .ok_or_else(|| format!("压缩包里没有找到 {exe_name} 可执行文件"))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1183,6 +1244,59 @@ fn install_one(app: &AppHandle, bin_dir: &Path, name: &str, url: &str) -> Result
     let _ = std::fs::remove_dir_all(&staging);
     let _ = std::fs::remove_file(&zip_path);
     result.map(|_| false)
+}
+
+/// 安装后自检：把「下载成功但跑不起来」拦在报告给用户之前。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn self_check_installed(app: &AppHandle, ffmpeg_path: &Path) -> Result<(), String> {
+    emit_install_progress(app, "自检", "verifying", "检查安装结果", None, 0);
+    let runner = SystemRunner::new();
+    let report = probe_tool(
+        &runner,
+        "ffmpeg",
+        ffmpeg_path,
+        &["-hide_banner", "-version"],
+    );
+    if report.ok {
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    if report.detail.contains("Bad CPU type") {
+        return Err("安装完成但自检失败：CPU 架构不匹配（下载的是 Intel 版，需要 Rosetta 2）。请先在终端执行「softwareupdate --install-rosetta --agree-to-license」安装 Rosetta，再重新点击一键配置。".into());
+    }
+    Err(format!("安装完成但自检失败：{}", report.detail))
+}
+
+/// 把工具路径写回设置：只在用户没有显式配置（或配置失效）时写入，避免覆盖手工配置。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn persist_tool_paths(
+    app: &AppHandle,
+    ffmpeg_path: &Path,
+    ffprobe_path: &Path,
+) -> Result<(), String> {
+    let settings_path = crate::settings_path(app)?;
+    let mut settings = load_settings(&settings_path).settings;
+    let needs_ffmpeg = settings
+        .ffmpeg_path
+        .as_ref()
+        .map(|path| !path.is_file())
+        .unwrap_or(true);
+    let needs_ffprobe = settings
+        .ffprobe_path
+        .as_ref()
+        .map(|path| !path.is_file())
+        .unwrap_or(true);
+    if needs_ffmpeg {
+        settings.ffmpeg_path = Some(ffmpeg_path.to_path_buf());
+    }
+    if needs_ffprobe {
+        settings.ffprobe_path = Some(ffprobe_path.to_path_buf());
+    }
+    if needs_ffmpeg || needs_ffprobe {
+        dossier_core::save_settings(&settings_path, &settings)
+            .map_err(|error| format!("写入设置失败：{error}"))?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -1201,49 +1315,8 @@ fn install_runtime_blocking(app: &AppHandle) -> Result<InstallRuntimeReport, Str
     let ffmpeg_path = bin_dir.join("ffmpeg");
     let ffprobe_path = bin_dir.join("ffprobe");
 
-    // 安装后自检，把「下载成功但跑不起来」拦在报告给用户之前。
-    emit_install_progress(app, "自检", "verifying", "检查安装结果", None, 0);
-    {
-        let runner = SystemRunner::new();
-        let report = probe_tool(
-            &runner,
-            "ffmpeg",
-            &ffmpeg_path,
-            &["-hide_banner", "-version"],
-        );
-        if !report.ok {
-            if report.detail.contains("Bad CPU type") {
-                return Err("安装完成但自检失败：CPU 架构不匹配（下载的是 Intel 版，需要 Rosetta 2）。请先在终端执行「softwareupdate --install-rosetta --agree-to-license」安装 Rosetta，再重新点击一键配置。".into());
-            }
-            return Err(format!("安装完成但自检失败：{}", report.detail));
-        }
-    }
-
-    // 写回设置：只在用户没有显式配置（或配置失效）时写入，避免覆盖手工配置。
-    let settings_path = crate::settings_path(app)?;
-    let mut settings = load_settings(&settings_path).settings;
-    let needs_ffmpeg = settings
-        .ffmpeg_path
-        .as_ref()
-        .map(|path| !path.is_file())
-        .unwrap_or(true);
-    let needs_ffprobe = settings
-        .ffprobe_path
-        .as_ref()
-        .map(|path| !path.is_file())
-        .unwrap_or(true);
-    if needs_ffmpeg {
-        settings.ffmpeg_path = Some(ffmpeg_path.clone());
-    }
-    if needs_ffprobe {
-        settings.ffprobe_path = Some(ffprobe_path.clone());
-    }
-    if needs_ffmpeg || needs_ffprobe {
-        // 全限定调用而不是顶部导入：这行只在 macOS 分支编译，导入在
-        // Linux/Windows 上会成为未使用项，被 CI 的 -D warnings 拦下。
-        dossier_core::save_settings(&settings_path, &settings)
-            .map_err(|error| format!("写入设置失败：{error}"))?;
-    }
+    self_check_installed(app, &ffmpeg_path)?;
+    persist_tool_paths(app, &ffmpeg_path, &ffprobe_path)?;
 
     Ok(InstallRuntimeReport {
         ffmpeg_path: ffmpeg_path.display().to_string(),
@@ -1253,9 +1326,61 @@ fn install_runtime_blocking(app: &AppHandle) -> Result<InstallRuntimeReport, Str
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Windows：gyan.dev 的合包 zip 同时含 ffmpeg.exe / ffprobe.exe，下载一次装两个；
+/// 目标都齐了就不再动网络，直接走自检收尾。
+#[cfg(target_os = "windows")]
+fn install_runtime_blocking(app: &AppHandle) -> Result<InstallRuntimeReport, String> {
+    let bin_dir = app_bin_dir(app)?;
+    std::fs::create_dir_all(&bin_dir).map_err(|error| format!("创建运行环境目录失败：{error}"))?;
+
+    let ffmpeg_path = bin_dir.join("ffmpeg.exe");
+    let ffprobe_path = bin_dir.join("ffprobe.exe");
+    let mut skipped_existing = Vec::new();
+
+    if ffmpeg_path.is_file() && ffprobe_path.is_file() {
+        skipped_existing.push("ffmpeg".into());
+        skipped_existing.push("ffprobe".into());
+    } else {
+        let zip_path = bin_dir.join("ffmpeg.download.zip");
+        let staging = bin_dir.join("ffmpeg.staging");
+        let _ = std::fs::remove_dir_all(&staging);
+        let result = (|| -> Result<(), String> {
+            download_file(app, "ffmpeg", GYAN_FFMPEG_URL, &zip_path)?;
+            emit_install_progress(app, "ffmpeg", "extracting", "解压中", None, 0);
+            std::fs::create_dir_all(&staging)
+                .map_err(|error| format!("创建解压目录失败：{error}"))?;
+            extract_zip(&zip_path, &staging)?;
+            for (file_name, target) in
+                [("ffmpeg.exe", &ffmpeg_path), ("ffprobe.exe", &ffprobe_path)]
+            {
+                let extracted = find_extracted(&staging, file_name, 3)
+                    .ok_or_else(|| format!("压缩包里没有找到 {file_name}"))?;
+                std::fs::rename(&extracted, target)
+                    .map_err(|error| format!("安装 {file_name} 失败：{error}"))?;
+            }
+            emit_install_progress(app, "ffmpeg", "finished", "完成", Some(0), 0);
+            emit_install_progress(app, "ffprobe", "finished", "完成", Some(0), 0);
+            Ok(())
+        })();
+        let _ = std::fs::remove_dir_all(&staging);
+        let _ = std::fs::remove_file(&zip_path);
+        result?;
+    }
+
+    self_check_installed(app, &ffmpeg_path)?;
+    persist_tool_paths(app, &ffmpeg_path, &ffprobe_path)?;
+
+    Ok(InstallRuntimeReport {
+        ffmpeg_path: ffmpeg_path.display().to_string(),
+        ffprobe_path: ffprobe_path.display().to_string(),
+        skipped_existing,
+        note: format!("运行环境已就绪（安装目录：{}）", bin_dir.display()),
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn install_runtime_blocking(_app: &AppHandle) -> Result<InstallRuntimeReport, String> {
-    Err("运行环境自动安装目前仅支持 macOS；请手动安装 ffmpeg（含 ffprobe）。".to_string())
+    Err("运行环境自动安装目前仅支持 macOS / Windows；请手动安装 ffmpeg（含 ffprobe）。".to_string())
 }
 
 #[tauri::command]

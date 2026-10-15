@@ -321,7 +321,10 @@ pub fn resolve_tool(explicit: Option<&Path>, repo_root: Option<&Path>) -> Result
     }
     if let Some(root) = repo_root {
         for profile in ["release", "debug"] {
-            let candidate = root.join("target").join(profile).join("dossier-inpaint");
+            let candidate = root
+                .join("target")
+                .join(profile)
+                .join(binary_name("dossier-inpaint"));
             if candidate.is_file() {
                 return Ok(candidate);
             }
@@ -334,12 +337,29 @@ pub fn resolve_tool(explicit: Option<&Path>, repo_root: Option<&Path>) -> Result
     )
 }
 
+/// 平台可执行文件名：Windows 上带 `.exe` 后缀，其余平台原样。
+pub fn binary_name(base: &str) -> String {
+    if cfg!(windows) {
+        format!("{base}.exe")
+    } else {
+        base.to_string()
+    }
+}
+
 fn search_path(binary: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
+    let candidates: Vec<String> = if cfg!(windows) {
+        // Windows 的 PATHEXT 决定可执行后缀；常见顺序里 .exe 覆盖绝大多数场景。
+        vec![binary.to_string(), format!("{binary}.exe")]
+    } else {
+        vec![binary.to_string()]
+    };
     for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(binary);
-        if candidate.is_file() {
-            return Some(candidate);
+        for candidate in &candidates {
+            let full = dir.join(candidate);
+            if full.is_file() {
+                return Some(full);
+            }
         }
     }
     None

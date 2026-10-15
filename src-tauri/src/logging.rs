@@ -70,7 +70,9 @@ pub fn log_err<T>(op: &str, result: Result<T, String>) -> Result<T, String> {
     result
 }
 
-/// 家目录下的「文稿」（Finder 侧边栏可见，方便使用者取日志）。
+/// 家目录下的「文稿」（Finder / 资源管理器侧边栏可见，方便使用者取日志）。
+/// macOS/Linux 用 `HOME`；Windows 一般不设 `HOME`，用 `USERPROFILE`。
 fn home_documents() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| Path::new(&home).join("Documents"))
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(Path::new(&home).join("Documents"))
 }

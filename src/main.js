@@ -1783,11 +1783,8 @@ function renderRuntimeStatus(status) {
   renderRuntimeInstallEntry(status);
 }
 
-/** 非 macOS 没有可用下载源，按键必然失败，改为给出对应平台的手动安装指引。 */
+/** 没有「一键配置」的平台（现仅 Linux），按键必然失败，改为给出手动安装指引。 */
 function manualInstallHint(platform) {
-  if (platform === "windows") {
-    return "Windows 暂不支持一键配置：可执行「winget install Gyan.FFmpeg」，或从 https://www.gyan.dev/ffmpeg/builds/ 下载压缩包，解压后把其中的 bin 目录加入 PATH。";
-  }
   if (platform === "linux") {
     return "Linux 暂不支持一键配置：Debian/Ubuntu 执行「sudo apt install ffmpeg」，Fedora/RHEL 执行「sudo dnf install ffmpeg」。";
   }
