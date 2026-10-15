@@ -13,6 +13,7 @@ mod account;
 mod dossier;
 mod erase;
 mod jianying;
+mod logging;
 mod mount;
 mod paths;
 mod toolbox;
@@ -77,7 +78,23 @@ async fn pick_folder() -> Result<Option<String>, String> {
 #[tauri::command]
 fn scan_library(root: String) -> Result<Vec<Drama>, String> {
     let root = PathBuf::from(root);
-    dossier_core::scan_library(&root).map_err(|error| error.to_string())
+    logging::log_event("扫描", format!("开始：{}", root.display()));
+    let result = dossier_core::scan_library(&root).map_err(|error| error.to_string());
+    logging::log_event(
+        "扫描",
+        logging::result_text(&result, |dramas| {
+            format!(
+                "完成：{} 部剧（{}）",
+                dramas.len(),
+                dramas
+                    .iter()
+                    .map(|d| d.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("、")
+            )
+        }),
+    );
+    result
 }
 
 #[tauri::command]
@@ -92,12 +109,19 @@ fn load_app_settings(app: AppHandle) -> Result<SettingsPayload, String> {
 
 #[tauri::command]
 fn save_app_settings(app: AppHandle, settings: AppSettings) -> Result<String, String> {
+    // 测试期关键日志：设置保存直接影响「默认输出目录」「一键安装路径」等链路。
+    logging::log_event("设置", format!("保存：输出目录={}，含规则覆盖={}，剪映目录={}",
+        settings.output_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "留空".into()),
+        settings.rules.is_some(),
+        settings.jianying_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "自动探测".into()),
+    ));
     if let Some(rules) = &settings.rules {
         rules.validate()?;
     }
     let path = settings_path(&app)?;
     save_settings(&path, &settings)
         .map_err(|error| format!("保存设置失败（{}）：{error}", path.display()))?;
+    logging::log_event("设置", format!("已写入 {}", path.display()));
     Ok(path.display().to_string())
 }
 
@@ -174,9 +198,27 @@ fn analyze_drama(
     ffprobe_path: Option<String>,
     rules: Option<ChecklistRules>,
 ) -> Result<DramaAnalysis, String> {
-    analyze_drama_inner(root, name, ffprobe_path, rules, "analyze", |progress| {
+    logging::log_event("探测", format!("开始：{name}（根目录 {root}）"));
+    let result = analyze_drama_inner(root, name, ffprobe_path, rules, "analyze", |progress| {
         let _ = window.emit("probe-progress", progress);
-    })
+    });
+    logging::log_event(
+        "探测",
+        logging::result_text(&result, |analysis| {
+            let failed = analysis
+                .probes
+                .iter()
+                .filter(|probe| probe.error.is_some())
+                .count();
+            format!(
+                "完成：{} 集，检查 {} 项，探测失败 {} 集",
+                analysis.drama.episodes.len(),
+                analysis.checklist.items.len(),
+                failed
+            )
+        }),
+    );
+    result
 }
 
 #[tauri::command]
@@ -197,16 +239,28 @@ fn generate_package(
     rules: Option<ChecklistRules>,
 ) -> Result<PackageResult, String> {
     let root = PathBuf::from(root);
+    // 测试期关键日志：生成是最容易出问题的链路，入口参数与落点都要留痕。
+    logging::log_event(
+        "生成",
+        format!(
+            "开始：{name}（本次覆盖输出={:?}，默认产物根目录={:?}，复制分集={copy_episodes}）",
+            output_dir.as_deref().unwrap_or("留空"),
+            output_root.as_deref().unwrap_or("未设"),
+        ),
+    );
     // 生成前会重新探测（避免用过期规格），这一段同样要有进度，否则界面像卡死。
-    let analysis = analyze_drama_inner(
-        root.display().to_string(),
-        name,
-        ffprobe_path,
-        rules,
-        "generate",
-        |progress| {
-            let _ = window.emit("probe-progress", progress);
-        },
+    let analysis = logging::log_err(
+        "生成",
+        analyze_drama_inner(
+            root.display().to_string(),
+            name,
+            ffprobe_path,
+            rules,
+            "generate",
+            |progress| {
+                let _ = window.emit("probe-progress", progress);
+            },
+        ),
     )?;
     let drama = analysis.drama;
     let episodes: Vec<ProbedEpisode> = drama
@@ -234,15 +288,18 @@ fn generate_package(
         ai_generated,
     };
 
-    let result = generate_report_package(
-        &drama.name,
-        &drama.dir,
-        drama.cover.as_deref(),
-        drama.synopsis.as_deref(),
-        &episodes,
-        &opts,
-    )
-    .map_err(|error| error.to_string())?;
+    let result = logging::log_err(
+        "生成",
+        generate_report_package(
+            &drama.name,
+            &drama.dir,
+            drama.cover.as_deref(),
+            drama.synopsis.as_deref(),
+            &episodes,
+            &opts,
+        )
+        .map_err(|error| error.to_string()),
+    )?;
 
     // 成功后记入本机生成流水（设置-账单页展示；失败不影响生成结果本身）。
     mount::record_generation(
@@ -252,6 +309,14 @@ fn generate_package(
         Path::new(&result.package_dir),
     )
     .unwrap_or_else(|error| eprintln!("{error}"));
+    logging::log_event(
+        "生成",
+        format!(
+            "完成：{} 集，包目录 {}",
+            episodes.len(),
+            result.package_dir.display()
+        ),
+    );
     Ok(result)
 }
 
@@ -261,8 +326,30 @@ fn open_path(path: String) -> Result<(), String> {
     paths::open_in_file_manager(std::path::Path::new(&path))
 }
 
+/// 打开测试日志所在目录（Finder），供设置页「打开日志」按钮调用。
+#[tauri::command]
+fn open_log_dir() -> Result<(), String> {
+    let path = logging::log_file()
+        .map(PathBuf::from)
+        .ok_or_else(|| "日志尚未初始化".to_string())?;
+    let dir = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    paths::open_in_file_manager(&dir)
+}
+
 pub fn run() {
     tauri::Builder::default()
+        .setup(|app| {
+            // 测试期日志落盘位置：~/Documents/剧备日志/dossier.log（配置目录仅作兜底）。
+            let fallback = app
+                .path()
+                .app_config_dir()
+                .unwrap_or_else(|_| std::env::temp_dir().join("drama-dossier"));
+            logging::init(fallback);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             pick_folder,
             scan_library,
@@ -271,6 +358,7 @@ pub fn run() {
             analyze_drama,
             generate_package,
             open_path,
+            open_log_dir,
             account::account_register,
             account::account_login,
             account::account_logout,

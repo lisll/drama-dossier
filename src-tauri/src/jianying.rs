@@ -51,7 +51,28 @@ fn skip_tag(text: &str) -> Option<&str> {
 /// 探测剪映：设置里手动指定的目录优先，其次默认安装位置。
 #[tauri::command]
 pub fn jianying_detect(app: AppHandle) -> Result<JianyingDetect, String> {
-    let settings = read_settings(&app)?;
+    let result = jianying_detect_inner(&app);
+    // 测试期关键日志：剪映检测影响「设置-剪映」与挂载流程提示。
+    crate::logging::log_event(
+        "剪映",
+        crate::logging::result_text(&result, |detect| {
+            if detect.installed {
+                format!(
+                    "已安装：{}（版本 {:?}，草稿目录 {}）",
+                    detect.install_dir,
+                    detect.version,
+                    detect.draft_dir
+                )
+            } else {
+                format!("未安装（探测路径 {}）", detect.install_dir)
+            }
+        }),
+    );
+    result
+}
+
+fn jianying_detect_inner(app: &AppHandle) -> Result<JianyingDetect, String> {
+    let settings = read_settings(app)?;
     let configured = settings
         .jianying_dir
         .unwrap_or_else(|| PathBuf::from(DEFAULT_APP));

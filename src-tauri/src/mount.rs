@@ -56,6 +56,22 @@ pub fn mount_plan_save(
     root: String,
     drama_name: String,
 ) -> Result<MountPlan, String> {
+    crate::logging::log_event("挂载", format!("保存计划：{drama_name}（{root}）"));
+    let result = mount_plan_save_inner(&app, root, drama_name);
+    crate::logging::log_event(
+        "挂载",
+        crate::logging::result_text(&result, |plan| {
+            format!("计划已保存：{}", plan.csv_path)
+        }),
+    );
+    result
+}
+
+fn mount_plan_save_inner(
+    app: &AppHandle,
+    root: String,
+    drama_name: String,
+) -> Result<MountPlan, String> {
     // 剧目必须真实存在，避免计划指向不存在的目录。
     let csv = drama_csv_path(&root, &drama_name)?;
     let plan = MountPlan {
@@ -96,7 +112,30 @@ pub fn mount_csv_template(
     root: String,
     drama_name: String,
 ) -> Result<MountCsvCheckPayload, String> {
-    let drama = load_drama(&root, &drama_name)?;
+    crate::logging::log_event("挂载", format!("生成模板：{drama_name}"));
+    let result = mount_csv_template_inner(&root, &drama_name);
+    crate::logging::log_event(
+        "挂载",
+        crate::logging::result_text(&result, |payload| csv_check_text(payload, "模板就绪")),
+    );
+    result
+}
+
+/// 挂载校验结果摘要（成功 / 问题数复用给模板 / 保存 / 校验三处日志）。
+fn csv_check_text(payload: &MountCsvCheckPayload, prefix: &str) -> String {
+    if payload.check.ok {
+        format!("{prefix}：{}（校验通过，{} 行）", payload.csv_path, payload.check.rows)
+    } else {
+        format!(
+            "{prefix}：{}（{} 处问题）",
+            payload.csv_path,
+            payload.check.issues.len()
+        )
+    }
+}
+
+fn mount_csv_template_inner(root: &str, drama_name: &str) -> Result<MountCsvCheckPayload, String> {
+    let drama = load_drama(root, drama_name)?;
     let csv_path = PathBuf::from(&drama.dir).join(MOUNT_CSV_NAME);
 
     if !csv_path.exists() {
@@ -133,9 +172,23 @@ pub fn mount_csv_save(
     drama_name: String,
     content: String,
 ) -> Result<MountCsvCheckPayload, String> {
-    let drama = load_drama(&root, &drama_name)?;
+    crate::logging::log_event("挂载", format!("保存文案：{drama_name}（{} 字符）", content.chars().count()));
+    let result = mount_csv_save_inner(&root, &drama_name, &content);
+    crate::logging::log_event(
+        "挂载",
+        crate::logging::result_text(&result, |payload| csv_check_text(payload, "文案已保存")),
+    );
+    result
+}
+
+fn mount_csv_save_inner(
+    root: &str,
+    drama_name: &str,
+    content: &str,
+) -> Result<MountCsvCheckPayload, String> {
+    let drama = load_drama(root, drama_name)?;
     let csv_path = PathBuf::from(&drama.dir).join(MOUNT_CSV_NAME);
-    std::fs::write(&csv_path, &content)
+    std::fs::write(&csv_path, content)
         .map_err(|error| format!("保存挂载文案失败（{}）：{error}", csv_path.display()))?;
     let numbers: Vec<u32> = drama
         .episodes
@@ -143,16 +196,26 @@ pub fn mount_csv_save(
         .filter_map(|e| e.episode_number)
         .collect();
     Ok(MountCsvCheckPayload {
-        check: validate_mount_csv(&content, &numbers),
+        check: validate_mount_csv(content, &numbers),
         csv_path: csv_path.display().to_string(),
-        content,
+        content: content.to_string(),
     })
 }
 
 /// 只校验当前剧目目录下的「挂载文案.csv」（文案可能被外部编辑过）。
 #[tauri::command]
 pub fn mount_csv_check(root: String, drama_name: String) -> Result<MountCsvCheckPayload, String> {
-    let drama = load_drama(&root, &drama_name)?;
+    crate::logging::log_event("挂载", format!("校验文案：{drama_name}"));
+    let result = mount_csv_check_inner(&root, &drama_name);
+    crate::logging::log_event(
+        "挂载",
+        crate::logging::result_text(&result, |payload| csv_check_text(payload, "校验完成")),
+    );
+    result
+}
+
+fn mount_csv_check_inner(root: &str, drama_name: &str) -> Result<MountCsvCheckPayload, String> {
+    let drama = load_drama(root, drama_name)?;
     let csv_path = PathBuf::from(&drama.dir).join(MOUNT_CSV_NAME);
     if !csv_path.exists() {
         return Err(format!(

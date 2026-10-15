@@ -107,8 +107,33 @@ pub fn runtime_status(
     app: AppHandle,
     ffprobe_path: Option<String>,
 ) -> Result<RuntimeStatus, String> {
-    let ffmpeg = resolve_ffmpeg(&app)?;
-    let ffprobe = resolve_ffprobe(&app, ffprobe_path.as_deref())?;
+    let result = runtime_status_inner(&app, ffprobe_path.as_deref());
+    // 测试期关键日志：环境徽章 / 横幅 / 转码阻断都依赖这份检测结果。
+    crate::logging::log_event(
+        "环境",
+        crate::logging::result_text(&result, |status| {
+            let yes = |tool: &ToolReport| {
+                if tool.ok {
+                    format!("正常（{}）", tool.version.as_deref().unwrap_or(""))
+                } else {
+                    format!("缺失（{}）", tool.detail)
+                }
+            };
+            format!(
+                "ffmpeg {}，ffprobe {}，python {}，平台 {}",
+                yes(&status.ffmpeg),
+                yes(&status.ffprobe),
+                yes(&status.python),
+                status.platform
+            )
+        }),
+    );
+    result
+}
+
+fn runtime_status_inner(app: &AppHandle, ffprobe_path: Option<&str>) -> Result<RuntimeStatus, String> {
+    let ffmpeg = resolve_ffmpeg(app)?;
+    let ffprobe = resolve_ffprobe(app, ffprobe_path)?;
     let runner = SystemRunner::new();
     Ok(RuntimeStatus {
         // 只探解释器版本（秒级）；torch/onnxruntime 导入太慢，留给擦除页自查。
@@ -423,11 +448,28 @@ pub async fn fix_bitrate(
     min_kbps: Option<u64>,
     ffprobe_path: Option<String>,
 ) -> Result<FixBitrateReport, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    // 测试期关键日志：码率修复同样是长任务，入口与结果留痕。
+    crate::logging::log_event(
+        "码率",
+        format!("开始：{name}（阈值 {:?} kbps）", min_kbps),
+    );
+    let result = tauri::async_runtime::spawn_blocking(move || {
         fix_bitrate_blocking(&app, root, name, min_kbps, ffprobe_path)
     })
     .await
-    .map_err(|error| format!("码率修复任务失败：{error}"))?
+    .map_err(|error| format!("码率修复任务失败：{error}"))?;
+    crate::logging::log_event(
+        "码率",
+        crate::logging::result_text(&result, |report| {
+            format!(
+                "完成：修复 {} 项，失败 {} 项，无需处理 {} 项",
+                report.fixed.len(),
+                report.failed.len(),
+                report.untouched
+            )
+        }),
+    );
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -830,11 +872,29 @@ pub async fn transcode_execute(
     ffprobe_path: Option<String>,
     output_root: Option<String>,
 ) -> Result<TranscodeRunReport, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    // 测试期关键日志：转码是最耗时的长任务，入口参数与落点必须留痕。
+    crate::logging::log_event(
+        "转码",
+        format!(
+            "开始：{name} 模式 {}（目标集数 {:?}，输出 {:?}，产物根目录 {:?}）",
+            request.mode,
+            request.target_count,
+            request.output_dir.as_deref().unwrap_or("缺省"),
+            output_root.as_deref().unwrap_or("未设"),
+        ),
+    );
+    let result = tauri::async_runtime::spawn_blocking(move || {
         transcode_blocking(&app, root, name, request, ffprobe_path, output_root)
     })
     .await
-    .map_err(|error| format!("转码任务失败：{error}"))?
+    .map_err(|error| format!("转码任务失败：{error}"))?;
+    crate::logging::log_event(
+        "转码",
+        crate::logging::result_text(&result, |report| {
+            format!("完成：{} 项（{}）", report.items.len(), report.output_dir)
+        }),
+    );
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -1020,9 +1080,23 @@ fn install_runtime_blocking(_app: &AppHandle) -> Result<InstallRuntimeReport, St
 
 #[tauri::command]
 pub async fn install_runtime(app: AppHandle) -> Result<InstallRuntimeReport, String> {
-    tauri::async_runtime::spawn_blocking(move || install_runtime_blocking(&app))
+    // 测试期关键日志：一键配置运行环境（下载 ~25MB）是最关键的修复入口。
+    crate::logging::log_event("环境", "开始一键安装运行环境");
+    let result = tauri::async_runtime::spawn_blocking(move || install_runtime_blocking(&app))
         .await
-        .map_err(|error| format!("运行环境安装任务失败：{error}"))?
+        .map_err(|error| format!("运行环境安装任务失败：{error}"))?;
+    crate::logging::log_event(
+        "环境",
+        crate::logging::result_text(&result, |report| {
+            format!(
+                "安装完成：{} / {}（已存在跳过：{:?}）",
+                report.ffmpeg_path,
+                report.ffprobe_path,
+                report.skipped_existing
+            )
+        }),
+    );
+    result
 }
 
 #[cfg(test)]

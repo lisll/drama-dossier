@@ -39,6 +39,8 @@ const state = {
   mountStep: 1,
   mountPlan: null,
   publishRows: [],
+  // 设置独立视图当前子页（account/billing/jianying/ai/env/rules/about）。
+  settingsSub: null,
 };
 
 let renamePlan = null;
@@ -1746,14 +1748,16 @@ async function executeTranscode() {
 async function checkRuntime(force = false) {
   if (state.runtime && !force) {
     renderRuntimeStatus(state.runtime);
-    return;
+    return true;
   }
   try {
     const status = await call("runtime_status", { ffprobePath: effectiveFfprobe() });
     state.runtime = status;
     renderRuntimeStatus(status);
+    return true;
   } catch (error) {
     reportError(error);
+    return false;
   }
 }
 
@@ -2433,8 +2437,24 @@ function handleConfirmKeys(event) {
 
 document.addEventListener("keydown", handleConfirmKeys);
 $("#exec-run").addEventListener("click", executeTranscode);
-$("#runtime-recheck").addEventListener("click", () => checkRuntime(true));
+// 「重新检测」要有可感知反馈：环境正常时结果不变，不加状态会像点了没反应。
+$("#runtime-recheck").addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  button.textContent = "检测中…";
+  try {
+    const ok = await checkRuntime(true);
+    if (ok) toast("本机环境检测完成");
+  } finally {
+    button.disabled = false;
+    button.textContent = "重新检测";
+  }
+});
 $("#runtime-install").addEventListener("click", runtimeInstall);
+// 测试期排障：一键打开日志目录（~/Documents/剧备日志），把 dossier.log 发给维护者即可。
+$("#open-log").addEventListener("click", () =>
+  invoke("open_log_dir").catch((error) => toast(error, true)),
+);
 // 横幅里的安装按钮随 innerHTML 重建，用事件委托绑定。
 $("#env-banner").addEventListener("click", (event) => {
   if (event.target instanceof Element && event.target.id === "env-install") {

@@ -84,10 +84,25 @@ fn payload(app: &AppHandle, store: &AccountStore) -> Result<AccountPayload, Stri
 
 #[tauri::command]
 pub fn account_register(app: AppHandle, args: RegisterArgs) -> Result<AccountPayload, String> {
-    let mut store = read_store(&app)?;
-    flatten(register(&mut store, &args.email, &args.password))?;
-    write_store(&app, &store)?;
-    payload(&app, &store)
+    // 测试期关键日志：只记邮箱与结果，绝不记密码 / 验证码。
+    crate::logging::log_event("注册", format!("开始：{}", args.email));
+    let result = account_register_inner(&app, args.email.clone(), &args.password);
+    crate::logging::log_event(
+        "注册",
+        crate::logging::result_text(&result, |_| format!("成功：{}", args.email)),
+    );
+    result
+}
+
+fn account_register_inner(
+    app: &AppHandle,
+    email: String,
+    password: &str,
+) -> Result<AccountPayload, String> {
+    let mut store = read_store(app)?;
+    flatten(register(&mut store, &email, password))?;
+    write_store(app, &store)?;
+    payload(app, &store)
 }
 
 #[tauri::command]
@@ -96,14 +111,26 @@ pub fn account_login(
     email: String,
     password: String,
 ) -> Result<AccountPayload, String> {
-    let mut store = read_store(&app)?;
-    flatten(login(&mut store, &email, &password))?;
-    write_store(&app, &store)?;
-    payload(&app, &store)
+    // 测试期关键日志：只记邮箱与结果，绝不记密码。
+    crate::logging::log_event("登录", format!("开始：{email}"));
+    let result = account_login_inner(&app, &email, &password);
+    crate::logging::log_event(
+        "登录",
+        crate::logging::result_text(&result, |_| format!("成功：{email}")),
+    );
+    result
+}
+
+fn account_login_inner(app: &AppHandle, email: &str, password: &str) -> Result<AccountPayload, String> {
+    let mut store = read_store(app)?;
+    flatten(login(&mut store, email, password))?;
+    write_store(app, &store)?;
+    payload(app, &store)
 }
 
 #[tauri::command]
 pub fn account_logout(app: AppHandle) -> Result<AccountPayload, String> {
+    crate::logging::log_event("登出", "开始");
     let mut store = read_store(&app)?;
     logout(&mut store);
     write_store(&app, &store)?;
@@ -121,12 +148,22 @@ pub fn account_change_password(
     app: AppHandle,
     args: ChangePasswordArgs,
 ) -> Result<AccountPayload, String> {
-    let mut store = read_store(&app)?;
-    flatten(change_password(
-        &mut store,
-        &args.old_password,
-        &args.new_password,
-    ))?;
-    write_store(&app, &store)?;
-    payload(&app, &store)
+    // 测试期关键日志：不记任何密码内容。
+    let result = account_change_password_inner(&app, &args.old_password, &args.new_password);
+    crate::logging::log_event(
+        "改密",
+        crate::logging::result_text(&result, |_| "成功".to_string()),
+    );
+    result
+}
+
+fn account_change_password_inner(
+    app: &AppHandle,
+    old_password: &str,
+    new_password: &str,
+) -> Result<AccountPayload, String> {
+    let mut store = read_store(app)?;
+    flatten(change_password(&mut store, old_password, new_password))?;
+    write_store(app, &store)?;
+    payload(app, &store)
 }
