@@ -22,7 +22,15 @@ cargo tauri build
 
 > macOS Intel 使用 `macos-15-intel` 标签：`macos-13` 镜像已于 2025 年 12 月退役，使用该标签的任务会一直排队而无法启动。`macos-15-intel` 是 GitHub Actions 最后一个 x86_64 macOS 镜像，支持至 2027 年秋季。
 
-GitHub Actions 工作流会先运行 Rust 测试和 Clippy，再使用 Tauri Action 构建安装包。发布 tag 形如 `app-v0.1.0` 时会创建 GitHub Release。
+GitHub Actions 工作流会先运行 Rust 测试和 Clippy，再使用 Tauri Action 构建三个平台的安装包。
+
+发布 tag 形如 `app-v0.2.1` 时，`bundle` 三个平台全部构建成功后，`release` job 会自动创建
+GitHub Release（标记为 prerelease），并挂上 Windows NSIS `.exe`、两个 macOS `.dmg`
+以及 `SHA256SUMS.txt`。任一平台构建失败则不会创建 Release；产物缺失时 `release` job
+会直接失败，不会发出残缺的 Release。
+
+`release` job 只在推 tag 时运行：手动触发（`workflow_dispatch`）只构建、不发布，
+推 `master` 只跑质量门与测试。
 
 ## 代码签名
 

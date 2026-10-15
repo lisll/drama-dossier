@@ -95,3 +95,62 @@ jobs:
             target/${{ matrix.target }}/release/bundle/macos/*.app
             target/${{ matrix.target }}/release/bundle/dmg/*.dmg
           if-no-files-found: error
+
+  # 三个平台构建全部成功后，由这**一个** job 统一创建 Release。
+  #
+  # 为什么不给上面三个 bundle job 直接加发布参数：它们是**并行**跑的，若各自
+  # 去创建同一个 Release，会出现「都查到不存在 → 都去创建 → 其中一个失败」
+  # 的竞态。单一执行者没有这个问题，且 needs 天然保证「三平台全绿才发布」，
+  # 不会产生残缺的 Release。
+  release:
+    needs: bundle
+    if: startsWith(github.ref, 'refs/tags/app-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all bundles
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd artifacts
+          find . -type f \( -name '*.exe' -o -name '*.dmg' \) -print0 \
+            | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          # 只取安装包本体：产物解包后 .app/Contents/ 下的散装文件
+          # （Info.plist、可执行文件、图标）位于 macos/ 目录，用 **/* 会把它们
+          # 一并传上去，用户会看到一堆无意义条目。
+          files: |
+            artifacts/*/*.exe
+            artifacts/*/dmg/*.dmg
+            artifacts/SHA256SUMS.txt
+          # 任一平台产物缺失就失败，不静默发一个残缺的 Release。
+          fail_on_unmatched_files: true
+          prerelease: true
+          generate_release_notes: true
+          body: |
+            > 本项目仅用于技术学习与交流，不用于实际报审提交或对外分发。
+
+            ## 安装前请注意
+
+            **安装包未做代码签名**，系统会给出安全提示，这是正常的：
+
+            - **Windows**：首次运行可能弹出 SmartScreen 提示，点「更多信息」→「仍要运行」。
+            - **macOS**：首次打开请在 Finder 中**右键点图标 → 选「打开」**，之后双击即可。直接双击会被 Gatekeeper 拦截。
+
+            **需要自行安装 FFmpeg**：应用通过外部 `ffprobe` 读取视频信息，不捆绑 FFmpeg。请先安装 FFmpeg 并确保 `ffprobe` 在 PATH 中，或在应用设置里手动指定路径。没有 `ffprobe` 时无法读取分集信息。
+
+            **macOS Intel 版**：不支持运行环境一键配置（该功能仅 macOS + Apple Silicon），需手动安装 FFmpeg 并在设置里指定路径。
+
+            ## 已知问题
+
+            - 分集表格的「集号」「文件名」两列可能显示为空白：后端结构体缺少 camelCase 序列化声明，界面读不到这两个字段。**不影响生成的材料包内容**，报告数据本身完整。
+
+            下载后可对照本页 `SHA256SUMS.txt` 校验完整性。
