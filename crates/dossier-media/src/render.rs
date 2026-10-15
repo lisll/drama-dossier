@@ -577,6 +577,7 @@ fn first_line(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dossier_runtime::probe::probe_ffmpeg_capabilities;
     use dossier_runtime::{CommandRunner, CommandSpec, SystemRunner};
 
     fn plan_for(input: &str, output: &str) -> RenderPlan {
@@ -713,6 +714,10 @@ mod tests {
             eprintln!("跳过：本机没有可用的 ffmpeg");
             return;
         }
+        if !filter_ready(&runner, &["drawtext"]) {
+            eprintln!("跳过：本机 ffmpeg 不带 drawtext 滤镜，无法真跑文字渲染");
+            return;
+        }
         let dir = test_dir("render-text");
         let source = dir.join("black.mp4");
         run_ok(
@@ -841,6 +846,10 @@ mod tests {
             eprintln!("跳过：本机没有可用的 ffmpeg");
             return;
         }
+        if !filter_ready(&runner, &["subtitles"]) {
+            eprintln!("跳过：本机 ffmpeg 不带 subtitles 滤镜（需 libass），无法真跑字幕烧录");
+            return;
+        }
         let dir = test_dir("render-subs");
         let source = dir.join("black.mp4");
         run_ok(
@@ -890,6 +899,15 @@ mod tests {
             .run(&CommandSpec::new("ffmpeg").arg("-version"))
             .map(|output| output.success())
             .unwrap_or(false)
+    }
+
+    /// drawtext / subtitles 这类滤镜**不是 ffmpeg 的必编项**：精简构建（实测
+    /// Homebrew 的默认 bottle 就不含 libfreetype/libass）会整个没有这些滤镜。
+    /// 真跑前按能力跳过，与本仓库「缺工具跳过」的约定一致；能力冒烟用例
+    /// （tools.rs）会把缺失项连原因一起打出来，不会静默。
+    fn filter_ready(runner: &SystemRunner, needed: &[&str]) -> bool {
+        let caps = probe_ffmpeg_capabilities(runner, None);
+        needed.iter().all(|name| caps.filters.supports(name))
     }
 
     fn test_dir(tag: &str) -> PathBuf {
@@ -968,13 +986,25 @@ mod tests {
             eprintln!("跳过：本机没有可用的 ffmpeg");
             return;
         }
+        if !filter_ready(&runner, &["drawtext"]) {
+            eprintln!("跳过：本机 ffmpeg 不带 drawtext 滤镜，无法真跑转义表比对");
+            return;
+        }
         // 中文字符必须显式指定含汉字的字体文件：fontconfig 的默认匹配
         // (`fc-match :lang=zh`) 在本机会选中没有汉字的字体，渲染结果是**一个字都不画**。
         // 那样「参考帧 == 候选帧」会退化成 0 == 0 的假通过，测不出任何东西。
         let font = cjk_font();
+        // fontfile 是文件路径，要过 `escape_filter_value`：Windows 路径里的
+        // `C:` 冒号和反斜杠都是滤镜语法的特殊字符，不转义会被 ffmpeg 拆坏。
+        // 产品代码（TextOverlay::build）对 fontfile 早就是这样处理的。
         let font_option = font
             .as_ref()
-            .map(|path| format!(":fontfile={}", path.display()))
+            .map(|path| {
+                format!(
+                    ":fontfile={}",
+                    escape_filter_value(&path.display().to_string())
+                )
+            })
             .unwrap_or_default();
         let dir = test_dir("render-escape");
         let source = dir.join("black.mp4");
@@ -1025,7 +1055,12 @@ mod tests {
             let reference_spec = text_spec(
                 &source,
                 &reference,
-                &format!("textfile={}", textfile.display()),
+                // textfile 同样是文件路径，同样要转义（原因见上面 font_option 的注释）。
+                // 转义只作用于**路径**，文件内容仍是原始字节，参考帧的语义不变。
+                &format!(
+                    "textfile={}",
+                    escape_filter_value(&textfile.display().to_string())
+                ),
                 &font_option,
             );
             run_ok(&runner, &reference_spec);
