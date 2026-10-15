@@ -211,26 +211,13 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             raise HTTPException(401, detail={"error": "unauthorized", "message": "令牌无效"})
         return principal
 
-    def current_principal(
-        request: Request,
-        authorization: Optional[str] = Header(None),
-        token: Optional[str] = Query(None),
-    ) -> Principal:
-        """从 `Authorization: Bearer` 或 `?token=` 取用户令牌。"""
-        raw = None
-        if authorization and authorization.lower().startswith("bearer "):
-            raw = authorization[7:].strip()
-        elif token:
-            raw = token
-        if not raw:
-            raise HTTPException(401, detail={"error": "unauthorized", "message": "缺少访问令牌"})
-        conn = connect(settings)
-        try:
-            principal = resolve_token(conn, raw)
-        finally:
-            conn.close()
-        if principal is None:
-            raise HTTPException(401, detail={"error": "unauthorized", "message": "令牌无效"})
+    def current_principal(request: Request, authorization: Optional[str] = Header(None)) -> Principal:
+        """用户令牌只认 `Authorization: Bearer` 请求头，不接受 `?token=`。
+
+        网址会被写进访问日志和浏览器历史，长期有效的用户令牌放进网址就等于泄露。
+        上传、下载用的短时专用令牌另有校验路径，不受影响。
+        """
+        principal = principal_from_header(authorization)
         limiter.check(f"{principal.user_id}:{request.url.path}")
         return principal
 

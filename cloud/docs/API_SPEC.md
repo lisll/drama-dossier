@@ -11,8 +11,7 @@
 
 | 凭证 | 形式 | 用途 | 有效期 |
 | --- | --- | --- | --- |
-| 用户令牌 | `Authorization: Bearer <token>` | 所有业务端点 | 长期（数据库存 SHA-256） |
-| 用户令牌（查询串） | `?token=<token>` | 浏览器直接打开的链接 | 同上 |
+| 用户令牌 | `Authorization: Bearer <token>`（**只**认请求头） | 所有业务端点 | 长期（数据库存 SHA-256） |
 | 上传会话令牌 | `X-Upload-Token: <token>` 或 `?token=` | **只**给 `PUT /uploads/{id}` | 60..86400s，默认 900s |
 | 下载令牌 | `?token=<token>` | **只**给 `GET /artifacts/{id}/download` | 900s |
 

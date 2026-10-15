@@ -44,6 +44,13 @@ def test_missing_and_bad_token(client):
     assert client.get("/api/v1/auth/whoami", headers=auth("nope")).status_code == 401
 
 
+def test_user_token_only_accepted_in_header(client, conn):
+    # 长期用户令牌放在网址里会被写进访问日志，所以 ?token= 不再被接受。
+    token = create_user(conn, "header-only", role="viewer", actor="test")
+    assert client.get("/api/v1/auth/whoami", params={"token": token}).status_code == 401
+    assert client.get("/api/v1/auth/whoami", headers=auth(token)).status_code == 200
+
+
 def test_whoami(client, conn):
     token = tokens(conn)["operator"]
     body = client.get("/api/v1/auth/whoami", headers=auth(token)).json()
