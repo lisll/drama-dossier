@@ -31,6 +31,21 @@ jobs:
         shell: bash
         run: cargo install tauri-cli --locked
 
+      # 把 ffmpeg/ffprobe 直接打进 NSIS 安装包：用户端一键配置时零下载，
+      # 不再依赖 gyan.dev 等第三方下载源的可用性（曾出现 404）。
+      - name: 预置 ffmpeg 到安装包资源
+        shell: pwsh
+        run: |
+          $zip = "$env:RUNNER_TEMP\ffmpeg.zip"
+          curl.exe -sSL --retry 5 --max-time 600 -o $zip https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
+          if (-not (Test-Path $zip)) { throw "ffmpeg zip 下载失败" }
+          $stage = "$env:RUNNER_TEMP\ffstage"
+          Expand-Archive -Force $zip $stage
+          $bin = (Get-ChildItem -Recurse -Filter ffmpeg.exe $stage | Select-Object -First 1).DirectoryName
+          New-Item -ItemType Directory -Force src-tauri/resources/ffmpeg | Out-Null
+          Copy-Item "$bin\ffmpeg.exe","$bin\ffprobe.exe" src-tauri/resources/ffmpeg/
+          Get-ChildItem src-tauri/resources/ffmpeg | ForEach-Object { "{0}  {1:N1} MB" -f $_.Name, ($_.Length/1MB) }
+
       - name: 构建 NSIS 安装包
         shell: bash
         run: cargo tauri build

@@ -36,27 +36,31 @@ pub struct FfprobeConfig {
 /// 探测单个分集。
 pub fn probe_episode(file: &EpisodeFile, cfg: &FfprobeConfig) -> Result<ProbedEpisode, ProbeError> {
     let bin = cfg.bin.clone().unwrap_or_else(|| PathBuf::from("ffprobe"));
-    let output = Command::new(&bin)
-        .args([
-            "-v",
-            "quiet",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-        ])
-        .arg(&file.path)
-        .output()
-        .map_err(|source| {
-            if source.kind() == std::io::ErrorKind::NotFound {
-                ProbeError::FfprobeMissing(bin.display().to_string())
-            } else {
-                ProbeError::Spawn {
-                    path: bin.clone(),
-                    source,
-                }
+    let mut command = Command::new(&bin);
+    command.args([
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+    ]);
+    // Windows 的 GUI 进程拉起 ffprobe 会弹黑色 cmd 窗口，CREATE_NO_WINDOW 静默运行。
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let output = command.arg(&file.path).output().map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            ProbeError::FfprobeMissing(bin.display().to_string())
+        } else {
+            ProbeError::Spawn {
+                path: bin.clone(),
+                source,
             }
-        })?;
+        }
+    })?;
     if !output.status.success() {
         return Err(ProbeError::NonZero {
             path: bin,

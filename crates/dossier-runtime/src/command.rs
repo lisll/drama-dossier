@@ -218,6 +218,13 @@ impl CommandRunner for SystemRunner {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            // GUI 进程拉起控制台程序默认会弹出黑色 cmd 窗口；
+            // CREATE_NO_WINDOW 让所有子进程（ffmpeg/curl 等）静默运行。
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
         if let Some(cwd) = &spec.cwd {
             command.current_dir(cwd);
         }

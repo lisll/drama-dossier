@@ -432,6 +432,12 @@ fn run(args: &Args) -> Result<ExitCode, String> {
         "重新封装"
     };
     let mut mux = std::process::Command::new(ffmpeg.program());
+    // Windows 的 GUI 进程拉起 ffmpeg 会弹黑色 cmd 窗口，CREATE_NO_WINDOW 静默运行。
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        mux.creation_flags(0x0800_0000);
+    }
     mux.args(["-hide_banner", "-loglevel", "error", "-nostdin"])
         .arg("-i")
         .arg(&temp_video)

@@ -439,11 +439,19 @@ pub fn run_plan_with_progress(
     timeout_secs: u64,
     mut on_progress: impl FnMut(&ProgressEvent),
 ) -> Result<EraseRun, String> {
-    let mut child = Command::new(&plan.program)
+    let mut command = Command::new(&plan.program);
+    command
         .args(&plan.args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Windows 的 GUI 进程拉起擦除工具会弹黑色 cmd 窗口，CREATE_NO_WINDOW 静默运行。
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let mut child = command
         .spawn()
         .map_err(|error| format!("无法启动擦除工具（{}）：{error}", plan.program.display()))?;
 

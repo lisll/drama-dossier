@@ -43,27 +43,31 @@ pub fn probe_video(ffprobe_bin: Option<&Path>, input: &Path) -> Result<VideoInfo
     let bin = ffprobe_bin
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("ffprobe"));
-    let output = Command::new(&bin)
-        .args([
-            "-v",
-            "quiet",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-        ])
-        .arg(input)
-        .output()
-        .map_err(|source| {
-            if source.kind() == std::io::ErrorKind::NotFound {
-                ProbeError::Missing(bin.display().to_string())
-            } else {
-                ProbeError::Spawn {
-                    path: bin.clone(),
-                    source,
-                }
+    let mut command = Command::new(&bin);
+    command.args([
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+    ]);
+    // Windows 的 GUI 进程拉起 ffprobe 会弹黑色 cmd 窗口，CREATE_NO_WINDOW 静默运行。
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let output = command.arg(input).output().map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            ProbeError::Missing(bin.display().to_string())
+        } else {
+            ProbeError::Spawn {
+                path: bin.clone(),
+                source,
             }
-        })?;
+        }
+    })?;
     if !output.status.success() {
         return Err(ProbeError::NonZero {
             path: bin,

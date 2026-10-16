@@ -216,16 +216,20 @@ impl WorkerTextDetector {
                 .run(&self.work_dir)
                 .map_err(|error| DetectError::Backend(error.to_string()));
         }
-        let output = Command::new(&self.config.program)
-            .args(&self.config.args)
-            .arg(&self.work_dir)
-            .output()
-            .map_err(|error| {
-                DetectError::Backend(format!(
-                    "无法启动检测后端 {}：{error}",
-                    self.config.program.display()
-                ))
-            })?;
+        let mut command = Command::new(&self.config.program);
+        command.args(&self.config.args);
+        // Windows 的 GUI 进程拉起检测后端会弹黑色 cmd 窗口，CREATE_NO_WINDOW 静默运行。
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        let output = command.arg(&self.work_dir).output().map_err(|error| {
+            DetectError::Backend(format!(
+                "无法启动检测后端 {}：{error}",
+                self.config.program.display()
+            ))
+        })?;
         if !output.status.success() {
             return Err(DetectError::Backend(format!(
                 "检测后端退出码 {:?}：{}",

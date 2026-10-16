@@ -1891,7 +1891,14 @@ function handleInstallProgress(payload) {
         ? "正在检查安装结果。"
         : payload.stage === "extracting"
           ? "正在解压安装。"
-          : `正在${payload.stageLabel}。`;
+          : payload.stage === "installing"
+            ? "正在安装（安装包内置资源）。"
+            : `正在${payload.stageLabel}。`;
+  if (payload.stage === "installing") {
+    // 内置资源复制路径没有网络动作，统计区如实标注。
+    $("#install-total").textContent = "内置资源";
+    $("#install-downloaded").textContent = "内置资源";
+  }
   if (payload.stage === "downloading" || payload.stage === "connecting") {
     const total = payload.totalBytes;
     const done = payload.downloadedBytes ?? 0;

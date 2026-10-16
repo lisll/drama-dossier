@@ -1051,10 +1051,11 @@ const EVERMEET_FFMPEG_URL: &str = "https://evermeet.cx/ffmpeg/ffmpeg-9.0.2.zip";
 const EVERMEET_FFPROBE_URL: &str = "https://evermeet.cx/ffmpeg/ffprobe-9.0.2.zip";
 
 /// Windows 发行源：gyan.dev 的 essentials 构建（官方推荐分发包），一个 zip 同时
-/// 含 ffmpeg.exe 与 ffprobe.exe，因此 Windows 只需下载一次。版本钉死保证可复现。
+/// 含 ffmpeg.exe 与 ffprobe.exe，因此 Windows 只需下载一次。这是滚动更新的
+/// 「release-essentials」包（钉版 URL 会因官网清理旧包而 404），仅作兜底——
+/// 正式安装包由 CI 预置 ffmpeg（见 bundled_runtime_dir），运行时不再联网。
 #[cfg(target_os = "windows")]
-const GYAN_FFMPEG_URL: &str =
-    "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-7.1.1-essentials_build.zip";
+const GYAN_FFMPEG_URL: &str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
 
 /// 一键安装结果。
 #[derive(Debug, Serialize)]
@@ -1074,6 +1075,12 @@ fn download_file(app: &AppHandle, component: &str, url: &str, target: &Path) -> 
     let total = probe_content_length(url);
     emit_install_progress(app, component, "connecting", "连接下载源", total, 0);
     let mut command = std::process::Command::new(CURL_PROGRAM);
+    // Windows 的 GUI 进程拉起 curl 会弹黑色 cmd 窗口，CREATE_NO_WINDOW 静默运行。
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
     command
         .args([
             "-fL",
@@ -1304,12 +1311,68 @@ fn persist_tool_paths(
     Ok(())
 }
 
+/// 安装包内置的运行环境目录：Windows 安装包由 CI 预置 ffmpeg/ffprobe
+/// （见 .github/workflows/build-windows.yml），装好后**运行时零下载**。
+/// 源码直跑或未内置（mac）时返回 None，调用方退回下载流程。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn bundled_runtime_dir(app: &AppHandle) -> Option<PathBuf> {
+    use tauri::Manager;
+    let dir = app.path().resource_dir().ok()?.join("ffmpeg");
+    (dir.is_dir()).then_some(dir)
+}
+
+/// 从安装包内置资源把工具复制到 bin 目录；返回实际安装的组件名。
+/// 复制虽是本地 IO，仍逐组件播报「正在安装 → 完成」进度事件，
+/// 让安装弹窗有可见的推进（内置包约 200MB，复制肉眼可感知）。
+/// 目标已存在且大小一致时跳过，避免每次点击都整块复制。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn copy_bundled_tools(
+    app: &AppHandle,
+    bin_dir: &Path,
+    bundled: &Path,
+    names: &[&str],
+) -> Vec<String> {
+    let mut installed = Vec::new();
+    for name in names {
+        let exe_name = dossier_inpaint::erase::binary_name(name);
+        let Some(source) = std::fs::metadata(bundled.join(&exe_name))
+            .ok()
+            .filter(|meta| meta.is_file())
+            .map(|meta| (bundled.join(&exe_name), meta.len()))
+        else {
+            continue;
+        };
+        let target = bin_dir.join(&exe_name);
+        let stale = std::fs::metadata(&target)
+            .map(|meta| meta.len() != source.1)
+            .unwrap_or(true);
+        if stale {
+            emit_install_progress(app, name, "installing", "正在安装", None, 0);
+            if let Err(_error) = std::fs::copy(&source.0, &target) {
+                // 单个复制失败不致命：可能是目标正被占用，交给下载流程或自检去暴露。
+                continue;
+            }
+            emit_install_progress(app, name, "finished", "完成", Some(0), 0);
+            installed.push(name.to_string());
+        }
+    }
+    installed
+}
+
 #[cfg(target_os = "macos")]
 fn install_runtime_blocking(app: &AppHandle) -> Result<InstallRuntimeReport, String> {
     let bin_dir = app_bin_dir(app)?;
     std::fs::create_dir_all(&bin_dir).map_err(|error| format!("创建运行环境目录失败：{error}"))?;
 
+    // 优先用安装包内置的 ffmpeg（未来 mac 包也可能预置），没有再走下载。
+    let mut bundled_note = String::new();
     let mut skipped_existing = Vec::new();
+    if let Some(bundled) = bundled_runtime_dir(app) {
+        let copied = copy_bundled_tools(app, &bin_dir, &bundled, &["ffmpeg", "ffprobe"]);
+        if !copied.is_empty() {
+            bundled_note = format!("已从安装包内置资源安装：{}", copied.join("、"));
+        }
+    }
     if install_one(app, &bin_dir, "ffmpeg", EVERMEET_FFMPEG_URL)? {
         skipped_existing.push("ffmpeg".into());
     }
@@ -1327,12 +1390,15 @@ fn install_runtime_blocking(app: &AppHandle) -> Result<InstallRuntimeReport, Str
         ffmpeg_path: ffmpeg_path.display().to_string(),
         ffprobe_path: ffprobe_path.display().to_string(),
         skipped_existing,
-        note: format!("运行环境已就绪（安装目录：{}）", bin_dir.display()),
+        note: format!(
+            "运行环境已就绪（安装目录：{}）{bundled_note}",
+            bin_dir.display()
+        ),
     })
 }
 
-/// Windows：gyan.dev 的合包 zip 同时含 ffmpeg.exe / ffprobe.exe，下载一次装两个；
-/// 目标都齐了就不再动网络，直接走自检收尾。
+/// Windows：优先复制安装包内置的 ffmpeg/ffprobe（CI 预置，零下载）；
+/// 内置缺失（如旧版安装包）才退回 gyan.dev 合包 zip 下载。目标都齐了直接自检收尾。
 #[cfg(target_os = "windows")]
 fn install_runtime_blocking(app: &AppHandle) -> Result<InstallRuntimeReport, String> {
     let bin_dir = app_bin_dir(app)?;
@@ -1341,10 +1407,23 @@ fn install_runtime_blocking(app: &AppHandle) -> Result<InstallRuntimeReport, Str
     let ffmpeg_path = bin_dir.join("ffmpeg.exe");
     let ffprobe_path = bin_dir.join("ffprobe.exe");
     let mut skipped_existing = Vec::new();
+    let mut bundled_note = String::new();
 
+    if !(ffmpeg_path.is_file() && ffprobe_path.is_file()) {
+        if let Some(bundled) = bundled_runtime_dir(app) {
+            let copied = copy_bundled_tools(app, &bin_dir, &bundled, &["ffmpeg", "ffprobe"]);
+            if !copied.is_empty() {
+                bundled_note = format!("（已从安装包内置资源安装：{}）", copied.join("、"));
+            }
+        }
+    }
     if ffmpeg_path.is_file() && ffprobe_path.is_file() {
-        skipped_existing.push("ffmpeg".into());
-        skipped_existing.push("ffprobe".into());
+        if bundled_note.is_empty() {
+            // 两个工具本来就在（本轮既没下载也没复制）：报告里如实标注为跳过。
+            skipped_existing.push("ffmpeg".into());
+            skipped_existing.push("ffprobe".into());
+        }
+        // 都齐了（可能刚从内置资源复制）就不动网络，直接自检收尾。
     } else {
         let zip_path = bin_dir.join("ffmpeg.download.zip");
         let staging = bin_dir.join("ffmpeg.staging");
@@ -1379,7 +1458,10 @@ fn install_runtime_blocking(app: &AppHandle) -> Result<InstallRuntimeReport, Str
         ffmpeg_path: ffmpeg_path.display().to_string(),
         ffprobe_path: ffprobe_path.display().to_string(),
         skipped_existing,
-        note: format!("运行环境已就绪（安装目录：{}）", bin_dir.display()),
+        note: format!(
+            "运行环境已就绪（安装目录：{}）{bundled_note}",
+            bin_dir.display()
+        ),
     })
 }
 

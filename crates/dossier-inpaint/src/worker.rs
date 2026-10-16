@@ -41,17 +41,23 @@ pub struct WorkerSession {
 impl WorkerSession {
     /// 以 `--serve` 启动 worker，并等待它的 `{"ready": true}` 握手。
     pub fn spawn(config: &WorkerConfig) -> Result<Self, WorkerError> {
-        let mut child = Command::new(&config.program)
+        let mut command = Command::new(&config.program);
+        command
             .args(&config.args)
             .arg("--serve")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|source| WorkerError::Spawn {
-                program: config.program.display().to_string(),
-                source,
-            })?;
+            .stderr(Stdio::inherit());
+        // Windows 的 GUI 进程拉起 python worker 会弹黑色 cmd 窗口，CREATE_NO_WINDOW 静默运行。
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        let mut child = command.spawn().map_err(|source| WorkerError::Spawn {
+            program: config.program.display().to_string(),
+            source,
+        })?;
         let stdin = child
             .stdin
             .take()
