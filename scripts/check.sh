@@ -102,6 +102,19 @@ if [ "$run_rust" -eq 1 ] && require cargo; then
   if rust_env_ready; then
     step "Clippy：cargo clippy --workspace --all-targets --no-deps -- -D warnings" \
       cargo clippy --workspace --all-targets --no-deps -- -D warnings
+    # windows 目标交叉 lint：抓只在 Windows 编译路径上的问题（死代码、cfg 拼写错等）。
+    # tauri-winres 要调 llvm-rc（mac 没有），用桩糊弄过构建脚本——clippy 不链接资源，
+    # 空产物无害。桩解析 /FO 参数生成空文件后退出 0。
+    if command -v cargo >/dev/null 2>&1; then
+      stub_dir=$(mktemp -d)
+      {
+        printf '#!/bin/bash\nprev=""\nfor a in "$@"; do\n  case "$prev" in\n    /FO|-FO|/fo|-fo) mkdir -p "$(dirname "$a")"; : > "$a" ;;\n  esac\n  prev="$a"\ndone\nexit 0\n'
+      } > "$stub_dir/llvm-rc"
+      chmod +x "$stub_dir/llvm-rc"
+      step "Clippy（windows 目标）：--target x86_64-pc-windows-msvc -- -D warnings" \
+        env PATH="$stub_dir:$PATH" cargo clippy --workspace --all-targets \
+          --target x86_64-pc-windows-msvc --no-deps -- -D warnings
+    fi
     if [ "$fast" -eq 1 ]; then
       printf '==> 跳过 Test（--fast，pre-push 或 CI 会跑）\n'
     else

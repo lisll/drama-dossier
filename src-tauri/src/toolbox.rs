@@ -1224,7 +1224,8 @@ fn find_extracted(dir: &Path, file_name: &str, depth: u8) -> Option<PathBuf> {
 
 /// 安装单个工具：下载 zip → 解压到临时目录 → 授权 → 移到目标位置。
 /// 返回 `Ok(true)` 表示目标已存在、本次跳过。
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+/// 仅 macOS 主安装流使用；Windows 走内置复制 + 合包 zip 兜底（见 install_runtime_blocking）。
+#[cfg(target_os = "macos")]
 fn install_one(app: &AppHandle, bin_dir: &Path, name: &str, url: &str) -> Result<bool, String> {
     let exe_name = dossier_inpaint::erase::binary_name(name);
     let target = bin_dir.join(&exe_name);
