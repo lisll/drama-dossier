@@ -1,10 +1,9 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use dossier_core::{
-    generate_report_package, load_settings, probe_episode, resolve_product_dir, run_checks,
-    save_settings, scan_drama_dir, validate_drama_dir, validate_drama_name, validate_library_root,
-    AppSettings, ChecklistReport, ChecklistRules, CostSheetForm, Drama, EpisodeSpec, FfprobeConfig,
-    LoadedSettings, PackageOptions, PackageResult, ProbedEpisode,
+    load_settings, probe_episode, run_checks, save_settings, scan_drama_dir, validate_drama_dir,
+    validate_drama_name, validate_library_root, AppSettings, ChecklistReport, ChecklistRules,
+    Drama, EpisodeSpec, FfprobeConfig, LoadedSettings,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
@@ -14,14 +13,15 @@ mod dossier;
 mod erase;
 mod jianying;
 mod mount;
+mod package;
 mod paths;
 mod toolbox;
 
 #[derive(Debug, Serialize)]
-struct ProbeOutcome {
+pub(crate) struct ProbeOutcome {
     file_name: String,
     episode_number: Option<u32>,
-    spec: Option<EpisodeSpec>,
+    pub(crate) spec: Option<EpisodeSpec>,
     error: Option<String>,
 }
 
@@ -31,7 +31,7 @@ struct ProbeOutcome {
 /// 因为两者都会重新探测，界面需要知道进度条该挂在哪个模块上。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ProbeProgress {
+pub(crate) struct ProbeProgress {
     task: String,
     done: usize,
     total: usize,
@@ -39,9 +39,9 @@ struct ProbeProgress {
 }
 
 #[derive(Debug, Serialize)]
-struct DramaAnalysis {
-    drama: Drama,
-    probes: Vec<ProbeOutcome>,
+pub(crate) struct DramaAnalysis {
+    pub(crate) drama: Drama,
+    pub(crate) probes: Vec<ProbeOutcome>,
     checklist: ChecklistReport,
 }
 
@@ -105,7 +105,7 @@ fn save_app_settings(app: AppHandle, settings: AppSettings) -> Result<String, St
 ///
 /// 与 IPC 命令分开，是为了让「生成报审包」这类内部调用也能走同一份探测逻辑，
 /// 同时把进度回调留给调用方决定要不要发事件（发出去了界面才画进度条）。
-fn analyze_drama_inner(
+pub(crate) fn analyze_drama_inner(
     root: String,
     name: String,
     ffprobe_path: Option<String>,
@@ -179,82 +179,6 @@ fn analyze_drama(
     })
 }
 
-#[tauri::command]
-// 参数名即前端 IPC 协议字段（camelCase 映射），合并成结构体会破坏现有调用方；
-// 与 dossier-inpaint/src/pipeline.rs 的既有做法一致，这里显式豁免参数数量检查。
-#[allow(clippy::too_many_arguments)]
-fn generate_package(
-    window: tauri::Window,
-    app: AppHandle,
-    root: String,
-    name: String,
-    output_dir: Option<String>,
-    output_root: Option<String>,
-    copy_episodes: bool,
-    ai_generated: bool,
-    cost_sheet: Option<CostSheetForm>,
-    ffprobe_path: Option<String>,
-    rules: Option<ChecklistRules>,
-) -> Result<PackageResult, String> {
-    let root = PathBuf::from(root);
-    // 生成前会重新探测（避免用过期规格），这一段同样要有进度，否则界面像卡死。
-    let analysis = analyze_drama_inner(
-        root.display().to_string(),
-        name,
-        ffprobe_path,
-        rules,
-        "generate",
-        |progress| {
-            let _ = window.emit("probe-progress", progress);
-        },
-    )?;
-    let drama = analysis.drama;
-    let episodes: Vec<ProbedEpisode> = drama
-        .episodes
-        .iter()
-        .cloned()
-        .zip(analysis.probes)
-        .filter_map(|(file, probe)| probe.spec.map(|spec| ProbedEpisode { file, spec }))
-        .collect();
-
-    // 落点三层：本次覆盖 → 设置里的「默认输出目录」（产物根目录）→ 剧目目录内。
-    // 规则与单测都在 `dossier_core::resolve_product_dir`，这一层只做字符串到路径的转换。
-    let package_dir = resolve_product_dir(
-        output_dir.as_deref().map(Path::new),
-        output_root.as_deref().map(Path::new),
-        &drama.dir,
-        &drama.name,
-        "报审包",
-    );
-
-    let opts = PackageOptions {
-        output_dir: Some(package_dir),
-        copy_episodes,
-        cost_sheet,
-        ai_generated,
-    };
-
-    let result = generate_report_package(
-        &drama.name,
-        &drama.dir,
-        drama.cover.as_deref(),
-        drama.synopsis.as_deref(),
-        &episodes,
-        &opts,
-    )
-    .map_err(|error| error.to_string())?;
-
-    // 成功后记入本机生成流水（设置-账单页展示；失败不影响生成结果本身）。
-    mount::record_generation(
-        &app,
-        &drama.name,
-        episodes.len(),
-        Path::new(&result.package_dir),
-    )
-    .unwrap_or_else(|error| eprintln!("{error}"));
-    Ok(result)
-}
-
 /// 在系统文件管理器里打开目录（或文件所在目录），供界面「打开目录」按钮调用。
 #[tauri::command]
 fn open_path(path: String) -> Result<(), String> {
@@ -274,7 +198,7 @@ pub fn run() {
             load_app_settings,
             save_app_settings,
             analyze_drama,
-            generate_package,
+            package::generate_package,
             open_path,
             account::commands::account_status,
             account::commands::account_retry,

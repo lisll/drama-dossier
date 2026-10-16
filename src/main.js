@@ -310,7 +310,7 @@ function handleProbeProgress(payload) {
     setProgress({
       label:
         task === "generate"
-          ? "探测完成，正在写入报审包与清单（复制分集时较慢）"
+          ? "探测完成，正在计算分集校验值（视频不上传，只发校验值）"
           : `探测完成（${total} 集），正在汇总检查结果`,
     });
     return;
@@ -931,8 +931,9 @@ function validateCostForm() {
   const investment = investmentText === "" ? null : Number(investmentText);
   const ratio = ratioText === "" ? null : Number(ratioText);
   const problems = [];
-  if (investment !== null && !(investment >= 0)) {
-    problems.push(["#total-investment", "投资总额必须是不小于 0 的数字。"]);
+  // 上限和 dossier-core 的 validate_request 一致（1e9 万元），免得本地放过、生成时才报错。
+  if (investment !== null && !(investment >= 0 && investment <= 1e9)) {
+    problems.push(["#total-investment", "投资总额（万元）必须在 0 到 1,000,000,000 之间。"]);
   }
   if (ratio !== null && !(ratio >= 0 && ratio <= 100)) {
     problems.push(["#actor-ratio", "演员成本占比必须在 0–100 之间。"]);
@@ -967,18 +968,23 @@ async function generate() {
         contact: $("#contact").value.trim(),
       },
     });
+    // 占位章必须写明：这个包里的盖章文档不具法律效力，正式报审前要换成真实签章。
+    const unsigned = result.placeholder
+      ? `<br /><strong>注意：盖的是占位章，未签署，无法律效力。</strong>正式报审前请换成加盖公章的版本：
+        ${result.unsignedDocuments.map((path) => esc(path)).join("、")}`
+      : "";
     renderResult("#generate-result", {
-      tone: "ok",
+      tone: result.placeholder ? "warn" : "ok",
       html: `<strong>报审包已生成</strong><br />
         位置：${esc(result.packageDir)}<br />
-        文件数：${result.fileCount} · 总大小：${formatBytes(Number(result.totalBytes))}`,
-        paths: [["package", result.packageDir]],
+        文件数：${result.fileCount} · 总大小：${formatBytes(Number(result.totalBytes))}${unsigned}`,
+      paths: [["package", result.packageDir]],
     });
-    toast("报审包生成完成");
+    toast(result.placeholder ? "报审包已生成（占位章，未签署，无法律效力）" : "报审包生成完成");
     // 流水多了一条：首页的引导和近 7 天图表跟着更新。
     loadHome();
   } catch (error) {
-    const message = String(error);
+    const message = error instanceof CommandError ? L.errorText(error) : String(error);
     // 「目录已存在」是可控的：后端没有动任何文件，把旧包位置摆出来，
     // 直接给「打开旧包 / 换个目录」两条路，而不是让人自己去找那个路径。
     if (/已存在/.test(message)) {

@@ -120,6 +120,10 @@ struct Server {
     unbind_remaining: u32,
     entitlement: (&'static str, Option<u64>),
     calls: HashMap<String, u32>,
+    /// 配方：签发时写进载荷的机器码（`None` = 请求里的机器码；设成别的模拟服务端发错了）。
+    recipe_device: Option<String>,
+    /// 已消费的配方编号（服务端记账，第二次消费 409）。
+    consumed: HashSet<String>,
 }
 
 impl Default for Server {
@@ -137,6 +141,8 @@ impl Default for Server {
             unbind_remaining: 3,
             entitlement: ("lifetime", None),
             calls: HashMap::new(),
+            recipe_device: None,
+            consumed: HashSet::new(),
         }
     }
 }
@@ -228,6 +234,42 @@ impl Server {
             .collect();
         json!({ "devices": devices, "device_limit": self.device_limit,
                 "unbind_quota": { "limit": 3, "window_days": 30, "remaining": self.unbind_remaining } })
+    }
+
+    /// 付费接口的前提：请求体里的机器码绑定在这个账号上。
+    fn require_bound(&self, body: &Value) -> Result<(), ApiError> {
+        let device = body["device_id"].as_str().unwrap_or("");
+        if self.bindings.iter().any(|(_, bound)| bound == device) {
+            Ok(())
+        } else {
+            Err(error(403, "device_not_bound", Value::Null))
+        }
+    }
+
+    /// 和服务端 `RecipeService.issue` 一样：用途前缀 recipe，真签。
+    fn recipe_response(&mut self, body: &Value) -> Value {
+        self.serial += 1;
+        let key = server_key();
+        let iat = now();
+        let rid = format!("00000000-0000-4000-8000-{:012}", self.serial);
+        let device = self
+            .recipe_device
+            .clone()
+            .unwrap_or_else(|| body["device_id"].as_str().unwrap_or("").to_owned());
+        let payload = json!({
+            "v": 1, "kid": key_id(&key.verifying_key().to_bytes()), "rid": rid, "sub": USER_ID,
+            "dev": device, "task": body["task"], "platform": body["platform"], "strength": body["strength"],
+            "seed": 7, "params": { "subtle": { "grain": 4 } }, "iat": iat, "exp": iat + 86_400,
+        })
+        .to_string();
+        let mut message = b"drama-dossier/recipe/v1\n".to_vec();
+        message.extend_from_slice(payload.as_bytes());
+        let token = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(payload.as_bytes()),
+            URL_SAFE_NO_PAD.encode(key.sign(&message).to_bytes())
+        );
+        json!({ "recipe_id": rid, "token": token, "expires_at": iat + 86_400, "params": {} })
     }
 
     fn check_bearer(&mut self, bearer: Option<&str>) -> Result<(), ApiError> {
@@ -336,6 +378,31 @@ impl Transport for FakeApi {
                 server.revoked = true;
                 server.bindings.clear();
                 Ok(Value::Null)
+            }
+            "POST /packages" => {
+                server.check_bearer(bearer)?;
+                server.require_bound(&body)?;
+                // 会话层只关心传输和重试；清单的验签与组装在 dossier-core 的 assemble 测试里。
+                Ok(
+                    json!({ "package_id": "pkg-1", "manifest": "{}", "signature": "{}", "files": [] }),
+                )
+            }
+            "POST /recipes" => {
+                server.check_bearer(bearer)?;
+                server.require_bound(&body)?;
+                Ok(server.recipe_response(&body))
+            }
+            other if other.starts_with("POST /recipes/") && other.ends_with("/consume") => {
+                server.check_bearer(bearer)?;
+                server.require_bound(&body)?;
+                let id = other
+                    .trim_start_matches("POST /recipes/")
+                    .trim_end_matches("/consume")
+                    .to_owned();
+                if !server.consumed.insert(id.clone()) {
+                    return Err(error(409, "recipe_consumed", Value::Null));
+                }
+                Ok(json!({ "recipe_id": id, "consumed": true }))
             }
             other if other.starts_with("DELETE /devices/") => {
                 server.check_bearer(bearer)?;
@@ -486,6 +553,79 @@ async fn revoked_session_signs_out_and_clears_store() {
     );
     assert_eq!(store.get(store::SESSION), None);
     assert_eq!(store.get(store::LICENSE), None);
+}
+
+// ---------- 报审包与处理配方 ----------
+
+fn package_body() -> Value {
+    json!({ "device_id": device_id(), "drama_name": "测试剧", "episodes": [] })
+}
+
+#[tokio::test]
+async fn create_package_retries_once_after_401() {
+    let (session, api, _store) = logged_in().await;
+    api.with(|server| server.reject_next_access = true);
+    let response = session
+        .create_package(package_body())
+        .await
+        .expect("刷新一次后重试成功");
+    assert_eq!(response.manifest, "{}");
+    assert_eq!(api.calls("POST /auth/refresh"), 1);
+    assert_eq!(api.calls("POST /packages"), 2);
+    assert!(session.is_logged_in());
+}
+
+#[tokio::test]
+async fn create_package_offline_reports_network_and_goes_offline() {
+    let (session, api, _store) = logged_in().await;
+    api.with(|server| server.offline = true);
+    let error = session.create_package(package_body()).await.unwrap_err();
+    assert!(error.is_unreachable(), "{error:?}");
+    assert_eq!(error.code(), "network");
+    // 断网不是被踢下线：还登录着，只是转成离线档。
+    assert!(session.is_logged_in());
+    assert_eq!(session.status().tier, "offline");
+}
+
+#[tokio::test]
+async fn create_package_passes_server_errors_through() {
+    let (session, _api, _store) = logged_in().await;
+    let mut body = package_body();
+    body["device_id"] = json!(OTHER_DEVICE);
+    let error = session.create_package(body).await.unwrap_err();
+    assert_eq!(error.code(), "device_not_bound");
+    assert!(session.is_logged_in(), "403 不应清掉登录状态");
+}
+
+const TASK: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+#[tokio::test]
+async fn recipe_is_verified_locally_then_consumed_once() {
+    let (session, api, _store) = logged_in().await;
+    let recipe = session
+        .issue_recipe(TASK, "douyin", "medium")
+        .await
+        .expect("签发并本地验签");
+    assert_eq!(recipe.device_id, device_id());
+    assert_eq!(recipe.task, TASK);
+    assert_eq!(recipe.platform, "douyin");
+    session.consume_recipe(&recipe).await.expect("第一次消费");
+    let error = session.consume_recipe(&recipe).await.unwrap_err();
+    assert_eq!(error.code(), "recipe_consumed");
+    assert_eq!(api.calls("POST /recipes"), 1);
+}
+
+#[tokio::test]
+async fn recipe_for_another_computer_is_rejected_locally() {
+    let (session, api, _store) = logged_in().await;
+    // 服务端（或者中间人）发回的配方签名没问题，但不是给这台电脑的。
+    api.with(|server| server.recipe_device = Some(OTHER_DEVICE.into()));
+    let error = session
+        .issue_recipe(TASK, "douyin", "medium")
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "recipe_wrong_device");
+    assert!(session.is_logged_in());
 }
 
 // ---------- 断网、时钟 ----------

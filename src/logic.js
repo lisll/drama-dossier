@@ -146,6 +146,15 @@
     mail_unavailable: "验证码邮件没发出去，请稍后重试",
     service_unavailable: "服务暂时不可用，请稍后重试",
     unauthorized: "登录已失效：这台电脑可能已在别处被解绑，请重新登录",
+    // 报审包（M4a）。分集被改动、被移走、目录已存在这几种，后端的说明里带了具体文件名，直接用后端的。
+    entitlement_required: "没有有效的使用权，不能生成报审包：请先兑换卡密或续期",
+    scan_invalid: "扫描件不符合要求：只支持 PNG、JPEG、PDF，每份不超过 5 MB",
+    payload_too_large: "提交的内容太大，服务端拒收了：请减少扫描件或集数后重试",
+    package_manifest_invalid: "报审包清单没有通过校验（签名不对或不是发给这台电脑的），本次没有写入任何文件，请重新生成",
+    package_server_file_mismatch: "服务端发回的文件和清单对不上，本次没有写入任何文件，请重新生成",
+    // 处理配方（M4b 接入界面，文案先备好）。
+    recipe_consumed: "这份处理配方已经用过了，请重新申请",
+    recipe_expired: "这份处理配方已过期，请重新申请",
   };
 
   /** 把后端错误变成给人看的一句话。 */

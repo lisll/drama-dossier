@@ -30,6 +30,8 @@ reqwest = { version = "=0.13.5", default-features = false, features = [
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio = { version = "=1.53.2", features = ["sync", "time", "macros"] }
 chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
+# 解码服务端发回的报审包文件（标准 base64）。
+base64 = "=0.22.1"
 
 # 系统钥匙串：Windows 凭据管理器 / macOS 钥匙串。
 # 这两个 feature 漏开的话 keyring 会退回到只存在内存里的假实现且不报错，启动自检会发现它（account/store.rs）。
@@ -41,7 +43,6 @@ keyring = { version = "=3.6.3", features = ["apple-native"] }
 
 [dev-dependencies]
 # 会话测试：假服务端用测试私钥签授权凭证，测试用 tokio 的单线程运行时。
-base64 = "=0.22.1"
 ed25519-dalek = "=2.2.0"
 tokio = { version = "=1.53.2", features = ["rt", "macros", "time"] }
 

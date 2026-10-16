@@ -254,3 +254,37 @@ test("主题：只认 light，其余一律暗色", () => {
     assert.equal(L.resolveTheme(stored), "dark", String(stored));
   }
 });
+
+test("报审包错误文案：有固定说法的给说法，带文件名的原样用后端 message", () => {
+  // M4a 新加的错误码：每一条都命中对应文案里的关键词。
+  const known = {
+    entitlement_required: /没有有效的使用权/,
+    scan_invalid: /PNG、JPEG、PDF/,
+    payload_too_large: /太大/,
+    package_manifest_invalid: /清单没有通过校验/,
+    package_server_file_mismatch: /和清单对不上/,
+    recipe_consumed: /已经用过/,
+    recipe_expired: /已过期/,
+  };
+  for (const [code, pattern] of Object.entries(known)) {
+    assert.match(L.errorText({ code }), pattern, code);
+    // 后端就算也给了 message，固定文案优先：这是给人看的说法，比后端原文清楚。
+    assert.match(L.errorText({ code, message: "后端原文" }), pattern, code);
+    assert.match(L.errorText({ error: code }), pattern, code);
+  }
+  // 这几种后端的说明里带具体文件名，没有固定文案，原样显示 message。
+  assert.equal(
+    L.errorText({ code: "package_local_changed", message: "第02集.mp4 在提交后被改动或调换过" }),
+    "第02集.mp4 在提交后被改动或调换过",
+  );
+  assert.equal(
+    L.errorText({ code: "package_local_missing", message: "找不到本机文件 第02集.mp4，它可能被移走或改名了" }),
+    "找不到本机文件 第02集.mp4，它可能被移走或改名了",
+  );
+  assert.equal(
+    L.errorText({ code: "package_already_exists", message: "报审包目录已存在：/输出/报审包" }),
+    "报审包目录已存在：/输出/报审包",
+  );
+  // 前端自己发的包错也走这条：后端只给码、不给 message 时兜底一句，不是空白。
+  assert.equal(L.errorText({ code: "package_local_missing" }), "操作失败");
+});

@@ -16,9 +16,11 @@ use reqwest::Method;
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use dossier_license::recipe::{self, Recipe};
+
 use super::api::{
-    decode, ApiError, AuthResponse, DeviceList, LicenseResponse, RedeemResponse, RefreshResponse,
-    Request, Transport,
+    decode, ApiError, AuthResponse, DeviceList, LicenseResponse, PackageResponse, RecipeResponse,
+    RedeemResponse, RefreshResponse, Request, Transport,
 };
 use super::store::{self, CredentialStore, LicenseRecord, SessionRecord, RECORD_VERSION};
 
@@ -795,6 +797,80 @@ impl<T: Transport, S: CredentialStore> Session<T, S> {
         self.authed(Request::new(Method::POST, "/me/delete").json(json!({ "password": password })))
             .await?;
         self.clear_local(Some("账号已注销".into())).await;
+        Ok(())
+    }
+
+    // ---------- 报审包与处理配方 ----------
+
+    /// 本机机器码和受信公钥：组装报审包、校验配方都要用。安装包配置有误时报错。
+    pub fn signing_context(&self) -> Result<(String, Vec<TrustedKey>), ApiError> {
+        let setup = self.require_setup()?;
+        Ok((setup.identity.device_id.clone(), setup.keys.clone()))
+    }
+
+    /// 让服务端生成报审包文档。`body` 由调用方按接口格式拼好（含本机机器码）。
+    pub async fn create_package(&self, body: Value) -> Result<PackageResponse, ApiError> {
+        decode(
+            self.authed(Request::new(Method::POST, "/packages").json(body))
+                .await?,
+        )
+    }
+
+    /// 申请处理配方，拿到后立刻在本机验一遍（签名、机器码、任务、有效期），验不过不交给调用方。
+    // 处理管线在 M4b 才接入界面；M4a 只有测试调用它。
+    #[allow(dead_code)]
+    pub async fn issue_recipe(
+        &self,
+        task: &str,
+        platform: &str,
+        strength: &str,
+    ) -> Result<Recipe, ApiError> {
+        let (device_id, keys) = self.signing_context()?;
+        let body = json!({
+            "device_id": device_id,
+            "task": task,
+            "platform": platform,
+            "strength": strength,
+        });
+        let response: RecipeResponse = decode(
+            self.authed(Request::new(Method::POST, "/recipes").json(body))
+                .await?,
+        )?;
+        let recipe = recipe::verify(&response.token, &keys, &device_id, task, (self.now)())
+            .map_err(|error| ApiError::Server {
+                status: 0,
+                code: format!("recipe_{}", error.code()),
+                message: error.to_string(),
+                retry_after: None,
+                extra: Value::Null,
+            })?;
+        if recipe.recipe_id != response.recipe_id {
+            return Err(ApiError::Protocol("配方编号和签名内容不一致".into()));
+        }
+        Ok(recipe)
+    }
+
+    /// 开工前消费配方：同一个配方只能成功一次（服务端记账）。
+    #[allow(dead_code)]
+    pub async fn consume_recipe(&self, recipe: &Recipe) -> Result<(), ApiError> {
+        let (device_id, _) = self.signing_context()?;
+        // 配方编号来自验过签的载荷；仍按 UUID 的字符集检查一遍再拼进路径。
+        let valid = recipe.recipe_id.len() == 36
+            && recipe
+                .recipe_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() || byte == b'-');
+        if !valid {
+            return Err(ApiError::Protocol("配方编号格式不正确".into()));
+        }
+        self.authed(
+            Request::new(
+                Method::POST,
+                format!("/recipes/{}/consume", recipe.recipe_id),
+            )
+            .json(json!({ "device_id": device_id })),
+        )
+        .await?;
         Ok(())
     }
 

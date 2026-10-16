@@ -60,7 +60,7 @@ fn field_messages(extra: &Value) -> Option<String> {
     (!messages.is_empty()).then(|| messages.join("；"))
 }
 
-fn local_error(code: &str, message: impl Into<String>) -> CommandError {
+pub(crate) fn local_error(code: &str, message: impl Into<String>) -> CommandError {
     CommandError {
         error: code.to_owned(),
         message: message.into(),

@@ -9,15 +9,20 @@
 
 #![cfg(target_os = "linux")]
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use base64::Engine;
+use dossier_core::{
+    assemble_package, diff_packages, hash_file, AssembleError, AssembleRequest, PackageResult,
+};
 use dossier_license::{
     derive_device_id, unix_now, LockReason, MachineIdentity, Platform, TrustedKey,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 
-use super::api::HttpTransport;
+use super::api::{HttpTransport, PackageResponse};
 use super::session::{Session, Setup};
 use super::store::{self, CredentialStore, PlatformStore};
 
@@ -216,4 +221,217 @@ async fn register_redeem_kick_export_delete() {
     s3.restore().await;
     let error = s3.login(&email, PASSWORD).await.unwrap_err();
     assert_eq!(error.code(), "invalid_credentials");
+}
+
+/// 一部临时样例剧：两集（内容随便写，服务端只认校验值），用完删掉。
+struct SampleDrama {
+    dir: PathBuf,
+    episodes: Vec<(String, PathBuf)>,
+}
+
+impl SampleDrama {
+    fn new(seed: u128) -> Self {
+        let dir = std::env::temp_dir().join(format!("dossier-e2e-drama-{seed:x}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let episodes = ["第01集.mp4", "第02集.mp4"]
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let path = dir.join(name);
+                std::fs::write(&path, format!("episode-{index}-{seed:x}").repeat(1000)).unwrap();
+                (name.to_string(), path)
+            })
+            .collect();
+        Self { dir, episodes }
+    }
+
+    fn local_sources(&self) -> HashMap<String, PathBuf> {
+        self.episodes.iter().cloned().collect()
+    }
+
+    /// `POST /packages` 的请求体：和 `package::prepare` 拼的一样，校验值现算。
+    fn body(&self, device_id: &str) -> Value {
+        let episodes: Vec<Value> = self
+            .episodes
+            .iter()
+            .enumerate()
+            .map(|(index, (name, path))| {
+                let (size, sha256) = hash_file(path).unwrap();
+                json!({
+                    "file_name": name,
+                    "episode_number": index + 1,
+                    "size_bytes": size,
+                    "sha256": sha256,
+                    "spec": {
+                        "duration_sec": 60.0, "width": 1080, "height": 1920,
+                        "video_codec": "h264", "audio_codec": "aac", "fps": 30.0,
+                        "bitrate_bps": 4_000_000,
+                    },
+                })
+            })
+            .collect();
+        json!({
+            "device_id": device_id,
+            "drama_name": "端到端样例剧",
+            "ai_generated": false,
+            "copy_episodes": true,
+            "cost_sheet": null,
+            "synopsis": null,
+            "cover": null,
+            "episodes": episodes,
+            "signer": "mock",
+        })
+    }
+}
+
+impl Drop for SampleDrama {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn decode_server_files(response: &PackageResponse) -> HashMap<String, Vec<u8>> {
+    response
+        .files
+        .iter()
+        .map(|file| {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(file.content.as_bytes())
+                .expect("服务端发回的是合法 base64");
+            (file.path.clone(), bytes)
+        })
+        .collect()
+}
+
+/// 用服务端的回复在 `output` 组装一次报审包。
+fn assemble(
+    response: &PackageResponse,
+    manifest: &[u8],
+    sources: &HashMap<String, PathBuf>,
+    output: &Path,
+    keys: &[TrustedKey],
+    device_id: &str,
+) -> Result<PackageResult, AssembleError> {
+    let server_files = decode_server_files(response);
+    assemble_package(
+        &AssembleRequest {
+            manifest,
+            signature: response.signature.as_bytes(),
+            server_files: &server_files,
+            local_sources: sources,
+            output_dir: output,
+            trusted: keys,
+            device_id,
+        },
+        |_, _, _| {},
+    )
+}
+
+/// 要第二张没用过的月卡 `DOSSIER_E2E_PACKAGE_CARD`（第一张在上面的测试里兑换掉了）。
+#[tokio::test]
+#[ignore = "需要本机真实的 commerce 服务、Mailpit 和 target/debug/dossier-artifacts，见 docs/DEVELOPMENT.md"]
+async fn package_and_recipe_against_real_server() {
+    let base = env("DOSSIER_E2E_BASE");
+    let email = format!("e2e-pkg-{:x}@example.test", unique() & 0xffff_ffff);
+    let machine = Machine::new(unique().rotate_left(7));
+    let drama = SampleDrama::new(unique());
+
+    // 1. 注册 → 兑换：这台电脑绑定、有使用权。
+    let session = machine.session(&base, unix_now);
+    session.restore().await;
+    session
+        .send_code(&email, "register")
+        .await
+        .expect("发验证码");
+    let code = mailed_code(&email).await;
+    session
+        .register(&email, &code, PASSWORD, true)
+        .await
+        .expect("注册成功");
+    session
+        .redeem(&env("DOSSIER_E2E_PACKAGE_CARD"))
+        .await
+        .expect("兑换成功");
+    let (device_id, keys) = session.signing_context().expect("有机器码和公钥");
+
+    // 2. 服务端生成文档：只发校验值，不发视频。
+    let body = drama.body(&device_id);
+    assert!(
+        !body.to_string().contains("episode-0-"),
+        "请求里没有视频内容"
+    );
+    let response = session.create_package(body).await.expect("服务端生成成功");
+    let manifest = response.manifest.as_bytes().to_vec();
+    let sources = drama.local_sources();
+
+    // 3. 正常组装：清单原样写回，两集都复制进包，差异对比能读。
+    let good = drama.dir.join("报审包");
+    let result =
+        assemble(&response, &manifest, &sources, &good, &keys, &device_id).expect("组装成功");
+    assert!(result.file_count >= 2, "{result:?}");
+    assert_eq!(std::fs::read(good.join("manifest.json")).unwrap(), manifest);
+    for (name, _) in &drama.episodes {
+        assert!(good.join("06_分集视频").join(name).is_file(), "{name}");
+    }
+    assert!(!diff_packages(&good, &good).unwrap().has_changes());
+
+    // 4. 清单被改一个字节：验签失败，不留目录。
+    let mut tampered = manifest.clone();
+    let at = tampered
+        .iter()
+        .position(|&b| b == b'1')
+        .expect("清单里有数字");
+    tampered[at] = b'2';
+    let out = drama.dir.join("报审包-篡改清单");
+    let error = assemble(&response, &tampered, &sources, &out, &keys, &device_id).unwrap_err();
+    assert_eq!(error.code(), "manifest_invalid", "{error}");
+    assert!(!out.exists());
+
+    // 5. 清单是别的电脑的：拒绝。
+    let other = Machine::new(unique().rotate_left(29));
+    let out = drama.dir.join("报审包-别的电脑");
+    let error = assemble(
+        &response,
+        &manifest,
+        &sources,
+        &out,
+        &keys,
+        &other.setup.identity.device_id,
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), "manifest_invalid", "{error}");
+    assert!(!out.exists());
+
+    // 6. 两集调换（文件名对调）：内容和提交时的校验值对不上，拒绝，不留目录。
+    let mut swapped = sources.clone();
+    let first = swapped["第01集.mp4"].clone();
+    let second = swapped["第02集.mp4"].clone();
+    swapped.insert("第01集.mp4".into(), second);
+    swapped.insert("第02集.mp4".into(), first);
+    let out = drama.dir.join("报审包-调换");
+    let error = assemble(&response, &manifest, &swapped, &out, &keys, &device_id).unwrap_err();
+    assert_eq!(error.code(), "local_changed", "{error}");
+    assert!(!out.exists());
+
+    // 7. 提交后改了一集：拒绝。
+    std::fs::write(&drama.episodes[1].1, b"changed after submit").unwrap();
+    let out = drama.dir.join("报审包-改了一集");
+    let error = assemble(&response, &manifest, &sources, &out, &keys, &device_id).unwrap_err();
+    assert_eq!(error.code(), "local_changed", "{error}");
+    assert!(!out.exists());
+
+    // 8. 配方：签发后本机验签通过；消费一次成功，第二次被拒。
+    let task = "ab".repeat(32);
+    let recipe = session
+        .issue_recipe(&task, "douyin", "medium")
+        .await
+        .expect("签发配方");
+    assert_eq!(recipe.device_id, device_id);
+    assert_eq!(recipe.task, task);
+    session.consume_recipe(&recipe).await.expect("第一次消费");
+    let error = session.consume_recipe(&recipe).await.unwrap_err();
+    assert_eq!(error.code(), "recipe_consumed", "{error:?}");
+
+    // 9. 清理：注销账号（服务端连同报审包、配方记录一起删）。
+    session.delete_account(PASSWORD).await.expect("注销成功");
 }

@@ -180,6 +180,29 @@ pub struct RedeemResponse {
     pub already_redeemed: bool,
 }
 
+/// 服务端生成的一个文件：包内路径 + base64（标准字母表）内容。
+#[derive(Debug, Clone, Deserialize)]
+pub struct PackageFileView {
+    pub path: String,
+    pub content: String,
+}
+
+/// `POST /packages` 的结果。`manifest` 是原样字符串：签名针对的就是这些字节，不能重新序列化。
+#[derive(Debug, Clone, Deserialize)]
+pub struct PackageResponse {
+    pub manifest: String,
+    /// `manifest.sig` 的内容（`{"kid","sig"}` 的 JSON 文本）。
+    pub signature: String,
+    pub files: Vec<PackageFileView>,
+}
+
+/// `POST /recipes` 的结果。`params` 只是方便查看；处理时以验过签的 `token` 里的为准。
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecipeResponse {
+    pub recipe_id: String,
+    pub token: String,
+}
+
 // ---------- 传输层 ----------
 
 /// 一次请求：方法、路径（不含 `/api/v1`）、可选的访问令牌和 JSON 请求体。
