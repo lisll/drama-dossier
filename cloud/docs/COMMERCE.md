@@ -5,8 +5,10 @@
 数据库用 PostgreSQL，因为卡密兑换、抢设备名额和以后的支付回调都需要可靠的并发事务。
 
 - M1（已完成）：邮件验证码、注册、登录、刷新与吊销令牌、重设密码、修改密码、集中限流、审计日志。
-- M2（本期）：卡密批量生成与兑换、使用权、电脑绑定与解绑、授权凭证的签发与刷新、管理命令。
+- M2：卡密批量生成与兑换、使用权、电脑绑定与解绑、授权凭证的签发与刷新、管理命令。
 - 桌面端接入（钥匙串、本机机器码、本地验签、离线提示）在 M3。
+- M4a（本期）：报审包（`POST /packages`）与处理配方（`POST /recipes`、`/recipes/{id}/consume`），
+  三种签名用途前缀隔离；处理配方接桌面界面在 M4b。
 
 ## 1. 本地开发
 
@@ -55,9 +57,13 @@ export DRAMA_COMMERCE_LICENSE_KEY_FILE="$HOME/.config/drama-commerce/license-dev
 | `DRAMA_COMMERCE_DEVICE_LIMIT` | 否 | 每个账号同时绑定几台电脑（1..20，默认 1） |
 | `DRAMA_COMMERCE_UNBIND_LIMIT` | 否 | 每个周期最多解绑几次（1..100，默认 3） |
 | `DRAMA_COMMERCE_UNBIND_WINDOW_DAYS` | 否 | 解绑次数的统计周期，单位天（1..365，默认 30） |
+| `DRAMA_COMMERCE_PDF_FONT` | 否 | 报审包 PDF 用的中文字体（`.otf` / `.ttf` / `.ttc` 文件路径）。不设时按常见系统路径找 Noto Sans CJK SC；**找不到字体服务拒绝启动** |
+| `DRAMA_COMMERCE_ARTIFACTS_BIN` | 否 | `dossier-artifacts` 可执行文件路径。不设时按 PATH → `target/release` → `target/debug` 查找（见 `toolchain.py`） |
 
 配置缺失或非法时，服务拒绝启动，报错里只出现变量名，不出现变量值。
 `migrate`、`cleanup`、`cards` 只需要 `DRAMA_COMMERCE_DSN`；`keygen`、`keyinfo` 不读任何配置。
+报审包与处理配方相关的接口还会用到上面两项：字体缺失时**启动**就失败；`dossier-artifacts`
+缺失时启动不失败，但 `POST /packages` 会返回 503 `service_unavailable`。
 
 ## 3. 接口
 
@@ -99,6 +105,7 @@ export DRAMA_COMMERCE_LICENSE_KEY_FILE="$HOME/.config/drama-commerce/license-dev
 | `devices` | 全部绑定记录，含已解绑的：`code`（4 位一组的展示形式）、`name`、`platform`、`app_version`、`bound_at`、`last_seen_at`、`unbound_at`、`unbind_reason` |
 | `redemptions` | 兑换记录：卡的 `kind`、`days`、`redeemed_at`，不含卡密 |
 | `sessions` | 登录会话：`created_at`、`expires_at`、`revoked_at`、`revoke_reason` |
+| `packages` | 报审包记录（**只有元数据**，不含文档内容）：`id`、`created_at`、`signer`、`episode_count` |
 | `audit_log` | 本账号发起的操作：`at`、`action`、`subject`、`detail` |
 | `exported_at` | 导出时间（数据库时间） |
 
@@ -107,7 +114,8 @@ export DRAMA_COMMERCE_LICENSE_KEY_FILE="$HOME/.config/drama-commerce/license-dev
 注销（`/me/delete`）必须重新输入密码，在一个事务里完成：
 
 - 清空邮箱和密码哈希，记下 `deleted_at`；
-- 删除会话（访问令牌、刷新令牌随之删除）、使用权、全部设备绑定、这个邮箱的验证码；
+- 删除会话（访问令牌、刷新令牌随之删除）、使用权、全部设备绑定、这个邮箱的验证码、报审包记录
+  （`packages`）和处理配方记录（`recipes`）——前者含机器码和生成时间，后者绑定机器码，都属于个人数据；
 - 审计日志记一条 `user.delete`，只记各项删除的数量。
 
 用户行本身保留：兑换过的卡仍然指向它，不会被别人再兑换一次；审计日志只记账号 ID，邮箱删掉以后对不上具体的人。
@@ -214,17 +222,157 @@ export DRAMA_COMMERCE_LICENSE_KEY_FILE="$HOME/.config/drama-commerce/license-dev
 | 400 | `wrong_password` | 修改密码时当前密码不对；注销时密码不对 |
 | 401 | `invalid_credentials` | 邮箱或密码不正确（两种情况不区分） |
 | 401 | `unauthorized` | 没带令牌、令牌无效或已过期、会话已吊销（包括这台电脑被解绑） |
-| 403 | `device_not_bound` | 刷新凭证：这台电脑没绑定到当前账号，或已被解绑 |
+| 403 | `device_not_bound` | 刷新凭证：这台电脑没绑定到当前账号，或已被解绑；生成报审包、签发 / 消费配方时也是这个含义 |
+| 403 | `entitlement_required` | 账号还没有使用权，或者使用权已到期（生成报审包、签发 / 消费配方的共同前提） |
+| 403 | `wrong_device` | 消费配方：这个配方不是发给这台电脑的 |
 | 404 | `email_not_registered` | 重设密码：邮箱没注册 |
 | 404 | `card_not_found` / `device_not_found` | 卡密不存在 / 要解绑的电脑不存在或已解绑 |
+| 404 | `recipe_not_found` | 消费配方：找不到这个配方（别人的配方和不存在的配方回同一个错误，不透露配方 ID 是否存在） |
 | 409 | `email_taken` | 注册：邮箱已被占用 |
 | 409 | `card_used` / `card_revoked` | 卡密已被别人用过 / 所在批次已作废 |
 | 409 | `already_lifetime` | 账号已经是永久授权，不需要再兑换（卡不会被用掉） |
 | 409 | `device_limit` | 名额满了；附带 `devices`、`device_limit`、`unbind_quota` |
-| 422 | `invalid_request` | 参数校验失败 |
+| 409 | `recipe_consumed` | 消费配方：这个配方已经用过了，要重新申请 |
+| 410 | `recipe_expired` | 消费配方：这个配方已过期，要重新申请 |
+| 413 | `payload_too_large` | 请求体太大：一般接口上限 1 MiB；`POST /packages` 上限 1 MiB + 4 份扫描件（见 3.5）。在解析 JSON 之前就拒绝 |
+| 422 | `invalid_request` | 参数校验失败；报审包还包括「文档内容太长压到签章位」这类排版错误，`message` 是 Rust 侧给的中文说明 |
+| 422 | `scan_invalid` | 生成报审包：扫描件不是合法的 base64、格式不支持、超过 5 MB、页数与原文档不一致，或者给出了不需要盖章的文档路径 |
 | 429 | `rate_limited` | 太频繁；`Retry-After` 响应头给出要等的秒数 |
 | 429 | `unbind_limit` | 本周期解绑次数用完；附带 `unbind_quota`，`Retry-After` 给出要等的秒数（可能是好几天） |
-| 503 | `mail_unavailable` / `service_unavailable` | 发信失败（可立即重试） / 数据库不可用 |
+| 503 | `mail_unavailable` / `service_unavailable` | 发信失败（可立即重试） / 数据库不可用；报审包还包括服务端缺少 `dossier-artifacts`、工具运行失败或超时、签章服务未实现 |
+
+### 3.5 报审包
+
+| 方法 | 路径 | 请求体 / 参数 | 成功 |
+| --- | --- | --- | --- |
+| POST | `/packages` | 见下 | 200 `{"package_id", "manifest", "signature", "files"}` |
+
+三个前提缺一不可：**登录**（没带令牌或令牌失效是 401 `unauthorized`，见 3.4）、`device_id` 是当前账号
+绑定且未解绑的电脑（否则 403 `device_not_bound`）、账号有**有效使用权**（否则 403 `entitlement_required`）。
+
+请求体（字段 snake_case，多一个不认识的字段一律 422）：
+
+| 字段 | 必填 | 说明与上限 |
+| --- | --- | --- |
+| `device_id` | 是 | 机器码，64 位小写十六进制 |
+| `drama_name` | 是 | 剧名，1..200 个字符（Rust 侧还要求能当文件名用、不含 `/`） |
+| `ai_generated` | 是 | 只接受 JSON 的 `true` / `false` |
+| `copy_episodes` | 是 | 是否把分集视频复制进包；`false` 时只登记哈希 |
+| `cost_sheet` | 否 | `company_name` / `contact` 各 ≤ 200 个字符；`total_investment_wan` 0..1e9；`actor_ratio_percent` 0..100 |
+| `synopsis` / `cover` | 否 | `file_name` 1..255 个字符、`size_bytes` 0..2^50、`sha256` 64 位小写十六进制 |
+| `episodes` | 是 | 最多 **500** 集；每集含 `file_name`、`size_bytes`、`sha256`、可选 `episode_number`（0..100000）和 `spec` |
+| `episodes[].spec` | 是 | `duration_sec` 0..86400；`width` / `height` 0..16384；`video_codec` / `audio_codec` 各 ≤ 32 字符；`fps` 0..1000；`bitrate_bps` 0..1e10 |
+| `signer` | 否 | `mock`（默认，占位章）/ `scan`（上传盖章扫描件） |
+| `scans` | 否 | `signer: scan` 时：文档路径 → 扫描件（PNG / JPEG / PDF）的 base64，每份 ≤ 7,000,000 个字符（约 5 MB 原始字节），最多 **4** 份 |
+
+整个请求体的上限是 1 MiB + 4 × 7,000,000 字节（`commerce/body_limit.py`）：先看 `Content-Length`，
+没有或谎报时边收边数，超了立即返回 413 `payload_too_large`，不把请求读进内存。其余接口一律 1 MiB。
+
+`scans` 的键必须是这次要盖章的文档路径（`04_成本配置表/成本配置表.pdf`、
+`05_权属声明/内容权属声明.pdf`），给了别的路径返回 422 `scan_invalid`；
+用 `signer: mock` 时不允许带 `scans`（同样 422）。
+
+服务端做的事：检查前提 → 调 `dossier-artifacts render-package` 生成文本文件与排版模型 →
+把两份文档画成 A4 PDF 并盖章 → 拼清单 `drama-dossier/package@2`、用 Ed25519 签名
+（用途前缀 `package-manifest`）→ 在一个事务里记一行 `packages` 和一条审计日志 → 返回。
+
+返回：
+
+```json
+{"package_id": "<UUID>",
+ "manifest": "<manifest.json 的原样字符串>",
+ "signature": "{\"kid\": \"…\", \"sig\": \"…\"}",
+ "files": [{"path": "01_剧集信息/剧名.txt", "content": "<base64>"}]}
+```
+
+`manifest` 和 `signature` 是**原样字符串**：签名针对的就是这些字节，桌面端必须把原文写回包里、
+不能重新序列化。`files` 里是包内路径 → base64 内容，桌面端逐个重算 SHA-256 与清单比对。
+
+- **视频不上传**：分集、封面、简介只传桌面端算好的文件名、大小和 SHA-256，服务端把它们登记进清单，
+  组装时由桌面端重新算一遍对比。服务端**不接收也不保存**任何文档内容。
+- 占位章（`signer: mock`）：文件名在 `.pdf` 前加 `_未签署`，清单里 `signature.placeholder = true`。
+- 失败时不会留下半成品：`dossier-artifacts` 找不到 / 运行失败 / 超时（30 秒）/ 输出不是 JSON
+  一律 503 `service_unavailable`，请求本身不合法（退出码 2）返回 422 `invalid_request`，
+  `message` 就是 Rust 侧的中文说明。`dossier-artifacts` 对传给它的请求 JSON 有 1 MiB
+  （`1 << 20`）上限，超了同样按请求不合法处理。
+
+限流（每账号，固定时间窗）：
+
+| 接口 | 规则 |
+| --- | --- |
+| `POST /packages` | 每账号每小时 **30** 次 |
+| `POST /recipes` | 每账号每小时 **60** 次 |
+| `POST /recipes/{id}/consume` | 每账号每小时 **120** 次 |
+
+### 3.6 处理配方
+
+处理配方（M4a 服务端接口，M4b 才接桌面界面）由服务端签发参数，绑定机器码和任务，**只能消费一次**。
+
+| 方法 | 路径 | 请求体 | 成功 |
+| --- | --- | --- | --- |
+| POST | `/recipes` | `device_id`、`task`、`platform`、`strength` | 200 `{"recipe_id", "token", "expires_at", "params"}` |
+| POST | `/recipes/{recipe_id}/consume` | `device_id` | 200 `{"recipe_id", "consumed": true}` |
+
+- 两个接口都要求登录、这台电脑绑定在当前账号上、使用权有效（与 3.5 同样的三个前提）。
+- 请求字段：`device_id` 是 64 位小写十六进制机器码；`task` 是**任务描述的哈希**，64 位小写十六进制；
+  `platform` 只能是 `douyin` / `kuaishou` / `channels`；`strength` 只能是 `light` / `medium` / `heavy`。
+
+**任务哈希（`task`）**：由桌面端计算后传给服务端；服务端只把它绑进配方并原样回填，**不解析也不校验内容**。
+具体规则在 M4b 定，本文不预设。
+
+`token` 是 `base64url(载荷 JSON) + "." + base64url(签名)`，签名用途前缀 `recipe`（和授权凭证、报审包清单
+互不冒充）。载荷字段与 `dossier-license::recipe` 一致：`v`（版本号，目前 1）、`kid`、`rid`（配方 ID）、
+`sub`（账号 ID）、`dev`（机器码）、`task`、`platform`、`strength`、`seed`、`params`、`iat`、`exp`。
+桌面端本地验签顺序是 格式 → 签名 → 载荷 → 机器码 → 任务 → 有效期，错误码分别是
+`malformed` / `bad_signature` / `bad_payload` / `wrong_device` / `wrong_task` / `expired`。
+
+**有效期**：`RECIPE_TTL_SECONDS = 24 × 3600`，即签发后 **24 小时**内要开工。桌面端判断「当前时间等于
+`exp`」即算过期。
+
+**只能消费一次**：由服务端记账。消费时先锁住这一行，再按顺序检查——找不到（别人的配方也是这个结果）
+→ `recipe_not_found`（404）→ 机器码不对 `wrong_device`（403）→ 已消费 `recipe_consumed`（409）
+→ 已过期 `recipe_expired`（410）→ 再查一次使用权（403 `entitlement_required`）→ 记 `consumed_at`。
+第二次消费一定失败；只靠本地记录挡不住重放（把本地记录删掉就能再用一次），所以必须在服务端记账。
+`recipes` 表里记着 `seed` 和平台 / 强度，配合 `derive_params` 就能算出同样的参数，处理结果可以复现。
+
+#### 各强度的参数上下限
+
+`params.subtle` 的每一项都在该档的上下限内取值（同一 `seed` 永远算出同样的参数）。
+`brightness` / `hue_degrees` / `pitch_semitones` 是**偏移量**：上下限描述幅度，正负号随机。
+
+| 参数 | 含义 | light | medium | heavy |
+| --- | --- | --- | --- | --- |
+| `grain` | ffmpeg `noise` 滤镜 alls 强度（0–100） | 1–3 | 3–6 | 6–10 |
+| `zoom_percent` | 放大再裁回原尺寸的比例（%） | 1.0–1.5 | 1.5–2.2 | 2.2–3.0 |
+| `brightness` | `eq` 亮度偏移（-1–1） | 0–0.01 | 0–0.02 | 0–0.03 |
+| `saturation` | 饱和度倍数 | 0.98–1.02 | 0.96–1.04 | 0.94–1.06 |
+| `hue_degrees` | 色相偏移（度） | 0–1.0 | 0–2.0 | 0–3.0 |
+| `tempo` | 整体变速倍数（画面和声音一起） | 0.99–1.01 | 0.98–1.02 | 0.97–1.03 |
+| `pitch_semitones` | 变调（半音） | 0–0.1 | 0–0.2 | 0–0.3 |
+| `trim_head_frames` | 片头裁几帧 | 1–2 | 2–3 | 3–5 |
+| `trim_tail_frames` | 片尾裁几帧 | 1–2 | 2–3 | 3–5 |
+| `quality.min_ssim` | 画质损失下限（M4b 检测用） | 0.97 | 0.95 | 0.93 |
+| `quality.min_psnr` | 画质损失下限（M4b 检测用） | 38.0 | 35.0 | 32.0 |
+
+#### 平台规格（第一层 `params.platform`）
+
+**保守值，待复核**：按公开资料里各平台都能接受的范围取交集，不追求每个平台的上限；
+平台随时会改规则，M4b 动手处理视频前要按官方帮助中心复核一次。
+
+| 平台 | 分辨率 | 帧率 | 视频码率 | 音频码率 | 单集时长上限 | 封装 / 编码 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `douyin` | 1080×1920 | 30 | 6000 kbps | 128 kbps | 900 秒 | mp4 / h264 / aac |
+| `kuaishou` | 1080×1920 | 30 | 6000 kbps | 128 kbps | 900 秒 | mp4 / h264 / aac |
+| `channels` | 1080×1920 | 30 | 5000 kbps | 128 kbps | 900 秒 | mp4 / h264 / aac |
+
+整理日期 **2026-10-15**，来源（`platform_specs.py` 的 `SOURCES`）：
+
+- <https://www.kuaishou.com/help/feedback/2730>
+- <https://www.kuaishou.com/help/feedback/4000>
+- <https://developers.weixin.qq.com>
+- <https://developer.open-douyin.com/docs/resource/zh-CN/dop/develop/openapi/video-management/video-upload/upload-video>
+
+状态：**待复核**——抖音、视频号没有官方原文，其余是二手转述，M4b 前需按官方帮助中心再核一次。
 
 ## 4. 安全规则
 
@@ -256,6 +404,9 @@ export DRAMA_COMMERCE_LICENSE_KEY_FILE="$HOME/.config/drama-commerce/license-dev
   | 绑定电脑 | 每账号每小时 20 次 |
   | 刷新凭证 | 每账号每小时 120 次 |
   | 设备列表、解绑 | 合计每账号每小时 60 次（解绑另有 30 天 3 次的上限） |
+  | 生成报审包 | 每账号每小时 30 次 |
+  | 签发处理配方 | 每账号每小时 60 次 |
+  | 消费处理配方 | 每账号每小时 120 次 |
 
   限流键是 IP、邮箱的 HMAC，数据库里不出现明文。卡密有 80 位随机数，靠猜是猜不中的，
   兑换的限流不是为了防猜，而是挡住脚本刷接口。
@@ -267,12 +418,23 @@ export DRAMA_COMMERCE_LICENSE_KEY_FILE="$HOME/.config/drama-commerce/license-dev
   这个摘要算法一改，库里所有没兑换的卡全部失效，所以用测试钉死了。
 - **授权签名私钥**：只放在服务器上（权限 600，权限过宽时启动日志会警告），不进仓库，也不进环境变量。
   泄露了，任何人都能给自己签永久授权；丢了，要换新密钥并发布内置新公钥的桌面端（见 5.1）。
+- **签名用途隔离**：同一把私钥签三种东西，签名对象前面各加一个固定前缀
+  （`drama-dossier/license/v1\n`、`drama-dossier/package-manifest/v1\n`、`drama-dossier/recipe/v1\n`），
+  所以授权凭证的签名挪去冒充报审包清单或处理配方都验不过，反过来也一样。
+- **报审包只存元数据**：`packages` 表只有 ID、账号、机器码、生成时间、签章方式、集数与
+  `manifest.json` 原始字节的 SHA-256；**服务端不保存任何文档内容**（PDF、文本、封面、简介、视频都不存），
+  生成完就直接发回桌面端。清单和签名也由桌面端在验签后写进本地包里。
+- **审计日志不记原文**：生成报审包只记一条 `package.create`，内容是**剧名的 SHA-256 前 16 位**、
+  集数和签章方式；不记剧名、公司名、联系方式原文。签发 / 消费配方记 `recipe.issue`（平台、强度）和
+  `recipe.consume`；任务哈希和机器码都不进审计日志的明细。
+- **扫描件**：只在请求体里出现，`scan_invalid` 时立即返回；上限 5 MB、像素上限 4000 万（按文件头判断
+  类型，不信扩展名），防止「解压炸弹」。不是通用文件上传接口，路径必须落在这次要盖章的文档上。
 - **机器码**：桌面端只上传摘要，接口也只收 64 位十六进制，服务端拿不到硬件原始信息。
   机器码是桌面端自己算的，改过的客户端可以冒用别的机器码，服务端分辨不出来：
   名额限制挡的是随手共享账号，挡不住有意破解；解绑次数上限和审计日志用来限制、发现「轮流换电脑」。
 - **审计日志**：注册、登录、退出、重设密码、修改密码、注销、刷新令牌重放，以及生成和作废卡密批次、兑换卡密、
-  绑定和解绑电脑都会记录。只记 ID、计数、卡的类型和天数、电脑平台、使用权的前后变化，
-  不记邮箱、令牌、验证码、卡密、授权凭证和 IP。
+  绑定和解绑电脑、生成报审包、签发和消费配方都会记录。只记 ID、计数、卡的类型和天数、电脑平台、
+  使用权的前后变化，不记邮箱、令牌、验证码、卡密、授权凭证和 IP。
   卡密批次的操作人记 `--by`，没给就记当前系统用户名。
 - 所有时间判断都用数据库的 `now()`，不依赖应用服务器的时钟；授权凭证的签发和到期时间也取数据库时间。
 
@@ -281,9 +443,18 @@ export DRAMA_COMMERCE_LICENSE_KEY_FILE="$HOME/.config/drama-commerce/license-dev
 - `drama-commerce migrate`：按编号执行 `src/drama_cloud/commerce/migrations/` 下的 SQL，每个迁移一个事务，
   用咨询锁防止两个进程同时迁移。已执行的迁移被改动、或数据库里有程序不认识的版本，都会报错停止。
   新改动写成新的编号文件。
-- 服务启动时检查迁移和授权私钥：数据库没迁移到最新、私钥读不到或不是 Ed25519 私钥，都拒绝启动。
+- 服务启动时检查迁移、授权私钥和**中文字体**：数据库没迁移到最新、私钥读不到或不是 Ed25519 私钥、
+  字体找不到，都拒绝启动。
+- 部署机要装**中文字体**（报审包的两份 PDF 要嵌入简体中文）：Debian / Ubuntu 上装 `fonts-noto-cjk`
+  （`apt install fonts-noto-cjk`），或把 `DRAMA_COMMERCE_PDF_FONT` 指向一个 `.otf` / `.ttf` / `.ttc`
+  文件。找不到时日志报「找不到报审包 PDF 要用的中文字体」并**拒绝启动**——不生成一份方块字的 PDF。
+  `.ttc` 合集里会取简体中文那一款（Noto Sans CJK SC / Noto Sans SC / Source Han Sans SC / CN），
+  拆成单独的字体文件交给 fpdf2，进程退出时删掉。
+- 报审包还依赖 Rust 侧的 `dossier-artifacts`：用 `DRAMA_COMMERCE_ARTIFACTS_BIN` 指定，
+  或让它在 `PATH` / 仓库的 `target/release`、`target/debug` 里能被找到。
+  它缺失时服务能启动，但 `POST /packages` 会返回 503 `service_unavailable`。
 - `drama-commerce cleanup`：清理过期的验证码、令牌、会话和限流计数，建议每天跑一次（cron 或 systemd timer）。
-  审计日志、卡密、电脑绑定都不在这里清理：解绑次数要从绑定历史里数。
+  审计日志、卡密、电脑绑定、报审包记录和处理配方记录都不在这里清理：解绑次数要从绑定历史里数。
   会话被清掉后，绑定上记的会话变成空，绑定本身不受影响。
 - 对外部署：必须在反向代理上终止 HTTPS，并把 `DRAMA_COMMERCE_TRUSTED_PROXIES` 设成实际的代理层数，
   否则限流拿到的都是代理的地址。SMTP 用 `starttls` 或 `ssl`。

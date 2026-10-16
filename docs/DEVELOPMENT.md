@@ -4,7 +4,7 @@
 
 | 模块 | 责任 | 禁止事项 |
 |---|---|---|
-| `crates/dossier-core` | 领域模型、目录扫描、ffprobe 解析、检查规则、报审包生成、转码建议、报审包差异、平台档案、剪映草稿 | 不依赖 Tauri/GUI，不做网络请求；`transcode` 只产出建议，不执行转码 |
+| `crates/dossier-core` | 领域模型、目录扫描、ffprobe 解析、检查规则、报审包文档生成与组装（`render_documents` / `assemble_package`）、验签、转码建议、报审包差异、平台档案、剪映草稿 | 不依赖 Tauri/GUI，不做网络请求（与服务端通信在 `src-tauri/src/account/`）；`transcode` 只产出建议，不执行转码 |
 | `crates/dossier-inpaint` | 硬字幕与角标擦除管线（学习原型）：帧 IO、掩码、检测/修复后端编排、结果自动校验、桌面入口的命令拼装 | 不做 DRM 绕过，不处理他人作品的版权标识；桌面端只能经 `erase.rs` 拼参数，不另写一套规则 |
 | `tools/model_worker` | 模型侧 worker：DBNet 检测、E2FGVI / LaMa / ProPainter 修复（`--serve` 常驻） | 不决定「改哪些像素」；不碰整帧回贴 |
 | `src-tauri` | 桌面窗口、IPC 命令、文件夹选择、打包 | 不把业务规则写在命令层（`erase.rs` / `dossier.rs` 只做参数适配） |
@@ -43,7 +43,7 @@
 | `load_app_settings` | 无 | 读取本机设置文件，返回设置、告警与文件路径 |
 | `save_app_settings` | `settings` | 校验检查规则并写入本机设置文件 |
 | `analyze_drama` | `root`, `name`, `ffprobePath`, `rules` | 探测规格并返回检查报告 |
-| `generate_package` | 剧目与包选项，含 `rules` | 重新探测后生成材料包 |
+| `generate_package` | 剧目与包选项，含 `rules` | 重新探测、逐集算哈希后调服务端生成文档，再验签组装报审包（需要联网与有效使用权） |
 | `pick_video` | 无 | 选择待擦除的视频文件 |
 | `erase_status` | `toolPath` | 查询擦除工具是否可用 |
 | `plan_erase` | `request`, `toolPath` | 只拼装命令供预览，不执行 |
@@ -66,11 +66,14 @@ Rust 命令使用 snake_case，Tauri 会把 JavaScript 的 camelCase 参数映�
   → UI 剧目列表
   → probe::probe_episode（ffprobe）
   → checklist::run_checks
-  → package::generate_report_package
-  → 本地报审包 + manifest.json
+  → 逐集算 SHA-256（视频不上传）
+  → POST /packages（服务端调 render_documents、渲染 PDF、盖章、签清单）
+  → package::assemble_package（验签 + 重算哈希）
+  → 报审包 + manifest.json + manifest.sig
 ```
 
 生成报审包时会重新扫描和探测，避免使用过期的前端状态；没有成功探测规格的分集不会写入 CSV。
+渲染文字内容只写在 Rust 的 `render_documents` 里一份，服务端只把它画成 PDF，不自己拼文字。
 
 ## 质量门槛
 
@@ -118,7 +121,8 @@ cd tools/model_worker && python3 -m unittest discover -s tests -v
 桌面端连 `cloud/` 里的账号与授权服务（`drama_cloud.commerce`，接口见 `cloud/docs/COMMERCE.md`）。
 各部分的位置：
 
-- `crates/dossier-license`：授权凭证验签、防时钟倒退、使用权判定、机器码。纯逻辑，不联网；
+- `crates/dossier-license`：授权凭证验签、报审包清单与处理配方验签（共用 `envelope` 的用途前缀隔离）、
+  防时钟倒退、使用权判定、机器码。纯逻辑，不联网；
 - `src-tauri/src/account/`：联网（`api.rs`）、钥匙串（`store.rs`）、会话与自动刷新（`session.rs`）、
   功能闸门（`gate.rs`，按命令名放行或拒绝，没登记的命令按「本地功能」处理）、命令（`commands.rs`）；
 - `src/logic.js`：界面用到的纯函数（卡密格式、倒计时、错误文案、引导、近 7 天统计），`node --test` 直接测。
@@ -127,6 +131,30 @@ cd tools/model_worker && python3 -m unittest discover -s tests -v
 
 按 `cloud/docs/COMMERCE.md` 第 1 节启动 PostgreSQL、Mailpit 和服务（`serve --port 8100`）。
 `keygen` 打印的 `public_key` 下一步要用。
+
+本地联调还要给服务端准备两样东西，缺了服务会拒绝启动或在生成时报错：
+
+- **`dossier-artifacts` 二进制**：`POST /packages` 用它把「生成文档」的纯函数调用起来
+  （`render-package` 子命令，stdin 读 JSON、stdout 写 JSON，不碰磁盘）。
+
+  ```bash
+  cargo build -p dossier-core --bin dossier-artifacts
+  ```
+
+  服务端按固定顺序找它：`DRAMA_COMMERCE_ARTIFACTS_BIN` 指定的路径 → `PATH` →
+  仓库的 `target/release/dossier-artifacts` → `target/debug/dossier-artifacts`
+  （实现见 `cloud/src/drama_cloud/toolchain.py` 的 `search_candidates` / `resolve_binary`）。
+  所以刚 `cargo build` 完不用配就能找到；找不到时 `POST /packages` 返回
+  503 `service_unavailable`「服务端缺少报审包生成工具」。
+- **中文字体**：报审包的两份 PDF 要嵌入简体中文字体，Debian / Ubuntu 上装 `fonts-noto-cjk`：
+
+  ```bash
+  sudo apt install fonts-noto-cjk
+  ```
+
+  找不到字体时服务**拒绝启动**（不生成一份方块字的 PDF）。配置项是
+  `DRAMA_COMMERCE_PDF_FONT`（.otf / .ttf / .ttc 文件路径，不设时按 `documents/pdf.py` 里的
+  常见系统路径找 Noto Sans CJK SC）。
 
 ### 2. 编译时变量
 
@@ -156,16 +184,25 @@ cargo tauri dev                       # 或 cargo build -p drama-dossier
 ### 4. 端到端测试（真实 HTTP）
 
 `src-tauri/src/account/e2e_tests.rs` 默认忽略，只在 Linux 上编译（Windows / macOS 上存储是系统钥匙串，测试不该往里写）。
-走一遍：注册（验证码从 Mailpit 取）→ 兑换 → 第二台电脑名额满 → 踢掉第一台 → 第一台刷新失败并退出 →
-断网进离线档、往回调时间判倒退 → 导出 → 注销 → 再登录失败。
+两条测试：
+
+- `register_redeem_kick_export_delete`：注册（验证码从 Mailpit 取）→ 兑换 → 第二台电脑名额满 → 踢掉第一台 →
+  第一台刷新失败并退出 → 断网进离线档、往回调时间判倒退 → 导出 → 注销 → 再登录失败。
+- `package_and_recipe_against_real_server`：注册 → 兑换 → 服务端生成报审包（只发校验值）→ 本机组装 →
+  清单改一个字节、清单是别的电脑的、两集调换、提交后改了一集，组装都被拒且不留目录 →
+  签发配方并本机验签 → 消费一次成功、第二次 409 → 注销。要先 `cargo build -p dossier-core --bin dossier-artifacts`。
+
+每条测试兑换一张卡，所以要两张没用过的月卡：
 
 ```bash
-# 按第 1 节拉起服务端（建议用一个临时库，跑完删掉），再生成一张月卡
+# 按第 1 节拉起服务端（建议用一个临时库，跑完删掉），再生成两张月卡
 export DOSSIER_E2E_BASE=http://127.0.0.1:8100
 export DOSSIER_E2E_MAILPIT=http://127.0.0.1:8025
 export DOSSIER_E2E_PUBKEY='<keygen 打印的 public_key>'
 export DOSSIER_E2E_CARD='<cards.csv 里一张没用过的卡>'
+export DOSSIER_E2E_PACKAGE_CARD='<cards.csv 里另一张没用过的卡>'
 cargo test -p drama-dossier --lib e2e -- --ignored
+```
 ```
 
 「服务端停了」用指向没人监听的端口模拟，不用真的停服务；时钟倒退用注入的时钟模拟，不改系统时间。
