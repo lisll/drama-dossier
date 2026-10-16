@@ -147,9 +147,11 @@ jobs:
             - **Windows**：首次运行可能弹出 SmartScreen 提示，点「更多信息」→「仍要运行」。
             - **macOS**：首次打开请在 Finder 中**右键点图标 → 选「打开」**，之后双击即可。直接双击会被 Gatekeeper 拦截。
 
-            **需要自行安装 FFmpeg**：应用通过外部 `ffprobe` 读取视频信息，不捆绑 FFmpeg。请先安装 FFmpeg 并确保 `ffprobe` 在 PATH 中，或在应用设置里手动指定路径。没有 `ffprobe` 时无法读取分集信息。
+            **内置运行环境（免手动装 FFmpeg）**：Windows 版安装包已内置
+            ffmpeg/ffprobe，应用内点「一键配置运行环境」即可离线完成；macOS
+            Apple Silicon 版支持一键在线安装。均无需手动配置 PATH。
 
-            **macOS Intel 版**：不支持运行环境一键配置（该功能仅 macOS + Apple Silicon），需手动安装 FFmpeg 并在设置里指定路径。
+            **macOS Intel 版**：不支持一键配置，需手动安装 FFmpeg 并在设置里指定路径。
 
             ## 已知问题
 
