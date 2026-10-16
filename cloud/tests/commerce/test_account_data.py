@@ -157,8 +157,10 @@ def test_export_has_every_section_without_secrets(client, pg, account):
     assert response.status_code == 200, response.text
     body = response.json()
     assert set(body) == {"format", "exported_at", "account", "entitlement", "devices", "redemptions",
-                         "sessions", "audit_log"}
+                         "sessions", "packages", "audit_log"}
     assert body["format"] == "drama-dossier/account-export/v1"
+    # 还没生成过报审包；每条记录的字段在 test_packages.py 里生成之后再核对。
+    assert body["packages"] == []
     assert set(body["account"]) == {"id", "email", "created_at", "terms_version", "terms_accepted_at"}
     assert body["account"]["email"] == EMAIL
     assert body["entitlement"]["kind"] == "timed"

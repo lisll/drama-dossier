@@ -17,15 +17,19 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from psycopg_pool import ConnectionPool
 
-from . import auth_routes, license_routes
+from . import auth_routes, license_routes, package_routes
 from .accounts import AccountService
+from .body_limit import BodyLimitMiddleware
 from .config import CommerceSettings, load_settings
 from .db import MigrationError, open_pool, pending
 from .deps import get_conn
+from .documents.pdf import load_font
 from .errors import CommerceError
 from .license_service import LicenseService
 from .license_token import Signer
 from .mailer import Mailer, SmtpMailer
+from .package_service import PackageService
+from .recipes import RecipeService
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +71,8 @@ def create_app(
     settings = settings or load_settings()
     # 先加载签名私钥：私钥有问题就在打开连接池之前报错。
     signer = Signer.from_pem_file(settings.license_key_file)
+    # 报审包 PDF 的中文字体：找不到就拒绝启动，不生成一份方块字的 PDF。
+    font = load_font(settings.pdf_font)
     owns_pool = pool is None
     if pool is None:
         pool = open_pool(settings.dsn, settings.pool_min_size, settings.pool_max_size)
@@ -95,6 +101,8 @@ def create_app(
     app.state.pool = pool
     app.state.service = AccountService(settings, mailer or SmtpMailer(settings.smtp), hasher)
     app.state.licenses = LicenseService(settings, signer)
+    app.state.packages = PackageService(settings, signer, font)
+    app.state.recipes = RecipeService(signer)
     log.info("授权签名公钥 kid=%s", signer.kid)
 
     @app.exception_handler(CommerceError)
@@ -128,4 +136,7 @@ def create_app(
 
     app.include_router(auth_routes.router)
     app.include_router(license_routes.router)
+    app.include_router(package_routes.router)
+    # 最外层：在路由、认证、JSON 解析之前就挡住超大请求体。
+    app.add_middleware(BodyLimitMiddleware)
     return app

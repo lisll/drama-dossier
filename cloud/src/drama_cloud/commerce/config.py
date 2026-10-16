@@ -55,6 +55,10 @@ class CommerceSettings:
     license_ttl_hours: int = 72
     #: 联网时桌面端每隔多久刷新一次凭证，让断网时剩下的宽限期接近完整的 license_ttl_hours。
     license_refresh_hours: int = 1
+    #: 报审包 PDF 用的中文字体（.otf / .ttf / .ttc）。不设时按常见系统路径找 Noto Sans CJK SC。
+    pdf_font: Optional[str] = None
+    #: `dossier-artifacts` 可执行文件。不设时按 PATH → target/release → target/debug 找。
+    artifacts_bin: Optional[str] = None
 
 
 def _get(env: Mapping[str, str], name: str) -> str:
@@ -141,4 +145,6 @@ def load_settings(env: Optional[Mapping[str, str]] = None) -> CommerceSettings:
         unbind_window_days=_int(env, "UNBIND_WINDOW_DAYS", 30, 1, 365),
         license_ttl_hours=ttl_hours,
         license_refresh_hours=refresh_hours,
+        pdf_font=_get(env, "PDF_FONT") or None,
+        artifacts_bin=_get(env, "ARTIFACTS_BIN") or None,
     )

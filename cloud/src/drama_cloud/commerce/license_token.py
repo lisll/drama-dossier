@@ -31,6 +31,13 @@ from .config import ConfigError
 log = logging.getLogger(__name__)
 
 SIGNING_CONTEXT = b"drama-dossier/license/v1\n"
+#: 同一把私钥签三种东西，签名对象前缀各不相同，任何一种签名都不能被挪去冒充另一种。
+#: 和桌面端 `dossier_license::envelope::Purpose::context` 一一对应。
+PURPOSE_CONTEXTS = {
+    "license": SIGNING_CONTEXT,
+    "package-manifest": b"drama-dossier/package-manifest/v1\n",
+    "recipe": b"drama-dossier/recipe/v1\n",
+}
 PAYLOAD_VERSION = 1
 ENTITLEMENT_KINDS = ("none", "timed", "lifetime")
 #: 整数字段的取值范围：非负且小于 2^63，和 Rust 的 i64 一致。
@@ -122,6 +129,16 @@ class Signer:
 
     def sign(self, payload: dict) -> str:
         return self.sign_bytes(canonical_payload(payload))
+
+    def sign_detached(self, purpose: str, payload: bytes) -> str:
+        """按用途给一段字节签名，返回 base64url 签名（不含载荷）。报审包清单用这个。"""
+        signature = self._private_key.sign(PURPOSE_CONTEXTS[purpose] + payload)
+        return b64url_encode(signature)
+
+    def sign_envelope(self, purpose: str, payload: dict) -> str:
+        """按用途签内嵌写法 `载荷.签名`。处理配方用这个。"""
+        raw = canonical_payload(payload)
+        return b64url_encode(raw) + "." + self.sign_detached(purpose, raw)
 
     def __repr__(self) -> str:
         return f"Signer(kid={self.kid!r})"

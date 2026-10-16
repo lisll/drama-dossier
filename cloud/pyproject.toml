@@ -19,6 +19,9 @@ dependencies = [
     "psycopg-pool==3.3.3",
     "argon2-cffi==25.1.0",
     "cryptography==50.0.2",
+    # 报审包：fpdf2 排版 PDF（能嵌入 Noto CJK 这类 CFF 中文字体），pypdf 叠加签章层、替换扫描页
+    "fpdf2==2.8.3",
+    "pypdf==5.4.0",
 ]
 
 [project.optional-dependencies]

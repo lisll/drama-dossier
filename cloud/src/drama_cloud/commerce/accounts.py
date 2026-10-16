@@ -240,6 +240,11 @@ class AccountService:
                 " WHERE user_id = %s::uuid ORDER BY created_at",
                 (ctx.user_id,),
             ).fetchall()
+            package_rows = conn.execute(
+                "SELECT id, created_at, signer, episode_count FROM packages"
+                " WHERE user_id = %s::uuid ORDER BY created_at",
+                (ctx.user_id,),
+            ).fetchall()
             audit_rows = conn.execute(
                 "SELECT at, action, subject, detail FROM audit_log WHERE actor = %s ORDER BY at, id",
                 (ctx.user_id,),
@@ -283,6 +288,12 @@ class AccountService:
                 }
                 for row in session_rows
             ],
+            # 报审包只有元数据：服务端不存文档内容。
+            "packages": [
+                {"id": str(row["id"]), "created_at": _iso(row["created_at"]), "signer": row["signer"],
+                 "episode_count": row["episode_count"]}
+                for row in package_rows
+            ],
             "audit_log": [
                 {"at": _iso(row["at"]), "action": row["action"], "subject": row["subject"], "detail": row["detail"]}
                 for row in audit_rows
@@ -320,6 +331,13 @@ class AccountService:
                 ).rowcount,
                 "email_codes": conn.execute(
                     "DELETE FROM email_codes WHERE email = %s", (row["email"],)
+                ).rowcount,
+                # 报审包记录里有机器码和生成时间；配方绑定机器码。都属于个人数据，一并删除。
+                "packages": conn.execute(
+                    "DELETE FROM packages WHERE user_id = %s::uuid", (ctx.user_id,)
+                ).rowcount,
+                "recipes": conn.execute(
+                    "DELETE FROM recipes WHERE user_id = %s::uuid", (ctx.user_id,)
                 ).rowcount,
             }
             conn.execute(

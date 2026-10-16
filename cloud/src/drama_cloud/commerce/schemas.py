@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from typing import Annotated, Literal, Optional
+from typing import Annotated, Dict, List, Literal, Optional
 
-from pydantic import AfterValidator, StrictBool, field_validator
+from pydantic import AfterValidator, Field, StrictBool, field_validator
 
 from ..base import StrictModel
 from . import cards
@@ -156,3 +156,83 @@ class ActivateRequest(StrictModel):
 class LicenseRefreshRequest(StrictModel):
     device_id: DeviceId
     app_version: Optional[AppVersion] = None
+
+
+# ---------- 报审包与处理配方 ----------
+# 字段的细节校验（文件名、哈希格式、数值范围、撞名）在 Rust 的 render_documents 里做一份，
+# 这里只挡类型、长度和数量，免得两边规则写两遍。
+
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+#: 单份扫描件 5 MB，base64 之后约 6.7 MB。
+SCAN_B64_MAX = 7_000_000
+
+
+def _sha256(value: str) -> str:
+    if not _SHA256.match(value):
+        raise ValueError("校验和应该是 64 位小写十六进制")
+    return value
+
+
+Sha256 = Annotated[str, AfterValidator(_sha256)]
+ShortText = Annotated[str, Field(max_length=200)]
+
+
+class LocalAssetIn(StrictModel):
+    file_name: Annotated[str, Field(min_length=1, max_length=255)]
+    size_bytes: Annotated[int, Field(ge=0, le=1 << 50)]
+    sha256: Sha256
+
+
+class EpisodeSpecIn(StrictModel):
+    duration_sec: Annotated[float, Field(ge=0, le=86_400)]
+    width: Annotated[int, Field(ge=0, le=16_384)]
+    height: Annotated[int, Field(ge=0, le=16_384)]
+    video_codec: Optional[Annotated[str, Field(max_length=32)]] = None
+    audio_codec: Optional[Annotated[str, Field(max_length=32)]] = None
+    fps: Optional[Annotated[float, Field(ge=0, le=1000)]] = None
+    bitrate_bps: Optional[Annotated[int, Field(ge=0, le=10_000_000_000)]] = None
+
+
+class EpisodeIn(LocalAssetIn):
+    episode_number: Optional[Annotated[int, Field(ge=0, le=100_000)]] = None
+    spec: EpisodeSpecIn
+
+
+class CostSheetIn(StrictModel):
+    company_name: ShortText = ""
+    total_investment_wan: Optional[Annotated[float, Field(ge=0, le=1e9)]] = None
+    actor_ratio_percent: Optional[Annotated[float, Field(ge=0, le=100)]] = None
+    contact: ShortText = ""
+
+
+class PackageRequest(StrictModel):
+    device_id: DeviceId
+    drama_name: Annotated[str, Field(min_length=1, max_length=200)]
+    ai_generated: StrictBool
+    copy_episodes: StrictBool
+    cost_sheet: Optional[CostSheetIn] = None
+    synopsis: Optional[LocalAssetIn] = None
+    cover: Optional[LocalAssetIn] = None
+    episodes: Annotated[List[EpisodeIn], Field(max_length=500)]
+    signer: Literal["mock", "scan"] = "mock"
+    #: signer = scan 时：要盖章的文档路径 → 扫描件（PNG / JPEG / PDF）的 base64。
+    scans: Optional[Dict[str, Annotated[str, Field(max_length=SCAN_B64_MAX)]]] = None
+
+    @field_validator("scans")
+    @classmethod
+    def _scans_limit(cls, value):
+        if value is not None and len(value) > 4:
+            raise ValueError("扫描件最多 4 份")
+        return value
+
+
+class RecipeRequest(StrictModel):
+    device_id: DeviceId
+    #: 任务描述的哈希（桌面端按 COMMERCE.md 的规则算），配方绑定这个任务。
+    task: Sha256
+    platform: Literal["douyin", "kuaishou", "channels"]
+    strength: Literal["light", "medium", "heavy"]
+
+
+class RecipeConsumeRequest(StrictModel):
+    device_id: DeviceId
