@@ -73,6 +73,21 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      # Windows 包内置 ffmpeg/ffprobe（与 build-windows.yml 同源逻辑）：
+      # 用户端「一键配置运行环境」从安装包资源复制，零下载。
+      - name: 预置 ffmpeg 到安装包资源
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $zip = "$env:RUNNER_TEMP\ffmpeg.zip"
+          curl.exe -sSL --retry 5 --max-time 600 -o $zip https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
+          if (-not (Test-Path $zip)) { throw "ffmpeg zip 下载失败" }
+          $stage = "$env:RUNNER_TEMP\ffstage"
+          Expand-Archive -Force $zip $stage
+          $bin = (Get-ChildItem -Recurse -Filter ffmpeg.exe $stage | Select-Object -First 1).DirectoryName
+          New-Item -ItemType Directory -Force src-tauri/resources/ffmpeg | Out-Null
+          Copy-Item "$bin\ffmpeg.exe","$bin\ffprobe.exe" src-tauri/resources/ffmpeg/
+          Get-ChildItem src-tauri/resources/ffmpeg | ForEach-Object { "{0}  {1:N1} MB" -f $_.Name, ($_.Length/1MB) }
       - name: Build desktop bundles
         uses: tauri-apps/tauri-action@v0
         env:
