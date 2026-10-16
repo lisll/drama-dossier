@@ -100,8 +100,8 @@ if [ "$run_rust" -eq 1 ] && require cargo; then
   step "Format：cargo fmt --all -- --check" \
     cargo fmt --all -- --check
   if rust_env_ready; then
-    step "Clippy：cargo clippy --workspace --all-targets -- -D warnings" \
-      cargo clippy --workspace --all-targets -- -D warnings
+    step "Clippy：cargo clippy --workspace --all-targets --no-deps -- -D warnings" \
+      cargo clippy --workspace --all-targets --no-deps -- -D warnings
     if [ "$fast" -eq 1 ]; then
       printf '==> 跳过 Test（--fast，pre-push 或 CI 会跑）\n'
     else

@@ -37,8 +37,10 @@ jobs:
         uses: swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all -- --check
+      # --no-deps：只警告我们自己的代码。依赖库（tauri 系等）在 windows 宿主机
+      # 编译构建脚本时会暴露它们自身的 clippy 警告，不由本仓库把关。
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
       - name: Test
         run: cargo test --workspace --all-features
 

@@ -1026,7 +1026,7 @@ dependencies = [
 
 [[package]]
 name = "drama-dossier"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "dossier-core",
  "dossier-inpaint",
