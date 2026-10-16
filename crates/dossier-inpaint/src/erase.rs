@@ -693,12 +693,21 @@ mod tests {
         let me = std::env::current_exe().unwrap();
         assert_eq!(resolve_tool(Some(&me), None).unwrap(), me);
         let no_tool = resolve_tool(None, Some(Path::new("/nonexistent-repo")));
-        assert!(
-            no_tool.is_err(),
-            "无显式路径时应报错，实际返回：{:?}；PATH={:?}",
-            no_tool,
-            std::env::var_os("PATH"),
-        );
+        match no_tool {
+            // 正常：PATH 与伪 repo_root 都没有工具，报可行动的错误。
+            Err(_) => {}
+            // Windows 特例：cargo test 会把 target\debug 塞进 PATH（DLL 解析需要），
+            // workspace 刚构建出的 dossier-inpaint.exe 因此能被 search_path 找到，
+            // 属环境事实而非解析缺陷——此时只要求解析结果是那个二进制。
+            Ok(found) => {
+                let name = found.file_name().unwrap().to_string_lossy();
+                assert!(
+                    name.starts_with("dossier-inpaint"),
+                    "PATH 上意外解析出非目标二进制：{}",
+                    found.display()
+                );
+            }
+        }
     }
 
     use std::io::Write;
