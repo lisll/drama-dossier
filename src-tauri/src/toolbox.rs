@@ -1314,12 +1314,25 @@ fn persist_tool_paths(
 
 /// 安装包内置的运行环境目录：Windows 安装包由 CI 预置 ffmpeg/ffprobe
 /// （见 .github/workflows/build-windows.yml），装好后**运行时零下载**。
-/// 源码直跑或未内置（mac）时返回 None，调用方退回下载流程。
+/// Tauri v2 的 resources 按「相对 tauri.conf.json 的路径」原样落盘：
+/// 声明 `resources/ffmpeg/*` 实际装在 `<resource_dir>/resources/ffmpeg/`；
+/// 兼容再查一层 `<resource_dir>/ffmpeg`，防打包器行为差异。
+/// 源码直跑或未内置（mac DMG）时返回 None，调用方退回下载流程。
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn bundled_runtime_dir(app: &AppHandle) -> Option<PathBuf> {
     use tauri::Manager;
-    let dir = app.path().resource_dir().ok()?.join("ffmpeg");
-    (dir.is_dir()).then_some(dir)
+    let root = app.path().resource_dir().ok()?;
+    let exe_name = dossier_inpaint::erase::binary_name("ffmpeg");
+    let dir = [root.join("resources").join("ffmpeg"), root.join("ffmpeg")]
+        .into_iter()
+        .find(|dir| dir.join(&exe_name).is_file());
+    if dir.is_none() {
+        crate::logging::log_event(
+            "环境",
+            format!("安装包内置运行环境未找到（已尝试 {}\\resources\\ffmpeg 与 {}\\ffmpeg），退回在线下载", root.display(), root.display()),
+        );
+    }
+    dir
 }
 
 /// 从安装包内置资源把工具复制到 bin 目录；返回实际安装的组件名。
