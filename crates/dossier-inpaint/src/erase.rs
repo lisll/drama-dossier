@@ -692,7 +692,13 @@ mod tests {
         assert!(missing.is_err());
         let me = std::env::current_exe().unwrap();
         assert_eq!(resolve_tool(Some(&me), None).unwrap(), me);
-        assert!(resolve_tool(None, Some(Path::new("/nonexistent-repo"))).is_err());
+        let no_tool = resolve_tool(None, Some(Path::new("/nonexistent-repo")));
+        assert!(
+            no_tool.is_err(),
+            "无显式路径时应报错，实际返回：{:?}；PATH={:?}",
+            no_tool,
+            std::env::var_os("PATH"),
+        );
     }
 
     use std::io::Write;
