@@ -12,8 +12,11 @@
 
 pub mod access;
 pub mod clock;
+pub mod envelope;
 pub mod keys;
 pub mod machine;
+pub mod manifest;
+pub mod recipe;
 pub mod token;
 
 pub use access::{decide, Access, Connectivity, LockReason, ServerEntitlement, Tier};

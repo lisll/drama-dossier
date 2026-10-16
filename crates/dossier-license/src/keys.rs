@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 use ed25519_dalek::VerifyingKey;
 use sha2::{Digest, Sha256};
 
-use crate::token::b64url_decode;
+use crate::envelope::b64url_decode;
 
 /// 内置的正式公钥（32 字节公钥的 base64url，不带填充）。
 pub const BUILTIN_KEYS: &[&str] = &[];
