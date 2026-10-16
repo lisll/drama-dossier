@@ -1,4 +1,4 @@
-//! `dossier-artifacts`：产物戳记的一致性校验（Tier 3 的消费端）。
+//! `dossier-artifacts`：产物戳记的一致性校验（Tier 3 的消费端），以及报审包的「生成文档」。
 //!
 //! 生产端是各个管线（例如 `dossier-inpaint` 默认写 `<输出>.stamp.json`）；
 //! 这里负责回答「这一批产物是不是同一套管线、同一个工具版本、同一组参数、同一批输入出的」。
@@ -6,13 +6,18 @@
 //! 为什么要有独立的命令行：一致性问题往往在**跑完之后**才被发现（一次跑批里混进了
 //! 旧工具产出的分集），这时候已经不可能靠退出码拦住，只能拿戳记来审。
 //!
-//! 退出码：`0` 一致；`1` 发现不一致；`2` 戳记读不出来（路径错、文件损坏、管线未登记）。
+//! `render-package`：服务端调用。stdin 读 JSON 请求（[`RenderRequest`]），stdout 写 JSON 结果
+//! （[`dossier_core::RenderedDocuments`]），不碰磁盘。
+//!
+//! 退出码：`0` 一致 / 成功；`1` 发现不一致；`2` 戳记读不出来、请求不合法（错误写到 stderr）。
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use dossier_core::pipeline_version::{load_and_check, ArtifactStamp, STAMP_SUFFIX};
+use dossier_core::{render_documents, RenderRequest};
 
 #[derive(Parser)]
 #[command(
@@ -35,6 +40,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// 生成报审包文档：stdin 读 JSON 请求，stdout 写 JSON 结果，不碰磁盘
+    RenderPackage,
 }
 
 fn main() -> ExitCode {
@@ -50,6 +57,7 @@ fn main() -> ExitCode {
 
 fn run(cli: &Cli) -> Result<ExitCode, String> {
     match &cli.command {
+        Command::RenderPackage => render_package(),
         Command::Check { paths, json } => {
             let stamps = collect_stamps(paths)?;
             if stamps.is_empty() {
@@ -144,4 +152,25 @@ fn walk(dir: &Path, found: &mut Vec<PathBuf>) -> Result<(), String> {
 #[allow(dead_code)]
 fn load_one(path: &Path) -> Result<ArtifactStamp, String> {
     ArtifactStamp::load(path).map_err(|error| error.to_string())
+}
+
+/// 请求体上限：不含扫描件的报审包请求不会超过 1 MiB（500 集也只有几百 KiB）。
+const MAX_RENDER_INPUT: u64 = 1 << 20;
+
+fn render_package() -> Result<ExitCode, String> {
+    let mut input = String::new();
+    std::io::stdin()
+        .take(MAX_RENDER_INPUT + 1)
+        .read_to_string(&mut input)
+        .map_err(|error| format!("读取请求失败：{error}"))?;
+    if input.len() as u64 > MAX_RENDER_INPUT {
+        return Err("请求太大".to_string());
+    }
+    let request: RenderRequest =
+        serde_json::from_str(&input).map_err(|error| format!("请求格式不对：{error}"))?;
+    let rendered = render_documents(&request).map_err(|error| error.to_string())?;
+    let text =
+        serde_json::to_string(&rendered).map_err(|error| format!("结果序列化失败：{error}"))?;
+    println!("{text}");
+    Ok(ExitCode::SUCCESS)
 }
