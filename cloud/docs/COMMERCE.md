@@ -315,10 +315,24 @@ export DRAMA_COMMERCE_LICENSE_KEY_FILE="$HOME/.config/drama-commerce/license-dev
 
 - 两个接口都要求登录、这台电脑绑定在当前账号上、使用权有效（与 3.5 同样的三个前提）。
 - 请求字段：`device_id` 是 64 位小写十六进制机器码；`task` 是**任务描述的哈希**，64 位小写十六进制；
-  `platform` 只能是 `douyin` / `kuaishou` / `channels`；`strength` 只能是 `light` / `medium` / `heavy`。
+  `platform` 只能是 `universal`（只生成一套通用版本，见 3.6 的平台规格）；
+  `strength` 只能是 `light` / `medium` / `heavy`。
 
 **任务哈希（`task`）**：由桌面端计算后传给服务端；服务端只把它绑进配方并原样回填，**不解析也不校验内容**。
-具体规则在 M4b 定，本文不预设。
+规则（`dossier-license::version_task`）：
+
+- `task = SHA-256( 规范化 JSON )`，JSON 只含这几项，键按字母序、无空白（非 ASCII 字符按 UTF-8 原样输出）：
+
+```json
+{"episodes":[{"name":"第01集.mp4","sha256":"…"}],"rights":"<权属材料 sha256>","schema":"version-task@1","strength":"medium","template":"<模板哈希>"}
+```
+
+- `episodes`：按文件名升序排列；`name` 是文件本身的名字（不带目录）；`sha256` 是文件内容的 SHA-256（小写十六进制）。
+- `rights`：权属材料文件内容的 SHA-256（同上）。没声明权属材料就没有任务哈希，也就申请不了配方。
+- `template`：第一层模板 JSON 的哈希。算法：把模板解析成 JSON 对象，按同样的规则规范化（键排序、无空白、UTF-8 原样）后取 SHA-256。
+- `strength`：`light` / `medium` / `heavy`。
+- 换一集、改模板、换档位、换权属材料，哈希就变，本机验签（`wrong_task`）就不过。
+- Python 参考实现（对拍用）在 `cloud/tests/commerce/version_task.py`。
 
 `token` 是 `base64url(载荷 JSON) + "." + base64url(签名)`，签名用途前缀 `recipe`（和授权凭证、报审包清单
 互不冒充）。载荷字段与 `dossier-license::recipe` 一致：`v`（版本号，目前 1）、`kid`、`rid`（配方 ID）、
@@ -351,19 +365,20 @@ export DRAMA_COMMERCE_LICENSE_KEY_FILE="$HOME/.config/drama-commerce/license-dev
 | `pitch_semitones` | 变调（半音） | 0–0.1 | 0–0.2 | 0–0.3 |
 | `trim_head_frames` | 片头裁几帧 | 1–2 | 2–3 | 3–5 |
 | `trim_tail_frames` | 片尾裁几帧 | 1–2 | 2–3 | 3–5 |
-| `quality.min_ssim` | 画质损失下限（M4b 检测用） | 0.97 | 0.95 | 0.93 |
+| `quality.min_ssim` | 画质损失下限（M4b 检测用） | 0.97 | 0.92 | 0.84 |
 | `quality.min_psnr` | 画质损失下限（M4b 检测用） | 38.0 | 35.0 | 32.0 |
 
 #### 平台规格（第一层 `params.platform`）
 
-**保守值，待复核**：按公开资料里各平台都能接受的范围取交集，不追求每个平台的上限；
-平台随时会改规则，M4b 动手处理视频前要按官方帮助中心复核一次。
+只生成**一套通用版本**（`platform = "universal"`），生成后由用户自己决定发到哪里：取值是抖音 / 快手 /
+视频号三家公开要求里**最严**的值，三家各自的数值见 `platform_specs.py` 的注释（只有视频码率三家不同：
+抖音 6000kbps、快手 6000kbps、视频号 5000kbps，取最严的 5000kbps）。
+
+**保守值，待复核**：平台随时会改规则，M4b 动手处理视频前要按官方帮助中心复核一次。
 
 | 平台 | 分辨率 | 帧率 | 视频码率 | 音频码率 | 单集时长上限 | 封装 / 编码 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `douyin` | 1080×1920 | 30 | 6000 kbps | 128 kbps | 900 秒 | mp4 / h264 / aac |
-| `kuaishou` | 1080×1920 | 30 | 6000 kbps | 128 kbps | 900 秒 | mp4 / h264 / aac |
-| `channels` | 1080×1920 | 30 | 5000 kbps | 128 kbps | 900 秒 | mp4 / h264 / aac |
+| `universal` | 1080×1920 | 30 | 5000 kbps | 128 kbps | 900 秒 | mp4 / h264 / aac |
 
 整理日期 **2026-10-15**，来源（`platform_specs.py` 的 `SOURCES`）：
 

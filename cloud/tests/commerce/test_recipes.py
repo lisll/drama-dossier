@@ -37,7 +37,7 @@ def account(client, register, pg):
     return _entitled(client, register, pg, EMAIL)
 
 
-def issue(client, token: str, device: str = PC, task: str = TASK, platform: str = "douyin",
+def issue(client, token: str, device: str = PC, task: str = TASK, platform: str = "universal",
           strength: str = "medium"):
     return client.post("/api/v1/recipes", headers=auth(token),
                        json={"device_id": device, "task": task, "platform": platform, "strength": strength})
@@ -59,9 +59,9 @@ def test_issue_signs_bound_recipe(client, pg, signer, account):
     assert payload["v"] == 1 and payload["kid"] == signer.kid
     assert payload["rid"] == body["recipe_id"]
     assert payload["sub"] == account["id"] and payload["dev"] == PC and payload["task"] == TASK
-    assert payload["platform"] == "douyin" and payload["strength"] == "medium"
+    assert payload["platform"] == "universal" and payload["strength"] == "medium"
     assert payload["exp"] - payload["iat"] == RECIPE_TTL_SECONDS
-    assert payload["params"] == body["params"] == derive_params("douyin", "medium", payload["seed"])
+    assert payload["params"] == body["params"] == derive_params("universal", "medium", payload["seed"])
     # 只能用 recipe 前缀验过：授权凭证的验签器（同样是 载荷.签名 写法）不认它。
     with pytest.raises(lt.LicenseError) as caught:
         lt.verify(body["token"], [signer.public_key], PC, payload["iat"])
@@ -136,6 +136,14 @@ def test_issue_requires_bound_device_and_entitlement(client, register, pg):
 
 # ---------- 参数 ----------
 
+def test_old_platform_douyin_is_rejected(client, pg, account):
+    """平台只有 universal 一个取值：旧取值按参数不合法拒掉，而且不往库里写。"""
+    response = issue(client, account["token"], platform="douyin")
+    assert response.status_code == 422, response.text
+    assert response.json()["error"] == "invalid_request"
+    assert pg.execute("SELECT count(*) AS n FROM recipes").fetchone()["n"] == 0
+
+
 @pytest.mark.parametrize("strength", sorted(STRENGTHS))
 @pytest.mark.parametrize("platform", sorted(PLATFORM_SPECS))
 def test_params_stay_within_bounds(platform, strength):
@@ -152,8 +160,8 @@ def test_params_stay_within_bounds(platform, strength):
 
 
 def test_same_seed_same_params_and_seeds_differ():
-    assert derive_params("douyin", "heavy", 42) == derive_params("douyin", "heavy", 42)
-    assert derive_params("douyin", "heavy", 42) != derive_params("douyin", "heavy", 43)
+    assert derive_params("universal", "heavy", 42) == derive_params("universal", "heavy", 42)
+    assert derive_params("universal", "heavy", 42) != derive_params("universal", "heavy", 43)
 
 
 def test_issued_seeds_are_random(client, account):

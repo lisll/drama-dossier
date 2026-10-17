@@ -71,7 +71,7 @@ def create(client, token: str, body: dict):
     return client.post("/api/v1/packages", json=body, headers=auth(token))
 
 
-def issue(client, token: str, device: str = PC, task: str = TASK, platform: str = "douyin",
+def issue(client, token: str, device: str = PC, task: str = TASK, platform: str = "universal",
           strength: str = "medium"):
     return client.post("/api/v1/recipes", headers=auth(token),
                        json={"device_id": device, "task": task, "platform": platform, "strength": strength})
@@ -146,7 +146,7 @@ def test_requires_login(client, pg):
     """三个接口都不接受匿名请求，也不会留下任何记录。"""
     responses = [
         client.post("/api/v1/packages", json=package_body()),
-        client.post("/api/v1/recipes", json={"device_id": PC, "task": TASK, "platform": "douyin",
+        client.post("/api/v1/recipes", json={"device_id": PC, "task": TASK, "platform": "universal",
                                              "strength": "medium"}),
         client.post(f"/api/v1/recipes/{uuid.uuid4()}/consume", json={"device_id": PC}),
     ]

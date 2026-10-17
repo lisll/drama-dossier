@@ -16,9 +16,10 @@ use crate::keys::TrustedKey;
 /// 载荷版本号。
 pub const PAYLOAD_VERSION: u64 = 1;
 /// 认识的平台和强度；服务端多出来的取值这里不认，按载荷无效处理。
-pub const PLATFORMS: &[&str] = &["douyin", "kuaishou", "channels"];
+///
+/// 平台只有 `universal` 一个取值：只生成一套通用版本（取抖音 / 快手 / 视频号三家公开要求里最严的值）。
+pub const PLATFORMS: &[&str] = &["universal"];
 pub const STRENGTHS: &[&str] = &["light", "medium", "heavy"];
-
 /// 验签通过的配方。`params` 的具体字段在 M4b 的处理管线里解析。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Recipe {
@@ -26,7 +27,7 @@ pub struct Recipe {
     pub recipe_id: String,
     pub user_id: String,
     pub device_id: String,
-    /// 任务描述的哈希（服务端算，桌面端按同样规则算后比对）。
+    /// 任务描述的哈希（桌面端按 COMMERCE.md 的规则算，见 `version_task` 模块）。
     pub task: String,
     pub platform: String,
     pub strength: String,
@@ -96,7 +97,7 @@ pub fn verify(
     Ok(recipe)
 }
 
-fn parse_payload(raw: &[u8], signed_by: &str) -> Result<Recipe, RecipeError> {
+pub(super) fn parse_payload(raw: &[u8], signed_by: &str) -> Result<Recipe, RecipeError> {
     let bad = RecipeError::BadPayload;
     let value = envelope::parse_strict_json(raw).ok_or(bad)?;
     let object = value.as_object().ok_or(bad)?;

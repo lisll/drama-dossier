@@ -230,7 +230,8 @@ class RecipeRequest(StrictModel):
     device_id: DeviceId
     #: 任务描述的哈希（桌面端按 COMMERCE.md 的规则算），配方绑定这个任务。
     task: Sha256
-    platform: Literal["douyin", "kuaishou", "channels"]
+    #: 只生成一套通用版本（取抖音 / 快手 / 视频号三家里最严的值），所以只有这一个取值。
+    platform: Literal["universal"]
     strength: Literal["light", "medium", "heavy"]
 
 

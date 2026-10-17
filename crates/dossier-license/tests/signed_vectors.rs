@@ -112,7 +112,7 @@ fn every_recipe_vector_matches() {
     let cases = doc["recipe_cases"].as_array().unwrap();
     assert_eq!(
         cases.len(),
-        54,
+        53,
         "配方向量条数变了，请确认桌面端规则是否需要跟进"
     );
 

@@ -220,7 +220,7 @@ def _recipe(signer, **overrides) -> dict:
         "sub": USER,
         "dev": DEVICE,
         "task": TASK,
-        "platform": "douyin",
+        "platform": "universal",
         "strength": "medium",
         "seed": 12345,
         "params": {"platform": {"width": 1080}, "subtle": {"grain": 4}},
@@ -263,10 +263,10 @@ def build_recipe_cases(test, other) -> list:
     case("valid_just_before_expiry", good, now=EXP - 1, expect=expect_of(base))
     by_other = _recipe(other)
     case("valid_second_trusted_key", sign(by_other, other), trusted=(test, other), expect=expect_of(by_other))
-    for platform in ("kuaishou", "channels"):
-        for strength in ("light", "heavy"):
-            payload = _recipe(test, platform=platform, strength=strength)
-            case(f"valid_{platform}_{strength}", sign(payload), expect=expect_of(payload))
+    # 平台只有 universal 一个取值，所以这里只遍历强度。
+    for strength in ("light", "heavy"):
+        payload = _recipe(test, platform="universal", strength=strength)
+        case(f"valid_universal_{strength}", sign(payload), expect=expect_of(payload))
     extra = _recipe(test, future_field=[1, 2])
     case("valid_unknown_field_ignored", sign(extra), expect=expect_of(base))
     # ---- malformed ----
@@ -302,6 +302,9 @@ def build_recipe_cases(test, other) -> list:
     payload_case("bad_payload_version_bool", _recipe(test, v=True))
     payload_case("bad_payload_kid_not_signer", _recipe(test, kid=other.kid))
     payload_case("bad_payload_unknown_platform", _recipe(test, platform="bilibili"))
+    # 旧取值：签名是对的（就是这一份载荷签出来的），但 `douyin` 已经不在 PLATFORMS 里了，
+    # 按载荷无效拒绝（recipe.rs 的 parse_payload：平台 / 强度不在常量列表里 → bad_payload）。
+    payload_case("bad_payload_old_platform_douyin", _recipe(test, platform="douyin"))
     payload_case("bad_payload_unknown_strength", _recipe(test, strength="extreme"))
     payload_case("bad_payload_params_not_object", _recipe(test, params=[1]))
     payload_case("bad_payload_seed_string", _recipe(test, seed="12345"))
