@@ -32,6 +32,11 @@ pub struct LedgerRecord {
 /// 追加一条流水记录到 JSONL 文件；文件不存在时自动创建（含父目录）。
 /// 若上次写入中途失败留下未断行的半行，先补一个换行把它隔离，避免吞掉新记录。
 pub fn append_record(path: &Path, record: &LedgerRecord) -> std::io::Result<()> {
+    append_jsonl(path, record)
+}
+
+/// 往任意 JSONL 文件追加一条记录（生成流水和处理台账 `processing.jsonl` 共用）。
+pub fn append_jsonl<T: Serialize>(path: &Path, record: &T) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;

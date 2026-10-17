@@ -32,6 +32,7 @@ pub mod settings;
 pub mod tools;
 pub mod transcode;
 pub mod types;
+pub mod version;
 
 pub use checklist::{run_checks, ChecklistReport, ChecklistRules};
 pub use checkpoint::{
@@ -44,7 +45,7 @@ pub use diff::{
 pub use draft::{
     export_capcut_draft, import_capcut_draft, CapcutDraft, DraftExportOptions, DraftExportResult,
 };
-pub use ledger::{append_record, list_records, now_timestamp, LedgerRecord};
+pub use ledger::{append_jsonl, append_record, list_records, now_timestamp, LedgerRecord};
 pub use package::{
     assemble_package, hash_file, render_documents, AssembleError, AssembleRequest, CostSheetForm,
     EpisodeEntry, LocalAsset, PackageResult, RenderRequest, RenderedDocuments,
