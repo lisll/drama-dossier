@@ -46,8 +46,13 @@ pub fn need(command: &str) -> Need {
         | "pick_folder"
         | "ledger_list"
         | "runtime_status"
-        | "platform_profiles" => Need::Open,
-        "generate_package" => Need::Paid,
+        | "platform_profiles"
+        // 看任务、停任务任何时候都要能做：授权到期了也得能把正在跑的编码停下来。
+        | "job_list"
+        | "job_pause"
+        | "job_terminate" => Need::Open,
+        // 处理版本要向服务端申请并消费配方。
+        "generate_package" | "version_start" => Need::Paid,
         _ => Need::Local,
     }
 }

@@ -602,13 +602,18 @@ const TASK: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 #[tokio::test]
 async fn recipe_is_verified_locally_then_consumed_once() {
     let (session, api, _store) = logged_in().await;
-    let recipe = session
-        .issue_recipe(TASK, "douyin", "medium")
+    let (recipe, token) = session
+        .issue_recipe(TASK, "universal", "medium")
         .await
         .expect("签发并本地验签");
+    // 原文留给续跑：本机重新验签（不看有效期）得到同一个配方。
+    let (device, keys) = session.signing_context().unwrap();
+    let again = dossier_license::version_task::verify_consumed(&token, &keys, &device, TASK)
+        .expect("原文可续跑验签");
+    assert_eq!(again, recipe);
     assert_eq!(recipe.device_id, device_id());
     assert_eq!(recipe.task, TASK);
-    assert_eq!(recipe.platform, "douyin");
+    assert_eq!(recipe.platform, "universal");
     session.consume_recipe(&recipe).await.expect("第一次消费");
     let error = session.consume_recipe(&recipe).await.unwrap_err();
     assert_eq!(error.code(), "recipe_consumed");
@@ -621,7 +626,7 @@ async fn recipe_for_another_computer_is_rejected_locally() {
     // 服务端（或者中间人）发回的配方签名没问题，但不是给这台电脑的。
     api.with(|server| server.recipe_device = Some(OTHER_DEVICE.into()));
     let error = session
-        .issue_recipe(TASK, "douyin", "medium")
+        .issue_recipe(TASK, "universal", "medium")
         .await
         .unwrap_err();
     assert_eq!(error.code(), "recipe_wrong_device");

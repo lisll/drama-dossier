@@ -14,7 +14,7 @@ use super::{emit, AccountState};
 #[serde(rename_all = "camelCase")]
 pub struct CommandError {
     error: String,
-    message: String,
+    pub(crate) message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     retry_after: Option<u64>,
     /// 服务端附加的字段（如 `device_limit` 带的设备列表、`unbind_quota`），原样转给前端。

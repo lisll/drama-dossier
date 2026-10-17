@@ -50,7 +50,7 @@ pub(crate) fn read_settings(app: &AppHandle) -> Result<dossier_core::AppSettings
 }
 
 /// ffmpeg 解析顺序：设置里显式路径 → 一键安装目录 → `PATH`。
-fn resolve_ffmpeg(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn resolve_ffmpeg(app: &AppHandle) -> Result<PathBuf, String> {
     if let Some(path) = read_settings(app)?.ffmpeg_path {
         if path.is_file() {
             return Ok(path);
@@ -66,7 +66,7 @@ fn resolve_ffmpeg(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 /// ffprobe 解析顺序：界面显式提示（填了就用，错误让它自然暴露）→ 设置 → 一键安装目录 → `PATH`。
-fn resolve_ffprobe(app: &AppHandle, hint: Option<&str>) -> Result<PathBuf, String> {
+pub(crate) fn resolve_ffprobe(app: &AppHandle, hint: Option<&str>) -> Result<PathBuf, String> {
     if let Some(hint) = hint.map(str::trim).filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(hint));
     }
@@ -465,14 +465,16 @@ pub struct TranscodeRunReport {
 }
 
 /// 统一的重编码参数：画质优先兼容，音频统一 AAC。
-const ENCODE_ARGS: [&str; 10] = [
-    "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k",
-];
-
+/// 委托给 `crate::encode`（M4b-1）：三个转码功能和处理版本共用同一份参数生成，
+/// 旧功能没有输出规格，按「不限码率、软件编码」的口径走（`u64::MAX` = 不封顶）。
 fn encode_output_args(output: &Path) -> Vec<String> {
-    let mut args: Vec<String> = ENCODE_ARGS.iter().map(|s| s.to_string()).collect();
-    args.push("-movflags".into());
-    args.push("+faststart".into());
+    let request = crate::encode::EncodeRequest {
+        output,
+        max_video_kbps: None,
+        audio_kbps: 128,
+        metadata_tags: false,
+    };
+    let mut args = crate::encode::encode_output_args("libx264", false, &request);
     args.push(output.display().to_string());
     args
 }
@@ -579,7 +581,7 @@ fn spans_for_segment(
 
 /// 分集重组：全剧拼成一条时间线，在场景切点附近重新分集；切不到精确关键帧，
 /// 因此每个片段统一重编码（保证切点帧级精确）。输出名保持「第NN集」以便再次扫描。
-fn transcode_recut_blocking(
+pub(crate) fn transcode_recut_blocking(
     ffmpeg: &Path,
     episodes: &[ProbedEpisode],
     target_count: usize,

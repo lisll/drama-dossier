@@ -817,14 +817,13 @@ impl<T: Transport, S: CredentialStore> Session<T, S> {
     }
 
     /// 申请处理配方，拿到后立刻在本机验一遍（签名、机器码、任务、有效期），验不过不交给调用方。
-    // 处理管线在 M4b 才接入界面；M4a 只有测试调用它。
-    #[allow(dead_code)]
+    /// 返回验过的配方和签名原文：原文要存进任务目录，续跑时用 `verify_consumed` 重新验。
     pub async fn issue_recipe(
         &self,
         task: &str,
         platform: &str,
         strength: &str,
-    ) -> Result<Recipe, ApiError> {
+    ) -> Result<(Recipe, String), ApiError> {
         let (device_id, keys) = self.signing_context()?;
         let body = json!({
             "device_id": device_id,
@@ -847,11 +846,10 @@ impl<T: Transport, S: CredentialStore> Session<T, S> {
         if recipe.recipe_id != response.recipe_id {
             return Err(ApiError::Protocol("配方编号和签名内容不一致".into()));
         }
-        Ok(recipe)
+        Ok((recipe, response.token))
     }
 
     /// 开工前消费配方：同一个配方只能成功一次（服务端记账）。
-    #[allow(dead_code)]
     pub async fn consume_recipe(&self, recipe: &Recipe) -> Result<(), ApiError> {
         let (device_id, _) = self.signing_context()?;
         // 配方编号来自验过签的载荷；仍按 UUID 的字符集检查一遍再拼进路径。

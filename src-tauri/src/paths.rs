@@ -40,6 +40,22 @@ pub(crate) fn normalize(path: &Path) -> PathBuf {
     }
 }
 
+/// 把任意名字（分集文件名、步骤名）变成可以安全放进一个目录里的文件名主干：
+/// 路径分隔符和控制字符换成 `_`，再接上原名的短哈希，避免「a/b」和「a_b」撞名。
+pub(crate) fn safe_file_stem(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            ch if ch.is_control() => '_',
+            ch => ch,
+        })
+        .take(80)
+        .collect();
+    let digest = dossier_runtime::sha256_bytes(name.as_bytes());
+    format!("{cleaned}-{}", &digest[..8])
+}
+
 /// 平台对应的「打开文件管理器」命令；不支持的平台返回 `None`。
 fn opener_command() -> Option<Command> {
     #[cfg(target_os = "windows")]

@@ -422,8 +422,8 @@ async fn package_and_recipe_against_real_server() {
 
     // 8. 配方：签发后本机验签通过；消费一次成功，第二次被拒。
     let task = "ab".repeat(32);
-    let recipe = session
-        .issue_recipe(&task, "douyin", "medium")
+    let (recipe, _token) = session
+        .issue_recipe(&task, "universal", "medium")
         .await
         .expect("签发配方");
     assert_eq!(recipe.device_id, device_id);

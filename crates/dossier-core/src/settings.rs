@@ -33,6 +33,10 @@ pub struct AppSettings {
     pub jianying_dir: Option<PathBuf>,
     /// 剪映草稿目录；`None` 表示使用剪映默认路径。
     pub jianying_draft_dir: Option<PathBuf>,
+    /// 中文字体文件（水印、AI 标识、封面文字）；`None` 表示自动找系统字体。
+    pub font_path: Option<PathBuf>,
+    /// 编码器：`false` 自动（有可用的硬件编码就用），`true` 只用软件编码。
+    pub software_encode_only: bool,
 }
 
 impl AppSettings {
@@ -320,8 +324,13 @@ mod tests {
             ai_template: Some("你是短剧报审材料撰写助手…".to_string()),
             jianying_dir: Some(PathBuf::from("/Applications/JianyingPro.app")),
             jianying_draft_dir: None,
+            font_path: Some(PathBuf::from("/字体/苹方.ttc")),
+            software_encode_only: true,
         };
         save_settings(&path, &settings).unwrap();
+        let reloaded = load_settings(&path).settings;
+        assert_eq!(reloaded.font_path, Some(PathBuf::from("/字体/苹方.ttc")));
+        assert!(reloaded.software_encode_only);
 
         let loaded = load_settings(&path);
         assert!(loaded.warning.is_none());
