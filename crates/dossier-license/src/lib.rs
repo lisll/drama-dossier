@@ -18,6 +18,7 @@ pub mod machine;
 pub mod manifest;
 pub mod recipe;
 pub mod token;
+pub mod version_task;
 
 pub use access::{decide, Access, Connectivity, LockReason, ServerEntitlement, Tier};
 pub use clock::{ClockVerdict, ROLLBACK_TOLERANCE_SECS};
