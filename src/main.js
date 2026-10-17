@@ -998,6 +998,8 @@ async function generate() {
       aiGenerated: $("#ai-generated").checked,
       ffprobePath: effectiveFfprobe(),
       rules: effectiveRules(),
+      costSheetScan: $("#scan-cost-sheet").value.trim() || null,
+      ownershipScan: $("#scan-ownership").value.trim() || null,
       costSheet: {
         companyName: $("#company-name").value.trim(),
         totalInvestmentWan: cost.investment,
@@ -1005,19 +1007,42 @@ async function generate() {
         contact: $("#contact").value.trim(),
       },
     });
-    // 占位章必须写明：这个包里的盖章文档不具法律效力，正式报审前要换成真实签章。
-    const unsigned = result.placeholder
-      ? `<br /><strong>注意：盖的是占位章，未签署，无法律效力。</strong>正式报审前请换成加盖公章的版本：
-        ${result.unsignedDocuments.map((path) => esc(path)).join("、")}`
+    // 逐份标明签章方式：混合签章时整个包不能只写一个结论，
+    // 否则使用者会以为「有扫描件 = 整包都盖好了」。
+    const signers = Array.isArray(result.documentSigners) ? result.documentSigners : [];
+    const documents = signers.length
+      ? `<br />盖章文档：<ul class="signer-list">${signers
+          .map((item) => {
+            const scanned = item.signer === "scan";
+            return `<li class="${scanned ? "status-pass" : "status-fail"}">${esc(
+              item.document,
+            )} — ${scanned ? "扫描件签章" : "<strong>占位章 · 未签署 · 无法律效力</strong>"}</li>`;
+          })
+          .join("")}</ul>`
       : "";
+    // 没有逐份信息时（旧版服务端）退回原来的整包提示。
+    const unsigned =
+      signers.length === 0 && result.placeholder
+        ? `<br /><strong>注意：盖的是占位章，未签署，无法律效力。</strong>正式报审前请换成加盖公章的版本：
+        ${result.unsignedDocuments.map((path) => esc(path)).join("、")}`
+        : "";
+    const stillUnsigned = signers.filter((item) => item.signer !== "scan").length;
     renderResult("#generate-result", {
       tone: result.placeholder ? "warn" : "ok",
       html: `<strong>报审包已生成</strong><br />
         位置：${esc(result.packageDir)}<br />
-        文件数：${result.fileCount} · 总大小：${formatBytes(Number(result.totalBytes))}${unsigned}`,
+        文件数：${result.fileCount} · 总大小：${formatBytes(Number(result.totalBytes))}${documents}${unsigned}${
+          stillUnsigned > 0
+            ? `<br /><strong>还有 ${stillUnsigned} 份是占位章，正式报审前要换成已盖章的版本。</strong>`
+            : ""
+        }`,
       paths: [["package", result.packageDir]],
     });
-    toast(result.placeholder ? "报审包已生成（占位章，未签署，无法律效力）" : "报审包生成完成");
+    toast(
+      result.placeholder
+        ? "报审包已生成（仍有占位章，未签署的部分无法律效力）"
+        : "报审包生成完成",
+    );
     // 流水多了一条：首页的引导和近 7 天图表跟着更新。
     loadHome();
   } catch (error) {
@@ -1150,6 +1175,13 @@ async function diffReportPackages() {
       html: `
       <strong>${esc(result.summary)}</strong><br />
       ${esc(result.leftGeneratedAt)} → ${esc(result.rightGeneratedAt)}<br />
+      签章：左侧「${esc(L.signingLabel(result.leftSigning))}」 · 右侧「${esc(
+        L.signingLabel(result.rightSigning),
+      )}」${
+        result.leftSigning !== result.rightSigning
+          ? "<br /><strong>两侧签章方式不同，对比时不要只看文件是否一致。</strong>"
+          : ""
+      }<br />
       ${
         rows
           ? `<table><thead><tr><th>路径</th><th>变化</th><th>字节</th><th>说明</th></tr></thead><tbody>${rows}</tbody></table>`
@@ -1369,152 +1401,145 @@ async function savePublishCopy() {
   }
 }
 
-function parseEraseRegions() {
-  const raw = $("#erase-regions").value.trim();
-  if (!raw) return [];
-  return raw
-    .split(/[;；\n]/)
-    .map((chunk) => chunk.trim())
-    .filter(Boolean)
-    .map((chunk) => {
-      const parts = chunk.split(/[,，\s]+/).map(Number);
-      if (parts.length !== 4 || parts.some((value) => !Number.isFinite(value))) {
-        throw new Error(`区域格式应为 x,y,w,h：${chunk}`);
-      }
-      const [x, y, width, height] = parts;
-      return { x, y, width, height };
-    });
+// ============ 工具箱：区域擦除（M4b-2） ============
+//
+// 工作流：取一帧 → 自动识别候选区域 → 在画布上拖动微调 → 左右对比 → 勾选权利确认 → 批量。
+// 坐标一律在「原始分辨率」下保存，画布上只做换算（换算规则在 logic.js，有单测）。
+
+/** 擦除画布的状态。 */
+const eraseState = {
+  /** 取帧对应的分集路径（批量时取的是同一集的同一秒）。 */
+  framePath: null,
+  /** 原始画面尺寸（取帧时由 `img.naturalWidth/Height` 反推）。 */
+  sourceSize: { width: 0, height: 0 },
+  /** 画布上显示的画面尺寸。 */
+  viewSize: { width: 0, height: 0 },
+  /** 原始分辨率下的区域。 */
+  regions: [],
+  /** 正在拖的状态：`{ mode, index, from, original }`。 */
+  drag: null,
+};
+
+const ERASE_FRAME_MAX_WIDTH = 720;
+
+/** 当前剧的第 1 集（取帧预览用）。 */
+function eraseEpisodeList() {
+  const drama = selectedDrama();
+  return drama && drama.episodes ? drama.episodes : [];
 }
 
-function eraseRequest() {
-  const optionalNumber = (selector) => {
-    const value = $(selector).value.trim();
-    return value === "" ? null : Number(value);
-  };
-  const workerArgs = $("#erase-worker-args")
-    .value.split(/[,，]/)
-    .map((item) => item.trim())
-    .filter(Boolean);
-  return {
-    input: $("#erase-input").value.trim(),
-    output: $("#erase-output").value.trim(),
-    regions: parseEraseRegions(),
-    detector: $("#erase-detector").value,
-    inpainter: $("#erase-inpainter").value,
-    dilate: Number($("#erase-dilate").value || 4),
-    feather: Number($("#erase-feather").value || 2),
-    context: Number($("#erase-context").value || 1.6),
-    start: optionalNumber("#erase-start"),
-    duration: optionalNumber("#erase-duration"),
-    persistentWorker: $("#erase-persistent").checked,
-    workerProgram: $("#erase-worker-program").value.trim() || null,
-    workerArgs,
-  };
+/**
+ * 画布尺寸：**像素缓冲**按显示尺寸算，**显示尺寸**交给 CSS（按栏宽自适应）。
+ *
+ * 早先这里把 width/height 都写成像素、还用 inline style 固定住，结果是两栏并排时
+ * 每栏只有两百来像素宽，画布被挤成细长条，框虽然画了却挤得看不清。
+ * 现在只定缓冲尺寸（canvas.width/height 决定绘制坐标系），显示由 CSS 的
+ * `width:100%` + `aspect-ratio` 决定；换算用 getBoundingClientRect 读实际显示尺寸。
+ */
+function syncCanvasSize(sourceSize, viewSize) {
+  const canvas = $("#erase-canvas");
+  // 缓冲尺寸按「显示尺寸 × 设备像素比」定，保证清晰度；坐标换算另外用 CSS 尺寸做。
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = Math.max(1, Math.round(viewSize.width * dpr));
+  canvas.height = Math.max(1, Math.round(viewSize.height * dpr));
+  canvas.style.aspectRatio = `${viewSize.width} / ${viewSize.height}`;
+  // 清掉旧版本留下的 inline 像素宽高（否则会盖住 CSS 的自适应）。
+  canvas.style.width = "";
+  canvas.style.height = "";
+  const frame = $("#erase-frame");
+  frame.style.width = "";
+  frame.style.height = "";
+  const wrap = $("#erase-canvas-wrap");
+  wrap.style.width = "";
+  wrap.style.height = "";
+  wrap.classList.add("has-frame");
+  // 记一下原始与显示尺寸的对应关系，拖动时要用。
+  eraseState.sourceSize = sourceSize;
+  eraseState.viewSize = viewSize;
 }
 
-/** 就地校验擦除表单：输入/输出必填、且不能是同一个文件（后端也会再拦一次）。 */
-function eraseIoProblems(request) {
-  clearFieldErrors(["#erase-input", "#erase-output"]);
-  const problems = [];
-  if (!request.input) problems.push(["#erase-input", "请选择要擦除的输入视频。"]);
-  if (!request.output) problems.push(["#erase-output", "请选择擦除后的输出文件。"]);
-  if (request.input && request.output && stripPath(request.input) === stripPath(request.output)) {
-    problems.push(["#erase-output", "输出文件不能和输入文件相同，请换一个输出文件名。"]);
+/** 重画画布上的区域框。 */
+function drawEraseRegions() {
+  const canvas = $("#erase-canvas");
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  const { viewSize, sourceSize } = eraseState;
+  // 显示尺寸（CSS 决定）与缓冲尺寸（DPR 决定）可能不同：绘制前把坐标整体缩放过去。
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = rect.width > 0 ? canvas.width / rect.width : 1;
+  const scaleY = rect.height > 0 ? canvas.height / rect.height : 1;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!viewSize.width || !sourceSize.width) return;
+  ctx.setTransform(scaleX, 0, 0, scaleY, 0, 0);
+  eraseState.regions.forEach((region, index) => {
+    const box = L.toViewRect(region, viewSize, sourceSize);
+    ctx.strokeStyle = "#5b8cff";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(box.x, box.y, box.width, box.height);
+    // 右下角的缩放把手。
+    ctx.fillStyle = "#5b8cff";
+    ctx.fillRect(box.x + box.width - 6, box.y + box.height - 6, 8, 8);
+    // 序号：多框时便于对照列表。
+    ctx.fillStyle = "#e8edf5";
+    ctx.font = "14px sans-serif";
+    ctx.fillText(String(index + 1), box.x + 4, Math.max(14, box.y - 4));
+  });
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  $("#erase-region-summary").textContent = L.regionSummary(eraseState.regions);
+}
+
+/** 画布上的鼠标点 → 画布坐标。 */
+function canvasPoint(event) {
+  const canvas = $("#erase-canvas");
+  const rect = canvas.getBoundingClientRect();
+  return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+}
+
+/** 取一帧：按当前剧第 1 集的指定秒数。 */
+async function loadEraseFrame() {
+  const drama = selectedDrama();
+  if (!drama) {
+    toast("请先在剧目库里选一部剧", true);
+    return;
   }
-  problems.forEach(([selector, message]) => setFieldError(selector, message));
-  return problems.length === 0;
-}
-
-/** 读擦除表单：区域格式或路径不对时给出就地提示，返回 null 表示先别执行。 */
-function readEraseRequest() {
-  let request;
+  const episodes = eraseEpisodeList();
+  if (episodes.length === 0) {
+    toast("这部剧没有分集", true);
+    return;
+  }
+  const seconds = Number($("#erase-frame-sec").value || 0);
+  if (!beginTask("正在取帧")) return;
   try {
-    request = eraseRequest();
-  } catch (error) {
-    setFieldError("#erase-regions", String(error));
-    reportError(error);
-    return null;
-  }
-  if (!eraseIoProblems(request)) {
-    toast("请先修正标红的输入或输出路径", true);
-    return null;
-  }
-  return request;
-}
-
-function renderErasePlan(plan) {
-  const node = $("#erase-result");
-  node.innerHTML = `
-    <strong>将要执行的命令</strong><br />
-    <code>${esc(plan.commandLine)}</code><br />
-    处理日志：${esc(plan.reportPath)}${
-      plan.requiresWorker ? " · 需要模型 worker" : ""
+    const first = episodes[0];
+    const dataUrl = await call("video_frame", {
+      path: first.path,
+      seconds,
+      maxWidth: ERASE_FRAME_MAX_WIDTH,
+    });
+    const image = $("#erase-frame");
+    await new Promise((resolve, reject) => {
+      image.onload = resolve;
+      image.onerror = () => reject(new Error("取到的帧无法显示"));
+      image.src = dataUrl;
+    });
+    image.classList.remove("hidden");
+    $("#erase-empty").classList.add("hidden");
+    const viewWidth = image.naturalWidth;
+    const viewHeight = image.naturalHeight;
+    // 反推原始尺寸：预览是等比缩到 maxWidth 的，高度按原始比例算过。
+    const source = probeSourceSize(first.path);
+    if (!source) {
+      // 拿不到原始分辨率就不能往下走：区域会按预览坐标提交，擦的位置会偏。
+      // 明确让用户先去探测，而不是给出一个「看起来能跑但擦错地方」的结果。
+      toast("还没有这部剧的分集规格，请先到「剧目库」点「探测并检查」再取帧", true);
+      return;
     }
-  `;
-  node.classList.remove("hidden");
-}
-
-async function checkEraseStatus() {
-  try {
-    const status = await call("erase_status", {
-      toolPath: $("#erase-tool-path").value.trim() || null,
-    });
-    const node = $("#erase-result");
-    node.innerHTML = `
-      <strong>擦除工具：${status.available ? "可用" : "不可用"}</strong><br />
-      ${status.tool ? `路径：<code>${esc(status.tool)}</code><br />` : ""}
-      ${esc(status.message)}
-    `;
-    node.classList.remove("hidden");
-    toast(status.available ? "擦除工具可用" : "未找到擦除工具", !status.available);
-  } catch (error) {
-    reportError(error);
-  }
-}
-
-async function planErase() {
-  const request = readEraseRequest();
-  if (!request) return;
-  try {
-    const plan = await call("plan_erase", {
-      request,
-      toolPath: $("#erase-tool-path").value.trim() || null,
-    });
-    renderErasePlan(plan);
-  } catch (error) {
-    reportError(error);
-  }
-}
-
-async function runErase() {
-  const request = readEraseRequest();
-  if (!request) return;
-  if (!beginTask("正在擦除（可能需要较长时间，请勿关闭窗口）")) return;
-  try {
-    const run = await call("run_erase", {
-      request,
-      toolPath: $("#erase-tool-path").value.trim() || null,
-      timeoutSeconds: 1800,
-    });
-    const report = run.report ?? {};
-    const verification = report.verification ?? {};
-    const residual = verification.residual ?? {};
-    const ssim = verification.ssim ?? {};
-    const node = $("#erase-result");
-    node.innerHTML = `
-      <strong>擦除结论：${esc(run.outcomeLabel)}（退出码 ${run.exitCode}）</strong><br />
-      ${verification.verdict ? `工具自检：${esc(String(verification.verdict))}<br />` : ""}
-      ${
-        residual.maxRatio != null
-          ? `残留峰值：${(Number(residual.maxRatio) * 100).toFixed(2)}%<br />`
-          : ""
-      }
-      ${ssim.minSsim != null ? `结构相似度最低：${Number(ssim.minSsim).toFixed(3)}<br />` : ""}
-      ${run.stderrTail ? `<pre>${esc(run.stderrTail)}</pre>` : ""}
-      处理日志：${esc(run.reportPath ?? "")}
-    `;
-    node.classList.remove("hidden");
-    toast(`擦除结束：${run.outcomeLabel}`);
+    syncCanvasSize(source, { width: viewWidth, height: viewHeight });
+    eraseState.framePath = first.path;
+    eraseState.regions = [];
+    drawEraseRegions();
+    toast(`已取 ${seconds} 秒处的画面`);
   } catch (error) {
     reportError(error);
   } finally {
@@ -1522,6 +1547,258 @@ async function runErase() {
   }
 }
 
+/**
+ * 取帧时 ffmpeg 缩到 720 宽，这里要还原原始宽高。
+ *
+ * 探测结果（`state.analysis.probes`）里带着每集的规格，按**文件名**对上那一集。
+ * 拿不到时返回 null：调用方会退回「原始 = 预览」（换算比例 1），区域就会按预览坐标提交——
+ * 那样在原始分辨率不是 720 宽时会偏，所以要尽量拿到真值。
+ */
+function probeSourceSize(path) {
+  const probes = state.analysis && state.analysis.probes;
+  if (!Array.isArray(probes)) return null;
+  const name = path.split(/[\\/]/).pop();
+  const probe = probes.find((item) => item && item.fileName === name);
+  const spec = probe && probe.spec;
+  if (spec && spec.width && spec.height) {
+    return { width: Number(spec.width), height: Number(spec.height) };
+  }
+  return null;
+}
+
+/** 自动识别静止区域，填进画布（由人微调）。 */
+async function detectEraseRegions() {
+  const drama = selectedDrama();
+  if (!drama) {
+    toast("请先在剧目库里选一部剧", true);
+    return;
+  }
+  const episodes = eraseEpisodeList();
+  if (episodes.length === 0) {
+    toast("这部剧没有分集", true);
+    return;
+  }
+  const samples = Number($("#erase-samples").value || 30);
+  if (!beginTask("正在自动识别静止区域")) return;
+  try {
+    const report = await call("detect_still_regions", {
+      path: episodes[0].path,
+      samples,
+      toolPath: $("#erase-tool-path").value.trim() || null,
+    });
+    const candidates = L.acceptableCandidates(report.candidates);
+    if (candidates.length === 0) {
+      toast("没有找到「位置固定、内容不变」的区域；可以手动在画面上拖框", true);
+      eraseState.regions = [];
+    } else {
+      eraseState.regions = candidates.map((item) => ({
+        x: item.x,
+        y: item.y,
+        width: item.width,
+        height: item.height,
+      }));
+      toast(`识别到 ${candidates.length} 个候选区域，可在画面上拖动微调`);
+    }
+    // 只更新「原始分辨率」这一半：画布的**显示尺寸**必须保持取帧时算好的值。
+    // 这里如果拿 report 尺寸当显示尺寸传进去，画布会被撑到原始分辨率，
+    // 画面和框都会跑到可见区域外面（框其实画了，只是看不见）。
+    if (report.width && report.height) {
+      eraseState.sourceSize = { width: report.width, height: report.height };
+      const view = eraseState.viewSize;
+      // 还没取过帧（viewSize 为空）时，才按 report 尺寸把画布建起来。
+      if (!view.width || !view.height) {
+        syncCanvasSize(
+          { width: report.width, height: report.height },
+          { width: report.width, height: report.height },
+        );
+      }
+    }
+    drawEraseRegions();
+  } catch (error) {
+    reportError(error);
+  } finally {
+    endTask();
+  }
+}
+
+/** 先做一小段擦除，再取同一时刻的帧，左右对比。 */
+async function previewErase() {
+  if (eraseState.regions.length === 0) {
+    toast("先识别或拖出至少一个区域", true);
+    return;
+  }
+  if (!eraseState.framePath) {
+    toast("先取一帧再预览对比", true);
+    return;
+  }
+  const seconds = Number($("#erase-frame-sec").value || 0);
+  const start = Math.max(0, seconds - 2);
+  const duration = 4;
+  if (!beginTask("正在做小段擦除对比（只处理 4 秒）")) return;
+  try {
+    const preview = await call("erase_preview", {
+      input: eraseState.framePath,
+      seconds,
+      startSec: start,
+      durationSec: duration,
+      regions: eraseState.regions,
+      toolPath: $("#erase-tool-path").value.trim() || null,
+    });
+    const image = $("#erase-preview");
+    image.src = preview;
+    image.classList.remove("hidden");
+    $("#erase-preview-empty").classList.add("hidden");
+    toast("已生成对比帧（右图是擦除后）");
+  } catch (error) {
+    reportError(error);
+  } finally {
+    endTask();
+  }
+}
+
+/** 批量擦除当前剧的所有集（走任务队列）。 */
+async function startEraseBatch() {
+  const drama = selectedDrama();
+  if (!drama) {
+    toast("请先在剧目库里选一部剧", true);
+    return;
+  }
+  if (eraseState.regions.length === 0) {
+    toast("先识别或拖出至少一个区域", true);
+    return;
+  }
+  if (!$("#erase-rights").checked) {
+    toast("开始批量擦除前必须勾选「我确认对该素材拥有权利」", true);
+    return;
+  }
+  const episodes = eraseEpisodeList().map((item) => item.fileName);
+  if (episodes.length === 0) {
+    toast("这部剧没有分集", true);
+    return;
+  }
+  try {
+    const view = await call("erase_batch_start", {
+      request: {
+        dramaName: drama.name,
+        dramaDir: drama.dir,
+        outputDir: eraseOutputDir(drama),
+        episodes,
+        regions: eraseState.regions,
+        rightsConfirmed: true,
+        rightsSha256: null,
+        toolPath: $("#erase-tool-path").value.trim() || null,
+      },
+    });
+    const node = $("#erase-job-result");
+    node.innerHTML = `
+      <strong>已加入任务队列</strong><br />
+      任务：${esc(view.title)}<br />
+      输出目录：${esc(view.outputDir)}<br />
+      进度到侧栏底部的「任务」里看（能暂停、终止、继续）。
+    `;
+    node.classList.remove("hidden");
+    toast("已开始批量擦除");
+  } catch (error) {
+    reportError(error);
+  }
+}
+
+/** 擦除产物目录：和「处理版本」同一套规则。 */
+function eraseOutputDir(drama) {
+  const base = state.outputRoot || drama.dir;
+  return `${base}/${drama.name}/擦除输出`;
+}
+
+/** 清空区域。 */
+function clearEraseRegions() {
+  eraseState.regions = [];
+  drawEraseRegions();
+  toast("已清空区域");
+}
+
+/** 绑定画布上的拖动：新建 / 移动 / 缩放。 */
+function bindEraseCanvas() {
+  const canvas = $("#erase-canvas");
+  canvas.addEventListener("mousedown", (event) => {
+    if (!eraseState.framePath) return;
+    const point = canvasPoint(event);
+    const viewRegions = eraseState.regions.map((region) =>
+      L.toViewRect(region, eraseState.viewSize, eraseState.sourceSize),
+    );
+    const hit = L.hitTestRegions(point, viewRegions, 12);
+    if (hit) {
+      eraseState.drag = {
+        mode: hit.part,
+        index: hit.index,
+        from: point,
+        original: { ...eraseState.regions[hit.index] },
+      };
+    } else {
+      eraseState.drag = { mode: "new", index: -1, from: point, original: null };
+    }
+    event.preventDefault();
+  });
+
+  canvas.addEventListener("mousemove", (event) => {
+    const drag = eraseState.drag;
+    if (!drag) return;
+    const point = canvasPoint(event);
+    if (drag.mode === "new") {
+      const rect = L.normalizeRect(drag.from, point);
+      const source = L.toSourceRect(rect, eraseState.viewSize, eraseState.sourceSize);
+      if (L.rectIsUsable(rect)) {
+        // 新建中的框实时显示：先放进区域列表的末尾预览。
+        const rest = eraseState.regions.slice(0, drag.index);
+        eraseState.regions = [...rest, L.clampRect(source, eraseState.sourceSize)];
+      }
+      drawEraseRegions();
+      return;
+    }
+    if (drag.mode === "move") {
+      const dx = (point.x - drag.from.x) * (eraseState.sourceSize.width / eraseState.viewSize.width);
+      const dy = (point.y - drag.from.y) * (eraseState.sourceSize.height / eraseState.viewSize.height);
+      eraseState.regions[drag.index] = L.clampRect(
+        {
+          x: drag.original.x + dx,
+          y: drag.original.y + dy,
+          width: drag.original.width,
+          height: drag.original.height,
+        },
+        eraseState.sourceSize,
+      );
+      drawEraseRegions();
+      return;
+    }
+    if (drag.mode === "resize") {
+      const dx = (point.x - drag.from.x) * (eraseState.sourceSize.width / eraseState.viewSize.width);
+      const dy = (point.y - drag.from.y) * (eraseState.sourceSize.height / eraseState.viewSize.height);
+      eraseState.regions[drag.index] = L.clampRect(
+        {
+          x: drag.original.x,
+          y: drag.original.y,
+          width: Math.max(8, drag.original.width + dx),
+          height: Math.max(8, drag.original.height + dy),
+        },
+        eraseState.sourceSize,
+      );
+      drawEraseRegions();
+    }
+  });
+
+  const finish = () => {
+    if (!eraseState.drag) return;
+    // 太小的框丢掉（多半是误点）。
+    if (eraseState.drag.mode === "new") {
+      eraseState.regions = eraseState.regions.filter(
+        (region) => region.width >= 8 && region.height >= 8,
+      );
+    }
+    eraseState.drag = null;
+    drawEraseRegions();
+  };
+  canvas.addEventListener("mouseup", finish);
+  canvas.addEventListener("mouseleave", finish);
+}
 async function browse(targetId) {
   try {
     const folder = await call("pick_folder");
@@ -1867,10 +2144,11 @@ function renderRuntimeStatus(status) {
   renderRuntimeInstallEntry(status);
 }
 
-/** 非 macOS 没有可用下载源，按键必然失败，改为给出对应平台的手动安装指引。 */
+/** 非 macOS/Windows 没有可用下载源，按竖必然失败，改为给出对应平台的手动安装指引。 */
 function manualInstallHint(platform) {
   if (platform === "windows") {
-    return "Windows 暂不支持一键配置：可执行「winget install Gyan.FFmpeg」，或从 https://www.gyan.dev/ffmpeg/builds/ 下载压缩包，解压后把其中的 bin 目录加入 PATH。";
+    // Windows 走一键安装（gyan.dev → BtbN 两个来源），这条只在装了旧系统（缺 curl.exe/tar.exe）时出现。
+    return "Windows 一键配置需要系统自带的 curl.exe 与 tar.exe（Windows 10 1803 及以上）：请先更新系统，或执行「winget install Gyan.FFmpeg」/ 从 https://www.gyan.dev/ffmpeg/builds/ 下载压缩包，解压后把其中的 bin 目录加入 PATH。";
   }
   if (platform === "linux") {
     return "Linux 暂不支持一键配置：Debian/Ubuntu 执行「sudo apt install ffmpeg」，Fedora/RHEL 执行「sudo dnf install ffmpeg」。";
@@ -4007,17 +4285,12 @@ $("#env-banner").addEventListener("click", (event) => {
     runtimeInstall();
   }
 });
-$("#browse-erase-input").addEventListener("click", async () => {
-  try {
-    const file = await call("pick_video");
-    if (file) $("#erase-input").value = file;
-  } catch (error) {
-    reportError(error);
-  }
-});
-$("#erase-status").addEventListener("click", checkEraseStatus);
-$("#erase-plan").addEventListener("click", planErase);
-$("#erase-run").addEventListener("click", runErase);
+$("#erase-load-frame").addEventListener("click", loadEraseFrame);
+$("#erase-detect").addEventListener("click", detectEraseRegions);
+$("#erase-clear").addEventListener("click", clearEraseRegions);
+$("#erase-preview-run").addEventListener("click", previewErase);
+$("#erase-batch").addEventListener("click", startEraseBatch);
+bindEraseCanvas();
 $("#transcode-plan").addEventListener("click", transcodeAdvice);
 $("#diff-run").addEventListener("click", diffReportPackages);
 $("#diff-left-pick").addEventListener("click", () => browse("#diff-left"));
@@ -4030,6 +4303,23 @@ $("#publish-copy-generate").addEventListener("click", generatePublishCopy);
 $("#publish-copy-load").addEventListener("click", loadPublishCopy);
 $("#publish-copy-preview").addEventListener("click", previewPublishCopy);
 $("#browse-output").addEventListener("click", () => browse("#output-dir"));
+// 扫描件：选了就填进只读输入框，结果里会逐份标明签章方式。
+async function pickScan(targetId) {
+  try {
+    const file = await call("pick_scan_file");
+    if (file) $(targetId).value = file;
+  } catch (error) {
+    reportError(error);
+  }
+}
+$("#scan-cost-pick").addEventListener("click", () => pickScan("#scan-cost-sheet"));
+$("#scan-ownership-pick").addEventListener("click", () => pickScan("#scan-ownership"));
+$("#scan-cost-clear").addEventListener("click", () => {
+  $("#scan-cost-sheet").value = "";
+});
+$("#scan-ownership-clear").addEventListener("click", () => {
+  $("#scan-ownership").value = "";
+});
 $("#scan").addEventListener("click", scan);
 $("#analyze").addEventListener("click", analyze);
 $("#generate").addEventListener("click", generate);

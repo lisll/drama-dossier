@@ -12,6 +12,7 @@ mod account;
 mod dossier;
 mod encode;
 mod erase;
+mod erase_batch;
 mod jianying;
 mod jobs;
 #[cfg(test)]
@@ -208,6 +209,7 @@ pub fn run() {
             save_app_settings,
             analyze_drama,
             package::generate_package,
+            package::pick_scan_file,
             open_path,
             account::commands::account_status,
             account::commands::account_retry,
@@ -264,7 +266,11 @@ pub fn run() {
             jobs::job_list,
             jobs::job_pause,
             jobs::job_resume,
-            jobs::job_terminate
+            jobs::job_terminate,
+            erase_batch::video_frame,
+            erase_batch::detect_still_regions,
+            erase_batch::erase_preview,
+            erase_batch::erase_batch_start
         ]))
         .build(tauri::generate_context!())
         .expect("failed to build DramaDossier");

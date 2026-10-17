@@ -289,7 +289,125 @@ test("报审包错误文案：有固定说法的给说法，带文件名的原�
   assert.equal(L.errorText({ code: "package_local_missing" }), "操作失败");
 });
 
-// ---------- 处理版本与任务队列（M4b-1） ----------
+// ---------- 擦除画布的区域换算（M4b-2） ----------
+
+test("签章状态的说法：四种状态各一句，认不出的原样显示", () => {
+  // 和后端 SigningStatus 的取值一一对应，不能漏、不能错位。
+  assert.equal(L.signingLabel("none"), "无盖章文档");
+  assert.equal(L.signingLabel("placeholder"), "占位章（未签署）");
+  assert.equal(L.signingLabel("scan"), "扫描件签章");
+  assert.equal(L.signingLabel("mixed"), "混合（部分占位章）");
+  // 后端将来加了新状态：原样显示，不假装成已知的四种之一。
+  assert.equal(L.signingLabel("sealed_by_lawyer"), "sealed_by_lawyer");
+  assert.equal(L.signingLabel(null), "未知");
+  assert.equal(L.signingLabel(undefined), "未知");
+});
+
+test("画布坐标换算：预览缩放过时要换回原始分辨率", () => {
+  // 原始 1080×1920，预览缩到 540×960（一半）。
+  const view = { width: 540, height: 960 };
+  const source = { width: 1080, height: 1920 };
+  const inView = { x: 100, y: 200, width: 50, height: 40 };
+  assert.deepEqual(L.toSourceRect(inView, view, source), {
+    x: 200,
+    y: 400,
+    width: 100,
+    height: 80,
+  });
+  // 反方向回到画布。
+  assert.deepEqual(
+    L.toViewRect({ x: 200, y: 400, width: 100, height: 80 }, view, source),
+    inView,
+  );
+  // 比例是 1 时原样返回。
+  assert.deepEqual(
+    L.toSourceRect(inView, source, source),
+    inView,
+  );
+});
+
+test("拖出矩形：两个对角点顺序任意，结果一致", () => {
+  const a = { x: 30, y: 40 };
+  const b = { x: 10, y: 10 };
+  assert.deepEqual(L.normalizeRect(a, b), { x: 10, y: 10, width: 20, height: 30 });
+  assert.deepEqual(L.normalizeRect(b, a), { x: 10, y: 10, width: 20, height: 30 });
+  // 同一个点：宽高为 0。
+  assert.deepEqual(L.normalizeRect(a, a), { x: 30, y: 40, width: 0, height: 0 });
+});
+
+test("太小的框算误点，不该提交", () => {
+  assert.equal(L.rectIsUsable({ x: 0, y: 0, width: 3, height: 30 }), false);
+  assert.equal(L.rectIsUsable({ x: 0, y: 0, width: 30, height: 3 }), false);
+  assert.equal(L.rectIsUsable({ x: 0, y: 0, width: 4, height: 4 }), true);
+  assert.equal(L.rectIsUsable({ x: 0, y: 0, width: 3, height: 3 }, 2), true);
+});
+
+test("区域要夹在画面内：拖出边界不会得到负坐标或超长宽", () => {
+  const bounds = { width: 200, height: 100 };
+  assert.deepEqual(
+    L.clampRect({ x: -10, y: -5, width: 50, height: 20 }, bounds),
+    { x: 0, y: 0, width: 50, height: 20 },
+  );
+  // 右边的框超出画面：宽度被裁到边界。
+  assert.deepEqual(
+    L.clampRect({ x: 180, y: 10, width: 50, height: 20 }, bounds),
+    { x: 180, y: 10, width: 20, height: 20 },
+  );
+  // 完全在画面外：宽度夹成 0（调用方据此丢弃）。
+  const outside = L.clampRect({ x: 500, y: 500, width: 10, height: 10 }, bounds);
+  assert.equal(outside.x, 200);
+  assert.equal(outside.y, 100);
+  assert.equal(outside.width, 0);
+  assert.equal(outside.height, 0);
+});
+
+test("命中测试：后画的框优先，右下角是缩放、框内是移动", () => {
+  const regions = [
+    { x: 0, y: 0, width: 100, height: 100 },
+    { x: 50, y: 50, width: 100, height: 100 },
+  ];
+  // 两个框重叠处：后一个（下标 1）优先。
+  assert.deepEqual(L.hitTestRegions({ x: 60, y: 60 }, regions, 12), {
+    index: 1,
+    part: "move",
+  });
+  // 只有第 1 个框覆盖的地方。
+  assert.deepEqual(L.hitTestRegions({ x: 10, y: 10 }, regions, 12), {
+    index: 0,
+    part: "move",
+  });
+  // 第 2 个框的右下角（150,150）附近：缩放。
+  assert.deepEqual(L.hitTestRegions({ x: 148, y: 152 }, regions, 12), {
+    index: 1,
+    part: "resize",
+  });
+  // 空白处：没命中。
+  assert.equal(L.hitTestRegions({ x: 400, y: 400 }, regions, 12), null);
+});
+
+test("区域数量与自动识别候选的过滤", () => {
+  assert.equal(L.regionSummary([]), "区域：0 个");
+  assert.equal(L.regionSummary([{ x: 0, y: 0, width: 10, height: 10 }]), "区域：1 个");
+  assert.equal(
+    L.regionSummary([
+      { x: 0, y: 0, width: 10, height: 10 },
+      { x: 20, y: 20, width: 10, height: 10 },
+    ]),
+    "区域：2 个",
+  );
+
+  // 自动识别回来的候选：短边不足 8 像素的（噪点残影）要丢掉。
+  const candidates = [
+    { x: 0, y: 0, width: 40, height: 30 },
+    { x: 0, y: 0, width: 7, height: 30 },
+    { x: 0, y: 0, width: 40, height: 5 },
+  ];
+  assert.deepEqual(L.acceptableCandidates(candidates), [
+    { x: 0, y: 0, width: 40, height: 30 },
+  ]);
+  assert.deepEqual(L.acceptableCandidates(null), []);
+});
+
 
 /** 一行任务的 JobView 骨架，默认是最没内容的样子。 */
 const job = (extra = {}) => ({ id: "j1", state: "queued", done: 0, total: 0, current: null, ...extra });

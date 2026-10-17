@@ -349,6 +349,30 @@
                 <label>演员成本占比（%）<input id="actor-ratio" type="number" min="0" max="100" step="0.01" /></label>
                 <label>联系方式<input id="contact" type="text" placeholder="仅写入本地报审包" /></label>
               </div>
+              <details class="adv" id="scan-signing">
+                <summary>用已盖章的扫描件代替占位章（可选，可只给其中一份）</summary>
+                <p class="hint">
+                  两份要盖章的文档（成本配置表、内容权属声明）可以各上传一份已盖好章的扫描件。
+                  给哪份用哪份，没给的仍然盖占位章——结果里会逐份标明，不会笼统写成「已签章」。
+                  支持 PNG / JPEG / PDF，单份不超过 5 MB。
+                </p>
+                <div class="form-grid">
+                  <label>成本配置表扫描件
+                    <input id="scan-cost-sheet" type="text" readonly placeholder="未选择（将盖占位章）" />
+                  </label>
+                  <div class="option-row">
+                    <button id="scan-cost-pick" class="ghost">选择…</button>
+                    <button id="scan-cost-clear" class="ghost">清除</button>
+                  </div>
+                  <label>内容权属声明扫描件
+                    <input id="scan-ownership" type="text" readonly placeholder="未选择（将盖占位章）" />
+                  </label>
+                  <div class="option-row">
+                    <button id="scan-ownership-pick" class="ghost">选择…</button>
+                    <button id="scan-ownership-clear" class="ghost">清除</button>
+                  </div>
+                </div>
+              </details>
               <div class="option-row">
                 <label><input id="copy-episodes" type="checkbox" /> 复制分集视频进报审包</label>
                 <label><input id="ai-generated" type="checkbox" /> 剧名/简介/封面使用了 AI 辅助生成</label>
@@ -771,46 +795,71 @@
               </details>
 
               <details class="panel tool-card" id="tool-erase">
-                <summary>字幕 / 角标擦除（实验功能，仅限自有素材）</summary>
+                <summary>区域擦除：试用版水印、台标、固定字幕（仅限自有素材）</summary>
+                <p class="hint">
+                  做法：先取一帧看清画面 → 自动识别「位置固定、内容不变」的候选区域 → 在画面上拖动微调 →
+                  左右对比确认 → 勾选权利确认 → 批量应用到所有集（能暂停、终止、继续）。
+                </p>
                 <div class="form-grid">
-                  <label>输入视频<input id="erase-input" type="text" placeholder="仅限自有素材" /></label>
-                  <label>输出视频<input id="erase-output" type="text" placeholder="例如 /path/out.mp4" /></label>
-                  <label>区域（x,y,w,h）<input id="erase-regions" type="text" placeholder="120,300,400,40；多个用分号分隔" /></label>
-                  <label>检测后端<select id="erase-detector">
-                    <option value="fixed">fixed（按上面的区域）</option>
-                    <option value="worker">worker（DBNet 模型检测）</option>
-                  </select></label>
-                  <label>修复后端<select id="erase-inpainter">
-                    <option value="column">column（本地基线，无需模型）</option>
-                    <option value="worker">worker（时序模型）</option>
-                  </select></label>
+                  <label>取帧秒数<input id="erase-frame-sec" type="number" min="0" step="0.1" value="2" /></label>
+                  <label>工具路径<input id="erase-tool-path" type="text" placeholder="留空时从 PATH / 仓库 target 查找" /></label>
                 </div>
-                <details class="adv">
-                  <summary>高级参数（膨胀 / 羽化 / worker / 截取）</summary>
-                  <div class="form-grid">
-                    <label>掩码膨胀（px）<input id="erase-dilate" type="number" min="0" max="64" step="1" value="4" /></label>
-                    <label>羽化（px）<input id="erase-feather" type="number" min="0" max="64" step="1" value="2" /></label>
-                    <label>ROI 外扩比例<input id="erase-context" type="number" min="1" max="8" step="0.1" value="1.6" /></label>
-                    <label>起始秒（可选）<input id="erase-start" type="number" min="0" step="0.1" /></label>
-                    <label>时长秒（可选）<input id="erase-duration" type="number" min="0.1" step="0.1" /></label>
-                    <label>worker 程序<input id="erase-worker-program" type="text" placeholder="如 python3" /></label>
-                    <label>worker 参数<input id="erase-worker-args" type="text" placeholder="逗号分隔，如 tools/model_worker/worker.py,--serve" /></label>
-                    <label>工具路径<input id="erase-tool-path" type="text" placeholder="留空时从 PATH / 仓库 target 查找" /></label>
-                  </div>
-                  <div class="option-row">
-                    <label><input id="erase-persistent" type="checkbox" /> 常驻 worker（--persistent-worker）</label>
-                  </div>
-                </details>
                 <div class="option-row">
-                  <button id="browse-erase-input" class="ghost">选择输入视频</button>
-                  <button id="erase-status" class="ghost">检测工具状态</button>
-                  <button id="erase-plan" class="primary">预览命令</button>
-                  <button id="erase-run" data-long-task class="success">执行擦除</button>
+                  <button id="erase-load-frame" class="ghost">按当前剧第 1 集取帧</button>
+                  <button id="erase-detect" class="primary">自动识别</button>
+                  <button id="erase-clear" class="ghost">清空区域</button>
                 </div>
-                <div id="erase-result" class="result hidden"></div>
+
+                <div class="erase-workbench">
+                  <div class="erase-pane">
+                    <div class="erase-pane-title">原片（在画面上拖动可新建框；拖框可移动，拖右下角可缩放）</div>
+                    <div class="erase-canvas-wrap" id="erase-canvas-wrap">
+                      <img id="erase-frame" alt="取帧预览" class="hidden" />
+                      <canvas id="erase-canvas" width="720" height="1280"></canvas>
+                      <div id="erase-empty" class="empty">还没有取帧。点上面的「按当前剧第 1 集取帧」。</div>
+                    </div>
+                  </div>
+                  <div class="erase-pane">
+                    <div class="erase-pane-title">擦除后（同一时刻，只擦这一小段做预览）</div>
+                    <div class="erase-canvas-wrap">
+                      <img id="erase-preview" alt="擦除效果预览" class="hidden" />
+                      <div id="erase-preview-empty" class="empty">确认区域后点「预览对比」。</div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="option-row">
+                  <button id="erase-preview-run" class="ghost">预览对比</button>
+                  <span id="erase-region-summary" class="hint">区域：0 个</span>
+                </div>
+
+                <details class="adv">
+                  <summary>高级参数（自动识别阈值 / 工具路径）</summary>
+                  <div class="form-grid">
+                    <label>识别采样帧数<input id="erase-samples" type="number" min="2" max="600" step="1" value="30" /></label>
+                  </div>
+                  <p class="hint">
+                    批量擦除固定用本地 <code>column</code> 修复基线（无需模型）。要用时序模型（E2FGVI）请走命令行
+                    <code>dossier-inpaint --inpainter worker</code>：那条路需要 Python 与模型文件，
+                    界面这一版没有接，避免给出做不到的选项。
+                  </p>
+                </details>
+
+                <div id="erase-job-result" class="result hidden"></div>
+                <div class="option-row">
+                  <label class="confirm-line">
+                    <input id="erase-rights" type="checkbox" />
+                    我确认对该素材拥有权利（勾选会记进本机处理台账）
+                  </label>
+                </div>
+                <div class="option-row">
+                  <button id="erase-batch" class="success">对当前剧全部集开始擦除</button>
+                </div>
                 <p class="legal">
                   只处理自有素材的硬字幕与角标；擦除结果按确认流自动校验（退出码 0 通过 / 3 需人工抽查 / 2 校验失败）。
                   本功能不提供 DRM 绕过能力，也不处理他人作品的版权标识。
+                  <br />
+                  提醒：试用版加水印通常是那款软件的授权手段，去掉水印后商用一般违反它的许可协议，有被追责的风险。最稳妥的办法是买正式版授权。
                 </p>
               </details>
             </div>

@@ -2135,3 +2135,88 @@ button.account-chip:hover {
     grid-template-columns: 1fr;
   }
 }
+
+/* ---------- 区域擦除画布（M4b-2） ---------- */
+
+.erase-workbench {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin: 12px 0;
+}
+
+.erase-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.erase-pane-title {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.erase-canvas-wrap {
+  position: relative;
+  display: block;
+  /* 画面按栏宽自适应：两栏并排时每栏本来就窄，再写死像素宽会被挤成细长条。 */
+  width: 100%;
+  max-width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--canvas);
+  /* 画布上要拖动，禁止文字选择，否则拖的时候会把标题一起选中。 */
+  user-select: none;
+}
+
+/* 骨架保持画面比例：取帧之前先撑出一个不会塌的高度，避免文案挤压布局。 */
+.erase-canvas-wrap::before {
+  content: "";
+  display: block;
+  padding-top: 56.25%;
+}
+
+.erase-canvas-wrap.has-frame::before {
+  /* 有画面之后由 img 自己决定高度，占位块收起。 */
+  display: none;
+}
+
+.erase-canvas-wrap img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.erase-canvas-wrap img.hidden {
+  display: none;
+}
+
+.erase-canvas-wrap canvas {
+  position: absolute;
+  inset: 0;
+  cursor: crosshair;
+}
+
+.erase-canvas-wrap .empty {
+  padding: 24px 16px;
+  color: var(--faint);
+  font-size: 13px;
+  text-align: center;
+}
+
+.confirm-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--warn-text);
+  font-size: 13px;
+}
+
+@media (max-width: 1080px) {
+  .erase-workbench {
+    grid-template-columns: 1fr;
+  }
+}

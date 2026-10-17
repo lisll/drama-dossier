@@ -53,7 +53,7 @@ const OUTPUT_LEAF: &str = "处理版本";
 const RECIPE_FILE: &str = "recipe.token";
 /// 任务目录里每集的结果（收尾时汇总进版本说明）。
 const RESULTS_DIR: &str = "results";
-const JOB_KIND: &str = "version";
+pub(crate) const JOB_KIND: &str = "version";
 
 /// 处理台账：和生成流水 `ledger.jsonl` 同目录。
 fn processing_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -1323,19 +1323,24 @@ impl PreparedJob for VersionJob {
     }
 }
 
-/// 应用启动时创建队列并注册执行器。
+/// 应用启动时创建队列并注册执行器（处理版本 + 区域擦除）。
 pub fn start_queue(app: &AppHandle) -> Result<JobQueue, String> {
     use tauri::Emitter;
     let root = jobs_root(app)?;
     std::fs::create_dir_all(&root)
         .map_err(|error| format!("创建任务目录失败（{}）：{error}", root.display()))?;
-    let runner: Arc<dyn JobRunner> = Arc::new(VersionRunner::new(app.clone()));
+    let runners: Vec<(String, Arc<dyn JobRunner>)> = vec![
+        (
+            JOB_KIND.to_string(),
+            Arc::new(VersionRunner::new(app.clone())),
+        ),
+        (
+            crate::erase_batch::JOB_KIND.to_string(),
+            Arc::new(crate::erase_batch::EraseRunner::new(app.clone())),
+        ),
+    ];
     let handle = app.clone();
-    Ok(JobQueue::start(
-        root,
-        vec![(JOB_KIND.to_string(), runner)],
-        move |view| {
-            let _ = handle.emit("job-progress", view);
-        },
-    ))
+    Ok(JobQueue::start(root, runners, move |view| {
+        let _ = handle.emit("job-progress", view);
+    }))
 }

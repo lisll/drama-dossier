@@ -496,6 +496,124 @@
    * 模板表单的本地校验（和 dossier-core VersionTemplate::validate 的规则一致，后端还会再校验一次）。
    * 返回 `[字段, 说明]` 列表；空列表表示通过。
    */
+  // ---------- 擦除画布的区域换算（M4b-2） ----------
+
+  /**
+   * 画布坐标 → 原始画面坐标。
+   *
+   * `view` 是画布上显示的画面尺寸，`source` 是视频的原始宽高（取帧时缩过，所以要换算回来）。
+   * 擦除区域必须按原始分辨率提交，否则在缩放过的预览上拖出来的框会偏。
+   */
+  function toSourceRect(rect, view, source) {
+    const sx = source.width / Math.max(1, view.width);
+    const sy = source.height / Math.max(1, view.height);
+    return {
+      x: Math.round(rect.x * sx),
+      y: Math.round(rect.y * sy),
+      width: Math.round(rect.width * sx),
+      height: Math.round(rect.height * sy),
+    };
+  }
+
+  /** 原始画面坐标 → 画布坐标（显示用）。 */
+  function toViewRect(rect, view, source) {
+    const sx = Math.max(1, view.width) / source.width;
+    const sy = Math.max(1, view.height) / source.height;
+    return {
+      x: rect.x * sx,
+      y: rect.y * sy,
+      width: rect.width * sx,
+      height: rect.height * sy,
+    };
+  }
+
+  /** 把两个对角点整理成非负宽高的矩形（拖动方向任意）。 */
+  function normalizeRect(from, to) {
+    const x = Math.min(from.x, to.x);
+    const y = Math.min(from.y, to.y);
+    return {
+      x,
+      y,
+      width: Math.abs(to.x - from.x),
+      height: Math.abs(to.y - from.y),
+    };
+  }
+
+  /** 区域是否足够大（太小多半是误点）。低于 4×4 画布像素的框直接丢掉。 */
+  function rectIsUsable(rect, minSide) {
+    const threshold = minSide ?? 4;
+    return rect.width >= threshold && rect.height >= threshold;
+  }
+
+  /** 把矩形夹到画面内，并取整到像素。 */
+  function clampRect(rect, bounds) {
+    const x = Math.max(0, Math.min(Math.round(rect.x), bounds.width));
+    const y = Math.max(0, Math.min(Math.round(rect.y), bounds.height));
+    return {
+      x,
+      y,
+      width: Math.max(0, Math.min(Math.round(rect.width), bounds.width - x)),
+      height: Math.max(0, Math.min(Math.round(rect.height), bounds.height - y)),
+    };
+  }
+
+  /**
+   * 命中测试：画布上的点落在哪个区域上，以及落在框内哪个部位。
+   *
+   * 返回 `{ index, part }`，`part` 是 `"move"`（框内）或 `"resize"`（右下角把手区），
+   * 没命中时返回 `null`。从**后往前**找，和绘制顺序一致（后画的压在上面）。
+   */
+  function hitTestRegions(point, regions, handleSize) {
+    const handle = handleSize ?? 12;
+    for (let index = regions.length - 1; index >= 0; index -= 1) {
+      const rect = regions[index];
+      const inRight = Math.abs(point.x - (rect.x + rect.width)) <= handle;
+      const inBottom = Math.abs(point.y - (rect.y + rect.height)) <= handle;
+      if (inRight && inBottom) return { index, part: "resize" };
+      const inside =
+        point.x >= rect.x &&
+        point.x <= rect.x + rect.width &&
+        point.y >= rect.y &&
+        point.y <= rect.y + rect.height;
+      if (inside) return { index, part: "move" };
+    }
+    return null;
+  }
+
+  /** 区域数量的说法（给界面用）。 */
+  function regionSummary(regions) {
+    if (!regions || regions.length === 0) return "区域：0 个";
+    return `区域：${regions.length} 个`;
+  }
+
+  /**
+   * 自动识别回来的候选要不要采纳：太小的框（噪点）直接丢掉。
+   * `minSide` 按原始分辨率算，默认 8 像素，和 `dossier-inpaint` 的判据一致。
+   */
+  function acceptableCandidates(candidates, minSide) {
+    const threshold = minSide ?? 8;
+    return (candidates || []).filter(
+      (candidate) => candidate.width >= threshold && candidate.height >= threshold,
+    );
+  }
+
+  /** 报审包签章状态的说法（和后端 `SigningStatus` 的取值一一对应）。 */
+  function signingLabel(status) {
+    switch (status) {
+      case "none":
+        return "无盖章文档";
+      case "placeholder":
+        return "占位章（未签署）";
+      case "scan":
+        return "扫描件签章";
+      case "mixed":
+        return "混合（部分占位章）";
+      default:
+        // 认不出的状态原样显示，不假装成别的。
+        return String(status ?? "未知");
+    }
+  }
+
   function templateProblems(template) {
     const problems = [];
     const unit = (value) => Number.isFinite(value) && value >= 0 && value <= 1;
@@ -578,5 +696,14 @@
     mergeJob,
     activeJobCount,
     templateProblems,
+    toSourceRect,
+    toViewRect,
+    normalizeRect,
+    rectIsUsable,
+    clampRect,
+    hitTestRegions,
+    regionSummary,
+    acceptableCandidates,
+    signingLabel,
   };
 });
