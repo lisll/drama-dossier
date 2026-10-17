@@ -14,6 +14,7 @@ pub mod mask;
 pub mod patch;
 pub mod pipeline;
 pub mod probe;
+pub mod still;
 pub mod verify;
 pub mod worker;
 

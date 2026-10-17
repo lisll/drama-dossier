@@ -25,6 +25,7 @@ use dossier_inpaint::inpaint::{ColumnFillInpainter, Inpainter, WorkerInpainter};
 use dossier_inpaint::mask::MaskRect;
 use dossier_inpaint::pipeline::{run_pipeline, PipelineConfig, ProgressStream};
 use dossier_inpaint::probe::probe_video;
+use dossier_inpaint::still::{detect_still_regions, sample_indices, StillConfig};
 use dossier_inpaint::verify::{Verdict, VerifyConfig};
 use dossier_inpaint::worker::WorkerSession;
 
@@ -38,9 +39,11 @@ struct Args {
     /// 输入视频
     #[arg(long)]
     input: PathBuf,
-    /// 输出视频（音轨从输入素材直接复制）
-    #[arg(long)]
-    output: PathBuf,
+    /// 输出视频（音轨从输入素材直接复制）。
+    ///
+    /// 只有 `--detect-only` 可以不填——那种模式下不产出视频。
+    #[arg(long, required_unless_present = "detect_only")]
+    output: Option<PathBuf>,
     /// 固定区域（字幕或角标），格式 x,y,w,h；可重复给出以支持多个标识。
     ///
     /// 给出后管线会跳过定位阶段，直接在这些区域内生成掩码；
@@ -192,6 +195,40 @@ struct Args {
     /// 不写产物戳记。默认**写**：没有戳记，事后就无法回答「这批产物是不是同一套流程出的」。
     #[arg(long)]
     no_stamp: bool,
+    /// 只检测、不擦除：找出画面里「位置固定、内容不变」的候选区域，输出 JSON 后退出。
+    ///
+    /// 用于界面上的「自动识别」（试用版水印、台标、固定字幕都属于这类区域）。
+    /// 给出这个开关时不写输出视频、不跑修复、不做自动校验，退出码恒为 0
+    /// （没找到候选也算成功，`candidates` 为空数组）。
+    #[arg(long)]
+    detect_only: bool,
+    /// 只检测时比较多少帧（均匀抽样）
+    #[arg(long, default_value_t = 30)]
+    still_samples: usize,
+    /// 只检测的帧间亮度方差上限
+    #[arg(long, default_value_t = StillConfig::default().max_variance, allow_hyphen_values = true)]
+    still_max_variance: f64,
+    /// 只检测的帧间亮度极差上限
+    #[arg(long, default_value_t = StillConfig::default().max_spread, allow_hyphen_values = true)]
+    still_max_spread: f64,
+    /// 只检测的相对方差系数（判据上限 = min(绝对上限, 全画面方差中位数 × 系数)）
+    #[arg(long, default_value_t = StillConfig::default().relative_variance, allow_hyphen_values = true)]
+    still_relative_variance: f64,
+    /// 只检测的相对极差系数（同上）
+    #[arg(long, default_value_t = StillConfig::default().relative_spread, allow_hyphen_values = true)]
+    still_relative_spread: f64,
+    /// 只检测的边缘梯度下限
+    #[arg(long, default_value_t = StillConfig::default().min_gradient, allow_hyphen_values = true)]
+    still_min_gradient: f64,
+    /// 只检测的候选块最小短边（像素）
+    #[arg(long, default_value_t = StillConfig::default().min_side)]
+    still_min_side: u32,
+    /// 只检测的候选块最大面积比例（占画面）
+    #[arg(long, default_value_t = StillConfig::default().max_area_ratio, allow_hyphen_values = true)]
+    still_max_area_ratio: f64,
+    /// 只检测的候选块最低占比（块内「静止且有边缘」的像素比例）
+    #[arg(long, default_value_t = StillConfig::default().min_score, allow_hyphen_values = true)]
+    still_min_score: f32,
     /// 进度流输出路径（JSONL，覆盖写）。
     ///
     /// 擦除是逐帧长任务，只靠 stdout 看不到「跑到哪了」。给出这个路径后，管线会把
@@ -269,7 +306,130 @@ fn verify_config_from_args(args: &Args) -> VerifyConfig {
     }
 }
 
+/// 只检测、不擦除：均匀抽帧 → 算静止区域 → 输出 JSON。
+///
+/// 不建临时目录、不写视频、不跑修复、不做校验，退出码恒为 0（没找到候选也算成功）。
+/// 这样界面上的「自动识别」按钮可以反复点，不会留下任何中间产物。
+fn run_detect_only(args: &Args) -> Result<ExitCode, String> {
+    if args.output.is_some() {
+        // 明确拒绝，而不是「顺便也擦一遍」：使用者给了 --output 多半以为会出视频。
+        return Err(
+            "--detect-only 只做检测、不产出视频，不能和 --output 一起用；要擦除请去掉 --detect-only"
+                .into(),
+        );
+    }
+    let info =
+        probe_video(args.ffprobe.as_deref(), &args.input).map_err(|error| error.to_string())?;
+    let fps = info
+        .fps
+        .or(args.fps)
+        .filter(|value| *value > 0.0)
+        .ok_or_else(|| "无法从素材确定帧率，请用 --fps 指定（只检测需要按帧号抽帧）".to_string())?;
+    let total_frames = (info.duration_sec * fps).round().max(1.0) as u64;
+    let indices = sample_indices(total_frames, args.still_samples.max(2));
+    if indices.len() < 2 {
+        return Err("素材太短，至少需要 2 帧才能判断静止区域".into());
+    }
+
+    let config = StillConfig {
+        max_variance: args.still_max_variance,
+        max_spread: args.still_max_spread,
+        relative_variance: args.still_relative_variance,
+        relative_spread: args.still_relative_spread,
+        min_gradient: args.still_min_gradient,
+        min_side: args.still_min_side,
+        max_area_ratio: args.still_max_area_ratio,
+        min_score: args.still_min_score,
+        ..StillConfig::default()
+    };
+
+    let mut frames: Vec<Vec<u8>> = Vec::with_capacity(indices.len());
+    for index in &indices {
+        frames.push(
+            read_frame_at(args, &info, *index, fps)
+                .map_err(|error| format!("读取第 {index} 帧失败：{error}"))?,
+        );
+    }
+    let report =
+        detect_still_regions(&frames, info.size, &config).map_err(|error| error.to_string())?;
+
+    // 报告里补上素材路径，界面不必自己再拼一次。
+    let payload = serde_json::json!({
+        "video": args.input.display().to_string(),
+        "width": report.width,
+        "height": report.height,
+        "fps": fps,
+        "durationSec": info.duration_sec,
+        "samples": report.samples,
+        "minFrames": report.min_frames,
+        "candidates": report.candidates,
+    });
+    let text = serde_json::to_string_pretty(&payload)
+        .map_err(|error| format!("序列化检测结果失败：{error}"))?;
+    match &args.report_json {
+        Some(path) => {
+            std::fs::write(path, &text)
+                .map_err(|error| format!("写入 {} 失败：{error}", path.display()))?;
+            println!("检测结果：{}", path.display());
+        }
+        None => println!("{text}"),
+    }
+    println!(
+        "共抽 {} 帧，候选区域 {} 个",
+        report.samples,
+        report.candidates.len()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// 取指定帧序号的原始 BGR 像素（`-ss` 跳转后只解一帧）。
+fn read_frame_at(
+    args: &Args,
+    info: &dossier_inpaint::probe::VideoInfo,
+    index: u64,
+    fps: f64,
+) -> Result<Vec<u8>, String> {
+    let ffmpeg = FfmpegConfig {
+        bin: args.ffmpeg.clone(),
+    };
+    let seconds = index as f64 / fps;
+    let output = std::process::Command::new(ffmpeg.program())
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin"])
+        .arg("-ss")
+        .arg(format!("{seconds:.6}"))
+        .arg("-i")
+        .arg(&args.input)
+        .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"])
+        .output()
+        .map_err(|error| format!("ffmpeg 启动失败：{error}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let first = detail
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("（无输出）");
+        return Err(format!("ffmpeg 退出码 {:?}：{first}", output.status.code()));
+    }
+    let expected = (info.size.width as usize) * (info.size.height as usize) * 3;
+    if output.stdout.len() != expected {
+        return Err(format!(
+            "取到的帧大小不对：期望 {expected} 字节，实际 {}",
+            output.stdout.len()
+        ));
+    }
+    Ok(output.stdout)
+}
+
 fn run(args: &Args) -> Result<ExitCode, String> {
+    // 只检测、不擦除：早于一切修复逻辑返回，不建临时目录、不写视频。
+    if args.detect_only {
+        return run_detect_only(args);
+    }
+    let output = args
+        .output
+        .clone()
+        .ok_or_else(|| "缺少 --output（只有 --detect-only 可以不填）".to_string())?;
     let lossless_intermediate = match args.intermediate.as_str() {
         "delivery" => false,
         "lossless" => true,
@@ -295,7 +455,7 @@ fn run(args: &Args) -> Result<ExitCode, String> {
         if info.has_audio { "有" } else { "无" }
     );
 
-    let temp_dir = args.output.with_extension("inpaint-tmp");
+    let temp_dir = output.with_extension("inpaint-tmp");
     // 无损中间态用 matroska 承载 FFV1；交付模式直接写 mp4。
     let temp_video = temp_dir.join(if lossless_intermediate {
         "video.mkv"
@@ -316,8 +476,7 @@ fn run(args: &Args) -> Result<ExitCode, String> {
     }
     let progress = args.progress_json.clone().map(|path| ProgressStream {
         path,
-        task_id: args
-            .output
+        task_id: output
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_else(|| "dossier-inpaint".to_string()),
@@ -422,7 +581,7 @@ fn run(args: &Args) -> Result<ExitCode, String> {
     let report_path = args
         .report_json
         .clone()
-        .unwrap_or_else(|| args.output.with_extension("inpaint-report.json"));
+        .unwrap_or_else(|| output.with_extension("inpaint-report.json"));
     write_report(&report_path, &report)?;
     println!("处理日志：{}", report_path.display());
 
@@ -447,23 +606,26 @@ fn run(args: &Args) -> Result<ExitCode, String> {
     }
     let status = mux
         .args(["-movflags", "+faststart", "-y"])
-        .arg(&args.output)
+        .arg(&output)
         .status()
         .map_err(|error| format!("{mux_label}失败：{error}"))?;
     if !status.success() {
         return Err(format!("{mux_label}失败（退出码 {:?}）", status.code()));
     }
 
-    println!("输出：{}", args.output.display());
+    println!("输出：{}", output.display());
     if !args.no_stamp {
         match write_stamp(
             args,
-            &info,
-            fps,
-            start_frame,
-            end_frame,
-            &report_path,
-            lossless_intermediate,
+            &StampContext {
+                output: &output,
+                info: &info,
+                fps,
+                start_frame,
+                end_frame,
+                report_path: &report_path,
+                lossless_intermediate,
+            },
         ) {
             Ok(path) => println!("产物戳记：{}", path.display()),
             Err(message) if args.stamp_json.is_some() => {
@@ -513,23 +675,37 @@ fn print_verification(report: &dossier_inpaint::pipeline::PipelineReport) {
     }
 }
 
-/// 写产物戳记（`<输出>.stamp.json`）：回答「这份产物是哪套管线、哪个版本、哪组参数、
-/// 哪份输入跑出来的」。参数摘要覆盖所有会改变画面结果的开关——漏掉一个，
-/// 两次参数不同的跑批就会被判成「同一套参数」，戳记也就失去了意义。
-fn write_stamp(
-    args: &Args,
-    info: &dossier_inpaint::probe::VideoInfo,
+/// 写产物戳记时要写进去的运行上下文。
+///
+/// 收成一个结构体而不是继续加参数：`write_stamp` 本来就有 7 个参数，
+/// 再往上加会超出可读范围（clippy 也会拦）。
+struct StampContext<'a> {
+    output: &'a std::path::Path,
+    info: &'a dossier_inpaint::probe::VideoInfo,
     fps: f64,
     start_frame: Option<u64>,
     end_frame: Option<u64>,
-    report_path: &std::path::Path,
+    report_path: &'a std::path::Path,
     lossless_intermediate: bool,
-) -> Result<PathBuf, String> {
+}
+
+/// 写产物戳记（`<输出>.stamp.json`）：回答「这份产物是哪套管线、哪个版本、哪组参数、
+/// 哪份输入跑出来的」。参数摘要覆盖所有会改变画面结果的开关——漏掉一个，
+/// 两次参数不同的跑批就会被判成「同一套参数」，戳记也就失去了意义。
+fn write_stamp(args: &Args, ctx: &StampContext<'_>) -> Result<PathBuf, String> {
+    let StampContext {
+        output,
+        info,
+        fps,
+        start_frame,
+        end_frame,
+        report_path,
+        lossless_intermediate,
+    } = *ctx;
     let version = pipeline_version(ERASE_PIPELINE).ok_or_else(|| {
         format!("管线 {ERASE_PIPELINE} 没有登记版本（内部错误：请检查 pipeline_version）")
     })?;
-    let task_id = args
-        .output
+    let task_id = output
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_else(|| "dossier-inpaint".to_string());
@@ -610,7 +786,7 @@ fn write_stamp(
         })
         .with_inputs(vec![source.sha256.clone()]);
     stamp
-        .add_output(&args.output)
+        .add_output(output)
         .map_err(|error| error.to_string())?;
     if report_path.is_file() {
         stamp
@@ -625,7 +801,7 @@ fn write_stamp(
             Ok(path.clone())
         }
         None => stamp
-            .save_next_to(&args.output)
+            .save_next_to(output)
             .map_err(|error| error.to_string()),
     }
 }
@@ -814,7 +990,7 @@ mod desktop_entry_tests {
         let request = request();
         let args = parse(&request);
         assert_eq!(args.input, PathBuf::from("/tmp/in.mp4"));
-        assert_eq!(args.output, PathBuf::from("/tmp/out.mp4"));
+        assert_eq!(args.output, Some(PathBuf::from("/tmp/out.mp4")));
         assert_eq!(args.roi.len(), 2);
         assert_eq!(args.roi[0].x, 120);
         assert_eq!(args.roi[1].width, 120);
@@ -928,5 +1104,74 @@ mod desktop_entry_tests {
         assert_eq!(estimate_window_frames(10.0, 25.0, None, Some(9999)), 250);
         assert_eq!(estimate_window_frames(0.0, 25.0, None, None), 0);
         assert_eq!(estimate_window_frames(10.0, 0.0, None, None), 0);
+    }
+}
+
+#[cfg(test)]
+mod detect_only_tests {
+    //! `--detect-only` 的参数契约。
+    //!
+    //! 这一组只验参数解析与互相排斥的规则；真正跑 ffmpeg 抽帧的行为在
+    //! `crates/dossier-inpaint/tests/` 的集成测试里（需要本机 ffmpeg）。
+
+    use super::Args;
+    use clap::Parser;
+
+    #[test]
+    fn output_is_required_unless_detect_only() {
+        // 普通擦除：必须给 --output。
+        let missing = Args::try_parse_from(["dossier-inpaint", "--input", "/tmp/in.mp4"]);
+        assert!(
+            missing.is_err(),
+            "没给 --output 又没有 --detect-only 应当报错"
+        );
+
+        // 只检测：可以不给 --output。
+        let args =
+            Args::try_parse_from(["dossier-inpaint", "--input", "/tmp/in.mp4", "--detect-only"])
+                .expect("只检测不需要输出");
+        assert!(args.detect_only);
+        assert_eq!(args.output, None);
+    }
+
+    #[test]
+    fn detect_only_accepts_its_own_thresholds() {
+        let args = Args::try_parse_from([
+            "dossier-inpaint",
+            "--input",
+            "/tmp/in.mp4",
+            "--detect-only",
+            "--report-json",
+            "/tmp/candidates.json",
+            "--still-samples",
+            "12",
+            "--still-min-side",
+            "10",
+            "--still-min-score",
+            "0.5",
+        ])
+        .expect("只检测的参数");
+        assert_eq!(args.still_samples, 12);
+        assert_eq!(args.still_min_side, 10);
+        assert_eq!(args.still_min_score, 0.5);
+    }
+
+    /// 只检测 + 给了 --output：必须报错，而不是「顺便也擦一遍」。
+    #[test]
+    fn detect_only_refuses_to_produce_a_video() {
+        let args = Args::try_parse_from([
+            "dossier-inpaint",
+            "--input",
+            "/tmp/in.mp4",
+            "--output",
+            "/tmp/out.mp4",
+            "--detect-only",
+        ])
+        .expect("参数本身合法（冲突在执行阶段检查）");
+        let error = super::run_detect_only(&args).expect_err("不该产出视频");
+        assert!(
+            error.contains("不能和 --output 一起用"),
+            "错误信息要说清冲突：{error}"
+        );
     }
 }

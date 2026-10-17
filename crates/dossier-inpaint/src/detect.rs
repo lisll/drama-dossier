@@ -336,7 +336,7 @@ pub fn merge_overlapping(rects: &[MaskRect], iou_threshold: f64) -> Vec<MaskRect
 }
 
 /// 跨帧聚合的可信度参数。
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Reliability {
     /// 判定「同一位置」的 IoU 阈值。
