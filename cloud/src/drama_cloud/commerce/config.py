@@ -59,6 +59,27 @@ class CommerceSettings:
     pdf_font: Optional[str] = None
     #: `dossier-artifacts` 可执行文件。不设时按 PATH → target/release → target/debug 找。
     artifacts_bin: Optional[str] = None
+    #: 本服务的对外地址（例如 `https://drama.example.com`），用来拼支付回调地址。
+    #:
+    #: 支付渠道是**主动把通知推到这个地址**的，所以它必须能从公网访问。
+    #: 本地开发用 Mock 支付不需要它；接支付宝沙箱时要配（本机开发得用内网穿透）。
+    #: 没配时，真实渠道下单会明确报「未配置对外地址」，而不是拼出一个假地址。
+    public_base_url: Optional[str] = None
+    #: 模拟支付的回调签名密钥（HMAC-SHA256）。只在 mock 渠道用，不进日志。
+    #:
+    #: 开发环境必须显式配置（哪怕是一个固定串）：留空时 Mock 渠道会报「未配置」，
+    #: 而不是用空密钥签名——空密钥等于谁都能伪造回调。
+    mock_pay_secret: str = field(default="", repr=False)
+    #: 支付宝沙箱凭证（M5a 的 5a-7 才用；现在只有占位实现）。
+    alipay_app_id: Optional[str] = None
+    alipay_private_key: Optional[str] = field(default=None, repr=False)
+    alipay_public_key: Optional[str] = None
+    alipay_gateway: Optional[str] = None
+    #: 微信支付凭证（个人申请不了商户号，本期只留接口）。
+    wechat_mch_id: Optional[str] = None
+    wechat_api_v3_key: Optional[str] = field(default=None, repr=False)
+    wechat_private_key: Optional[str] = field(default=None, repr=False)
+    wechat_serial_no: Optional[str] = None
 
 
 def _get(env: Mapping[str, str], name: str) -> str:
@@ -147,4 +168,14 @@ def load_settings(env: Optional[Mapping[str, str]] = None) -> CommerceSettings:
         license_refresh_hours=refresh_hours,
         pdf_font=_get(env, "PDF_FONT") or None,
         artifacts_bin=_get(env, "ARTIFACTS_BIN") or None,
+        public_base_url=_get(env, "PUBLIC_BASE_URL") or None,
+        mock_pay_secret=_get(env, "MOCK_PAY_SECRET"),
+        alipay_app_id=_get(env, "ALIPAY_APP_ID") or None,
+        alipay_private_key=_get(env, "ALIPAY_PRIVATE_KEY") or None,
+        alipay_public_key=_get(env, "ALIPAY_PUBLIC_KEY") or None,
+        alipay_gateway=_get(env, "ALIPAY_GATEWAY") or None,
+        wechat_mch_id=_get(env, "WECHAT_MCH_ID") or None,
+        wechat_api_v3_key=_get(env, "WECHAT_API_V3_KEY") or None,
+        wechat_private_key=_get(env, "WECHAT_PRIVATE_KEY") or None,
+        wechat_serial_no=_get(env, "WECHAT_SERIAL_NO") or None,
     )

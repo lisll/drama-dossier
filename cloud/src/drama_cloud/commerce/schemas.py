@@ -67,6 +67,11 @@ class RegisterRequest(StrictModel):
     password: NewPassword
     #: 只接受 JSON 的 true，不接受 "true"、1 之类的值：同意条款必须是明确的动作。
     accept_terms: StrictBool
+    #: 邀请码（可选）。填错不会让注册失败——邀请是附加动作，不是注册的前提。
+    invite_code: Optional[Annotated[str, Field(max_length=16)]] = None
+    #: 机器码（可选）。用于邀请防刷：同一台电脑最多给一个账号当邀请来源。
+    #: 桌面端注册时能拿到就带上；拿不到只是少了一道防刷手段，不影响注册。
+    device_id: Optional[DeviceId] = None
 
     @field_validator("accept_terms")
     @classmethod
@@ -144,6 +149,14 @@ AppVersion = Annotated[str, AfterValidator(_app_version)]
 
 class RedeemRequest(StrictModel):
     code: Annotated[str, AfterValidator(_card_code)]
+
+
+class CreateOrderRequest(StrictModel):
+    """下单：选档位 + 选渠道。金额与积分由服务端按档位决定，客户端不能传。"""
+
+    tier_id: Annotated[str, Field(min_length=1, max_length=32)]
+    #: 目前支持 mock / alipay / wechat；渠道没配好时下单会返回 503。
+    channel: Literal["mock", "alipay", "wechat"]
 
 
 class ActivateRequest(StrictModel):
@@ -233,6 +246,9 @@ class RecipeRequest(StrictModel):
     #: 只生成一套通用版本（取抖音 / 快手 / 视频号三家里最严的值），所以只有这一个取值。
     platform: Literal["universal"]
     strength: Literal["light", "medium", "heavy"]
+    #: 这次要处理的集数。服务端只收到任务哈希、看不到集数，而计价按集算，
+    #: 所以必须由桌面端报上来。上限 500 和报审包那边一致。
+    episode_count: int = Field(ge=1, le=500)
 
 
 class RecipeConsumeRequest(StrictModel):

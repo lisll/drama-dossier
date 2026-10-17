@@ -3,6 +3,7 @@
     drama-commerce migrate | serve | cleanup
     drama-commerce keygen PATH | keyinfo PATH
     drama-commerce cards generate | list | revoke | status
+    drama-commerce credits balance | grant | history | expire
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from typing import List, Optional
 
 import psycopg
 
-from . import cards
+from . import cards, credits
 from .config import ConfigError, load_dsn, load_settings
 from .db import MigrationError, connect, migrate
 from .license_token import Signer, b64url_encode, generate_key_file
@@ -201,6 +202,62 @@ def cmd_cards_status(args) -> int:
     return 0
 
 
+def cmd_credits_balance(args) -> int:
+    with connect(load_dsn()) as conn:
+        user_id = _user_id_of(conn, args)
+        current = credits.balance(conn, user_id)
+    print(json.dumps({"user_id": user_id, "balance": current}, ensure_ascii=False))
+    return 0
+
+
+def cmd_credits_grant(args) -> int:
+    """管理员手动加积分（M5a 阶段没有充值界面时用它发测试积分）。"""
+    if args.amount <= 0:
+        raise UsageError("--amount 必须大于 0")
+    operator = _operator(args)
+    with connect(load_dsn()) as conn:
+        user_id = _user_id_of(conn, args)
+        # 幂等键由操作人 + 用户 + 金额 + 备注组成：同一条命令重复执行不会重复加分，
+        # 不同人给同一用户加同样金额也不会被误判成重复。
+        key = f"admin:{operator}:{user_id}:{args.amount}:{args.memo or ''}"
+        current = credits.grant(
+            conn, user_id, args.amount, idempotency_key=key, memo=args.memo or "", actor=operator
+        )
+    print(json.dumps({"user_id": user_id, "balance": current}, ensure_ascii=False))
+    return 0
+
+
+def cmd_credits_history(args) -> int:
+    with connect(load_dsn()) as conn:
+        user_id = _user_id_of(conn, args)
+        rows = credits.history(conn, user_id, args.limit)
+    for row in rows:
+        print(json.dumps(row, ensure_ascii=False))
+    return 0
+
+
+def cmd_credits_expire(args) -> int:
+    """回收悬挂过久的预扣（也可以交给 cleanup 定时跑）。"""
+    with connect(load_dsn()) as conn:
+        released = credits.release_stale_holds(conn)
+    print(json.dumps({"released": released}, ensure_ascii=False))
+    return 0
+
+
+def _user_id_of(conn, args) -> str:
+    """把 --email / --user-id 解析成用户 ID；两种都没给就报用法错误。"""
+    if args.user_id:
+        return args.user_id
+    if args.email:
+        row = conn.execute(
+            "SELECT id FROM users WHERE email = %s AND deleted_at IS NULL", (args.email.lower(),)
+        ).fetchone()
+        if row is None:
+            raise UsageError(f"找不到这个邮箱对应的账号：{args.email}")
+        return str(row["id"])
+    raise UsageError("需要 --email 或 --user-id 指定账号")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="drama-commerce", description="剧备账号与授权服务")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -251,6 +308,34 @@ def build_parser() -> argparse.ArgumentParser:
     p = card_sub.add_parser("status", help="查一张卡密的状态（未用 / 已兑换 / 已作废）")
     p.add_argument("code")
     p.set_defaults(func=cmd_cards_status)
+
+    credit_parser = sub.add_parser("credits", help="积分：查余额、手动加、查流水、回收悬挂预扣")
+    credit_sub = credit_parser.add_subparsers(dest="credits_command", required=True)
+
+    def add_account_args(parser: argparse.ArgumentParser) -> None:
+        # 二选一：邮箱更好记（人工操作用），用户 ID 更精确（脚本用）。
+        group = parser.add_mutually_exclusive_group(required=True)
+        group.add_argument("--email", help="账号邮箱")
+        group.add_argument("--user-id", help="账号 UUID")
+
+    p = credit_sub.add_parser("balance", help="查一个账号的可用积分")
+    add_account_args(p)
+    p.set_defaults(func=cmd_credits_balance)
+
+    p = credit_sub.add_parser("grant", help="手动给账号加积分（幂等：同一条命令重复执行不会重复加）")
+    add_account_args(p)
+    p.add_argument("--amount", type=int, required=True, help="加多少积分（正整数）")
+    p.add_argument("--memo", help="备注，会写进流水与审计日志")
+    p.add_argument("--by", help="操作人，默认是当前系统用户")
+    p.set_defaults(func=cmd_credits_grant)
+
+    p = credit_sub.add_parser("history", help="列出一个账号最近的积分流水（新到旧）")
+    add_account_args(p)
+    p.add_argument("--limit", type=int, default=50)
+    p.set_defaults(func=cmd_credits_history)
+
+    p = credit_sub.add_parser("expire", help="回收悬挂超过 2 小时的预扣（也可以交给 cleanup 定时跑）")
+    p.set_defaults(func=cmd_credits_expire)
     return parser
 
 

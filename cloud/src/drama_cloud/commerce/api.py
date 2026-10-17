@@ -17,7 +17,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from psycopg_pool import ConnectionPool
 
-from . import auth_routes, license_routes, package_routes
+from . import auth_routes, credits_routes, license_routes, mock_checkout, package_routes
 from .accounts import AccountService
 from .body_limit import BodyLimitMiddleware
 from .config import CommerceSettings, load_settings
@@ -137,6 +137,10 @@ def create_app(
     app.include_router(auth_routes.router)
     app.include_router(license_routes.router)
     app.include_router(package_routes.router)
+    app.include_router(credits_routes.router)
+    # 本地模拟收银台。只服务 Mock 渠道，页面里的按钮把回调打到上面的 notify 路由，
+    # 入账仍走 payments.service.handle_event。不进 OpenAPI（不是对外接口）。
+    app.include_router(mock_checkout.router)
     # 最外层：在路由、认证、JSON 解析之前就挡住超大请求体。
     app.add_middleware(BodyLimitMiddleware)
     return app

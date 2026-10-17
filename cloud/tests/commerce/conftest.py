@@ -33,9 +33,13 @@ from drama_cloud.commerce.mailer import MailError
 
 TEST_DSN_ENV = "COMMERCE_TEST_DSN"
 CODE_SECRET = "test-code-secret-0123456789abcdef-xyz"
+#: Mock 支付回调的签名密钥（测试用固定值）。
+MOCK_PAY_SECRET = "test-mock-pay-secret-0123456789"
 #: 测试用的低开销参数，只为跑得快；生产用 argon2-cffi 的默认参数。
 FAST_HASHER = PasswordHasher(time_cost=1, memory_cost=8, parallelism=1)
 TABLES = (
+    "invite_rewards", "invite_settings", "payment_orders", "recharge_tiers",
+    "credit_ledger", "price_rules",
     "audit_log", "rate_limits", "refresh_tokens", "access_tokens", "sessions", "email_codes",
     "devices", "entitlements", "cards", "card_batches", "users",
 )
@@ -94,6 +98,23 @@ def pg(pool):
     """先清空所有表，再把一个 autocommit 连接交给测试，用来直接查库、改时间。"""
     with pool.connection() as conn:
         conn.execute("TRUNCATE " + ", ".join(TABLES) + " RESTART IDENTITY CASCADE")
+        # price_rules 是迁移里的种子数据，被 TRUNCATE 清掉了要补回去：
+        # 积分相关测试依赖它，而且「缺价目」本身是另一种要单独测的状态。
+        conn.execute(
+            "INSERT INTO price_rules (subject, credits_per_unit, min_units) VALUES"
+            " ('version', 5, 1), ('package', 5, 1)"
+        )
+        # 充值档位同理。
+        conn.execute(
+            "INSERT INTO recharge_tiers (id, amount_fen, credits, sort_order) VALUES"
+            " ('tier-100', 1000, 100, 10), ('tier-500', 5000, 550, 20),"
+            " ('tier-2000', 20000, 2400, 30)"
+        )
+        # 邀请奖励配置（单行表）。
+        conn.execute(
+            "INSERT INTO invite_settings (inviter_credits, invitee_credits, max_rewards)"
+            " VALUES (50, 20, 20)"
+        )
         yield conn
 
 
@@ -140,6 +161,8 @@ def commerce_settings(database_dsn, license_key_file):
         code_secret=CODE_SECRET,
         smtp=SmtpSettings(host="127.0.0.1", port=1025, security="plain", sender="no-reply@drama.test"),
         license_key_file=license_key_file,
+        # Mock 支付的回调签名密钥：不给就报「未配置」，所以测试里显式给一个。
+        mock_pay_secret=MOCK_PAY_SECRET,
     )
 
 
