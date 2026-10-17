@@ -1481,6 +1481,116 @@ textarea {
   font-size: 14px;
 }
 
+/* ============ 处理版本与任务（M4b-1） ============ */
+
+/* 确认弹窗的正文用 textContent 写入，换行靠这里保留（路径、档位分行显示）。 */
+#confirm-body {
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+
+#version-strengths {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.form-section {
+  margin: 18px 0 10px;
+  font-size: 13px;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+/* 表单里的「输入框 + 选择」一行：label 是 grid，这里要横排。 */
+.form-grid label .path-row {
+  display: flex;
+  gap: 8px;
+  margin: 0;
+}
+
+.form-grid label .path-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.plan-list {
+  margin: 6px 0 0;
+  padding-left: 20px;
+}
+
+.plan-list li + li {
+  margin-top: 2px;
+}
+
+.nav-jobs {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  margin-bottom: 10px;
+}
+
+.jobs-list {
+  display: grid;
+  gap: 12px;
+}
+
+.job-card {
+  padding: 14px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+}
+
+.job-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.job-head strong {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.job-meta {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.job-error {
+  margin-top: 8px;
+  color: var(--err-text);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.job-track {
+  margin-top: 10px;
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+  overflow: hidden;
+}
+
+.job-track span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+
+.job-card details {
+  margin-top: 10px;
+  font-size: 13px;
+}
+
+.job-card table {
+  margin-top: 8px;
+}
+
 /* ============ 设置独立视图 ============ */
 
 .settings-view {

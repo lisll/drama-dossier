@@ -58,6 +58,7 @@ DramaDossier 是一个本地优先的桌面应用，用于把散落在磁盘上�
 - **桌面应用**：基于 Tauri 2 构建 Windows NSIS 安装包与 macOS `.app` / `.dmg`。
 - **隐私优先**：素材文件不上传，检查报告和生成结果都保留在本地文件系统。
 - **合规边界明确**：不伪造签名、印章、时间戳或权属证明。
+- **处理版本（需要联网）**：按服务端签发的配方，给一部剧生成一套通用处理版本（片头片尾、字幕、调色、水印、AI 标识），带 SSIM / PSNR 画质检测和可暂停、可终止、可续跑的任务队列。
 - **转码建议**：对照目标规格逐集判断是否需要转码、为什么，并生成可审阅的 `ffmpeg` 批处理脚本（只建议，不自动执行）。
 - **报审包差异对比**：读两份 `manifest.json`，列出改稿前后的新增 / 移除 / 修改文件。
 - **平台材料要求（示例档案）**：内置少量投放形态档案，逐集对照时长、画幅、码率、编码与必需材料。
@@ -66,17 +67,18 @@ DramaDossier 是一个本地优先的桌面应用，用于把散落在磁盘上�
 
 ## 产品界面
 
-应用主流程分为三个区域：
+应用主流程分为以下几块：
 
 1. **素材路径区**：选择或输入剧集素材根目录，执行扫描。
 2. **剧目列表**：展示剧目名称、分集数量和素材体积。
 3. **检查与生成区**：查看检查结果，填写真实成本信息，生成报审包。
-4. **报审配套工具（折叠）**：转码建议、改稿差异对比、平台档案对照、剪映草稿导入/导出。
-5. **擦除实验（折叠）**：检测工具状态 → 预览 `dossier-inpaint` 命令 → 执行 → 回显确认流结论。
+4. **处理版本**：声明权属材料 → 选强度档 → 调版本模板 → 预览计划 → 开始生成，进度到侧栏底部的「任务」里看。
+5. **报审配套工具（折叠）**：转码建议、改稿差异对比、平台档案对照、剪映草稿导入/导出。
+6. **擦除实验（折叠）**：检测工具状态 → 预览 `dossier-inpaint` 命令 → 执行 → 回显确认流结论。
 
 界面只负责状态展示和触发 Rust 命令，业务规则全部保存在 `dossier-core` 中。
 
-界面操作（含四模块工作台、工具箱与常见排错）见 [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md)。
+界面操作（含五模块工作台、任务队列、工具箱与常见排错）见 [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md)。
 
 ## 系统架构
 
@@ -132,6 +134,7 @@ DramaDossier 是一个本地优先的桌面应用，用于把散落在磁盘上�
 │   │       ├── progress.rs      # 长任务进度流（JSONL，可续写）
 │   │       ├── checkpoint.rs    # 检查点与断点续跑
 │   │       ├── pipeline_version.rs  # 管线版本与产物一致性校验
+│   │       ├── version.rs       # 处理版本：模板、滤镜图、画质结果、版本说明
 │   │       ├── types.rs         # 共享领域模型
 │   │       └── bin/dossier-artifacts.rs  # `check`：跨产物戳记一致性校验（退出码 0/1/2）
 │   ├── dossier-runtime/         # 运行时能力管理（Tier 1）
@@ -175,6 +178,9 @@ DramaDossier 是一个本地优先的桌面应用，用于把散落在磁盘上�
 ├── src-tauri/                   # Tauri 桌面壳
 │   ├── src/
 │   │   ├── lib.rs               # IPC commands 与应用入口
+│   │   ├── version.rs           # 处理版本：权属声明 / 模板 / 计划预览 / 开始生成与队列执行器
+│   │   ├── jobs.rs              # 持久化任务队列：状态机、暂停 / 终止 / 续跑
+│   │   ├── encode.rs            # 编码执行层：统一编码参数、可中断子进程、硬件失败退软件
 │   │   ├── erase.rs             # 擦除入口命令（预览 / 执行）
 │   │   └── dossier.rs           # 转码建议 / 差异对比 / 平台档案 / 剪映草稿命令
 │   ├── tauri.conf.json          # 窗口、bundle 和打包配置
@@ -199,7 +205,7 @@ DramaDossier 是一个本地优先的桌面应用，用于把散落在磁盘上�
 │   ├── PROJECT_REVIEW.md        # 全项目复盘、缺口清单与验证记录
 │   ├── RUNTIME.md               # Tier 1/2/3：运行时、后期与长任务能力层
 │   ├── SUBTITLE_REMOVAL.md      # 硬字幕擦除原理、协议与实测
-│   ├── USER_GUIDE.md            # 用户使用手册（界面操作、工具箱与排错）
+│   ├── USER_GUIDE.md            # 用户使用手册（界面操作、处理版本与任务队列、工具箱与排错）
 │   └── WATERMARK_REMOVAL.md     # 角标 / 水印擦除参数、编码策略与实测
 └── .github/workflows/           # CI 和桌面包构建
 ```
@@ -325,6 +331,23 @@ PDF 盖**占位章**（灰色虚线框 +「样章 · 未签署 · 无法律效�
 清单是完整性凭证，不是官方审核回执，也不能替代签名、公章或可信时间戳；包里的两份 PDF 是**占位章**，
 正式报审前必须换成盖章版本。
 
+### `version` — 处理版本（模板与滤镜图）
+
+位置 `crates/dossier-core/src/version.rs`，纯计算：不碰文件系统、不跑进程，所以滤镜图每个细节都能直接单测。
+
+- `VersionTemplate`：第一层模板（片头片尾、封面取帧秒数与封面文字、字幕目录与字号、调色五档、
+  剧名水印位置与透明度、重新分集、背景音乐与音量、AI 标识），存剧目目录的 `版本模板.json`；
+- `build_version_graph`：把「模板 + 配方参数 + 一集」变成一条可审阅、可复现的 `ffmpeg` 参数序列
+  ——几何（裁首尾帧、变速、缩放补边、放大裁边）→ 颗粒与调色 → 分出两路分别和「几何参考」画面做
+  `ssim` / `psnr` 统计 → 烧字幕 → 拼接片头片尾 → 水印与 AI 标识 → 输出映射与元数据；
+- `build_cover_args`：封面取第 1 集成品的某一秒，可叠封面文字，出 JPEG；
+- `QualityResult::from_stats`：解析画质统计文件，和配方的 `QualityFloor` 比对；
+- `VersionReport` / `EpisodeReport` / `ProcessingRecord` / `RightsDeclaration`：
+  `版本说明.json`、每集结果、处理台账 `processing.jsonl`、权属声明 `.dossier/rights.json` 的结构。
+
+输出规格（`OutputSpec`：分辨率、帧率、码率上限、单集时长上限、封装与编码）和细微处理参数
+（`SubtleParams`：颗粒、放大裁切、亮度饱和度色相、变速变调、裁首尾帧）都从配方参数解析，用户改不了。
+
 ### `transcode` / `diff` / `platforms` / `draft` — 报审配套能力
 
 - **`transcode`（转码建议与批量规范化）**：对照一个目标规格（容器 / 编码 / 码率上限 /
@@ -359,8 +382,40 @@ PDF 盖**占位章**（灰色虚线框 +「样章 · 未签署 · 无法律效�
 | `platform_profiles` | 列出内置平台档案（示例数据） |
 | `platform_review` | 按平台档案逐集对照 |
 | `export_draft` / `import_draft` | 导出 / 读回剪映草稿 |
+| `rights_status` / `rights_declare` / `pick_rights_file` | 权属材料的查询、声明与文件选择（只记路径与 SHA-256，不核验真伪） |
+| `version_template_load` / `version_template_save` / `pick_version_asset` | 读 / 写剧目目录的 `版本模板.json`，选片头片尾、背景音乐与字体 |
+| `version_plan` / `version_start` | 预览处理计划（不联网、不扣次数）/ 申请并消费配方后入队 |
+| `job_list` / `job_pause` / `job_resume` / `job_terminate` | 任务的列出、暂停、继续、终止 |
 
 Rust command 使用 snake_case，JavaScript 调用时使用 camelCase 参数。命令层返回中文可读错误，前端只做展示和用户输入适配。
+任务状态变化推 `job-progress` 事件，算任务哈希时推 `task-progress` 事件。
+
+### `jobs` — 持久化任务队列
+
+位置 `src-tauri/src/jobs.rs`。先进先出，**同一时间只跑一个任务**（视频编码吃满 CPU/GPU，并行只会都变慢）。
+
+- 状态机六种：`queued` / `running` / `paused` / `terminated` / `done` / `failed`；
+- 暂停 = 当前这一集做完再停；终止 = 立刻结束子进程并删掉这一集的半成品；继续 = 重新排队，
+  核对已完成的产物、对得上的集跳过（`dossier-core::checkpoint`）；
+- 持久化：每个任务一个目录（应用数据目录 `jobs/<任务号>/`），`job.json`（任务描述，只写一次）、
+  `checkpoint.json`（逐集进度，每集完成后原子写）、`state.json`（状态与每集说明）；
+- 应用重启后从磁盘读回，没做完的任务一律显示为「已暂停」，用户点「继续」才接着跑；
+- 本模块不懂视频：每集怎么处理由 `JobRunner` 实现（`version.rs`），所以状态机能用假执行器单测。
+
+### `encode` — 编码执行层
+
+位置 `src-tauri/src/encode.rs`。「智能微调」「分集重组」「码率修复」「处理版本」都从这里拿编码参数：
+
+- 硬件编码按目标码率设 `-b:v` / `-maxrate` / `-bufsize`；软件编码从 `-crf` 起步，同样用
+  `-maxrate` / `-bufsize` 封顶，两条分支都超不过规格上限；有自定义元数据（AI 隐式标识）时
+  加 `use_metadata_tags`，否则 MP4 会把自定义键静默丢掉；
+- 编码器候选链来自 `dossier-runtime::caps::encoder_chain`（NVENC → QSV → VideoToolbox → VAAPI →
+  V4L2 M2M → 软件），硬件信号由 `HardwareSignal::platform_defaults` 按平台补齐，
+  选中硬件后还要单帧实测；一个任务只探测一次；
+- 可中断子进程：`spawn` 后每 200 毫秒看一次终止标志，收到终止就 `kill` 并删半成品；
+  单次运行有 6 小时超时，超时同样杀进程删半成品；
+- 硬件失败退软件：首选硬件编码真实编码中途失败时用软件编码重跑一次，并把「已改用软件编码」
+  写进结果与版本说明——不静默降级。
 
 ### `src` — WebView UI
 

@@ -288,3 +288,311 @@ test("报审包错误文案：有固定说法的给说法，带文件名的原�
   // 前端自己发的包错也走这条：后端只给码、不给 message 时兜底一句，不是空白。
   assert.equal(L.errorText({ code: "package_local_missing" }), "操作失败");
 });
+
+// ---------- 处理版本与任务队列（M4b-1） ----------
+
+/** 一行任务的 JobView 骨架，默认是最没内容的样子。 */
+const job = (extra = {}) => ({ id: "j1", state: "queued", done: 0, total: 0, current: null, ...extra });
+
+test("任务状态：六种状态各有中文说法和色调", () => {
+  const expected = [
+    ["queued", { label: "排队中", tone: "" }],
+    ["running", { label: "运行中", tone: "ok" }],
+    ["paused", { label: "已暂停", tone: "warn" }],
+    ["terminated", { label: "已终止", tone: "warn" }],
+    ["done", { label: "完成", tone: "ok" }],
+    ["failed", { label: "失败", tone: "err" }],
+  ];
+  for (const [state, want] of expected) {
+    assert.deepEqual(L.jobStateLabel(state), want, state);
+  }
+  // 认不出的状态原样显示，不假装成别的；空值兜底成「未知」。
+  assert.deepEqual(L.jobStateLabel("encoding"), { label: "encoding", tone: "" });
+  assert.deepEqual(L.jobStateLabel(null), { label: "未知", tone: "" });
+  assert.deepEqual(L.jobStateLabel(undefined), { label: "未知", tone: "" });
+});
+
+test("步骤状态：五种状态各自的说法，认不出的原样显示", () => {
+  assert.equal(L.stepStateLabel("pending"), "待处理");
+  assert.equal(L.stepStateLabel("running"), "处理中");
+  assert.equal(L.stepStateLabel("done"), "完成");
+  assert.equal(L.stepStateLabel("failed"), "失败");
+  assert.equal(L.stepStateLabel("skipped"), "已跳过");
+  assert.equal(L.stepStateLabel("weird"), "weird");
+  assert.equal(L.stepStateLabel(null), "未知");
+  assert.equal(L.stepStateLabel(undefined), "未知");
+});
+
+test("任务操作：每种状态给出哪些按钮", () => {
+  const actions = (state) => L.jobActions(job({ state }));
+  assert.deepEqual(actions("queued"), { pause: true, resume: false, terminate: true });
+  assert.deepEqual(actions("running"), { pause: true, resume: false, terminate: true });
+  assert.deepEqual(actions("paused"), { pause: false, resume: true, terminate: true });
+  assert.deepEqual(actions("terminated"), { pause: false, resume: true, terminate: false });
+  assert.deepEqual(actions("failed"), { pause: false, resume: true, terminate: false });
+  // 已经完成的任务没有任何操作，别给用户一个点了没反应的按钮。
+  assert.deepEqual(actions("done"), { pause: false, resume: false, terminate: false });
+  // 认不出的状态、空的 job：一个按钮都不给。
+  assert.deepEqual(actions("encoding"), { pause: false, resume: false, terminate: false });
+  assert.deepEqual(L.jobActions(null), { pause: false, resume: false, terminate: false });
+});
+
+test("任务进度百分比：0 集、部分、全部，total 为 0 不出现 NaN", () => {
+  assert.equal(L.jobPercent({ done: 0, total: 10 }), 0);
+  assert.equal(L.jobPercent({ done: 3, total: 10 }), 30);
+  assert.equal(L.jobPercent({ done: 1, total: 3 }), 33);
+  assert.equal(L.jobPercent({ done: 10, total: 10 }), 100);
+  // 一集都没排进来、字段缺失、整个 job 为空：都是 0，不能是 NaN 或 Infinity。
+  for (const empty of [{ done: 0, total: 0 }, {}, { done: 5, total: 0 }, null]) {
+    const percent = L.jobPercent(empty);
+    assert.equal(percent, 0, JSON.stringify(empty));
+    assert.equal(Number.isFinite(percent), true, JSON.stringify(empty));
+  }
+  // 进度超过总数（后端回写不及时）截到 100；负数按 0 算。
+  assert.equal(L.jobPercent({ done: 9, total: 4 }), 100);
+  assert.equal(L.jobPercent({ done: -2, total: 5 }), 0);
+});
+
+test("任务进度文案：有当前集时带上集名，没有就只报计数", () => {
+  assert.equal(
+    L.jobProgressText({ state: "running", done: 3, total: 10, current: "第04集.mp4" }),
+    "3/10 · 正在处理 第04集.mp4",
+  );
+  assert.equal(L.jobProgressText({ state: "running", done: 3, total: 10, current: null }), "3/10");
+  assert.equal(
+    L.jobProgressText({ state: "paused", done: 3, total: 10, current: "第04集.mp4" }),
+    "3/10 · 停在 第04集.mp4",
+  );
+  assert.equal(
+    L.jobProgressText({ state: "terminated", done: 3, total: 10, current: "第04集.mp4" }),
+    "3/10 · 停在 第04集.mp4",
+  );
+  // 已暂停但没记下停在哪一集：只说计数。
+  assert.equal(L.jobProgressText({ state: "paused", done: 3, total: 10 }), "3/10");
+  // 完成时不再说「正在处理第几集」。
+  assert.equal(L.jobProgressText({ state: "done", done: 10, total: 10, current: "第10集.mp4" }), "10/10");
+  assert.equal(L.jobProgressText({ state: "failed" }), "0/0");
+});
+
+test("合并任务：同 id 原地替换，新任务放最前面", () => {
+  const list = [job({ id: "a", state: "running" }), job({ id: "b", state: "queued" }), job({ id: "c", state: "done" })];
+
+  // 列表里已有同 id：替换那一条，位置和其余顺序都不变。
+  const update = job({ id: "b", state: "paused", done: 2, total: 5 });
+  const replaced = L.mergeJob(list, update);
+  assert.notEqual(replaced, list); // 返回的是新数组
+  assert.deepEqual(replaced.map((item) => item.id), ["a", "b", "c"]);
+  assert.deepEqual(replaced[1], update);
+  // 原数组没被就地改掉。
+  assert.equal(list[1].state, "queued");
+  assert.equal(list[1].done, 0);
+
+  // 没有同 id：新任务插到最前面（和 job_list 的新到旧顺序一致），不是追加到末尾。
+  const added = L.mergeJob(list, job({ id: "d", state: "queued" }));
+  assert.deepEqual(added.map((item) => item.id), ["d", "a", "b", "c"]);
+  assert.equal(list.length, 3);
+  assert.deepEqual(list.map((item) => item.id), ["a", "b", "c"]);
+
+  // 没有 id 的事件：原样返回一份副本，不插入也不报错。
+  const copied = L.mergeJob(list, { state: "running" });
+  assert.notEqual(copied, list);
+  assert.deepEqual(copied, list);
+  assert.deepEqual(L.mergeJob(list, null).map((item) => item.id), ["a", "b", "c"]);
+});
+
+test("侧栏任务数：只数排队、运行、暂停", () => {
+  const list = [
+    job({ id: "a", state: "queued" }),
+    job({ id: "b", state: "running" }),
+    job({ id: "c", state: "paused" }),
+    job({ id: "d", state: "done" }),
+    job({ id: "e", state: "failed" }),
+    job({ id: "f", state: "terminated" }),
+  ];
+  // 已终止的不算：用户已经点了终止，不再催他去处理。
+  assert.equal(L.activeJobCount(list), 3);
+  assert.equal(L.activeJobCount([]), 0);
+  assert.equal(L.activeJobCount([job({ id: "g", state: "terminated" })]), 0);
+});
+
+/** 一份通过校验的模板，各条测试只改其中一项。 */
+const legalTemplate = () => ({
+  coverAtSec: 0,
+  subtitleSize: 32,
+  watermarkOpacity: 0.5,
+  musicVolume: 0.3,
+  aiMarked: false,
+  aiContentProducer: "",
+  watermarkText: "剧名",
+  watermarkCorner: "bottom_right",
+  musicPath: "",
+  musicLicensed: false,
+  recut: false,
+  recutCount: null,
+  subtitleDir: "",
+});
+
+test("模板校验：合法模板返回空数组，0 和 1 都在区间内", () => {
+  assert.deepEqual(L.templateProblems(legalTemplate()), []);
+  // 边界值：透明度/音量 0 和 1 都算合法，封面取 0 秒（第一帧）也合法。
+  assert.deepEqual(L.templateProblems({ ...legalTemplate(), coverAtSec: 0, watermarkOpacity: 0, musicVolume: 1 }), []);
+});
+
+test("模板校验：封面取帧秒数必须是 0 或正数", () => {
+  const problems = (value) => L.templateProblems({ ...legalTemplate(), coverAtSec: value });
+  const want = [["coverAtSec", "封面取帧秒数必须是 0 或正数"]];
+  assert.deepEqual(problems(-1), want);
+  assert.deepEqual(problems(NaN), want);
+  assert.deepEqual(problems("3"), want); // 字符串不当数字用
+  assert.deepEqual(problems(undefined), want);
+  assert.deepEqual(problems(0), []);
+  assert.deepEqual(problems(12.5), []); // 小数秒可以
+});
+
+test("模板校验：字幕字号必须是大于 0 的整数", () => {
+  const problems = (value) => L.templateProblems({ ...legalTemplate(), subtitleSize: value });
+  const want = [["subtitleSize", "字幕字号必须是大于 0 的整数"]];
+  assert.deepEqual(problems(0), want);
+  assert.deepEqual(problems(-4), want);
+  assert.deepEqual(problems(10.5), want);
+  assert.deepEqual(problems(24), []);
+  assert.deepEqual(problems(1), []);
+});
+
+test("模板校验：水印透明度与背景音乐音量必须在 0 到 1 之间", () => {
+  const opacity = (value) => L.templateProblems({ ...legalTemplate(), watermarkOpacity: value });
+  const opacityWant = [["watermarkOpacity", "水印透明度必须在 0 到 1 之间"]];
+  assert.deepEqual(opacity(1.2), opacityWant);
+  assert.deepEqual(opacity(-0.1), opacityWant);
+  assert.deepEqual(opacity(null), opacityWant);
+  assert.deepEqual(opacity(0), []);
+  assert.deepEqual(opacity(1), []);
+
+  const volume = (value) => L.templateProblems({ ...legalTemplate(), musicVolume: value });
+  const volumeWant = [["musicVolume", "背景音乐音量必须在 0 到 1 之间"]];
+  assert.deepEqual(volume(2), volumeWant);
+  assert.deepEqual(volume(-1), volumeWant);
+  assert.deepEqual(volume(undefined), volumeWant);
+  assert.deepEqual(volume(0), []);
+  assert.deepEqual(volume(0.5), []);
+});
+
+test("模板校验：勾了 AI 标识要填服务提供者，且水印不能放右下角", () => {
+  // 只看服务提供者这一条：水印先挪到左上角，免得同时命中右下角那条冲突。
+  const producer = (value) =>
+    L.templateProblems({ ...legalTemplate(), aiMarked: true, watermarkCorner: "top_left", aiContentProducer: value });
+  const want = [
+    ["aiContentProducer", "AI 生成合成服务提供者只能用字母、数字和常见英文符号（不能有空格、中文、引号和反斜杠）"],
+  ];
+  assert.deepEqual(producer(""), want); // 勾了就必须填
+  assert.deepEqual(producer(undefined), want);
+  assert.deepEqual(producer("某某科技"), want); // 中文不行
+  assert.deepEqual(producer("Foo Bar"), want); // 空格不行
+  assert.deepEqual(producer('Foo"Bar'), want); // 引号不行
+  assert.deepEqual(producer("Foo\\Bar"), want); // 反斜杠不行
+  assert.deepEqual(producer("ACME-Tech_1.0"), []);
+  // 没勾 AI 标识时不校验提供者，填什么都不管。
+  assert.deepEqual(L.templateProblems({ ...legalTemplate(), aiMarked: false, aiContentProducer: "某某科技" }), []);
+
+  const corner = (watermarkText, watermarkCorner) =>
+    L.templateProblems({ ...legalTemplate(), aiMarked: true, aiContentProducer: "ACME", watermarkText, watermarkCorner });
+  assert.deepEqual(corner("剧名", "bottom_right"), [
+    ["watermarkCorner", "勾选了 AI 标识时，剧名水印不能放在右下角（那里是 AI 标识的位置）"],
+  ]);
+  // 没写水印文字、或者水印不在右下角：都不冲突。
+  assert.deepEqual(corner("", "bottom_right"), []);
+  assert.deepEqual(corner("剧名", "top_left"), []);
+});
+
+test("模板校验：用背景音乐要先勾授权", () => {
+  assert.deepEqual(L.templateProblems({ ...legalTemplate(), musicPath: "/音乐/bgm.mp3", musicLicensed: false }), [
+    ["musicLicensed", "使用背景音乐前要先勾选「我有这段音乐的使用授权」"],
+  ]);
+  assert.deepEqual(L.templateProblems({ ...legalTemplate(), musicPath: "/音乐/bgm.mp3", musicLicensed: true }), []);
+  // 没选音乐时，授权勾不勾都不管。
+  assert.deepEqual(L.templateProblems({ ...legalTemplate(), musicLicensed: false }), []);
+});
+
+test("模板校验：重新分集的集数，以及不能同时烧字幕", () => {
+  const recut = (extra) => L.templateProblems({ ...legalTemplate(), recut: true, ...extra });
+  const countWant = [["recutCount", "重新分集的集数必须是大于 0 的整数（留空表示和原来一样多）"]];
+  assert.deepEqual(recut({ recutCount: 0 }), countWant);
+  assert.deepEqual(recut({ recutCount: 2.5 }), countWant);
+  assert.deepEqual(recut({ recutCount: -3 }), countWant);
+  assert.deepEqual(recut({ recutCount: null }), []); // 留空表示和原来一样多
+  assert.deepEqual(recut({ recutCount: 12 }), []);
+  // 重新分集后原字幕的时间对不上：不能同时烧字幕。
+  assert.deepEqual(recut({ subtitleDir: "/字幕" }), [
+    ["subtitleDir", "重新分集后原字幕的时间对不上，不能同时烧字幕；请二选一"],
+  ]);
+  // 不重新分集时，字幕目录和原来的字幕对得上，不冲突。
+  assert.deepEqual(L.templateProblems({ ...legalTemplate(), subtitleDir: "/字幕" }), []);
+});
+
+test("模板校验：多个问题一起报，按封面→字号→透明度→音量→音乐授权的顺序", () => {
+  const fields = L.templateProblems({
+    coverAtSec: -1,
+    subtitleSize: 0,
+    watermarkOpacity: 2,
+    musicVolume: 2,
+    musicPath: "/音乐/bgm.mp3",
+    musicLicensed: false,
+  }).map(([field]) => field);
+  assert.deepEqual(fields, ["coverAtSec", "subtitleSize", "watermarkOpacity", "musicVolume", "musicLicensed"]);
+});
+
+test("处理档位：三档的取值、中文标签和说明", () => {
+  assert.equal(L.STRENGTHS.length, 3);
+  assert.deepEqual(L.STRENGTHS.map((item) => item.value), ["light", "medium", "heavy"]);
+  assert.deepEqual(L.STRENGTHS.map((item) => item.label), ["轻", "中", "重"]);
+  assert.deepEqual(L.STRENGTHS.map((item) => item.detail), [
+    "变化最小，画质损失最少",
+    "折中",
+    "变化最大，画质损失也最多",
+  ]);
+});
+
+test("受限模块清单：处理版本在锁定范围内，有使用权时不上遮罩", () => {
+  assert.deepEqual(L.LICENSED_MODULES, ["library", "generate", "version", "mount", "transcode", "toolbox"]);
+  assert.equal(L.moduleLock(locked("no_entitlement"), "version").actionLabel, "兑换卡密");
+  assert.equal(L.moduleLock(online(), "version"), null);
+});
+
+test("处理配方与处理版本错误文案：每个码都有非空中文说法", () => {
+  const known = {
+    recipe_not_found: /找不到这份处理配方/,
+    recipe_malformed: /格式不对/,
+    recipe_bad_signature: /签名没有通过校验/,
+    recipe_bad_payload: /内容不完整/,
+    recipe_wrong_device: /不是发给这台电脑的/,
+    recipe_wrong_task: /和这部剧的文件对不上/,
+    wrong_device: /不是发给这台电脑的/,
+  };
+  for (const [code, pattern] of Object.entries(known)) {
+    const text = L.errorText({ code });
+    assert.match(text, pattern, code);
+    assert.match(text, /[\u4e00-\u9fa5]/, code); // 是中文句子，不是把错误码原样抛给用户
+    assert.notEqual(text, "操作失败", code); // 命中了固定文案，不是兜底
+    // 固定文案优先：后端就算也给了 message，也给这句更清楚的说法。
+    assert.equal(L.errorText({ code, message: "后端原文" }), text, code);
+    assert.equal(L.errorText({ error: code }), text, code);
+  }
+  // 配方相关的码都要说清是「处理配方」出的问题。
+  for (const code of [
+    "recipe_consumed",
+    "recipe_expired",
+    "recipe_not_found",
+    "recipe_malformed",
+    "recipe_bad_signature",
+    "recipe_bad_payload",
+    "recipe_wrong_device",
+    "recipe_wrong_task",
+  ]) {
+    assert.match(L.errorText({ code }), /处理配方/, code);
+  }
+  // 认不出的码：有 message 用 message，没有就兜底一句，绝不吞掉错误。
+  assert.equal(L.errorText({ code: "version_invalid", message: "模板里没有可选字幕轨" }), "模板里没有可选字幕轨");
+  assert.equal(L.errorText({ code: "version_invalid" }), "操作失败");
+  assert.equal(L.errorText({ code: "totally_unknown_code" }), "操作失败");
+  assert.equal(L.errorText({ code: "totally_unknown_code", message: "服务端原话" }), "服务端原话");
+});

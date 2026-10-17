@@ -152,9 +152,17 @@
     payload_too_large: "提交的内容太大，服务端拒收了：请减少扫描件或集数后重试",
     package_manifest_invalid: "报审包清单没有通过校验（签名不对或不是发给这台电脑的），本次没有写入任何文件，请重新生成",
     package_server_file_mismatch: "服务端发回的文件和清单对不上，本次没有写入任何文件，请重新生成",
-    // 处理配方（M4b 接入界面，文案先备好）。
+    // 处理配方与处理版本（M4b-1）。配方刚领到就在本机验签，验不过的这几种都说明「这次没扣、没生成」。
     recipe_consumed: "这份处理配方已经用过了，请重新申请",
     recipe_expired: "这份处理配方已过期，请重新申请",
+    recipe_not_found: "服务端找不到这份处理配方，请重新开始生成",
+    recipe_malformed: "服务端发回的处理配方格式不对，本次没有生成任何文件，请稍后重试",
+    recipe_bad_signature: "处理配方的签名没有通过校验，本次没有生成任何文件，请稍后重试",
+    recipe_bad_payload: "处理配方的内容不完整，本次没有生成任何文件，请稍后重试",
+    recipe_wrong_device: "这份处理配方不是发给这台电脑的，本次没有生成任何文件",
+    recipe_wrong_task: "处理配方和这部剧的文件对不上，本次没有生成任何文件，请重新开始生成",
+    wrong_device: "这份处理配方不是发给这台电脑的",
+    // 后端在本机核对时发现的问题已经写明了具体原因（哪个文件、哪一项），直接用后端的说明。
   };
 
   /** 把后端错误变成给人看的一句话。 */
@@ -213,7 +221,8 @@
   };
 
   // 没有使用权时锁住的模块；首页和设置一直能进。
-  const LICENSED_MODULES = ["library", "generate", "mount", "transcode", "toolbox"];
+  // 「任务」不锁：授权到期了也得能看到并停下正在跑的编码（后端闸门同样放行 job_list / job_pause / job_terminate）。
+  const LICENSED_MODULES = ["library", "generate", "version", "mount", "transcode", "toolbox"];
 
   /**
    * 该显示哪一屏：
@@ -243,7 +252,7 @@
     if (!LICENSED_MODULES.includes(moduleName)) return null;
     if (status?.tier !== "locked") return null;
     if (status.lockReason === "no_entitlement") {
-      return { title: "还没有使用权", message: "兑换卡密后就能使用剧目库、生成报审包、挂载、转码和工具箱。", actionLabel: "兑换卡密" };
+      return { title: "还没有使用权", message: "兑换卡密后就能使用剧目库、生成报审包、处理版本、挂载、转码和工具箱。", actionLabel: "兑换卡密" };
     }
     if (status.lockReason === "entitlement_expired") {
       return { title: "使用权已到期", message: "兑换新的卡密续期后，就能继续使用这些功能。", actionLabel: "兑换卡密续期" };
@@ -402,6 +411,123 @@
     return stored === "light" ? "light" : "dark";
   }
 
+  // ---------- 处理版本与任务队列（M4b-1） ----------
+  // 输入是 `job_list` / `job-progress` 的 JobView（src-tauri/src/jobs.rs）。
+
+  const STRENGTHS = [
+    { value: "light", label: "轻", detail: "变化最小，画质损失最少" },
+    { value: "medium", label: "中", detail: "折中" },
+    { value: "heavy", label: "重", detail: "变化最大，画质损失也最多" },
+  ];
+
+  const JOB_STATES = {
+    queued: { label: "排队中", tone: "" },
+    running: { label: "运行中", tone: "ok" },
+    paused: { label: "已暂停", tone: "warn" },
+    terminated: { label: "已终止", tone: "warn" },
+    done: { label: "完成", tone: "ok" },
+    failed: { label: "失败", tone: "err" },
+  };
+
+  const STEP_STATES = {
+    pending: "待处理",
+    running: "处理中",
+    done: "完成",
+    failed: "失败",
+    skipped: "已跳过",
+  };
+
+  /** 任务状态的说法与色调；认不出的状态原样显示，不假装成别的。 */
+  function jobStateLabel(state) {
+    return JOB_STATES[state] ?? { label: String(state ?? "未知"), tone: "" };
+  }
+
+  function stepStateLabel(status) {
+    return STEP_STATES[status] ?? String(status ?? "未知");
+  }
+
+  /**
+   * 一行任务能点哪些按钮（和 jobs.rs 的状态机一致）：
+   * - 暂停：排队中或运行中（运行中点了暂停，后端会做完这一集再停）；
+   * - 继续：已暂停、已终止、失败；
+   * - 终止：排队中、运行中、已暂停。
+   */
+  function jobActions(job) {
+    const state = job?.state;
+    return {
+      pause: state === "queued" || state === "running",
+      resume: state === "paused" || state === "terminated" || state === "failed",
+      terminate: state === "queued" || state === "running" || state === "paused",
+    };
+  }
+
+  /** 进度百分比（0–100 的整数）；没有步骤时是 0，不画假进度。 */
+  function jobPercent(job) {
+    const total = Number(job?.total) || 0;
+    if (total <= 0) return 0;
+    const done = Math.min(Math.max(Number(job?.done) || 0, 0), total);
+    return Math.round((done / total) * 100);
+  }
+
+  /** 进度一句话：「3/10 · 正在处理 第04集.mp4」。 */
+  function jobProgressText(job) {
+    const base = `${Number(job?.done) || 0}/${Number(job?.total) || 0}`;
+    if (job?.state === "running" && job.current) return `${base} · 正在处理 ${job.current}`;
+    if ((job?.state === "paused" || job?.state === "terminated") && job.current) return `${base} · 停在 ${job.current}`;
+    return base;
+  }
+
+  /** 新事件合进任务列表：同一个 id 替换，新任务放最前面（和 `job_list` 的新到旧顺序一致）。 */
+  function mergeJob(jobs, view) {
+    if (!view?.id) return jobs.slice();
+    const index = jobs.findIndex((job) => job.id === view.id);
+    if (index < 0) return [view, ...jobs];
+    const next = jobs.slice();
+    next[index] = view;
+    return next;
+  }
+
+  /** 侧栏「任务」入口上的数字：还没结束的任务（排队 + 运行 + 暂停）。 */
+  function activeJobCount(jobs) {
+    return jobs.filter((job) => job.state === "queued" || job.state === "running" || job.state === "paused").length;
+  }
+
+  /**
+   * 模板表单的本地校验（和 dossier-core VersionTemplate::validate 的规则一致，后端还会再校验一次）。
+   * 返回 `[字段, 说明]` 列表；空列表表示通过。
+   */
+  function templateProblems(template) {
+    const problems = [];
+    const unit = (value) => Number.isFinite(value) && value >= 0 && value <= 1;
+    if (!(Number.isFinite(template.coverAtSec) && template.coverAtSec >= 0)) {
+      problems.push(["coverAtSec", "封面取帧秒数必须是 0 或正数"]);
+    }
+    if (!(Number.isInteger(template.subtitleSize) && template.subtitleSize > 0)) {
+      problems.push(["subtitleSize", "字幕字号必须是大于 0 的整数"]);
+    }
+    if (!unit(template.watermarkOpacity)) problems.push(["watermarkOpacity", "水印透明度必须在 0 到 1 之间"]);
+    if (!unit(template.musicVolume)) problems.push(["musicVolume", "背景音乐音量必须在 0 到 1 之间"]);
+    if (template.aiMarked && !/^[\x21\x23-\x5b\x5d-\x7e]+$/.test(template.aiContentProducer ?? "")) {
+      problems.push([
+        "aiContentProducer",
+        "AI 生成合成服务提供者只能用字母、数字和常见英文符号（不能有空格、中文、引号和反斜杠）",
+      ]);
+    }
+    if (template.aiMarked && template.watermarkText && template.watermarkCorner === "bottom_right") {
+      problems.push(["watermarkCorner", "勾选了 AI 标识时，剧名水印不能放在右下角（那里是 AI 标识的位置）"]);
+    }
+    if (template.musicPath && !template.musicLicensed) {
+      problems.push(["musicLicensed", "使用背景音乐前要先勾选「我有这段音乐的使用授权」"]);
+    }
+    if (template.recut && template.recutCount != null && !(Number.isInteger(template.recutCount) && template.recutCount > 0)) {
+      problems.push(["recutCount", "重新分集的集数必须是大于 0 的整数（留空表示和原来一样多）"]);
+    }
+    if (template.recut && template.subtitleDir) {
+      problems.push(["subtitleDir", "重新分集后原字幕的时间对不上，不能同时烧字幕；请二选一"]);
+    }
+    return problems;
+  }
+
   // ---------- 公告（内置在本地，M7 换成远程来源） ----------
 
   const ANNOUNCEMENTS = [
@@ -443,5 +569,14 @@
     sortDevices,
     canConfirmDelete,
     resolveTheme,
+    STRENGTHS,
+    jobStateLabel,
+    stepStateLabel,
+    jobActions,
+    jobPercent,
+    jobProgressText,
+    mergeJob,
+    activeJobCount,
+    templateProblems,
   };
 });

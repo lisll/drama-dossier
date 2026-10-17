@@ -4,10 +4,10 @@
 
 | 模块 | 责任 | 禁止事项 |
 |---|---|---|
-| `crates/dossier-core` | 领域模型、目录扫描、ffprobe 解析、检查规则、报审包文档生成与组装（`render_documents` / `assemble_package`）、验签、转码建议、报审包差异、平台档案、剪映草稿 | 不依赖 Tauri/GUI，不做网络请求（与服务端通信在 `src-tauri/src/account/`）；`transcode` 只产出建议，不执行转码 |
+| `crates/dossier-core` | 领域模型、目录扫描、ffprobe 解析、检查规则、报审包文档生成与组装（`render_documents` / `assemble_package`）、验签、转码建议、报审包差异、平台档案、剪映草稿；处理版本的模板与滤镜图（`version.rs`：`VersionTemplate` / `build_version_graph` / `build_cover_args`、画质统计解析、`版本说明.json` 与处理台账记录的结构） | 不依赖 Tauri/GUI，不做网络请求（与服务端通信在 `src-tauri/src/account/`）；`transcode` 只产出建议，不执行转码；`version.rs` 纯计算，不碰文件系统、不跑进程 |
 | `crates/dossier-inpaint` | 硬字幕与角标擦除管线（学习原型）：帧 IO、掩码、检测/修复后端编排、结果自动校验、桌面入口的命令拼装 | 不做 DRM 绕过，不处理他人作品的版权标识；桌面端只能经 `erase.rs` 拼参数，不另写一套规则 |
 | `tools/model_worker` | 模型侧 worker：DBNet 检测、E2FGVI / LaMa / ProPainter 修复（`--serve` 常驻） | 不决定「改哪些像素」；不碰整帧回贴 |
-| `src-tauri` | 桌面窗口、IPC 命令、文件夹选择、打包 | 不把业务规则写在命令层（`erase.rs` / `dossier.rs` 只做参数适配） |
+| `src-tauri` | 桌面窗口、IPC 命令、文件夹选择、打包；处理版本的命令层与任务队列、编码执行层（`version.rs`：权属声明 / 模板 / 计划预览 / 开始生成与队列执行器；`jobs.rs`：持久化队列与状态机；`encode.rs`：统一编码参数、可中断子进程、硬件失败退软件） | 不把业务规则写在命令层（`erase.rs` / `dossier.rs` 只做参数适配）；队列不懂视频、执行器不懂队列状态机 |
 | `src` | 桌面 WebView UI | 不绕过 Rust 命令访问文件系统 |
 | `cloud/` | 云端制作系统（学习原型）：配方、任务队列、媒体处理模块、控制面 API 与 Web 客户端 | 不引入 GPU 依赖；不在配方里执行任意命令（模块走白名单）；桌面壳方案见 `cloud/docs/PACKAGING_GUIDE.md` |
 
@@ -53,10 +53,32 @@
 | `platform_profiles` | 无 | 内置平台档案（学习示例） |
 | `platform_review` | `root`, `name`, `profileId`, `ffprobePath` | 逐集对照平台档案 |
 | `export_draft` / `import_draft` | 剧目或草稿目录 | 剪映草稿导出 / 读回 |
+| `rights_status` | `root`, `name` | 读权属声明并重算文件哈希：是否已声明、是否需要重新声明 |
+| `rights_declare` | `root`, `name`, `file` | 声明权属材料（只记路径与 SHA-256，不核验真伪），写 `.dossier/rights.json` 并记处理台账 |
+| `pick_rights_file` | 无 | 选权属材料文件（`pdf` / `jpg` / `jpeg` / `png`） |
+| `pick_version_asset` | `kind` | 选片头片尾视频（`video`）、背景音乐（`audio`）或中文字体（`font`） |
+| `version_template_load` | `root`, `name` | 读剧目目录的 `版本模板.json`；文件不存在时返回默认模板 |
+| `version_template_save` | `root`, `name`, `template` | 校验并写入 `版本模板.json` |
+| `version_plan` | `root`, `name`, `strength`, `outputRoot` | 门槛检查 + 逐集哈希，返回任务哈希、输出目录、每集规格、处理步骤与待解决问题；不联网、不扣次数 |
+| `version_start` | `root`, `name`, `strength`, `outputRoot` | 申请配方并本机验签 → 服务端消费 → 入队；有问题时直接拒绝 |
+| `job_list` | 无 | 列任务（新到旧） |
+| `job_pause` | `id` | 暂停：排队中立刻停，运行中做完当前这一集再停 |
+| `job_resume` | `id` | 继续：已暂停 / 已终止 / 失败的任务重新排队，核对已完成产物后跳过对得上的集 |
+| `job_terminate` | `id` | 终止：杀掉正在跑的子进程并删掉这一集的半成品 |
 
 Rust 命令使用 snake_case，Tauri 会把 JavaScript 的 camelCase 参数映射到对应 Rust 参数。
 
 `rules` 为可选的 `ChecklistRules`；缺省时使用内置默认阈值。设置持久化由 `dossier-core` 的 `settings` 模块负责：文件缺失或损坏时回退默认值并带回告警，写入采用临时文件替换。
+
+处理版本还会推两个事件（前端监听，不是命令）：
+
+- `job-progress`：任务状态变化时推一份 `JobView`（状态、进度、每集状态与说明），前端按 id 合并进列表；
+- `task-progress`：算任务哈希时的进度（`task: "version"`，带已完成 / 总数与当前文件名），
+  大文件要算几十秒，靠它撑住进度条。
+
+功能闸门（`account/gate.rs`）：`version_start` 和 `generate_package` 一样按「需要有效使用权」放行；
+`job_list` / `job_pause` / `job_terminate` 归为不需授权——授权到期时也要能把正在跑的任务停下来；
+其余处理版本命令按「本地功能」处理。
 
 ## 数据流
 
@@ -75,6 +97,23 @@ Rust 命令使用 snake_case，Tauri 会把 JavaScript 的 camelCase 参数映�
 生成报审包时会重新扫描和探测，避免使用过期的前端状态；没有成功探测规格的分集不会写入 CSV。
 渲染文字内容只写在 Rust 的 `render_documents` 里一份，服务端只把它画成 PDF，不自己拼文字。
 
+处理版本（`src-tauri/src/version.rs` 文件头注释的 5 步）：
+
+```text
+剧目目录（含分集）
+  → 门槛：权属材料已声明且文件没变；这部剧还没有处理版本目录
+  → 算任务哈希（分集文件 + 模板 + 权属材料 + 档位）
+  → POST /recipes 申请配方 → 本机验签（签名 / 机器码 / 任务 / 有效期）
+  → POST /recipes/{id}/consume 消费（服务端记账，只能一次），配方原文存进任务目录 recipe.token
+  → 任务队列逐集处理：一次 ffmpeg 调用完成两层处理、编码、画质检测
+  → 全部完成后写 版本说明.json、封面.jpg 和台账 processing.jsonl
+```
+
+续跑走的是另一条路：不再找服务端，用本机保存的配方原文重新验签名、机器码和任务哈希
+（`dossier-license::version_task::verify_consumed`），**不再验有效期**——配方已经在服务端消费过，
+再限时间没有意义；参数和种子固定在配方里，所以反复续跑产出的文件和第一次完全相同。
+执行器每集开工前还会重算一次源文件哈希，避免「申请配方时用 A、处理时换成 B」。
+
 ## 质量门槛
 
 提交前运行：
@@ -90,6 +129,8 @@ node --test 'tests/frontend/*.test.js'   # 界面纯函数（src/logic.js）的�
 ```
 
 新增领域规则必须有单元测试；处理不可信文件名或文件系统错误时优先返回可操作的中文错误信息。
+处理版本的滤镜图（`dossier-core/version.rs`）、队列状态机（`jobs.rs`）、编码参数（`encode.rs`）
+和界面侧的纯函数（`src/logic.js` 里的任务状态与按钮可用性）都各自有单元测试。
 
 工作区里**不要写 doctest**。`tauri-build` 在 MSVC 下会往 `src-tauri` 的 `OUT_DIR` 写一个空壳
 `msvcrt.lib`（为了让 app 静态链接 VC 运行时）并把它加进原生库搜索路径，而配套的

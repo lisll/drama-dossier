@@ -44,6 +44,18 @@ const state = {
   mountStep: 1,
   mountPlan: null,
   publishRows: [],
+  // 处理版本（M4b-1）：当前载入的是哪部剧、已保存的模板、权属状态、最近一次预览计划。
+  version: {
+    drama: null,
+    template: null,
+    rights: null,
+    strength: "medium",
+    plan: null,
+    planKey: null,
+  },
+  // 任务列表（job_list / job-progress，新到旧）；展开了「每集情况」的任务 id。
+  jobs: [],
+  jobsOpen: new Set(),
 };
 
 let renamePlan = null;
@@ -298,6 +310,7 @@ function endTask() {
   // 所以这里按「当前状态」重算这两个按钮，而不是恢复到任务开始前的值。
   syncRenameApplyState();
   syncBitrateFixState();
+  syncVersionStartState();
   hideProgress();
 }
 
@@ -524,6 +537,8 @@ function settingsSnapshot() {
     rules,
     ffprobe: $("#ffprobe-path").value.trim(),
     output: $("#settings-output").value.trim(),
+    font: $("#settings-font").value.trim(),
+    software: $("#settings-software-encode").checked,
   });
 }
 
@@ -533,6 +548,8 @@ function refreshDirtyBadge() {
     rules: { ...DEFAULT_RULES, ...(state.settings?.rules ?? {}) },
     ffprobe: state.settings?.ffprobePath ?? "",
     output: state.settings?.outputDir ?? "",
+    font: state.settings?.fontPath ?? "",
+    software: Boolean(state.settings?.softwareEncodeOnly),
   });
   $("#settings-dirty").classList.toggle("hidden", settingsSnapshot() === saved);
 }
@@ -553,6 +570,8 @@ async function loadSettings() {
     if (settings.jianyingDraftDir)
       $("#jianying-draft-dir").value = settings.jianyingDraftDir;
     if (settings.aiTemplate) $("#ai-template").value = settings.aiTemplate;
+    $("#settings-font").value = settings.fontPath ?? "";
+    $("#settings-software-encode").checked = Boolean(settings.softwareEncodeOnly);
     if (state.root) $("#env-workdir").value = state.root;
     renderDefaultHints();
     renderEmptyGuide();
@@ -583,6 +602,9 @@ async function saveSettings() {
       aiTemplate: $("#ai-template").value.trim() || null,
       jianyingDir: $("#jianying-dir").value.trim() || null,
       jianyingDraftDir: $("#jianying-draft-dir").value.trim() || null,
+      // 处理版本（M4b-1）：中文字体、只用软件编码。
+      fontPath: $("#settings-font").value.trim() || null,
+      softwareEncodeOnly: $("#settings-software-encode").checked,
     };
     const path = await call("save_app_settings", { settings });
     state.settings = settings;
@@ -611,6 +633,8 @@ async function rememberRoot(root) {
     aiTemplate: state.settings?.aiTemplate ?? null,
     jianyingDir: state.settings?.jianyingDir ?? null,
     jianyingDraftDir: state.settings?.jianyingDraftDir ?? null,
+    fontPath: state.settings?.fontPath ?? null,
+    softwareEncodeOnly: Boolean(state.settings?.softwareEncodeOnly),
     libraryRoot: root,
   };
   state.settings = settings;
@@ -750,8 +774,10 @@ function selectDrama(index) {
   invalidatePlans();
   clearToolResults();
   clearResult("#generate-result");
+  resetVersionState();
   renderDramas();
   renderContexts();
+  if (state.module === "version") enterVersionModule();
 }
 
 // ============ 模块导航 ============
@@ -783,6 +809,8 @@ function switchModule(name) {
   if (name === "transcode") renderTranscodeGate();
   if (name === "mount") refreshMountContext();
   if (name === "home") loadHome();
+  if (name === "version") enterVersionModule();
+  if (name === "jobs") loadJobs();
 }
 
 /** 账号状态变了：当前模块要不要换成遮罩（或从遮罩恢复）跟着重算。只换显示，不重新读数据。 */
@@ -794,6 +822,14 @@ function refreshModuleLock() {
   if (state.module === "home") renderHome();
 }
 
+const CONTEXT_SELECTORS = [
+  "#generate-context",
+  "#version-context",
+  "#toolbox-context",
+  "#transcode-context",
+  "#mount-context",
+];
+
 function renderContexts() {
   const chip = $("#current-drama");
   const selected = state.selected == null ? null : state.dramas[state.selected];
@@ -801,7 +837,7 @@ function renderContexts() {
     chip.classList.add("hidden");
     const emptyText =
       "尚未选择剧目——请先到「剧目库」扫描并点选一部剧。";
-    for (const id of ["#generate-context", "#toolbox-context", "#transcode-context", "#mount-context"]) {
+    for (const id of CONTEXT_SELECTORS) {
       const node = $(id);
       node.textContent = emptyText;
       node.classList.add("empty");
@@ -811,7 +847,7 @@ function renderContexts() {
   }
   chip.textContent = `当前剧目：${selected.name}`;
   chip.classList.remove("hidden");
-  for (const id of ["#generate-context", "#toolbox-context", "#transcode-context", "#mount-context"]) {
+  for (const id of CONTEXT_SELECTORS) {
     const node = $(id);
     node.textContent = `当前剧目：${selected.name}（${selected.episodes.length} 集）`;
     node.classList.remove("empty");
@@ -869,6 +905,7 @@ async function scan() {
     $("#detail-placeholder").classList.remove("hidden");
     invalidatePlans();
     clearToolResults();
+    resetVersionState();
     renderDramas();
     renderContexts();
     // 工作目录与剧目库根目录同步（设置-本机环境回显）。
@@ -1962,6 +1999,7 @@ function renderRuntimeList(status) {
     engineBadge.className = `badge ${missing.length ? "status-fail" : "status-ready"}`;
   }
   renderTranscodeGate();
+  renderVersionGate();
 }
 
 // ============ 账号：登录闸门、状态提示、账号菜单 ============
@@ -3227,6 +3265,563 @@ function renderTranscodeGate() {
   body.classList.toggle("hidden", !ready);
 }
 
+// ============ 处理版本（M4b-1） ============
+//
+// 流程：权属材料 → 档位 → 模板（存剧目目录的「版本模板.json」）→ 预览计划（只在本机算）→ 开始生成。
+// 门槛都在后端（version.rs 的 prepare_version）：这里的校验只是让人早点看到问题，后端还会再查一遍。
+
+/** 换剧、重新扫描后清空：别拿着上一部剧的计划点「开始生成」。 */
+function resetVersionState() {
+  state.version.drama = null;
+  state.version.template = null;
+  state.version.rights = null;
+  state.version.plan = null;
+  state.version.planKey = null;
+  clearResult("#version-result");
+  clearResult("#rights-status");
+  syncVersionStartState();
+}
+
+/** 预览计划绑定的输入：剧、档位、模板（已保存的）。三者变了，旧计划作废。 */
+function versionPlanKey() {
+  const drama = state.version.drama;
+  if (!drama) return null;
+  return JSON.stringify([state.root, drama, state.version.strength, state.version.template]);
+}
+
+/** 「开始生成」只在「有计划、计划没有问题、计划没过期、表单没有未保存的改动、没有别的长任务」时可点。 */
+function syncVersionStartState() {
+  const button = $("#version-start");
+  if (!button) return;
+  const plan = state.version.plan;
+  const fresh = plan && state.version.planKey === versionPlanKey();
+  const dirty = !$("#template-dirty").classList.contains("hidden");
+  button.disabled = Boolean(state.task) || !fresh || plan.problems.length > 0 || dirty;
+}
+
+function renderVersionGate() {
+  const tools = state.runtime ? [state.runtime.ffmpeg, state.runtime.ffprobe] : [];
+  const ready = tools.length > 0 && tools.every((tool) => tool.found && tool.ok);
+  $("#version-gate").classList.toggle("hidden", ready);
+  $("#version-body").classList.toggle("hidden", !ready);
+}
+
+function renderStrengths() {
+  $("#version-strengths").innerHTML = L.STRENGTHS.map(
+    (item) => `
+      <button type="button" class="mode-card ${item.value === state.version.strength ? "active" : ""}"
+        role="radio" aria-checked="${item.value === state.version.strength}" data-strength="${esc(item.value)}">
+        <strong>${esc(item.label)}</strong>
+        <span>${esc(item.detail)}</span>
+      </button>`,
+  ).join("");
+}
+
+function selectStrength(value) {
+  if (!L.STRENGTHS.some((item) => item.value === value)) return;
+  state.version.strength = value;
+  renderStrengths();
+  syncVersionStartState();
+}
+
+/** 切进模块或换剧时：读权属状态和模板。读失败如实显示，不当作「没有」。 */
+async function enterVersionModule() {
+  renderVersionGate();
+  renderStrengths();
+  const drama = state.selected == null ? null : state.dramas[state.selected];
+  if (!drama) {
+    $("#version-main").classList.add("hidden");
+    $("#rights-declare").disabled = true;
+    $("#rights-badge").textContent = "未选剧目";
+    $("#rights-badge").className = "badge";
+    return;
+  }
+  $("#rights-declare").disabled = false;
+  if (state.version.drama === drama.name && state.version.template) {
+    renderRights();
+    return;
+  }
+  const root = state.root;
+  try {
+    const [rights, template] = await Promise.all([
+      call("rights_status", { root, name: drama.name }),
+      call("version_template_load", { root, name: drama.name }),
+    ]);
+    // 等待期间换了剧：这次结果作废。
+    if (state.dramas[state.selected]?.name !== drama.name || state.root !== root) return;
+    state.version.drama = drama.name;
+    state.version.rights = rights;
+    state.version.template = template;
+    state.version.plan = null;
+    fillTemplateForm(template);
+    renderRights();
+  } catch (error) {
+    $("#version-main").classList.add("hidden");
+    renderResult("#rights-status", {
+      tone: "error",
+      html: `<strong>读取这部剧的处理版本设置失败</strong><br />${esc(errorMessage(error))}`,
+    });
+    reportError(error);
+  }
+}
+
+function errorMessage(error) {
+  return error instanceof CommandError ? L.errorText(error) : String(error);
+}
+
+/** 权属区：没声明 / 文件变了 → 只显示声明区；声明有效 → 展开后面的步骤。 */
+function renderRights() {
+  const rights = state.version.rights;
+  const badge = $("#rights-badge");
+  const declared = rights?.declared;
+  if (!declared) {
+    badge.textContent = "未声明";
+    badge.className = "badge status-warn";
+    clearResult("#rights-status");
+    $("#rights-declare").textContent = "选择文件并声明";
+    $("#version-main").classList.add("hidden");
+    return;
+  }
+  const when = L.formatIso(declared.declaredAt);
+  if (rights.changed) {
+    badge.textContent = "需要重新声明";
+    badge.className = "badge status-fail";
+    renderResult("#rights-status", {
+      tone: "error",
+      html: `<strong>${esc(rights.message ?? "权属材料文件变了，请重新声明")}</strong><br />
+        上次声明：${esc(declared.file)}（${esc(when)}）`,
+    });
+    $("#rights-declare").textContent = "重新选择并声明";
+    $("#version-main").classList.add("hidden");
+    return;
+  }
+  badge.textContent = "已声明";
+  badge.className = "badge status-ready";
+  renderResult("#rights-status", {
+    tone: "ok",
+    html: `已声明：${esc(declared.file)}<br />
+      声明时间：${esc(when)} · 校验值 ${esc(String(declared.sha256).slice(0, 16))}…`,
+  });
+  $("#rights-declare").textContent = "换一份材料重新声明";
+  $("#version-main").classList.remove("hidden");
+  syncVersionStartState();
+}
+
+async function declareRights() {
+  let drama;
+  try {
+    drama = selectedDrama();
+  } catch (error) {
+    reportError(error);
+    return;
+  }
+  try {
+    const file = await call("pick_rights_file");
+    if (!file) return;
+    const ok = await confirmDialog({
+      title: "声明权属材料",
+      body: `确认《${drama.name}》的版权登记证书或授权书是这份文件：\n${file}\n\n程序只记录文件位置和校验值，不核验真伪；声明会记入本机的处理台账。`,
+      confirmLabel: "确认声明",
+      danger: false,
+    });
+    if (!ok) return;
+    const rights = await call("rights_declare", { root: state.root, name: drama.name, file });
+    // 换了材料，任务哈希就变了：旧计划作废。
+    state.version.rights = rights;
+    state.version.plan = null;
+    clearResult("#version-result");
+    renderRights();
+    toast("权属材料已声明");
+  } catch (error) {
+    reportError(error);
+  }
+}
+
+// ---- 模板表单 ----
+
+const CORNERS = ["top_left", "top_right", "bottom_left", "bottom_right"];
+const COLOR_PRESETS = ["original", "warm", "cool", "high_contrast", "low_saturation"];
+
+const TEMPLATE_FIELDS = {
+  coverAtSec: "#tpl-cover-at",
+  subtitleSize: "#tpl-subtitle-size",
+  watermarkOpacity: "#tpl-watermark-opacity",
+  musicVolume: "#tpl-music-volume",
+  aiContentProducer: "#tpl-ai-producer",
+  watermarkCorner: "#tpl-watermark-corner",
+  musicLicensed: "#tpl-music-licensed",
+  recutCount: "#tpl-recut-count",
+  subtitleDir: "#tpl-subtitle-dir",
+};
+
+function fillTemplateForm(template) {
+  const text = (selector, value) => {
+    $(selector).value = value ?? "";
+  };
+  text("#tpl-intro", template.introPath);
+  text("#tpl-outro", template.outroPath);
+  text("#tpl-cover-at", template.coverAtSec);
+  text("#tpl-cover-text", template.coverText);
+  text("#tpl-subtitle-dir", template.subtitleDir);
+  text("#tpl-subtitle-size", template.subtitleSize);
+  text("#tpl-subtitle-margin", template.subtitleMarginV);
+  $("#tpl-color").value = COLOR_PRESETS.includes(template.colorPreset) ? template.colorPreset : "original";
+  text("#tpl-watermark", template.watermarkText);
+  $("#tpl-watermark-corner").value = CORNERS.includes(template.watermarkCorner)
+    ? template.watermarkCorner
+    : "top_right";
+  text("#tpl-watermark-opacity", template.watermarkOpacity);
+  $("#tpl-ai").checked = Boolean(template.aiMarked);
+  text("#tpl-ai-producer", template.aiContentProducer);
+  $("#tpl-recut").checked = Boolean(template.recut);
+  text("#tpl-recut-count", template.recutCount);
+  text("#tpl-music", template.musicPath);
+  text("#tpl-music-volume", template.musicVolume);
+  $("#tpl-music-licensed").checked = Boolean(template.musicLicensed);
+  clearFieldErrors(Object.values(TEMPLATE_FIELDS));
+  syncTemplateToggles();
+  refreshTemplateDirty();
+}
+
+/** 读表单。空的数字框按「没填」处理（Number("") 是 0，不能直接用）。 */
+function readTemplateForm() {
+  const text = (selector) => $(selector).value.trim();
+  const optional = (selector) => text(selector) || null;
+  const number = (selector) => (text(selector) === "" ? null : Number(text(selector)));
+  return {
+    introPath: optional("#tpl-intro"),
+    outroPath: optional("#tpl-outro"),
+    coverAtSec: number("#tpl-cover-at") ?? 1,
+    coverText: optional("#tpl-cover-text"),
+    subtitleDir: optional("#tpl-subtitle-dir"),
+    subtitleSize: number("#tpl-subtitle-size") ?? 56,
+    subtitleMarginV: number("#tpl-subtitle-margin"),
+    colorPreset: $("#tpl-color").value,
+    watermarkText: text("#tpl-watermark"),
+    watermarkCorner: $("#tpl-watermark-corner").value,
+    watermarkOpacity: number("#tpl-watermark-opacity") ?? 0.5,
+    aiMarked: $("#tpl-ai").checked,
+    aiContentProducer: text("#tpl-ai-producer"),
+    recut: $("#tpl-recut").checked,
+    recutCount: $("#tpl-recut").checked ? number("#tpl-recut-count") : null,
+    musicPath: optional("#tpl-music"),
+    musicVolume: number("#tpl-music-volume") ?? 0.5,
+    musicLicensed: $("#tpl-music-licensed").checked,
+  };
+}
+
+/** AI 字段和「重新分几集」只在勾了对应选项时出现；勾了 AI 时右下角不可选。 */
+function syncTemplateToggles() {
+  const ai = $("#tpl-ai").checked;
+  $("#tpl-ai-fields").classList.toggle("hidden", !ai);
+  $("#tpl-recut-count-wrap").classList.toggle("hidden", !$("#tpl-recut").checked);
+  const corner = $("#tpl-watermark-corner");
+  const bottomRight = corner.querySelector('option[value="bottom_right"]');
+  bottomRight.disabled = ai;
+  bottomRight.textContent = ai ? "右下角（AI 标识占用）" : "右下角";
+  if (ai && corner.value === "bottom_right") corner.value = "bottom_left";
+}
+
+/** 表单和已保存的模板不一样时亮「有改动未保存」：预览和生成只认已保存的模板。 */
+function refreshTemplateDirty() {
+  const saved = state.version.template;
+  const dirty = Boolean(saved) && JSON.stringify(readTemplateForm()) !== JSON.stringify(normalizeTemplate(saved));
+  $("#template-dirty").classList.toggle("hidden", !dirty);
+  syncVersionStartState();
+}
+
+/** 后端返回的模板按表单的读法规整一遍（字段顺序、缺省值），才能和表单比较。 */
+function normalizeTemplate(template) {
+  return {
+    introPath: template.introPath ?? null,
+    outroPath: template.outroPath ?? null,
+    coverAtSec: template.coverAtSec ?? 1,
+    coverText: template.coverText || null,
+    subtitleDir: template.subtitleDir ?? null,
+    subtitleSize: template.subtitleSize ?? 56,
+    subtitleMarginV: template.subtitleMarginV ?? null,
+    colorPreset: template.colorPreset ?? "original",
+    watermarkText: template.watermarkText ?? "",
+    watermarkCorner: template.watermarkCorner ?? "top_right",
+    watermarkOpacity: template.watermarkOpacity ?? 0.5,
+    aiMarked: Boolean(template.aiMarked),
+    aiContentProducer: template.aiContentProducer ?? "",
+    recut: Boolean(template.recut),
+    recutCount: template.recut ? template.recutCount ?? null : null,
+    musicPath: template.musicPath ?? null,
+    musicVolume: template.musicVolume ?? 0.5,
+    musicLicensed: Boolean(template.musicLicensed),
+  };
+}
+
+async function saveTemplate() {
+  let drama;
+  try {
+    drama = selectedDrama();
+  } catch (error) {
+    reportError(error);
+    return;
+  }
+  const template = readTemplateForm();
+  clearFieldErrors(Object.values(TEMPLATE_FIELDS));
+  const problems = L.templateProblems(template);
+  problems.forEach(([field, message]) => setFieldError(TEMPLATE_FIELDS[field], message));
+  if (problems.length) {
+    toast(problems[0][1], true);
+    return;
+  }
+  try {
+    const saved = await call("version_template_save", { root: state.root, name: drama.name, template });
+    state.version.template = saved;
+    state.version.plan = null;
+    clearResult("#version-result");
+    fillTemplateForm(saved);
+    toast("模板已保存到剧目目录的「版本模板.json」");
+  } catch (error) {
+    reportError(error);
+  }
+}
+
+async function pickAsset(button) {
+  try {
+    const path = await call("pick_version_asset", { kind: button.dataset.pickAsset });
+    if (!path) return;
+    $(button.dataset.pickTarget).value = path;
+    refreshTemplateDirty();
+  } catch (error) {
+    reportError(error);
+  }
+}
+
+// ---- 预览计划与开始生成 ----
+
+function renderPlan(plan) {
+  const totalSec = plan.episodes.reduce((sum, episode) => sum + Number(episode.durationSec || 0), 0);
+  const rows = plan.episodes
+    .map(
+      (episode) => `<tr>
+        <td>${esc(episode.name)}</td>
+        <td>${Number(episode.durationSec).toFixed(1)} 秒</td>
+        <td>${esc(episode.width)}×${esc(episode.height)}</td>
+        <td>${episode.subtitle ? "有" : "—"}</td>
+      </tr>`,
+    )
+    .join("");
+  const steps = plan.steps.map((step) => `<li>${esc(step)}</li>`).join("");
+  const problems = plan.problems.length
+    ? `<strong>还不能开始生成，请先解决：</strong>
+       <ul class="plan-list">${plan.problems.map((problem) => `<li>${esc(problem)}</li>`).join("")}</ul>`
+    : `<strong>计划可以执行</strong>（${esc(strengthLabel(plan.strength))}档，${plan.episodes.length} 集，原片共约 ${Math.round(totalSec / 60)} 分钟）`;
+  renderResult("#version-result", {
+    tone: plan.problems.length ? "error" : "ok",
+    html: `${problems}<br />
+      输出位置：${esc(plan.outputDir)}
+      <p>每集要做的处理：</p><ul class="plan-list">${steps}</ul>
+      <div class="table-wrap"><table>
+        <thead><tr><th>分集</th><th>时长</th><th>原分辨率</th><th>字幕</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="4" class="empty">没有分集</td></tr>'}</tbody>
+      </table></div>`,
+  });
+}
+
+function strengthLabel(value) {
+  return L.STRENGTHS.find((item) => item.value === value)?.label ?? value;
+}
+
+async function planVersion() {
+  let drama;
+  try {
+    drama = selectedDrama();
+  } catch (error) {
+    reportError(error);
+    return;
+  }
+  if (!$("#template-dirty").classList.contains("hidden")) {
+    toast("模板有改动还没保存：预览只用已保存的模板，请先保存或放弃改动", true);
+    return;
+  }
+  if (!beginTask(`正在核对《${drama.name}》的分集（只在本机计算，不扣次数）`)) return;
+  const key = versionPlanKey();
+  try {
+    const plan = await call("version_plan", {
+      root: state.root,
+      name: drama.name,
+      strength: state.version.strength,
+      outputRoot: state.settings?.outputDir ?? null,
+    });
+    state.version.plan = plan;
+    state.version.planKey = key;
+    renderPlan(plan);
+  } catch (error) {
+    state.version.plan = null;
+    renderResult("#version-result", {
+      tone: "error",
+      html: `<strong>预览失败</strong><br />${esc(errorMessage(error))}`,
+    });
+    reportProbeFailure(error);
+  } finally {
+    endTask();
+  }
+}
+
+async function startVersion() {
+  let drama;
+  try {
+    drama = selectedDrama();
+  } catch (error) {
+    reportError(error);
+    return;
+  }
+  const plan = state.version.plan;
+  if (!plan || state.version.planKey !== versionPlanKey() || plan.problems.length) {
+    toast("请先重新预览计划", true);
+    return;
+  }
+  const ok = await confirmDialog({
+    title: "开始生成处理版本",
+    body:
+      `《${drama.name}》· ${strengthLabel(plan.strength)}档 · ${plan.episodes.length} 集\n` +
+      `输出到：${plan.outputDir}\n\n` +
+      "开始后会向服务端申请一份处理配方并立即用掉。配方只能用一次：中途暂停、终止可以继续，" +
+      "但如果要换档位或改模板，就得删掉这次的版本目录重新开始。",
+    confirmLabel: "申请配方并开始",
+    danger: false,
+  });
+  if (!ok) return;
+  if (!beginTask(`正在为《${drama.name}》申请处理配方`)) return;
+  try {
+    const job = await call("version_start", {
+      root: state.root,
+      name: drama.name,
+      strength: plan.strength,
+      outputRoot: state.settings?.outputDir ?? null,
+    });
+    state.jobs = L.mergeJob(state.jobs, job);
+    renderJobs();
+    // 版本目录生成后，这份计划就不能再用了（后端会因为「已有处理版本」拒绝）。
+    state.version.plan = null;
+    renderResult("#version-result", {
+      tone: "ok",
+      html: `<strong>已加入任务队列</strong><br />
+        ${esc(job.title)}：共 ${job.total} 步，进度在「任务」里看，可以随时暂停或终止。`,
+    });
+    toast("处理版本已开始生成", false, { label: "查看任务", run: () => switchModule("jobs") });
+  } catch (error) {
+    renderResult("#version-result", {
+      tone: "error",
+      html: `<strong>没有开始生成</strong><br />${esc(errorMessage(error))}`,
+    });
+    reportError(error);
+  } finally {
+    endTask();
+  }
+}
+
+// ============ 任务（M4b-1） ============
+
+async function loadJobs() {
+  if (!invoke) return;
+  try {
+    state.jobs = await call("job_list");
+    renderJobs();
+  } catch (error) {
+    reportError(error);
+  }
+}
+
+function renderJobsBadge() {
+  const count = L.activeJobCount(state.jobs);
+  const badge = $("#jobs-count");
+  badge.textContent = String(count);
+  badge.classList.toggle("hidden", count === 0);
+}
+
+function renderJobs() {
+  renderJobsBadge();
+  const list = $("#jobs-list");
+  if (!state.jobs.length) {
+    list.innerHTML = '<div class="empty">还没有任务。在「处理版本」里开始生成后，任务会出现在这里。</div>';
+    return;
+  }
+  list.innerHTML = state.jobs.map(renderJobCard).join("");
+}
+
+function renderJobCard(job) {
+  const status = L.jobStateLabel(job.state);
+  const tone = { ok: "status-ready", warn: "status-warn", err: "status-fail" }[status.tone] ?? "";
+  const actions = L.jobActions(job);
+  const key = `job-${job.id}`;
+  state.paths[key] = job.outputDir;
+  const buttons = [
+    actions.pause ? `<button class="ghost" type="button" data-job-action="pause" data-job-id="${esc(job.id)}">暂停</button>` : "",
+    actions.resume ? `<button class="primary" type="button" data-job-action="resume" data-job-id="${esc(job.id)}">继续</button>` : "",
+    actions.terminate ? `<button class="danger" type="button" data-job-action="terminate" data-job-id="${esc(job.id)}">终止</button>` : "",
+    `<button class="ghost" type="button" data-open-key="${esc(key)}">打开目录</button>`,
+  ].join("");
+  const steps = job.steps
+    .map(
+      (step) => `<tr>
+        <td>${esc(step.name)}</td>
+        <td class="${step.status === "failed" ? "status-fail" : step.status === "done" ? "status-pass" : ""}">${esc(L.stepStateLabel(step.status))}</td>
+        <td>${esc(step.detail ?? "")}</td>
+      </tr>`,
+    )
+    .join("");
+  const open = state.jobsOpen.has(job.id) ? " open" : "";
+  return `<article class="job-card" aria-label="${esc(job.title)}">
+    <div class="job-head">
+      <strong>${esc(job.title)}</strong>
+      <span class="badge ${tone}">${esc(status.label)}</span>
+      ${buttons}
+    </div>
+    <div class="job-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${L.jobPercent(job)}">
+      <span style="width: ${L.jobPercent(job)}%"></span>
+    </div>
+    <div class="job-meta">${esc(L.jobProgressText(job))} · 创建于 ${esc(L.formatIso(job.createdAt))} · ${esc(job.outputDir)}</div>
+    ${job.error ? `<div class="job-error">${esc(job.error)}</div>` : ""}
+    <details data-job-details="${esc(job.id)}"${open}>
+      <summary>每集情况</summary>
+      <div class="table-wrap"><table>
+        <thead><tr><th>步骤</th><th>状态</th><th>说明</th></tr></thead>
+        <tbody>${steps}</tbody>
+      </table></div>
+    </details>
+  </article>`;
+}
+
+async function runJobAction(action, id) {
+  const job = state.jobs.find((item) => item.id === id);
+  if (!job) return;
+  if (action === "terminate") {
+    const ok = await confirmDialog({
+      title: "终止任务",
+      body: `终止「${job.title}」：正在处理的这一集立刻停下，半成品会删掉；已经做完的集保留，之后可以「继续」。`,
+      confirmLabel: "终止",
+    });
+    if (!ok) return;
+  }
+  const command = { pause: "job_pause", resume: "job_resume", terminate: "job_terminate" }[action];
+  if (!command) return;
+  try {
+    const view = await call(command, { id });
+    state.jobs = L.mergeJob(state.jobs, view);
+    renderJobs();
+    if (action === "pause" && view.state === "running") toast("会在当前这一集做完后暂停");
+  } catch (error) {
+    reportError(error);
+  }
+}
+
+function handleJobProgress(view) {
+  const previous = state.jobs.find((job) => job.id === view?.id);
+  state.jobs = L.mergeJob(state.jobs, view);
+  renderJobs();
+  if (previous && previous.state !== view.state) {
+    if (view.state === "done") toast(`「${view.title}」已完成`);
+    if (view.state === "failed") toast(`「${view.title}」失败：${view.error ?? "原因未知"}`, true);
+  }
+}
+
 // ============ 关于 ============
 
 async function loadVersion() {
@@ -3439,6 +4034,48 @@ $("#scan").addEventListener("click", scan);
 $("#analyze").addEventListener("click", analyze);
 $("#generate").addEventListener("click", generate);
 $("#save-settings").addEventListener("click", saveSettings);
+$("#save-settings-env").addEventListener("click", saveSettings);
+$("#settings-font-pick").addEventListener("click", async () => {
+  try {
+    const path = await call("pick_version_asset", { kind: "font" });
+    if (!path) return;
+    $("#settings-font").value = path;
+    refreshDirtyBadge();
+  } catch (error) {
+    reportError(error);
+  }
+});
+// 处理版本（M4b-1）。
+$("#version-gate-install").addEventListener("click", runtimeInstall);
+$("#rights-declare").addEventListener("click", declareRights);
+$("#template-save").addEventListener("click", saveTemplate);
+$("#template-reload").addEventListener("click", () => {
+  if (state.version.template) fillTemplateForm(state.version.template);
+});
+$("#version-plan").addEventListener("click", planVersion);
+$("#version-start").addEventListener("click", startVersion);
+$("#jobs-refresh").addEventListener("click", loadJobs);
+// 模板表单任一改动：刷新「未保存」、清字段错误、同步联动开关。
+$$("#module-version input, #module-version select").forEach((node) => {
+  const onChange = () => {
+    setFieldError(`#${node.id}`, null);
+    syncTemplateToggles();
+    refreshTemplateDirty();
+  };
+  node.addEventListener("input", onChange);
+  node.addEventListener("change", onChange);
+});
+// 记住哪些任务展开了「每集情况」：进度事件会重画列表，不能每次都收起来。
+$("#jobs-list").addEventListener(
+  "toggle",
+  (event) => {
+    const id = event.target?.dataset?.jobDetails;
+    if (!id) return;
+    if (event.target.open) state.jobsOpen.add(id);
+    else state.jobsOpen.delete(id);
+  },
+  true,
+);
 $("#reset-settings").addEventListener("click", () => {
   fillRules(DEFAULT_RULES);
   $("#settings-output").value = "";
@@ -3453,7 +4090,8 @@ $("#library-root").addEventListener("input", renderEmptyGuide);
 
 // 设置页任一改动都刷新「未保存」标记，避免改了以为已经生效。
 ["#rule-min-episodes", "#rule-min-duration", "#rule-max-duration", "#rule-max-bitrate",
-  "#rule-prefer-portrait", "#settings-output", "#ffprobe-path",
+  "#rule-prefer-portrait", "#settings-output", "#ffprobe-path", "#settings-font",
+  "#settings-software-encode",
 ].forEach((selector) => {
   const node = $(selector);
   node.addEventListener("input", refreshDirtyBadge);
@@ -3482,6 +4120,26 @@ document.addEventListener("click", (event) => {
     runAccountAction(accountButton.dataset.accountAction);
     return;
   }
+  const jobButton = event.target.closest("[data-job-action]");
+  if (jobButton) {
+    runJobAction(jobButton.dataset.jobAction, jobButton.dataset.jobId);
+    return;
+  }
+  const strengthButton = event.target.closest("[data-strength]");
+  if (strengthButton) {
+    selectStrength(strengthButton.dataset.strength);
+    return;
+  }
+  const assetButton = event.target.closest("[data-pick-asset]");
+  if (assetButton) {
+    pickAsset(assetButton);
+    return;
+  }
+  const folderButton = event.target.closest("[data-pick-folder]");
+  if (folderButton) {
+    browse(folderButton.dataset.pickFolder).then(refreshTemplateDirty);
+    return;
+  }
   const gotoButton = event.target.closest("[data-goto-module]");
   if (gotoButton) {
     switchModule(gotoButton.dataset.gotoModule);
@@ -3503,6 +4161,7 @@ if (tauriEvent?.listen) {
   tauriEvent.listen("probe-progress", (event) => handleProbeProgress(event.payload));
   tauriEvent.listen("task-progress", (event) => handleTaskProgress(event.payload));
   tauriEvent.listen("erase-progress", (event) => handleEraseProgress(event.payload));
+  tauriEvent.listen("job-progress", (event) => handleJobProgress(event.payload));
 }
 
 // 启动：先等恢复登录，再决定显示登录页、锁定页还是主界面（浏览器预览无 IPC 时直接进主界面便于布局验证）。
@@ -3515,6 +4174,8 @@ if (invoke) {
     if (state.module === "home") renderHome();
   });
   loadPlatformProfiles();
+  // 重启后没做完的任务显示为「已暂停」：侧栏数字要一开始就对。
+  loadJobs();
 }
 loadVersion();
 

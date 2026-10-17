@@ -142,11 +142,15 @@
           <button class="nav-item active" data-module="home">首页</button>
           <button class="nav-item" data-module="library">剧目库</button>
           <button class="nav-item" data-module="generate">生成报审包</button>
+          <button class="nav-item" data-module="version">处理版本</button>
           <button class="nav-item" data-module="mount">挂载</button>
           <button class="nav-item" data-module="transcode">转码</button>
           <button class="nav-item" data-module="toolbox">工具箱</button>
           <button class="nav-item" data-module="settings">设置</button>
           <div class="sidenav-foot">
+            <button class="nav-item nav-jobs" data-module="jobs">
+              任务<span id="jobs-count" class="badge hidden" aria-label="未结束的任务数"></span>
+            </button>
             <button
               id="account-chip"
               type="button"
@@ -355,6 +359,180 @@
               <p class="legal">
                 合规说明：剧备只整理使用者提供的真实材料，不伪造签名、印章或时间戳；报审包固定包含内容权属声明模板。
               </p>
+            </section>
+          </section>
+
+          <!-- ============ 处理版本（M4b-1）：权属 → 档位 → 模板 → 预览计划 → 开始生成 ============ -->
+          <section id="module-version" class="module hidden">
+            <div id="version-context" class="drama-context empty">尚未选择剧目——请先到「剧目库」扫描并点选一部剧。</div>
+
+            <div id="version-gate" class="gate hidden">
+              <p>生成处理版本需要本地运行环境（ffmpeg / ffprobe），当前未就绪。</p>
+              <button id="version-gate-install" class="primary">下载运行环境</button>
+            </div>
+
+            <div id="version-body">
+              <section class="panel">
+                <section class="panel-header">
+                  <h3>1. 权属材料</h3>
+                  <span id="rights-badge" class="badge">未声明</span>
+                </section>
+                <p class="hint">
+                  每部剧声明一次：选一份版权登记证书或授权书的扫描件。程序只记下文件位置和校验值，不核验真伪；
+                  文件之后被改动或移走，要重新声明才能生成。
+                </p>
+                <div id="rights-status" class="result hidden" aria-live="polite"></div>
+                <div class="option-row">
+                  <button id="rights-declare" class="primary">选择文件并声明</button>
+                </div>
+              </section>
+
+              <div id="version-main" class="hidden">
+                <section class="panel">
+                  <section class="panel-header">
+                    <h3>2. 处理强度</h3>
+                  </section>
+                  <div class="mode-cards" id="version-strengths" role="radiogroup" aria-label="处理强度"></div>
+                  <p class="hint">
+                    颗粒、轻微放大裁边、调色、变速变调这些细微处理的具体数值由服务端配方给出，每部剧不同；
+                    档位越重变化越大，画质下限也放得越宽。输出规格固定为 1080×1920 竖屏、30 帧、H.264 + AAC，码率不超过 5000 kbps。
+                  </p>
+                </section>
+
+                <section class="panel">
+                  <section class="panel-header">
+                    <h3>3. 版本模板</h3>
+                    <span id="template-dirty" class="badge dirty hidden">有改动未保存</span>
+                  </section>
+                  <p class="hint">模板保存在剧目目录的 <code>版本模板.json</code>；预览和生成都用已保存的模板。</p>
+
+                  <h4 class="form-section">片头 / 片尾 / 封面</h4>
+                  <div class="form-grid">
+                    <label>片头视频（可不填）
+                      <span class="path-row">
+                        <input id="tpl-intro" type="text" placeholder="不加片头" />
+                        <button class="ghost" type="button" data-pick-asset="video" data-pick-target="#tpl-intro">选择</button>
+                      </span>
+                    </label>
+                    <label>片尾视频（可不填）
+                      <span class="path-row">
+                        <input id="tpl-outro" type="text" placeholder="不加片尾" />
+                        <button class="ghost" type="button" data-pick-asset="video" data-pick-target="#tpl-outro">选择</button>
+                      </span>
+                    </label>
+                    <label>封面取第 1 集第几秒<input id="tpl-cover-at" type="number" min="0" step="0.1" /></label>
+                    <label>封面文字（可不填）<input id="tpl-cover-text" type="text" placeholder="不叠字" /></label>
+                  </div>
+
+                  <h4 class="form-section">字幕与调色</h4>
+                  <div class="form-grid">
+                    <label>字幕文件夹（按集名对应 .srt，可不填）
+                      <span class="path-row">
+                        <input id="tpl-subtitle-dir" type="text" placeholder="不烧字幕" />
+                        <button class="ghost" type="button" data-pick-folder="#tpl-subtitle-dir">选择</button>
+                      </span>
+                    </label>
+                    <label>字幕字号（像素）<input id="tpl-subtitle-size" type="number" min="1" step="1" /></label>
+                    <label>字幕离底边（像素，可不填）<input id="tpl-subtitle-margin" type="number" min="1" step="1" placeholder="默认" /></label>
+                    <label>调色预设
+                      <select id="tpl-color">
+                        <option value="original">原色</option>
+                        <option value="warm">暖色</option>
+                        <option value="cool">冷色</option>
+                        <option value="high_contrast">高对比</option>
+                        <option value="low_saturation">低饱和</option>
+                      </select>
+                    </label>
+                  </div>
+
+                  <h4 class="form-section">剧名水印与 AI 标识</h4>
+                  <div class="form-grid">
+                    <label>水印文字（可不填）<input id="tpl-watermark" type="text" placeholder="不加水印" /></label>
+                    <label>水印位置
+                      <select id="tpl-watermark-corner">
+                        <option value="top_left">左上角</option>
+                        <option value="top_right">右上角</option>
+                        <option value="bottom_left">左下角</option>
+                        <option value="bottom_right">右下角</option>
+                      </select>
+                    </label>
+                    <label>水印透明度（0–1）<input id="tpl-watermark-opacity" type="number" min="0" max="1" step="0.05" /></label>
+                  </div>
+                  <div class="option-row">
+                    <label><input id="tpl-ai" type="checkbox" /> 本剧视频含 AI 生成内容</label>
+                  </div>
+                  <div id="tpl-ai-fields" class="hidden">
+                    <p class="hint">
+                      按《人工智能生成合成内容标识办法》和 GB 45438-2025：开头 3 秒在右下角显示「人工智能生成合成」，
+                      之后全片常驻「AI生成」，文件元数据里同时写入隐式标识。勾选后剧名水印不能放在右下角。
+                    </p>
+                    <div class="form-grid">
+                      <label>AI 生成合成服务提供者（名称或编码，只能用英文字母、数字和符号）
+                        <input id="tpl-ai-producer" type="text" placeholder="例如 SomeAIProvider" autocomplete="off" spellcheck="false" />
+                      </label>
+                    </div>
+                  </div>
+
+                  <h4 class="form-section">节奏与背景音乐</h4>
+                  <div class="option-row">
+                    <label><input id="tpl-recut" type="checkbox" /> 先按场景切点重新分集</label>
+                  </div>
+                  <div class="form-grid">
+                    <label id="tpl-recut-count-wrap" class="hidden">重新分成几集（留空和原来一样多）
+                      <input id="tpl-recut-count" type="number" min="1" step="1" />
+                    </label>
+                    <label>背景音乐（可不填）
+                      <span class="path-row">
+                        <input id="tpl-music" type="text" placeholder="不加背景音乐" />
+                        <button class="ghost" type="button" data-pick-asset="audio" data-pick-target="#tpl-music">选择</button>
+                      </span>
+                    </label>
+                    <label>音乐音量（0–1，相对原声）<input id="tpl-music-volume" type="number" min="0" max="1" step="0.05" /></label>
+                  </div>
+                  <div class="option-row">
+                    <label><input id="tpl-music-licensed" type="checkbox" /> 我有这段音乐的使用授权</label>
+                  </div>
+
+                  <div class="option-row">
+                    <button id="template-save" class="primary">保存模板</button>
+                    <button id="template-reload" class="ghost">放弃改动</button>
+                  </div>
+                </section>
+
+                <section class="panel">
+                  <section class="panel-header">
+                    <h3>4. 预览与生成</h3>
+                  </section>
+                  <p class="hint">
+                    「预览计划」只在本机核对，不扣次数。「开始生成」会向服务端申请一份处理配方并立即用掉：
+                    配方只能用一次，生成中途失败要重新开始。一部剧只保留一套处理版本。
+                  </p>
+                  <div class="option-row">
+                    <button id="version-plan" data-long-task class="primary">预览计划</button>
+                    <button id="version-start" data-long-task class="success" disabled>开始生成</button>
+                  </div>
+                  <div id="version-result" class="result hidden" aria-live="polite"></div>
+                </section>
+              </div>
+            </div>
+          </section>
+
+          <!-- ============ 任务（M4b-1）：处理版本的队列 ============ -->
+          <section id="module-jobs" class="module hidden">
+            <section class="panel">
+              <section class="panel-header">
+                <h3>任务</h3>
+                <div class="actions">
+                  <button id="jobs-refresh" class="ghost">刷新</button>
+                </div>
+              </section>
+              <p class="hint">
+                同一时间只跑一个任务。「暂停」在当前这一集做完后停下；「终止」立刻停下并删掉这一集的半成品；
+                已暂停、已终止或失败的任务可以「继续」，做完的集不会重做。应用重启后，没做完的任务显示为已暂停。
+              </p>
+              <div id="jobs-list" class="jobs-list" aria-live="polite">
+                <div class="empty">还没有任务。</div>
+              </div>
             </section>
           </section>
 
@@ -878,6 +1056,29 @@
                     type="text"
                     placeholder="一键配置后自动填写"
                 /></label>
+              </div>
+            </section>
+            <section class="panel">
+              <section class="panel-header">
+                <h3>处理版本</h3>
+              </section>
+              <div class="form-grid">
+                <label>中文字体文件（水印、AI 标识、封面文字用，留空自动找系统字体）
+                  <span class="path-row">
+                    <input id="settings-font" type="text" placeholder="自动：macOS 苹方、Windows 微软雅黑" />
+                    <button id="settings-font-pick" class="ghost" type="button">选择</button>
+                  </span>
+                </label>
+              </div>
+              <div class="option-row">
+                <label><input id="settings-software-encode" type="checkbox" /> 只用软件编码（不用显卡编码）</label>
+              </div>
+              <p class="settings-note">
+                默认有可用的显卡编码就用（更快）；某一集显卡编码失败时自动改用软件编码重做，任务列表和版本说明里会写明。
+                改动保存后，对之后开始或继续的任务生效。
+              </p>
+              <div class="option-row">
+                <button id="save-settings-env" class="primary" type="button">保存设置</button>
               </div>
             </section>
           </section>

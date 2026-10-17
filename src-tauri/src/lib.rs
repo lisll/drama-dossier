@@ -10,14 +10,20 @@ use tauri::{AppHandle, Emitter, Manager};
 
 mod account;
 mod dossier;
+mod encode;
 mod erase;
 mod jianying;
+mod jobs;
+#[cfg(test)]
+mod jobs_tests;
 mod mount;
 mod package;
 mod paths;
 mod toolbox;
+mod version;
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ProbeOutcome {
     file_name: String,
     episode_number: Option<u32>,
@@ -189,6 +195,9 @@ pub fn run() {
     let app = tauri::Builder::default()
         .setup(|app| {
             account::init(app.handle());
+            // 任务队列：读回上次没做完的任务（显示为已暂停），启动唯一的工作线程。
+            let queue = version::start_queue(app.handle())?;
+            app.manage(queue);
             Ok(())
         })
         // 闸门套在所有应用命令外面：本地功能要有使用权，生成报审包还要联网（见 account/gate.rs）。
@@ -243,14 +252,63 @@ pub fn run() {
             dossier::load_mount_copy,
             dossier::save_mount_copy,
             dossier::transition_mount_copy_row,
-            dossier::preview_mount_copy_publish
+            dossier::preview_mount_copy_publish,
+            version::rights_status,
+            version::rights_declare,
+            version::pick_rights_file,
+            version::pick_version_asset,
+            version::version_template_load,
+            version::version_template_save,
+            version::version_plan,
+            version::version_start,
+            jobs::job_list,
+            jobs::job_pause,
+            jobs::job_resume,
+            jobs::job_terminate
         ]))
         .build(tauri::generate_context!())
         .expect("failed to build DramaDossier");
     app.run(|handle, event| {
-        // 退出前把「见过的最晚时间」写回钥匙串（平时最多每分钟写一次）。
+        // 退出前把「见过的最晚时间」写回钥匙串(平时最多每分钟写一次)。
         if let tauri::RunEvent::Exit = event {
             handle.state::<account::AccountState>().flush();
         }
     });
+}
+
+#[cfg(test)]
+mod probe_outcome_tests {
+    use super::*;
+
+    /// 界面的「分集」表格读的是 `fileName` / `episodeNumber`。
+    ///
+    /// 这里钉的是一个真实踩过的坑:`ProbeOutcome` 少写 `#[serde(rename_all = "camelCase")]`
+    /// 时序列化成 `file_name` / `episode_number`,前端读不到,表格里「集号」和「文件」
+    /// 两列会一直是空的(而同一份数据里的 `spec` 是好的,所以只看时长、分辨率看不出问题)。
+    #[test]
+    fn probe_outcome_serializes_to_camel_case_keys() {
+        let outcome = ProbeOutcome {
+            file_name: "第01集.mp4".into(),
+            episode_number: Some(1),
+            spec: None,
+            error: Some("探测失败".into()),
+        };
+        let value = serde_json::to_value(&outcome).expect("能序列化");
+        let object = value.as_object().expect("是个对象");
+        assert_eq!(
+            object.get("fileName").and_then(|v| v.as_str()),
+            Some("第01集.mp4"),
+            "前端读的是 fileName,实际键名:{:?}",
+            object.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            object.get("episodeNumber").and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert!(
+            !object.contains_key("file_name") && !object.contains_key("episode_number"),
+            "不该同时出现下划线写法:{:?}",
+            object.keys().collect::<Vec<_>>()
+        );
+    }
 }
