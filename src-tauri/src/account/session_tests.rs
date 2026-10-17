@@ -602,8 +602,8 @@ const TASK: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 #[tokio::test]
 async fn recipe_is_verified_locally_then_consumed_once() {
     let (session, api, _store) = logged_in().await;
-    let (recipe, token) = session
-        .issue_recipe(TASK, "universal", "medium")
+    let (recipe, token, _credits) = session
+        .issue_recipe(TASK, "universal", "medium", 2)
         .await
         .expect("签发并本地验签");
     // 原文留给续跑：本机重新验签（不看有效期）得到同一个配方。
@@ -626,7 +626,7 @@ async fn recipe_for_another_computer_is_rejected_locally() {
     // 服务端（或者中间人）发回的配方签名没问题，但不是给这台电脑的。
     api.with(|server| server.recipe_device = Some(OTHER_DEVICE.into()));
     let error = session
-        .issue_recipe(TASK, "universal", "medium")
+        .issue_recipe(TASK, "universal", "medium", 2)
         .await
         .unwrap_err();
     assert_eq!(error.code(), "recipe_wrong_device");

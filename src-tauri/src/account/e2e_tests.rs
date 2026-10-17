@@ -140,7 +140,7 @@ async fn register_redeem_kick_export_delete() {
     s1.restore().await;
     s1.send_code(&email, "register").await.expect("发验证码");
     let code = mailed_code(&email).await;
-    s1.register(&email, &code, PASSWORD, true)
+    s1.register(&email, &code, PASSWORD, true, None)
         .await
         .expect("注册成功");
     assert_eq!(s1.status().lock_reason, Some("no_entitlement"));
@@ -345,7 +345,7 @@ async fn package_and_recipe_against_real_server() {
         .expect("发验证码");
     let code = mailed_code(&email).await;
     session
-        .register(&email, &code, PASSWORD, true)
+        .register(&email, &code, PASSWORD, true, None)
         .await
         .expect("注册成功");
     session
@@ -422,8 +422,8 @@ async fn package_and_recipe_against_real_server() {
 
     // 8. 配方：签发后本机验签通过；消费一次成功，第二次被拒。
     let task = "ab".repeat(32);
-    let (recipe, _token) = session
-        .issue_recipe(&task, "universal", "medium")
+    let (recipe, _token, _credits) = session
+        .issue_recipe(&task, "universal", "medium", 2)
         .await
         .expect("签发配方");
     assert_eq!(recipe.device_id, device_id);

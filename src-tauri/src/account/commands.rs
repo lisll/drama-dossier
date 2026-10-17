@@ -76,6 +76,60 @@ pub async fn account_status(account: State<'_, AccountState>) -> Reply<StatusPay
     Ok(account.status())
 }
 
+// ---------- 积分与支付（M5a） ----------
+
+/// 余额与最近流水。
+#[tauri::command]
+pub async fn credits_overview(account: State<'_, AccountState>) -> Reply<Value> {
+    Ok(account.credits().await?)
+}
+
+/// 更长的流水。
+#[tauri::command]
+pub async fn credit_history(account: State<'_, AccountState>, limit: Option<u32>) -> Reply<Value> {
+    Ok(account.credit_history(limit.unwrap_or(50)).await?)
+}
+
+/// 充值档位。
+#[tauri::command]
+pub async fn recharge_tiers(account: State<'_, AccountState>) -> Reply<Value> {
+    Ok(account.recharge_tiers().await?)
+}
+
+/// 下单，返回怎么去付。
+#[tauri::command]
+pub async fn create_recharge_order(
+    account: State<'_, AccountState>,
+    tier_id: String,
+    channel: String,
+) -> Reply<Value> {
+    Ok(account.create_order(&tier_id, &channel).await?)
+}
+
+/// 查订单状态。
+#[tauri::command]
+pub async fn recharge_order_status(
+    account: State<'_, AccountState>,
+    out_trade_no: String,
+) -> Reply<Value> {
+    Ok(account.order_status(&out_trade_no).await?)
+}
+
+/// 主动查单（「我已完成支付」）。
+#[tauri::command]
+pub async fn reconcile_recharge(
+    account: State<'_, AccountState>,
+    out_trade_no: String,
+) -> Reply<Value> {
+    Ok(account.reconcile_order(&out_trade_no).await?)
+}
+
+/// 我的邀请码与邀请战绩。
+#[tauri::command]
+pub async fn invite_status(account: State<'_, AccountState>) -> Reply<Value> {
+    Ok(account.invites().await?)
+}
+
 /// 「重试」：钥匙串不可用时重新自检；已登录时重新联网刷新（名额满了解绑后也走这里重新绑定）。
 #[tauri::command]
 pub async fn account_retry(
@@ -113,6 +167,9 @@ pub struct RegisterArgs {
     code: String,
     password: String,
     accept_terms: bool,
+    /// 邀请码（可选）。填错不会让注册失败——邀请是附加动作，不是注册的前提。
+    #[serde(default)]
+    invite_code: Option<String>,
 }
 
 #[tauri::command]
@@ -122,7 +179,13 @@ pub async fn account_register(
     args: RegisterArgs,
 ) -> Reply<StatusPayload> {
     account
-        .register(&args.email, &args.code, &args.password, args.accept_terms)
+        .register(
+            &args.email,
+            &args.code,
+            &args.password,
+            args.accept_terms,
+            args.invite_code.as_deref(),
+        )
         .await?;
     Ok(emit(&app, &account))
 }

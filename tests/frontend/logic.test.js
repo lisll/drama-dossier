@@ -172,14 +172,25 @@ test("顶部横幅：离线剩余时间、快到期（可关闭）、钥匙串�
   assert.equal(storage[0].id, "storage");
 });
 
-test("新手引导：按真实状态打勾，充值不计入总数", () => {
+test("新手引导：按真实状态打勾，充值步骤 M5a 起可用", () => {
   const empty = L.guideSteps({});
   assert.equal(empty.length, 6);
-  assert.deepEqual(L.guideProgress(empty), { done: 0, total: 5 });
-  assert.equal(empty[1].disabled, true);
+  // M5a 起「充值积分」不再是「即将推出」：有余额就算完成，所以计入总数。
+  assert.deepEqual(L.guideProgress(empty), { done: 0, total: 6 });
+  assert.equal(empty[1].disabled, undefined);
+  assert.equal(empty[1].action, "credits");
 
-  const steps = L.guideSteps({ entitled: true, libraryRoot: "/素材", ledgerCount: 2, jianyingReady: true });
-  assert.deepEqual(L.guideProgress(steps), { done: 5, total: 5 });
+  const steps = L.guideSteps({
+    entitled: true,
+    libraryRoot: "/素材",
+    ledgerCount: 2,
+    jianyingReady: true,
+    creditBalance: 100,
+  });
+  assert.deepEqual(L.guideProgress(steps), { done: 6, total: 6 });
+  // 余额为 0 或未知时，这一步不算完成。
+  assert.equal(L.guideSteps({ creditBalance: 0 })[1].done, false);
+  assert.equal(L.guideSteps({})[1].done, false);
   // 只扫描到了剧目、还没记住目录：也算准备好素材。
   assert.equal(L.guideSteps({ dramaCount: 3 })[2].done, true);
 

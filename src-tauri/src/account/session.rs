@@ -652,16 +652,26 @@ impl<T: Transport, S: CredentialStore> Session<T, S> {
         code: &str,
         password: &str,
         accept_terms: bool,
+        invite_code: Option<&str>,
     ) -> Result<(), ApiError> {
         self.require_setup()?;
+        let setup = self.require_setup()?;
+        let mut body = json!({
+            "email": email,
+            "code": code,
+            "password": password,
+            "accept_terms": accept_terms,
+            // 机器码用于邀请防刷：同一台电脑最多给一个账号当邀请来源。
+            // 拿不到时只是少一道防刷手段，不影响注册。
+            "device_id": setup.identity.device_id,
+        });
+        // 邀请码是可选的附加动作：填错或不填都不该让注册失败，所以空串就不传。
+        if let Some(value) = invite_code.map(str::trim).filter(|value| !value.is_empty()) {
+            body["invite_code"] = json!(value);
+        }
         let value = self
             .api
-            .send(Request::new(Method::POST, "/auth/register").json(json!({
-                "email": email,
-                "code": code,
-                "password": password,
-                "accept_terms": accept_terms,
-            })))
+            .send(Request::new(Method::POST, "/auth/register").json(body))
             .await?;
         self.signed_in(decode(value)?).await
     }
@@ -800,6 +810,60 @@ impl<T: Transport, S: CredentialStore> Session<T, S> {
         Ok(())
     }
 
+    // ---------- 积分与支付（M5a） ----------
+
+    /// 余额与最近流水（一次请求拿两样，界面上少一次往返）。
+    pub async fn credits(&self) -> Result<Value, ApiError> {
+        self.authed(Request::new(Method::GET, "/credits")).await
+    }
+
+    /// 更长的流水（积分页里的「查看全部」）。
+    pub async fn credit_history(&self, limit: u32) -> Result<Value, ApiError> {
+        self.authed(Request::new(
+            Method::GET,
+            format!("/credits/history?limit={limit}"),
+        ))
+        .await
+    }
+
+    /// 充值档位。
+    pub async fn recharge_tiers(&self) -> Result<Value, ApiError> {
+        self.authed(Request::new(Method::GET, "/payments/tiers"))
+            .await
+    }
+
+    /// 下单。返回「怎么去付」（跳转地址或二维码内容）。
+    pub async fn create_order(&self, tier_id: &str, channel: &str) -> Result<Value, ApiError> {
+        self.authed(
+            Request::new(Method::POST, "/payments/orders")
+                .json(json!({ "tier_id": tier_id, "channel": channel })),
+        )
+        .await
+    }
+
+    /// 查一笔订单的状态。
+    pub async fn order_status(&self, out_trade_no: &str) -> Result<Value, ApiError> {
+        self.authed(Request::new(
+            Method::GET,
+            format!("/payments/orders/{out_trade_no}"),
+        ))
+        .await
+    }
+
+    /// 主动查单（用户点「我已完成支付」时用，兜底丢失的回调）。
+    pub async fn reconcile_order(&self, out_trade_no: &str) -> Result<Value, ApiError> {
+        self.authed(Request::new(
+            Method::POST,
+            format!("/payments/orders/{out_trade_no}/reconcile"),
+        ))
+        .await
+    }
+
+    /// 我的邀请码与邀请战绩。
+    pub async fn invites(&self) -> Result<Value, ApiError> {
+        self.authed(Request::new(Method::GET, "/invites")).await
+    }
+
     // ---------- 报审包与处理配方 ----------
 
     /// 本机机器码和受信公钥：组装报审包、校验配方都要用。安装包配置有误时报错。
@@ -817,19 +881,25 @@ impl<T: Transport, S: CredentialStore> Session<T, S> {
     }
 
     /// 申请处理配方，拿到后立刻在本机验一遍（签名、机器码、任务、有效期），验不过不交给调用方。
-    /// 返回验过的配方和签名原文：原文要存进任务目录，续跑时用 `verify_consumed` 重新验。
+    /// 返回验过的配方、签名原文、以及这次要花的积分：
+    /// 原文要存进任务目录，续跑时用 `verify_consumed` 重新验；积分给界面显示。
+    ///
+    /// `episode_count` 是按集计价的输入（M5a）：服务端只收到任务哈希、看不到集数，
+    /// 而价格按集算，所以必须由桌面端报上去。真正扣款发生在消费配方时。
     pub async fn issue_recipe(
         &self,
         task: &str,
         platform: &str,
         strength: &str,
-    ) -> Result<(Recipe, String), ApiError> {
+        episode_count: usize,
+    ) -> Result<(Recipe, String, i64), ApiError> {
         let (device_id, keys) = self.signing_context()?;
         let body = json!({
             "device_id": device_id,
             "task": task,
             "platform": platform,
             "strength": strength,
+            "episode_count": episode_count,
         });
         let response: RecipeResponse = decode(
             self.authed(Request::new(Method::POST, "/recipes").json(body))
@@ -846,7 +916,7 @@ impl<T: Transport, S: CredentialStore> Session<T, S> {
         if recipe.recipe_id != response.recipe_id {
             return Err(ApiError::Protocol("配方编号和签名内容不一致".into()));
         }
-        Ok((recipe, response.token))
+        Ok((recipe, response.token, response.credits))
     }
 
     /// 开工前消费配方：同一个配方只能成功一次（服务端记账）。

@@ -722,8 +722,8 @@ pub async fn version_start(
     }
     let spec = prepared.spec;
 
-    let (recipe, token) = account
-        .issue_recipe(&spec.task, PLATFORM, &spec.strength)
+    let (recipe, token, _credits) = account
+        .issue_recipe(&spec.task, PLATFORM, &spec.strength, spec.episodes.len())
         .await?;
     // 配方参数先在本机解析一遍：格式不对就别浪费这次配方。
     let params = RecipeParams::parse(&recipe)

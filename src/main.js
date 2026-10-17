@@ -37,6 +37,8 @@ const state = {
   paths: {},
   // 最近一次账号状态（account_status / account-changed 事件的负载，见 src-tauri/src/account/session.rs）。
   account: null,
+  // 最近一次读到的积分余额（M5a）。只用于界面上提前提示，扣费永远以服务端为准。
+  creditBalance: null,
   // 最近一次读到的生成流水：首页的引导和近 7 天图表用。
   ledger: [],
   // 本次运行里剪映探测是否找到了草稿目录（引导第 5 步）。
@@ -986,6 +988,18 @@ async function generate() {
   if (!cost) {
     toast("请先修正表单里标红的字段", true);
     return;
+  }
+  // 生成报审包要扣积分（按集算）。先告诉用户要花多少、失败会退多少。
+  const episodes = drama.episodes ? drama.episodes.length : 0;
+  if (episodes > 0) {
+    const ok = await confirmDialog({
+      title: "生成报审包",
+      body:
+        `《${drama.name}》共 ${episodes} 集，按每集 5 积分计算，将消耗 ${episodes * 5} 积分。\n` +
+        "生成由服务端完成，所以如果生成失败，这些积分会自动退还。",
+      confirmLabel: "生成",
+    });
+    if (!ok) return;
   }
   if (!beginTask(`正在探测并生成《${drama.name}》的报审包`)) return;
   try {
@@ -2334,6 +2348,19 @@ function applyAccount(status) {
   }
   // 刚登录进来（包括注册、启动恢复成功）：读一遍首页要的数据。
   if (view === "app" && !previous?.loggedIn && status.loggedIn) loadHome();
+  // 登录态可用时顺手拉一次余额：首页引导的第 2 步与「去充值」按钮要知道有没有积分。
+  // 失败不打扰用户（可能是断网），余额保持未知，扣费仍然以服务端为准。
+  if (view === "app" && status.loggedIn) {
+    call("credits_overview")
+      .then((overview) => {
+        state.creditBalance = Number(overview.balance) || 0;
+        renderBalance(state.creditBalance);
+        renderHome();
+      })
+      .catch(() => {
+        state.creditBalance = null;
+      });
+  }
   if (!status.pendingActivation) accountUi.activationPrompted = false;
 }
 
@@ -2347,9 +2374,16 @@ function renderAccountChip() {
   node.textContent = badge.text;
   const tone = { ok: "status-ready", warn: "status-warn", err: "status-fail" }[badge.tone] ?? "";
   node.className = `badge ${tone}`;
+  // 余额挂在 title 与 aria-label 上：徽章文字要留给使用权状态，
+  // 但用户扫一眼账号区时也该知道还剩多少积分。
+  const balanceText =
+    state.creditBalance == null ? "" : `，剩余 ${state.creditBalance} 积分`;
+  $("#chip-email").title = status?.loggedIn ? `${status.email}${balanceText}` : "";
   $("#account-chip").setAttribute(
     "aria-label",
-    status?.loggedIn ? `账号 ${status.email}，${badge.text}，打开账号菜单` : "未登录",
+    status?.loggedIn
+      ? `账号 ${status.email}，${badge.text}${balanceText}，打开账号菜单`
+      : "未登录",
   );
 }
 
@@ -2543,6 +2577,9 @@ async function registerAccount(event) {
   const email = $("#register-email").value.trim();
   const code = $("#register-code").value.trim();
   const password = $("#register-password").value;
+  // 邀请码可选：留空就是不填。填了但格式不对也不拦——服务端会当成无效码忽略，
+  // 邀请是附加动作，不该因为一个手滑的邀请码把人挡在注册外面。
+  const inviteCode = $("#register-invite").value.trim();
   if (!$("#register-terms").checked) return showFormError("#register-error", "请先阅读并勾选同意条款");
   if (!email.includes("@")) return showFormError("#register-error", "请填写正确的邮箱");
   if (!/^\d{6}$/.test(code)) return showFormError("#register-error", "验证码是 6 位数字");
@@ -2552,10 +2589,11 @@ async function registerAccount(event) {
   await withBusy($("#register-submit"), async () => {
     try {
       const status = await call("account_register", {
-        args: { email, code, password, acceptTerms: true },
+        args: { email, code, password, acceptTerms: true, inviteCode },
       });
       $("#register-password").value = "";
       $("#register-code").value = "";
+      $("#register-invite").value = "";
       applyAccount(status);
       toast(`注册成功，已登录：${status.email}`);
     } catch (error) {
@@ -2663,12 +2701,193 @@ function handleAccountMenuKeys(event) {
 /** 账号菜单、首页、设置页里 `data-account-action` 的按钮都走这里。 */
 function runAccountAction(action) {
   closeAccountMenu();
-  if (action === "redeem") openRedeemDialog();
+  if (action === "credits") openCreditsDialog();
+  else if (action === "redeem") openRedeemDialog();
   else if (action === "devices") openDevicesDialog({ activation: false });
   else if (action === "settings") {
     state.settingsSub = "account";
     switchModule("settings");
   } else if (action === "logout") logoutAccount();
+}
+
+// ---- 积分与充值（M5a） ----
+
+/** 积分弹窗的状态：当前下单的订单号（用来轮询 / 主动查单）。 */
+const creditsState = { outTradeNo: null, channel: null };
+
+function openCreditsDialog() {
+  if (!state.account?.loggedIn) return;
+  showFormError("#credits-error", null);
+  $("#credits-checkout").classList.add("hidden");
+  $("#credits-balance").textContent = "—";
+  $("#credits-history").innerHTML = '<tr><td colspan="3" class="empty">正在读取…</td></tr>';
+  $("#invite-code").value = "";
+  $("#invite-stats").textContent = "—";
+  openDialog($("#dialog-credits"), { initialFocus: $("#credits-refresh") });
+  loadCredits();
+  loadInvites();
+  loadTiers();
+}
+
+/** 余额与最近流水。 */
+async function loadCredits() {
+  try {
+    const overview = await call("credits_overview");
+    renderBalance(overview.balance);
+    renderCreditHistory(overview.history || []);
+  } catch (error) {
+    showFormError("#credits-error", L.errorText(error));
+  }
+}
+
+function renderBalance(balance) {
+  $("#credits-balance").textContent = String(balance);
+  // 账号区的余额提示由 renderAccountChip 统一维护（避免两处各写一遍 title 互相覆盖）。
+  renderAccountChip();
+}
+
+/** 流水：变动带正负号，退还与奖励用不同颜色。 */
+function renderCreditHistory(items) {
+  const body = $("#credits-history");
+  if (!items || items.length === 0) {
+    body.innerHTML = '<tr><td colspan="3" class="empty">还没有积分记录。</td></tr>';
+    return;
+  }
+  body.innerHTML = items
+    .map((item) => {
+      const delta = Number(item.delta) || 0;
+      const tone = delta > 0 ? "status-pass" : "status-fail";
+      return `<tr>
+        <td>${esc(formatDateTime(item.createdAt))}</td>
+        <td class="${tone}">${delta > 0 ? "+" : ""}${delta}</td>
+        <td>${esc(describeCredit(item))}</td>
+      </tr>`;
+    })
+    .join("");
+}
+
+/** 一条流水的人类可读说明：种类 + 备注，预扣状态单独标出来。 */
+function describeCredit(item) {
+  const kind = item.kind;
+  const memo = item.memo || "";
+  if (kind === "hold") {
+    const state = item.settledState;
+    if (state === "reserved") return `预扣中：${memo}`;
+    if (state === "settled") return `已消费：${memo}`;
+    if (state === "released") return `已退还：${memo}`;
+  }
+  if (kind === "grant") return memo || "充值";
+  if (kind === "reward") return memo || "奖励";
+  if (kind === "release") return memo || "退还";
+  if (kind === "expire") return memo || "预扣超时退还";
+  return memo || kind;
+}
+
+/** 充值档位。 */
+async function loadTiers() {
+  const node = $("#credits-tiers");
+  try {
+    const payload = await call("recharge_tiers");
+    const items = payload.items || [];
+    if (items.length === 0) {
+      node.textContent = "还没有可用的充值档位。";
+      return;
+    }
+    node.innerHTML = items
+      .map(
+        (tier) =>
+          `<button type="button" class="primary" data-tier="${esc(tier.id)}" data-credits="${tier.credits}">
+            ${tier.credits} 积分 · ${formatMoney(tier.amountFen)}
+          </button>`,
+      )
+      .join("");
+  } catch (error) {
+    node.textContent = L.errorText(error);
+  }
+}
+
+/** 分换算成「元」。 */
+function formatMoney(fen) {
+  return `${(Number(fen) / 100).toFixed(2)} 元`;
+}
+
+/** 下单：拿回怎么去付。 */
+async function startRecharge(tierId) {
+  showFormError("#credits-error", null);
+  try {
+    const order = await call("create_recharge_order", { tierId, channel: "mock" });
+    creditsState.outTradeNo = order.outTradeNo;
+    creditsState.channel = order.channel;
+    const node = $("#credits-checkout");
+    // 收银台地址做成可点的链接：本地模拟支付时用户要在浏览器里打开它才能「付款」。
+    // 只显示一段死文本，本地闭环就走不下去。
+    //
+    // 只把 http/https 渲染成链接：地址虽然来自我们的服务端，但它是后端按环境拼的，
+    // 一律按不可信处理——`javascript:` 之类的协议绝不能进 href。
+    const rawTarget = String(order.checkout.payload ?? "");
+    const linkable = /^https?:\/\//i.test(rawTarget);
+    const payTarget =
+      order.checkout.kind === "redirect"
+        ? (linkable
+            ? `<a href="${esc(rawTarget)}" target="_blank" rel="noreferrer noopener">打开收银台付款</a><br />`
+            : "") + `<span class="hint">收银台地址：<code>${esc(rawTarget)}</code></span>`
+        : `二维码内容：<code>${esc(rawTarget)}</code>`;
+    // Mock 渠道没有「渠道侧」可查，点「我已完成支付」只会拿到 503。
+    // 与其让用户点了才发现，不如提前说清楚：去收银台页面点付款，回来刷新即可。
+    const isMock = order.channel === "mock";
+    node.innerHTML = `
+      <strong>订单已创建</strong><br />
+      应付：${formatMoney(order.amountFen)} · 到账：${order.credits} 积分<br />
+      ${payTarget}<br />
+      <span class="hint">当前是本地模拟支付（没有接真实渠道）。实际使用时这里会跳转到收银台或显示二维码。</span>
+      <div class="option-row">
+        <button id="credits-paid" type="button" class="success">我已完成支付</button>
+      </div>
+      ${
+        isMock
+          ? `<span class="hint">模拟支付没有渠道侧可查单，点「我已完成支付」会提示查不了。
+             请在上面的收银台页面点「支付成功」，再点弹窗顶部的「刷新」。</span>`
+          : ""
+      }
+    `;
+    node.classList.remove("hidden");
+    $("#credits-paid").addEventListener("click", reconcileRecharge);
+  } catch (error) {
+    showFormError("#credits-error", L.errorText(error));
+  }
+}
+
+/** 「我已完成支付」：主动查单（回调丢失的兜底）。 */
+async function reconcileRecharge() {
+  if (!creditsState.outTradeNo) return;
+  try {
+    const result = await call("reconcile_recharge", { outTradeNo: creditsState.outTradeNo });
+    if (result.credited > 0) {
+      toast(`充值成功，到账 ${result.credited} 积分`);
+    } else if (result.already) {
+      toast("这笔订单已经到账过了");
+    } else {
+      toast("还没有查到支付结果，请稍后再试或联系客服", true);
+    }
+    loadCredits();
+  } catch (error) {
+    // Mock 渠道查不了单：如实显示服务端的说明，不假装「已支付」。
+    showFormError("#credits-error", L.errorText(error));
+  }
+}
+
+/** 邀请码与战绩。 */
+async function loadInvites() {
+  try {
+    const info = await call("invite_status");
+    $("#invite-code").value = info.code || "";
+    $("#invite-stats").textContent =
+      `已邀请 ${info.invited} 人 · 已得奖励 ${info.rewards} 次（共 ${info.earnedCredits} 积分）。` +
+      `邀请人每成功一次得 ${info.inviterCredits} 积分，被邀请人得 ${info.inviteeCredits} 积分，` +
+      `每人最多奖励 ${info.maxRewards} 次。`;
+  } catch (error) {
+    $("#invite-stats").textContent = L.errorText(error);
+  }
 }
 
 // ---- 卡密兑换 ----
@@ -3119,6 +3338,7 @@ function renderHome() {
     dramaCount: state.dramas.length,
     ledgerCount: state.ledger.length,
     jianyingReady: Boolean(state.settings?.jianyingDraftDir) || state.jianyingFound,
+    creditBalance: state.creditBalance,
   });
   const progress = L.guideProgress(steps);
   const collapsed = guideCollapsed();
@@ -3152,6 +3372,9 @@ function renderHome() {
 
 function runOnboardAction(action) {
   if (action === "redeem") openRedeemDialog();
+  // 积分没有独立模块页（只有账号菜单里的弹窗），所以不能走 switchModule：
+  // 那会把工作区切成一个不存在的 module-credits，界面变空白。
+  else if (action === "credits") openCreditsDialog();
   else if (action === "jianying") {
     state.settingsSub = "jianying";
     switchModule("settings");
@@ -3960,6 +4183,10 @@ async function startVersion() {
     body:
       `《${drama.name}》· ${strengthLabel(plan.strength)}档 · ${plan.episodes.length} 集\n` +
       `输出到：${plan.outputDir}\n\n` +
+      `积分：本剧 ${plan.episodes.length} 集，按每集 5 积分计算，预计消耗 ` +
+      `${plan.episodes.length * 5} 积分（准确数额以服务端签发时为准）。\n` +
+      `这笔积分在开始处理前就会扣掉。如果处理中途失败，积分不退——` +
+      `视频只在本机处理、服务端看不到处理结果，无法判断真假。\n\n` +
       "开始后会向服务端申请一份处理配方并立即用掉。配方只能用一次：中途暂停、终止可以继续，" +
       "但如果要换档位或改模板，就得删掉这次的版本目录重新开始。",
     confirmLabel: "申请配方并开始",
@@ -4303,6 +4530,27 @@ $("#publish-copy-generate").addEventListener("click", generatePublishCopy);
 $("#publish-copy-load").addEventListener("click", loadPublishCopy);
 $("#publish-copy-preview").addEventListener("click", previewPublishCopy);
 $("#browse-output").addEventListener("click", () => browse("#output-dir"));
+$("#credits-refresh").addEventListener("click", () => {
+  loadCredits();
+  loadInvites();
+});
+// 档位按钮是动态生成的，用事件委托。
+$("#credits-tiers").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-tier]");
+  if (button) startRecharge(button.dataset.tier);
+});
+$("#invite-copy").addEventListener("click", async () => {
+  const code = $("#invite-code").value.trim();
+  if (!code) return;
+  try {
+    await navigator.clipboard.writeText(code);
+    toast("邀请码已复制");
+  } catch {
+    // 没有剪贴板权限时退回「选中让用户自己复制」。
+    $("#invite-code").select();
+    toast("请按 Ctrl+C / Cmd+C 复制选中的邀请码");
+  }
+});
 // 扫描件：选了就填进只读输入框，结果里会逐份标明签章方式。
 async function pickScan(targetId) {
   try {

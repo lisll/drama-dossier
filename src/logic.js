@@ -148,6 +148,17 @@
     unauthorized: "登录已失效：这台电脑可能已在别处被解绑，请重新登录",
     // 报审包（M4a）。分集被改动、被移走、目录已存在这几种，后端的说明里带了具体文件名，直接用后端的。
     entitlement_required: "没有有效的使用权，不能生成报审包：请先兑换卡密或续期",
+    // 积分（M5a）。余额不足是 402，和「没使用权」（403）分开：给的下一步不同。
+    insufficient_credits: "积分不足，请先充值",
+    price_missing: "服务端缺少计价规则，请联系管理员",
+    tier_not_found: "这个充值档位已下架，请刷新后重选",
+    order_not_found: "找不到这笔订单",
+    amount_mismatch: "回调金额与订单不一致，已拒绝入账",
+    payment_not_configured: "这个支付渠道还没配置好，暂时不能用",
+    payment_verify_failed: "支付回调没有通过验签，已拒绝",
+    invite_not_configured: "邀请奖励还没配置，请联系管理员",
+    hold_not_found: "找不到对应的预扣记录",
+    hold_closed: "这笔预扣已经结束，不能再改",
     scan_invalid: "扫描件不符合要求：只支持 PNG、JPEG、PDF，每份不超过 5 MB",
     payload_too_large: "提交的内容太大，服务端拒收了：请减少扫描件或集数后重试",
     package_manifest_invalid: "报审包清单没有通过校验（签名不对或不是发给这台电脑的），本次没有写入任何文件，请重新生成",
@@ -313,7 +324,7 @@
     const generated = (f.ledgerCount ?? 0) > 0;
     return [
       { id: "license", title: "授权卡密", detail: "兑换卡密，开通剧目库、报审包和工具箱。", done: Boolean(f.entitled), action: "redeem", actionLabel: "兑换卡密" },
-      { id: "recharge", title: "充值积分", detail: "积分与充值即将推出，现在可以跳过。", done: false, disabled: true, actionLabel: "即将推出" },
+      { id: "recharge", title: "充值积分", detail: "处理版本和报审包按集扣积分，先充一点再开始。", done: (f.creditBalance ?? 0) > 0, action: "credits", actionLabel: "去充值" },
       { id: "material", title: "准备素材", detail: "选好素材根目录并扫描，一部剧一个子目录。", done: Boolean(f.libraryRoot) || (f.dramaCount ?? 0) > 0, action: "library", actionLabel: "去剧目库" },
       { id: "cost", title: "配置成本报表", detail: "在「生成报审包」里填好成本信息，生成一次报审包。", done: generated, action: "generate", actionLabel: "去生成" },
       { id: "jianying", title: "找到剪映草稿目录", detail: "在设置里探测剪映专业版，或手动填写草稿目录。", done: Boolean(f.jianyingReady), action: "jianying", actionLabel: "去设置" },

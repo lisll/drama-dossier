@@ -201,6 +201,12 @@ pub struct PackageResponse {
 pub struct RecipeResponse {
     pub recipe_id: String,
     pub token: String,
+    /// 这次要花多少积分（M5a）。签发时定价，消费时扣。
+    ///
+    /// 不回填 `episode_count`：桌面端本来就知道自己报了多少集，
+    /// 服务端把它再传回来只会多一个字段、多一处需要同步的地方。
+    #[serde(default)]
+    pub credits: i64,
 }
 
 // ---------- 传输层 ----------
