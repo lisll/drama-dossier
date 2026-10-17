@@ -79,6 +79,9 @@ class PackageService:
         ]
         signed_documents: List[str] = []
         placeholder = False
+        # 逐份记录实际用的签章方式（`mock` / `scan`）：混合签章时整包不能只写一个结论，
+        # 否则使用者会以为「有扫描件 = 整包都盖好了」。
+        documents_signature: List[Dict[str, str]] = []
         footer = f"报审包 {package_id} · 生成于 {generated_at}"
         sealed_paths = {document["path"] for document in rendered["sealed"]}
         unknown = set(payload.scans or {}) - sealed_paths
@@ -106,6 +109,9 @@ class PackageService:
                 path = path.removesuffix(".pdf") + UNSIGNED_SUFFIX + ".pdf"
             files.append((path, result.signed_pdf))
             signed_documents.append(path)
+            documents_signature.append(
+                {"document": path, "signer": "mock" if result.is_placeholder else "scan"}
+            )
 
         manifest = {
             "schema": MANIFEST_SCHEMA,
@@ -116,7 +122,13 @@ class PackageService:
             "dramaName": payload.drama_name.strip(),
             "aiGenerated": payload.ai_generated,
             "copyEpisodes": payload.copy_episodes,
-            "signature": {"signer": doc_signer.name, "placeholder": placeholder, "documents": signed_documents},
+            "signature": {
+                "signer": doc_signer.name,
+                "placeholder": placeholder,
+                "documents": signed_documents,
+                # 每份文档的实际签章方式（混合签章时各不相同）。
+                "perDocument": documents_signature,
+            },
             "files": [
                 {"path": path, "sizeBytes": len(content), "sha256": hashlib.sha256(content).hexdigest(),
                  "source": "server"}

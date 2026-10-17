@@ -110,7 +110,11 @@ def test_creates_signed_package_with_placeholder_seal(client, pg, signer, accoun
     assert manifest["userId"] == account["id"]
     assert manifest["packageId"] == body["package_id"]
     assert manifest["signature"] == {"signer": "mock", "placeholder": True,
-                                     "documents": [COST_PDF, OWNERSHIP_PDF]}
+                                     "documents": [COST_PDF, OWNERSHIP_PDF],
+                                     "perDocument": [
+                                         {"document": COST_PDF, "signer": "mock"},
+                                         {"document": OWNERSHIP_PDF, "signer": "mock"},
+                                     ]}
 
     # 服务端文件和清单逐个对得上；本机文件（封面）只登记，不在 files 里返回内容。
     files = _files(body)
@@ -233,7 +237,12 @@ def test_scan_replaces_pages_and_is_not_placeholder(client, pg, account):
     response = create(client, account["token"], body)
     assert response.status_code == 200, response.text
     manifest = json.loads(response.json()["manifest"])
-    assert manifest["signature"] == {"signer": "scan", "placeholder": False, "documents": list(SEALED)}
+    assert manifest["signature"] == {
+        "signer": "scan",
+        "placeholder": False,
+        "documents": list(SEALED),
+        "perDocument": [{"document": path, "signer": "scan"} for path in SEALED],
+    }
     files = _files(response.json())
     for path in SEALED:
         assert path in files, "扫描件签章不加 _未签署 后缀"
@@ -257,6 +266,44 @@ def test_rejects_bad_scans(client, pg, account, scans, fragment):
     assert response.json()["error"] == "scan_invalid"
     assert fragment in response.json()["message"]
     assert _package_rows(pg, account["id"]) == []
+
+
+def test_mixed_signing_keeps_the_unsigned_document_placeholder(client, pg, account):
+    """只上传一份扫描件时：给的那份用扫描件，没给的那份仍是占位章。
+
+    用户的决定是「支持混合」。这条用例把三件事钉住：
+    1. 不给全也不报错（否则只准备了一份扫描件的人就交付不了）；
+    2. 没给的那份仍然带 `_未签署` 后缀、仍然是占位章；
+    3. 清单里逐份写明签章方式，界面才能逐份标红。
+    """
+    scanned = SEALED[0]
+    response = create(client, account["token"],
+                      package_body(signer="scan", scans={scanned: _png()}))
+    assert response.status_code == 200, response.text
+    manifest = json.loads(response.json()["manifest"])
+    signature = manifest["signature"]
+    # 整包仍有未签署的文档：`placeholder` 必须为 True，不能因为「有扫描件」就报成已签。
+    assert signature["placeholder"] is True
+    assert signature["signer"] == "scan"
+    unsigned = [path for path in signature["documents"] if "_未签署" in path]
+    assert len(unsigned) == 1, signature["documents"]
+    assert unsigned[0].startswith(SEALED[1].removesuffix(".pdf")), signature["documents"]
+
+    per_document = {item["document"]: item["signer"] for item in signature["perDocument"]}
+    assert len(per_document) == len(SEALED)
+    # 给的那份是扫描件（文件名没有后缀），没给的那份是占位章（带后缀）。
+    assert per_document[scanned] == "scan"
+    assert per_document[unsigned[0]] == "mock"
+
+    files = _files(response.json())
+    # 扫描件那份：整页换掉了。
+    pdf = PdfReader(io.BytesIO(files[scanned]))
+    assert "样章" not in (pdf.pages[0].extract_text() or "")
+    # 占位章那份：仍然带水印与「未签署」字样。
+    placeholder = PdfReader(io.BytesIO(files[unsigned[0]]))
+    assert "样章" in (placeholder.pages[0].extract_text() or "")
+    [row] = _package_rows(pg, account["id"])
+    assert row["signer"] == "scan"
 
 
 def test_rejects_scans_with_mock_signer(client, account):

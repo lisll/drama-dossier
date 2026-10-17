@@ -263,14 +263,17 @@ export DRAMA_COMMERCE_LICENSE_KEY_FILE="$HOME/.config/drama-commerce/license-dev
 | `episodes` | 是 | 最多 **500** 集；每集含 `file_name`、`size_bytes`、`sha256`、可选 `episode_number`（0..100000）和 `spec` |
 | `episodes[].spec` | 是 | `duration_sec` 0..86400；`width` / `height` 0..16384；`video_codec` / `audio_codec` 各 ≤ 32 字符；`fps` 0..1000；`bitrate_bps` 0..1e10 |
 | `signer` | 否 | `mock`（默认，占位章）/ `scan`（上传盖章扫描件） |
-| `scans` | 否 | `signer: scan` 时：文档路径 → 扫描件（PNG / JPEG / PDF）的 base64，每份 ≤ 7,000,000 个字符（约 5 MB 原始字节），最多 **4** 份 |
+| `scans` | 否 | `signer: scan` 时：文档路径 → 扫描件（PNG / JPEG / PDF）的 base64，每份 ≤ 7,000,000 个字符（约 5 MB 原始字节），最多 **4** 份。可以只覆盖一部分要盖章的文档（混合签章） |
 
 整个请求体的上限是 1 MiB + 4 × 7,000,000 字节（`commerce/body_limit.py`）：先看 `Content-Length`，
 没有或谎报时边收边数，超了立即返回 413 `payload_too_large`，不把请求读进内存。其余接口一律 1 MiB。
 
 `scans` 的键必须是这次要盖章的文档路径（`04_成本配置表/成本配置表.pdf`、
 `05_权属声明/内容权属声明.pdf`），给了别的路径返回 422 `scan_invalid`；
-用 `signer: mock` 时不允许带 `scans`（同样 422）。
+用 `signer: mock` 时不允许带 `scans`（同样 422）——想用占位章就不要顺手把扫描件一起发上来。
+`scans` **可以只覆盖其中一部分**文档：给了的走扫描件，没给的退回占位章（见下面的「混合签章」）。
+扫描件按**文件头**判断类型（不信扩展名）：PDF 原样检查后返回（不能加密、不能是空文件），
+PNG / JPEG 铺满一页 A4；页数必须与原文档一致，否则 422 `scan_invalid`。
 
 服务端做的事：检查前提 → 调 `dossier-artifacts render-package` 生成文本文件与排版模型 →
 把两份文档画成 A4 PDF 并盖章 → 拼清单 `drama-dossier/package@2`、用 Ed25519 签名
@@ -291,6 +294,28 @@ export DRAMA_COMMERCE_LICENSE_KEY_FILE="$HOME/.config/drama-commerce/license-dev
 - **视频不上传**：分集、封面、简介只传桌面端算好的文件名、大小和 SHA-256，服务端把它们登记进清单，
   组装时由桌面端重新算一遍对比。服务端**不接收也不保存**任何文档内容。
 - 占位章（`signer: mock`）：文件名在 `.pdf` 前加 `_未签署`，清单里 `signature.placeholder = true`。
+- **混合签章**（`signer: scan`，但 `scans` 只覆盖一部分要盖章的文档）：给了扫描件的那份用扫描件
+  （文件名不加后缀），没给的那份仍然走占位章（加 `_未签署` 后缀）。此时 `signature.placeholder`
+  仍为 `true`，因为包里确实还有未签署的文档。
+- 清单里 `signature.perDocument` 逐份给出实际用的签章方式：
+
+  ```json
+  "signature": {
+    "signer": "scan",
+    "placeholder": true,
+    "documents": ["04_成本配置表/成本配置表.pdf", "05_权属声明/内容权属声明_未签署.pdf"],
+    "perDocument": [
+      {"document": "04_成本配置表/成本配置表.pdf", "signer": "scan"},
+      {"document": "05_权属声明/内容权属声明_未签署.pdf", "signer": "mock"}
+    ]
+  }
+  ```
+
+  桌面端据此逐份标明「扫描件签章」或「占位章 · 未签署」，**不能只显示整包一个结论**——
+  否则使用者会以为整包都盖好了。旧版服务端不发这个字段，桌面端按「整包占位」处理（向后兼容）。
+  注意 `perDocument[].document` 是**实际写进包里的路径**（占位章那份带 `_未签署` 后缀），
+  而 `signature.signer` 是一次生成里用到的签章器名字（`scan` 或 `mock`）：
+  `signer: scan` 且 `scans` 为空时，逐份都会是 `mock`，此时等价于整包占位章。
 - 失败时不会留下半成品：`dossier-artifacts` 找不到 / 运行失败 / 超时（30 秒）/ 输出不是 JSON
   一律 503 `service_unavailable`，请求本身不合法（退出码 2）返回 422 `invalid_request`，
   `message` 就是 Rust 侧的中文说明。`dossier-artifacts` 对传给它的请求 JSON 有 1 MiB

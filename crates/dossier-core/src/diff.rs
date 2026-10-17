@@ -104,8 +104,67 @@ pub struct PackageDiff {
     pub unchanged: usize,
     /// 只列出 Added / Removed / Changed（未变文件不进列表，避免刷屏）。
     pub files: Vec<FileDiff>,
+    /// 两侧的签章状态（占位章 / 扫描件 / 混合）。
+    pub left_signing: SigningStatus,
+    pub right_signing: SigningStatus,
     pub summary: String,
 }
+
+/// 一份报审包的签章状态（对比时用）。
+///
+/// 只从**文件名**推断：占位章的文档带 `_未签署` 后缀，扫描件的没有。
+/// 这是清单里唯一能稳定拿到的信息——`manifest.json` 的 `signature` 段不在
+/// [`PackageManifest`] 里（对比只需要文件清单），所以不去解它。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SigningStatus {
+    /// 一份盖章文档都没有（清单里没有 PDF）。
+    None,
+    /// 全部是占位章。
+    Placeholder,
+    /// 全部是扫描件签章。
+    Scan,
+    /// 一部分占位章、一部分扫描件（混合签章）。
+    Mixed,
+}
+
+impl SigningStatus {
+    /// 从清单的文件列表推断：数一数带 `_未签署` 后缀的 PDF 有几个。
+    pub fn from_manifest(manifest: &PackageManifest) -> Self {
+        let sealed: Vec<&ManifestFileEntry> = manifest
+            .files
+            .iter()
+            .filter(|file| file.path.to_lowercase().ends_with(".pdf"))
+            .collect();
+        if sealed.is_empty() {
+            return SigningStatus::None;
+        }
+        let unsigned = sealed
+            .iter()
+            .filter(|file| file.path.contains(UNSIGNED_SUFFIX))
+            .count();
+        if unsigned == 0 {
+            SigningStatus::Scan
+        } else if unsigned == sealed.len() {
+            SigningStatus::Placeholder
+        } else {
+            SigningStatus::Mixed
+        }
+    }
+
+    /// 界面上的说法（不做法性判断，只陈述事实）。
+    pub fn label(self) -> &'static str {
+        match self {
+            SigningStatus::None => "无盖章文档",
+            SigningStatus::Placeholder => "占位章（未签署）",
+            SigningStatus::Scan => "扫描件签章",
+            SigningStatus::Mixed => "混合（部分占位章）",
+        }
+    }
+}
+
+/// 占位章文档的文件名后缀（和服务端 `UNSIGNED_SUFFIX` 一致）。
+const UNSIGNED_SUFFIX: &str = "_未签署";
 
 impl PackageDiff {
     /// 是否有内容变化。
@@ -214,6 +273,8 @@ pub fn diff_manifests(
         changed,
         unchanged,
         files,
+        left_signing: SigningStatus::from_manifest(left),
+        right_signing: SigningStatus::from_manifest(right),
         summary,
     }
 }
@@ -320,5 +381,48 @@ mod tests {
     #[test]
     fn rejects_invalid_manifest_json() {
         assert!(parse_manifest("not json").is_err());
+    }
+
+    #[test]
+    fn signing_status_is_inferred_from_the_unsigned_suffix() {
+        // 全部带后缀：占位章。
+        let placeholder = manifest(&[
+            ("04_成本配置表/成本配置表_未签署.pdf", 10, "a"),
+            ("05_权属声明/内容权属声明_未签署.pdf", 10, "b"),
+        ]);
+        assert_eq!(
+            SigningStatus::from_manifest(&placeholder),
+            SigningStatus::Placeholder
+        );
+
+        // 全都不带：扫描件签章。
+        let scanned = manifest(&[
+            ("04_成本配置表/成本配置表.pdf", 10, "a"),
+            ("05_权属声明/内容权属声明.pdf", 10, "b"),
+        ]);
+        assert_eq!(SigningStatus::from_manifest(&scanned), SigningStatus::Scan);
+
+        // 一份带一份不带：混合签章（M4b-2 支持的情形）。
+        let mixed = manifest(&[
+            ("04_成本配置表/成本配置表.pdf", 10, "a"),
+            ("05_权属声明/内容权属声明_未签署.pdf", 10, "b"),
+        ]);
+        assert_eq!(SigningStatus::from_manifest(&mixed), SigningStatus::Mixed);
+
+        // 没有任何 PDF：没有盖章文档。
+        let none = manifest(&[("01_剧集信息/剧名.txt", 10, "a")]);
+        assert_eq!(SigningStatus::from_manifest(&none), SigningStatus::None);
+    }
+
+    #[test]
+    fn diff_reports_both_sides_signing_status() {
+        let left = manifest(&[("04_成本配置表/成本配置表_未签署.pdf", 10, "a")]);
+        let right = manifest(&[("04_成本配置表/成本配置表.pdf", 10, "b")]);
+        let diff = diff_manifests(&left, &right, "改稿前", "盖章后");
+        assert_eq!(diff.left_signing, SigningStatus::Placeholder);
+        assert_eq!(diff.right_signing, SigningStatus::Scan);
+        // 每一侧的说明都要能直接展示。
+        assert_eq!(diff.left_signing.label(), "占位章（未签署）");
+        assert_eq!(diff.right_signing.label(), "扫描件签章");
     }
 }

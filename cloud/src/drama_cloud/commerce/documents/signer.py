@@ -155,7 +155,12 @@ class MockSigner:
 
 @dataclass
 class ScanUploadSigner:
-    """上传已经盖好真章的整页扫描件，原样替换对应页面。`scans`：文档路径 → 扫描件字节。"""
+    """上传已经盖好真章的整页扫描件，原样替换对应页面。`scans`：文档路径 → 扫描件字节。
+
+    支持**混合签章**：`scans` 里有的文档用扫描件，没有的仍走占位章
+    （用户只上传了其中一份时，另一份不该因此整批失败）。
+    占位的那份同样带水印、文件名加 `_未签署` 后缀，调用方据此逐份标明签章方式。
+    """
 
     font: Font
     scans: Dict[str, bytes]
@@ -164,7 +169,8 @@ class ScanUploadSigner:
     def start(self, request: SignRequest) -> SignResult:
         scan = self.scans.get(request.document_id)
         if scan is None:
-            raise SignerError("scan_invalid", f"缺少 {request.document_id} 的盖章扫描件")
+            # 没给这份的扫描件：退回占位章，而不是报错让整个报审包生成失败。
+            return MockSigner(self.font).start(request)
         original = PdfReader(io.BytesIO(request.pdf))
         replacement = scan_to_pdf(scan, self.font)
         pages = PdfReader(io.BytesIO(replacement)).pages

@@ -84,6 +84,20 @@ pub struct ManifestSignature {
     pub signer: String,
     pub placeholder: bool,
     pub documents: Vec<String>,
+    /// 每份文档的实际签章方式（混合签章时各不相同）。
+    ///
+    /// 旧版服务端不发这个字段，所以给默认值空列表——向后兼容，不至于让旧包验不过。
+    #[serde(default)]
+    pub per_document: Vec<ManifestDocumentSigner>,
+}
+
+/// 一份盖章文档的实际签章方式。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ManifestDocumentSigner {
+    pub document: String,
+    /// `mock`（占位章）或 `scan`（扫描件）。
+    pub signer: String,
 }
 
 /// 验签通过的清单。

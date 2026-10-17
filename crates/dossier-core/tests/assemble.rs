@@ -450,3 +450,89 @@ fn rejects_existing_output_dir_without_touching_it() {
     assert_eq!(entries.len(), 1, "旧目录不应被改动");
     assert_eq!(std::fs::read(output.join("旧文件.txt")).unwrap(), b"old");
 }
+
+// ---------- 混合签章（M4b-2） ----------
+
+/// 混合签章：清单里逐份写明签章方式时，`unsigned_documents` 只列占位章那几份。
+///
+/// 这一条守的是「不实陈述」：只上传了一份扫描件时，若把 `documents` 整个当成未签署
+/// 的列表，界面会把已经盖了真章的文档也标成「未签署」；反过来若只写一个整包结论，
+/// 使用者又会以为整包都盖好了。
+#[test]
+fn mixed_signing_lists_only_the_placeholder_documents() {
+    let fixture = Fixture::new(false);
+    let scanned = "04_成本配置表/成本配置表.pdf";
+    // 两份文档的内容一致（都是同一段假 PDF），但签章方式不同。
+    let content = b"%PDF-1.7 fake".to_vec();
+    let size = content.len();
+    let hash = sha256(&content);
+    // 清单里两份文档：一份扫描件（无后缀）、一份占位章（有后缀）。
+    // 基于 Fixture 的清单改：它已经带齐剧名、封面、分集等全部服务端文件，
+    // 只把签章相关信息换掉，避免手写清单漏文件（那会撞上「清单里没有 xxx」的校验）。
+    let mut manifest = fixture.manifest();
+    manifest["signature"] = json!({
+        "signer": "scan",
+        "placeholder": true,
+        "documents": [scanned, COST_PDF],
+        "perDocument": [
+            {"document": scanned, "signer": "scan"},
+            {"document": COST_PDF, "signer": "mock"},
+        ],
+    });
+    // 再加一份扫描件签章后的文档（无 `_未签署` 后缀）。
+    if let Some(files) = manifest["files"].as_array_mut() {
+        files.push(json!({
+            "path": scanned, "sizeBytes": size, "sha256": hash, "source": "server"
+        }));
+    }
+    let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+    let signature = sign(&fixture.signing, &bytes);
+    let mut server = fixture.server.clone();
+    server.insert(scanned.to_string(), content);
+    let output = fixture.output("报审包-混合");
+    let request = AssembleRequest {
+        manifest: &bytes,
+        signature: &signature,
+        server_files: &server,
+        local_sources: &fixture.local,
+        output_dir: &output,
+        trusted: &[trusted(&fixture.signing)],
+        device_id: DEVICE,
+    };
+    let result = assemble_package(&request, |_, _, _| {}).expect("混合签章应当能组装");
+
+    // 整包仍有未签署的文档。
+    assert!(result.placeholder);
+    // 只有占位章那份被列进未签署列表——扫描件那份不该被标成未签署。
+    assert_eq!(result.unsigned_documents, [COST_PDF]);
+    // 逐份签章方式如实带出来，界面据此逐条标色。
+    assert_eq!(result.document_signers.len(), 2);
+    let mut by_signer: Vec<(String, String)> = result
+        .document_signers
+        .iter()
+        .map(|item| (item.document.clone(), item.signer.clone()))
+        .collect();
+    by_signer.sort();
+    assert_eq!(
+        by_signer,
+        vec![
+            (scanned.to_string(), "scan".to_string()),
+            (COST_PDF.to_string(), "mock".to_string()),
+        ]
+    );
+}
+
+/// 旧版服务端不发 `perDocument`：退回「整包占位」的旧语义，不能让旧包验不过。
+#[test]
+fn manifests_without_per_document_still_assemble() {
+    let fixture = Fixture::new(false);
+    let result = fixture
+        .signed_assemble(&fixture.output("报审包-旧格式"))
+        .expect("旧格式清单应当能组装");
+    assert!(result.placeholder);
+    assert_eq!(result.unsigned_documents, [COST_PDF]);
+    assert!(
+        result.document_signers.is_empty(),
+        "旧格式没有逐份信息，不该凭空造出来"
+    );
+}

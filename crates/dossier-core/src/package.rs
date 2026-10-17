@@ -509,6 +509,21 @@ pub struct PackageResult {
     pub placeholder: bool,
     /// 用了占位章、带 `_未签署` 后缀的文档。
     pub unsigned_documents: Vec<String>,
+    /// 每份要盖章的文档实际用的签章方式（`mock` / `scan`）。
+    ///
+    /// 混合签章时整包不能只写一个结论：使用者要能逐份看清哪份是扫描件、哪份仍是占位章。
+    #[serde(default)]
+    pub document_signers: Vec<DocumentSigner>,
+}
+
+/// 一份盖章文档的实际签章方式。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentSigner {
+    /// 包里的相对路径（占位章的那份带 `_未签署` 后缀）。
+    pub document: String,
+    /// `mock` 或 `scan`。
+    pub signer: String,
 }
 
 /// 组装失败。`code()` 给前端分支用。
@@ -580,11 +595,35 @@ pub fn assemble_package(
         total_bytes: manifest.files.iter().map(|file| file.size_bytes).sum(),
         package_id: manifest.package_id.clone(),
         placeholder: manifest.signature.placeholder,
-        unsigned_documents: if manifest.signature.placeholder {
-            manifest.signature.documents.clone()
-        } else {
-            Vec::new()
+        unsigned_documents: {
+            // 优先用服务端给的「逐份签章方式」：混合签章时只有**部分**文档是占位章，
+            // 把 documents 整个当成未签署的会把扫描件也列进去（那是不实陈述）。
+            if manifest.signature.per_document.is_empty() {
+                // 旧版服务端没有这个字段：退回「整包占位」的旧语义。
+                if manifest.signature.placeholder {
+                    manifest.signature.documents.clone()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                manifest
+                    .signature
+                    .per_document
+                    .iter()
+                    .filter(|item| item.signer == "mock")
+                    .map(|item| item.document.clone())
+                    .collect()
+            }
         },
+        document_signers: manifest
+            .signature
+            .per_document
+            .iter()
+            .map(|item| DocumentSigner {
+                document: item.document.clone(),
+                signer: item.signer.clone(),
+            })
+            .collect(),
     })
 }
 

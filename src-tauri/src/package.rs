@@ -62,6 +62,8 @@ fn prepare(
     ffprobe_path: Option<String>,
     rules: Option<ChecklistRules>,
     device_id: &str,
+    cost_sheet_scan: Option<String>,
+    ownership_scan: Option<String>,
 ) -> Result<Prepared, CommandError> {
     // 生成前重新探测（避免用过期规格），这一段同样要有进度，否则界面像卡死。
     let analysis = analyze_drama_inner(root, name, ffprobe_path, rules, "generate", |progress| {
@@ -125,7 +127,11 @@ fn prepare(
         "校验值计算完成，正在请服务端生成文档".into(),
     );
 
-    let body = json!({
+    // 扫描件签章：给了哪几份就用哪几份，其余仍走占位章（混合签章，用户已确认要支持）。
+    // 本机先把格式与大小查清楚，免得传上去才被服务端拒（那会白占一次生成次数）。
+    let scans = read_scans(cost_sheet_scan.as_deref(), ownership_scan.as_deref())?;
+    let signer = if scans.is_empty() { "mock" } else { "scan" };
+    let mut body = json!({
         "device_id": device_id,
         "drama_name": drama.name,
         "ai_generated": ai_generated,
@@ -139,8 +145,11 @@ fn prepare(
         "synopsis": synopsis,
         "cover": cover,
         "episodes": episodes,
-        "signer": "mock",
+        "signer": signer,
     });
+    if !scans.is_empty() {
+        body["scans"] = serde_json::Value::Object(scans);
+    }
     Ok(Prepared {
         drama_name: drama.name,
         drama_dir: drama.dir,
@@ -148,6 +157,89 @@ fn prepare(
         body,
         local_sources,
     })
+}
+
+/// 选一份「已盖好章的扫描件」（成本配置表 / 内容权属声明用）。
+///
+/// 只允许 PNG / JPEG / PDF——和服务端的 `scan_to_pdf` 支持的格式一致，
+/// 也是本机 `read_scans` 会先查一遍的那三种。在文件选择器这一层就挡掉别的格式，
+/// 比让用户选完再报错省事。
+#[tauri::command]
+pub async fn pick_scan_file() -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("选择已盖好章的扫描件（PNG / JPEG / PDF，不超过 5 MB）")
+            .add_filter("扫描件", &["png", "jpg", "jpeg", "pdf"])
+            .pick_file()
+            .map(|path| path.display().to_string())
+    })
+    .await
+    .map_err(|error| format!("文件选择任务失败：{error}"))
+}
+
+/// 要盖章的两份文档在报审包里的路径（必须和服务端 `render_documents` 给出的 `sealed` 一致，
+/// 否则服务端会以「不需要盖章的文档」拒绝扫描件）。
+const COST_SHEET_PDF: &str = "04_成本配置表/成本配置表.pdf";
+const OWNERSHIP_PDF: &str = "05_权属声明/内容权属声明.pdf";
+/// 单份扫描件的本机上限：服务端 base64 字段上限约 5.24 MB 原文，留一点余量。
+const MAX_SCAN_BYTES: u64 = 5 * 1024 * 1024;
+
+/// 读扫描件并编码成 base64（按服务端要求的「文档路径 → base64」）。
+///
+/// 本机先查格式与大小：只认 PNG / JPEG / PDF，超过 5 MB 直接拒绝并说清原因。
+/// 一份都没给时返回空表（`signer` 保持 `mock`）。
+fn read_scans(
+    cost_sheet: Option<&str>,
+    ownership: Option<&str>,
+) -> Result<serde_json::Map<String, serde_json::Value>, CommandError> {
+    let mut scans = serde_json::Map::new();
+    for (label, path, document) in [
+        ("成本配置表", cost_sheet, COST_SHEET_PDF),
+        ("内容权属声明", ownership, OWNERSHIP_PDF),
+    ] {
+        let Some(path) = path else { continue };
+        let path = Path::new(path);
+        if !path.is_file() {
+            return Err(local_error(
+                "scan_invalid",
+                format!("{label}的扫描件不存在：{}", path.display()),
+            ));
+        }
+        let extension = path
+            .extension()
+            .map(|value| value.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if !matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "pdf") {
+            return Err(local_error(
+                "scan_invalid",
+                format!("{label}的扫描件只能是 PNG、JPEG 或 PDF，实际是 .{extension}"),
+            ));
+        }
+        let metadata = std::fs::metadata(path).map_err(|error| {
+            local_error(
+                "io",
+                format!("读取{label}的扫描件失败（{}）：{error}", path.display()),
+            )
+        })?;
+        if metadata.len() > MAX_SCAN_BYTES {
+            return Err(local_error(
+                "scan_invalid",
+                format!(
+                    "{label}的扫描件太大（{:.1} MB），上限是 5 MB；请压缩后再选",
+                    metadata.len() as f64 / (1024.0 * 1024.0)
+                ),
+            ));
+        }
+        let bytes = std::fs::read(path).map_err(|error| {
+            local_error(
+                "io",
+                format!("读取{label}的扫描件失败（{}）：{error}", path.display()),
+            )
+        })?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        scans.insert(document.to_string(), json!(encoded));
+    }
+    Ok(scans)
 }
 
 fn decode_files(
@@ -193,6 +285,8 @@ pub async fn generate_package(
     cost_sheet: Option<CostSheetForm>,
     ffprobe_path: Option<String>,
     rules: Option<ChecklistRules>,
+    cost_sheet_scan: Option<String>,
+    ownership_scan: Option<String>,
 ) -> Result<PackageResult, CommandError> {
     let (device_id, keys) = account.signing_context()?;
 
@@ -210,6 +304,8 @@ pub async fn generate_package(
                 ffprobe_path,
                 rules,
                 &device_id,
+                cost_sheet_scan,
+                ownership_scan,
             )
         })
         .await
