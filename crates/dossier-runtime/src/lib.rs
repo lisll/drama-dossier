@@ -30,8 +30,9 @@ pub mod update;
 
 pub use caps::{
     evaluate_gpu, negotiate_video, plan_encoder, plan_parallelism, probe_environment,
-    CapabilityReport, EncoderPlan, GpuCapability, ParallelismCapability, ParallelismPreset,
-    ProbeConfig, VideoProcessingCapabilities,
+    verify_encoder_plan, CapabilityReport, EncoderPlan, EncoderVerificationConfig, GpuCapability,
+    HardwareSignal, ParallelismCapability, ParallelismPreset, ProbeConfig,
+    VideoProcessingCapabilities,
 };
 pub use command::{
     CommandError, CommandOutput, CommandRunner, CommandSpec, FakeRunner, SystemRunner,

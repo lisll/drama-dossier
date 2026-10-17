@@ -41,6 +41,8 @@ pub enum CapsError {
 /// 硬件加速的**设备侧**信号：设备节点在不在。
 ///
 /// 这一层只是「值得一试」的门槛，不是结论——能不能用由 [`verify_hardware_encoder`] 说了算。
+/// VideoToolbox（macOS）和 QSV（Windows / Intel 核显）没有 Linux 式的设备节点，
+/// 信号位按目标平台常开：真机上靠 `-encoders` 列表 + 单帧实测把关。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HardwareSignal {
@@ -50,6 +52,12 @@ pub struct HardwareSignal {
     pub vaapi: bool,
     /// `/dev/video*`（V4L2 M2M 需要）。
     pub v4l2m2m: bool,
+    /// macOS VideoToolbox：没有设备节点，按平台常开（见 [`Self::platform_defaults`]）。
+    #[serde(default)]
+    pub videotoolbox: bool,
+    /// Intel 核显 Quick Sync（Windows 优先）：同上。
+    #[serde(default)]
+    pub qsv: bool,
 }
 
 impl HardwareSignal {
@@ -59,6 +67,8 @@ impl HardwareSignal {
             cuda: false,
             vaapi: false,
             v4l2m2m: false,
+            videotoolbox: false,
+            qsv: false,
         }
     }
 
@@ -68,15 +78,20 @@ impl HardwareSignal {
             cuda: true,
             vaapi: true,
             v4l2m2m: true,
+            videotoolbox: true,
+            qsv: true,
         }
     }
 
-    /// 读设备节点得到信号。
+    /// 读设备节点得到信号。macOS / Windows 没有这些节点；那两个平台的硬件编码
+    /// （VideoToolbox / QSV）由 [`Self::platform_defaults`] 补常开信号。
     pub fn detect() -> Self {
         Self {
             cuda: Path::new("/dev/nvidia0").exists() || Path::new("/dev/nvidiactl").exists(),
             vaapi: first_vaapi_device().is_some(),
             v4l2m2m: first_v4l2_device().is_some(),
+            videotoolbox: false,
+            qsv: false,
         }
     }
 
@@ -84,6 +99,19 @@ impl HardwareSignal {
     #[must_use]
     pub fn with_cuda(mut self, cuda: bool) -> Self {
         self.cuda = self.cuda || cuda;
+        self
+    }
+
+    /// 平台默认信号：macOS / Windows 没有设备节点可查，VideoToolbox / QSV 的信号按平台常开。
+    /// 剩下的把关是 `ffmpeg -encoders` 列表（编译没带就是不可用）+ 单帧实测。
+    #[must_use]
+    pub fn platform_defaults(mut self) -> Self {
+        if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
+            self.videotoolbox = true;
+        }
+        if cfg!(target_os = "windows") {
+            self.qsv = true;
+        }
         self
     }
 
@@ -95,6 +123,10 @@ impl HardwareSignal {
             self.vaapi
         } else if encoder.ends_with("_v4l2m2m") {
             self.v4l2m2m
+        } else if encoder.ends_with("_videotoolbox") {
+            self.videotoolbox
+        } else if encoder.ends_with("_qsv") {
+            self.qsv
         } else {
             true
         }
@@ -103,10 +135,12 @@ impl HardwareSignal {
     /// 可读描述（写进决策理由里）。
     pub fn describe(&self) -> String {
         format!(
-            "cuda={} vaapi={} v4l2m2m={}",
+            "cuda={} vaapi={} v4l2m2m={} videotoolbox={} qsv={}",
             if self.cuda { "有" } else { "无" },
             if self.vaapi { "有" } else { "无" },
-            if self.v4l2m2m { "有" } else { "无" }
+            if self.v4l2m2m { "有" } else { "无" },
+            if self.videotoolbox { "有" } else { "无" },
+            if self.qsv { "有" } else { "无" },
         )
     }
 }
@@ -173,12 +207,16 @@ impl EncoderPlan {
 
 /// 编码目标 → 候选编码器（硬件在前）。
 ///
-/// 顺序即优先级：NVENC（NVIDIA）→ VAAPI（Linux 通用硬件）→ V4L2 M2M（嵌入式/ARM）
-/// → 软件编码器。软件编码器永远在链尾，保证「硬件不可用就自动兜底」。
+/// 顺序即优先级：NVENC（NVIDIA）→ QSV（Intel 核显，Windows 优先）→ VideoToolbox（macOS）
+/// → VAAPI（Linux 通用硬件）→ V4L2 M2M（嵌入式/ARM）→ 软件编码器。
+/// 软件编码器永远在链尾，保证「硬件不可用就自动兜底」。非本平台的候选
+/// 因硬件信号（[`HardwareSignal::platform_defaults`]）不满足而跳过，不影响其他平台。
 pub fn encoder_chain(codec: &str) -> Option<Vec<(&'static str, bool)>> {
     let chain = match codec {
         "h264" | "avc" => vec![
             ("h264_nvenc", true),
+            ("h264_qsv", true),
+            ("h264_videotoolbox", true),
             ("h264_vaapi", true),
             ("h264_v4l2m2m", true),
             ("libx264", false),
@@ -186,13 +224,20 @@ pub fn encoder_chain(codec: &str) -> Option<Vec<(&'static str, bool)>> {
         ],
         "hevc" | "h265" => vec![
             ("hevc_nvenc", true),
+            ("hevc_qsv", true),
+            ("hevc_videotoolbox", true),
             ("hevc_vaapi", true),
             ("hevc_v4l2m2m", true),
             ("libx265", false),
         ],
-        "vp9" => vec![("vp9_vaapi", true), ("libvpx-vp9", false)],
+        "vp9" => vec![
+            ("vp9_qsv", true),
+            ("vp9_vaapi", true),
+            ("libvpx-vp9", false),
+        ],
         "av1" => vec![
             ("av1_nvenc", true),
+            ("av1_qsv", true),
             ("av1_vaapi", true),
             ("libaom-av1", false),
             ("libsvtav1", false),
@@ -928,7 +973,11 @@ pub fn probe_environment(runner: &dyn CommandRunner, config: &ProbeConfig) -> Ca
     let cpu_count = std::thread::available_parallelism()
         .map(|value| value.get())
         .unwrap_or(1);
-    let signal = HardwareSignal::detect().with_cuda(gpu.available);
+    // `platform_defaults` 必须带上：macOS 的 VideoToolbox 和 Windows 的 QSV 没有设备节点可查，
+    // `detect()` 对它们只会给 false。漏了这一步，那两个平台就永远落回软件编码。
+    let signal = HardwareSignal::detect()
+        .with_cuda(gpu.available)
+        .platform_defaults();
 
     let mut video = negotiate_video(
         &ffmpeg.encoders,
@@ -1065,9 +1114,8 @@ mod tests {
 
         // 只有 VAAPI 设备时选 VAAPI，不选 V4L2。
         let only_vaapi = HardwareSignal {
-            cuda: false,
             vaapi: true,
-            v4l2m2m: false,
+            ..HardwareSignal::none()
         };
         let plan = plan_encoder(&list, "h264", true, &only_vaapi).unwrap();
         assert_eq!(plan.selected, "h264_vaapi");
@@ -1130,10 +1178,42 @@ mod tests {
         match error {
             CapsError::NoEncoder { candidates, .. } => {
                 assert!(candidates.contains(&"libx264".to_string()));
-                assert_eq!(candidates.len(), 5);
+                // h264 候选链：nvenc / qsv / videotoolbox / vaapi / v4l2m2m + 两个软件编码器。
+                assert_eq!(candidates.len(), 7);
             }
             other => panic!("期望 NoEncoder，得到 {other:?}"),
         }
+    }
+
+    #[test]
+    fn platform_encoders_gate_on_platform_signal() {
+        // 模拟 macOS：VideoToolbox 信号开、QSV 不开。
+        let mac = HardwareSignal {
+            videotoolbox: true,
+            ..HardwareSignal::none()
+        };
+        let list = encoders(&["h264_videotoolbox", "h264_qsv", "libx264"]);
+        let plan = plan_encoder(&list, "h264", true, &mac).unwrap();
+        assert_eq!(plan.selected, "h264_videotoolbox");
+        // 选中硬件时理由是「选择硬件编码器 …（设备信号：…）」，被门挡住的候选看 describe。
+        assert!(plan.reason.contains("选择硬件编码器 h264_videotoolbox"));
+        assert!(plan.reason.contains("qsv=无"));
+
+        // 模拟 Windows：QSV 和 VideoToolbox 都开（VideoToolbox 也可能被编译进去），QSV 在前。
+        let win = HardwareSignal {
+            videotoolbox: true,
+            qsv: true,
+            ..HardwareSignal::none()
+        };
+        let list = encoders(&["h264_videotoolbox", "h264_qsv", "libx264"]);
+        let plan = plan_encoder(&list, "h264", true, &win).unwrap();
+        assert_eq!(plan.selected, "h264_qsv");
+
+        // 都没开（Linux 开发机）：两个平台候选都跳过，回软件编码。
+        let linux = HardwareSignal::none();
+        let plan = plan_encoder(&list, "h264", true, &linux).unwrap();
+        assert_eq!(plan.selected, "libx264");
+        assert!(!plan.hardware);
     }
 
     #[test]
@@ -1361,13 +1441,16 @@ mod tests {
     fn hardware_signal_describes_itself_and_gates_encoders() {
         let signal = HardwareSignal {
             cuda: true,
-            vaapi: false,
             v4l2m2m: true,
+            ..HardwareSignal::none()
         };
         assert!(signal.allows("h264_nvenc"));
         assert!(!signal.allows("h264_vaapi"));
         assert!(signal.allows("h264_v4l2m2m"));
         assert!(signal.allows("libx264"));
+        // 新增的平台编码器：信号不开就不允许。
+        assert!(!signal.allows("h264_videotoolbox"));
+        assert!(!signal.allows("h264_qsv"));
         let described = signal.describe();
         assert!(described.contains("cuda=有"));
         assert!(described.contains("vaapi=无"));
@@ -1527,5 +1610,416 @@ mod tests {
         let runner = FakeRunner::new();
         let caps = probe_ffmpeg_capabilities(&runner, None);
         assert!(!caps.usable());
+    }
+
+    // ===== M4b-1：硬件编码器探测与候选链（平台编码器）=====
+    //
+    // 本机是 Linux，没有 VideoToolbox / QSV 设备，所以这里验证的是**解析 + 选择逻辑**：
+    // 三段贴近真机的 `ffmpeg -encoders` 输出 → 交给 `parse_encoder_listing` → 交给 `plan_encoder`。
+
+    use crate::probe::parse_encoder_listing;
+
+    /// macOS 上的 `ffmpeg -encoders`（VideoToolbox 系列 + libx264/libx265）。
+    const MACOS_ENCODER_LISTING: &str = "\
+Encoders:
+ V..... = Video
+ A..... = Audio
+ S..... = Subtitle
+ .F.... = Frame-level multithreading
+ ..S... = Slice-level multithreading
+ ...X.. = Codec is experimental
+ ....B. = Supports draw_horiz_band
+ .....D = Supports direct rendering method 1
+ ------
+ V....D h264_videotoolbox    VideoToolbox H.264 Encoder (codec h264)
+ V....D hevc_videotoolbox    VideoToolbox HEVC Encoder (codec hevc)
+ V....D prores_videotoolbox  VideoToolbox ProRes Encoder (codec prores)
+ V....D libx264              libx264 H.264 / AVC / MPEG-4 AVC (codec h264)
+ V....D libx265              libx265 H.265 / HEVC (codec hevc)
+ A....D aac                  AAC (Advanced Audio Coding)
+";
+
+    /// Windows 上的 `ffmpeg -encoders`（QSV + NVENC + AMF 都在，实际只有一路能用）。
+    const WINDOWS_ENCODER_LISTING: &str = "\
+Encoders:
+ V..... = Video
+ A..... = Audio
+ S..... = Subtitle
+ .F.... = Frame-level multithreading
+ ..S... = Slice-level multithreading
+ ...X.. = Codec is experimental
+ ....B. = Supports draw_horiz_band
+ .....D = Supports direct rendering method 1
+ ------
+ V....D h264_qsv             H.264 (Intel Quick Sync Video) (codec h264)
+ V....D h264_nvenc           NVIDIA NVENC H.264 encoder (codec h264)
+ V....D h264_amf             AMD AMF H.264 Encoder (codec h264)
+ V....D hevc_qsv             HEVC (Intel Quick Sync Video) (codec hevc)
+ V....D libx264              libx264 H.264 / AVC / MPEG-4 AVC (codec h264)
+ V....D libx265              libx265 H.265 / HEVC (codec hevc)
+ A....D aac                  AAC (Advanced Audio Coding)
+";
+
+    /// 精简 Linux 版 ffmpeg（没编译任何硬件编码器，只有两个软件编码器）。
+    const LEAN_LINUX_ENCODER_LISTING: &str = "\
+Encoders:
+ V..... = Video
+ A..... = Audio
+ S..... = Subtitle
+ .F.... = Frame-level multithreading
+ ..S... = Slice-level multithreading
+ ...X.. = Codec is experimental
+ ....B. = Supports draw_horiz_band
+ .....D = Supports direct rendering method 1
+ ------
+ V....D libx264              libx264 H.264 / AVC / MPEG-4 AVC (codec h264)
+ V....D libx265              libx265 H.265 / HEVC (codec hevc)
+";
+
+    #[test]
+    fn parses_real_platform_encoder_listings() {
+        // ---- macOS：VideoToolbox 系列被解析进 video，描述里的单词不会被当成编码器名。
+        let mac = parse_encoder_listing(MACOS_ENCODER_LISTING);
+        assert!(mac.video.contains("h264_videotoolbox"));
+        assert!(mac.video.contains("hevc_videotoolbox"));
+        assert!(mac.video.contains("prores_videotoolbox"));
+        assert!(mac.video.contains("libx264"));
+        assert!(mac.video.contains("libx265"));
+        // 这一份输出里没有的编码器不能凭空出现。
+        assert!(!mac.video.contains("h264_qsv"));
+        assert!(!mac.video.contains("h264_nvenc"));
+        assert!(!mac.video.contains("h264_vaapi"));
+        assert_eq!(mac.video.len(), 5);
+        assert_eq!(mac.audio.len(), 1);
+
+        // ---- Windows：QSV / NVENC / AMF 都在清单里。
+        let windows = parse_encoder_listing(WINDOWS_ENCODER_LISTING);
+        assert!(windows.video.contains("h264_qsv"));
+        assert!(windows.video.contains("h264_nvenc"));
+        assert!(windows.video.contains("h264_amf"));
+        assert!(windows.video.contains("hevc_qsv"));
+        assert!(windows.video.contains("libx264"));
+        assert!(!windows.video.contains("h264_videotoolbox"));
+        assert!(!windows.video.contains("h264_vaapi"));
+        assert_eq!(windows.video.len(), 6);
+        assert_eq!(windows.audio.len(), 1);
+
+        // ---- 精简 Linux：只有两个软件编码器。
+        let lean = parse_encoder_listing(LEAN_LINUX_ENCODER_LISTING);
+        assert!(lean.video.contains("libx264"));
+        assert!(lean.video.contains("libx265"));
+        assert_eq!(lean.video.len(), 2);
+        assert!(lean.audio.is_empty());
+        assert!(lean.subtitle.is_empty());
+
+        // ---- 表头/图例/描述分词都不能被当成编码器名吃进来（三段一起查）。
+        for list in [&mac, &windows, &lean] {
+            assert!(!list.video.contains("Video"));
+            assert!(!list.video.contains("Encoders:"));
+            assert!(!list.video.contains("="));
+            assert!(!list.video.contains("Frame-level"));
+            assert!(!list.video.contains("Slice-level"));
+            assert!(!list.video.contains("Supports"));
+            assert!(!list.supports("Video"));
+            assert!(!list.supports("="));
+            assert!(!list.supports("Encoders:"));
+            // 描述列里的首个单词也不会被当成名字。
+            assert!(!list.video.contains("VideoToolbox"));
+            assert!(!list.video.contains("NVIDIA"));
+            assert!(!list.video.contains("H.264"));
+        }
+        assert!(!mac.supports("--"));
+    }
+
+    #[test]
+    fn plans_hardware_encoder_per_platform_signal() {
+        // macOS：只开 VideoToolbox 信号 → 选 h264_videotoolbox。
+        let mac_signal = HardwareSignal {
+            videotoolbox: true,
+            ..HardwareSignal::none()
+        };
+        let mac_list = parse_encoder_listing(MACOS_ENCODER_LISTING);
+        let mac = plan_encoder(&mac_list, "h264", true, &mac_signal).unwrap();
+        assert_eq!(mac.selected, "h264_videotoolbox");
+        assert!(mac.hardware);
+        assert!(mac.prefer_hardware);
+        assert_eq!(
+            mac.reason,
+            "选择硬件编码器 h264_videotoolbox（设备信号：cuda=无 vaapi=无 v4l2m2m=无 videotoolbox=有 qsv=无）"
+        );
+        // 同一个信号下 hevc 也走 VideoToolbox。
+        let mac_hevc = plan_encoder(&mac_list, "hevc", true, &mac_signal).unwrap();
+        assert_eq!(mac_hevc.selected, "hevc_videotoolbox");
+        assert!(mac_hevc.hardware);
+
+        // Windows：QSV + VideoToolbox 都开 → 链里 QSV 在 VideoToolbox 前面，选 h264_qsv。
+        let windows_signal = HardwareSignal {
+            qsv: true,
+            videotoolbox: true,
+            ..HardwareSignal::none()
+        };
+        let windows_list = parse_encoder_listing(WINDOWS_ENCODER_LISTING);
+        let windows = plan_encoder(&windows_list, "h264", true, &windows_signal).unwrap();
+        assert_eq!(windows.selected, "h264_qsv");
+        assert!(windows.hardware);
+        assert_eq!(
+            windows.reason,
+            "选择硬件编码器 h264_qsv（设备信号：cuda=无 vaapi=无 v4l2m2m=无 videotoolbox=有 qsv=有）"
+        );
+        // QSV 在链上确实排在 VideoToolbox 之前（前三项）。
+        let head: Vec<&str> = windows
+            .candidates
+            .iter()
+            .take(3)
+            .map(|candidate| candidate.name.as_str())
+            .collect();
+        assert_eq!(head, vec!["h264_nvenc", "h264_qsv", "h264_videotoolbox"]);
+        // NVENC 编译进来了但 CUDA 信号没开 → 不可用，被跳过。
+        let nvenc = windows.candidate("h264_nvenc").unwrap();
+        assert!(nvenc.compiled);
+        assert!(!nvenc.available);
+
+        // Linux（精简 ffmpeg）：没有任何硬件信号 → 落到 libx264，hardware=false。
+        let lean_list = parse_encoder_listing(LEAN_LINUX_ENCODER_LISTING);
+        let linux = plan_encoder(&lean_list, "h264", true, &HardwareSignal::none()).unwrap();
+        assert_eq!(linux.selected, "libx264");
+        assert!(!linux.hardware);
+        // 一个硬件编码器都没编译进来时没有「△」说明，理由是干净的一句回退。
+        assert_eq!(linux.reason, "没有可用的硬件编码器，回退软件编码 libx264");
+    }
+
+    #[test]
+    fn skips_hardware_encoders_absent_from_listing() {
+        // ---- 信号全开，但这份 ffmpeg 没编译 qsv/nvenc：每个硬件候选都被跳过，落到 libx264。
+        let lean_list = parse_encoder_listing(LEAN_LINUX_ENCODER_LISTING);
+        let plan = plan_encoder(&lean_list, "h264", true, &HardwareSignal::all()).unwrap();
+        assert_eq!(plan.selected, "libx264");
+        assert!(!plan.hardware);
+        assert_eq!(plan.reason, "没有可用的硬件编码器，回退软件编码 libx264");
+        let nvenc = plan.candidate("h264_nvenc").unwrap();
+        assert!(!nvenc.compiled);
+        assert!(!nvenc.available);
+        let qsv = plan.candidate("h264_qsv").unwrap();
+        assert!(!qsv.compiled);
+        assert!(!qsv.available);
+        let videotoolbox = plan.candidate("h264_videotoolbox").unwrap();
+        assert!(!videotoolbox.compiled);
+        assert!(!videotoolbox.available);
+        // 候选链本身不缩水：7 项全在，只是位置靠后/不可用。
+        assert_eq!(plan.candidates.len(), 7);
+
+        // ---- 链首的 nvenc 没编译 → 跳过后落到下一个候选 h264_qsv。
+        let qsv_only = encoders(&["h264_qsv", "libx264"]);
+        let plan = plan_encoder(&qsv_only, "h264", true, &HardwareSignal::all()).unwrap();
+        assert_eq!(plan.selected, "h264_qsv");
+        assert!(plan.hardware);
+        assert_eq!(
+            plan.reason,
+            "选择硬件编码器 h264_qsv（设备信号：cuda=有 vaapi=有 v4l2m2m=有 videotoolbox=有 qsv=有）"
+        );
+        assert_eq!(plan.candidates[0].name, "h264_nvenc");
+        assert!(!plan.candidates[0].compiled);
+
+        // ---- 信号全开、清单里一半硬件编码器没编译：跳过的写 `✗`，门被挡的写 `△`，
+        //      真正可用的写 `✓`；理由里能逐项看出谁被跳过了。
+        let mac_list = parse_encoder_listing(MACOS_ENCODER_LISTING);
+        let plan = plan_encoder(&mac_list, "h264", false, &HardwareSignal::all()).unwrap();
+        assert_eq!(plan.selected, "libx264");
+        assert!(!plan.hardware);
+        assert_eq!(
+            plan.reason,
+            "按用户要求优先软件编码 libx264；候选链里也有可用硬件编码器（h264_nvenc✗ / h264_qsv✗ / h264_videotoolbox✓ / h264_vaapi✗ / h264_v4l2m2m✗）"
+        );
+        assert!(plan.candidate("h264_videotoolbox").unwrap().available);
+        assert!(!plan.candidate("h264_qsv").unwrap().compiled);
+        // 关掉 VideoToolbox 信号后，软件优先路径的理由会变成「一个可用硬件都没有」，
+        // 被门挡住的编译候选写进 gated 说明里（`△` 只在软件优先时硬件仍可用的情况下出现）。
+        let plan = plan_encoder(&mac_list, "h264", false, &HardwareSignal::none()).unwrap();
+        assert_eq!(plan.selected, "libx264");
+        assert_eq!(
+            plan.reason,
+            "没有可用的硬件编码器，回退软件编码 libx264；h264_videotoolbox 编译进来了但缺少硬件设备（cuda=无 vaapi=无 v4l2m2m=无 videotoolbox=无 qsv=无）"
+        );
+        assert!(!plan.candidate("h264_videotoolbox").unwrap().available);
+        // 硬件优先时，同一份清单的理由里也是这句 gated 说明。
+        let plan = plan_encoder(&mac_list, "h264", true, &HardwareSignal::none()).unwrap();
+        assert!(plan
+            .reason
+            .contains("h264_videotoolbox 编译进来了但缺少硬件设备"));
+    }
+
+    #[test]
+    fn software_only_choice_ignores_available_hardware() {
+        // 用户选了「只用软件编码」：硬件信号全开、清单里也有硬件编码器，仍然选软件编码器。
+        let windows_list = parse_encoder_listing(WINDOWS_ENCODER_LISTING);
+        let plan = plan_encoder(&windows_list, "h264", false, &HardwareSignal::all()).unwrap();
+        assert_eq!(plan.selected, "libx264");
+        assert!(!plan.hardware);
+        assert!(!plan.prefer_hardware);
+        // 软件候选被提到链首（候选链顺序就是实际尝试顺序）。
+        assert_eq!(plan.candidates[0].name, "libx264");
+        assert_eq!(plan.candidates[1].name, "libx264rgb");
+        assert_eq!(plan.candidates[2].name, "h264_nvenc");
+        assert!(plan
+            .reason
+            .starts_with("按用户要求优先软件编码 libx264；候选链里也有可用硬件编码器"));
+        // 硬件候选依旧可用，只是没被选：QSV 在这份清单里、信号也开着。
+        assert!(plan.candidate("h264_qsv").unwrap().available);
+
+        // hevc 同理：libx265 优先，尽管 QSV 可用。
+        let plan = plan_encoder(&windows_list, "hevc", false, &HardwareSignal::all()).unwrap();
+        assert_eq!(plan.selected, "libx265");
+        assert!(!plan.hardware);
+        assert!(plan.candidate("hevc_qsv").unwrap().available);
+    }
+
+    #[test]
+    fn hardware_chains_carry_qsv_in_priority_order() {
+        // h264：nvenc → qsv → videotoolbox → vaapi → v4l2m2m → 软件。
+        assert_eq!(
+            encoder_chain("h264").unwrap(),
+            vec![
+                ("h264_nvenc", true),
+                ("h264_qsv", true),
+                ("h264_videotoolbox", true),
+                ("h264_vaapi", true),
+                ("h264_v4l2m2m", true),
+                ("libx264", false),
+                ("libx264rgb", false),
+            ]
+        );
+        // hevc：QSV 紧跟 NVENC（第 2 位）。
+        assert_eq!(
+            encoder_chain("hevc").unwrap(),
+            vec![
+                ("hevc_nvenc", true),
+                ("hevc_qsv", true),
+                ("hevc_videotoolbox", true),
+                ("hevc_vaapi", true),
+                ("hevc_v4l2m2m", true),
+                ("libx265", false),
+            ]
+        );
+        // vp9：链首就是 QSV（没有 nvenc/videotoolbox 分支）。
+        assert_eq!(
+            encoder_chain("vp9").unwrap(),
+            vec![
+                ("vp9_qsv", true),
+                ("vp9_vaapi", true),
+                ("libvpx-vp9", false)
+            ]
+        );
+        // av1：nvenc → qsv → vaapi → 两个软件编码器。
+        assert_eq!(
+            encoder_chain("av1").unwrap(),
+            vec![
+                ("av1_nvenc", true),
+                ("av1_qsv", true),
+                ("av1_vaapi", true),
+                ("libaom-av1", false),
+                ("libsvtav1", false),
+            ]
+        );
+        // 别名走同一条链。
+        assert_eq!(encoder_chain("h265"), encoder_chain("hevc"));
+        assert_eq!(encoder_chain("avc"), encoder_chain("h264"));
+
+        // 链里带 QSV 且信号开着时，vp9 / av1 真的会选到 QSV。
+        let qsv_only = HardwareSignal {
+            qsv: true,
+            ..HardwareSignal::none()
+        };
+        let plan = plan_encoder(
+            &encoders(&["vp9_qsv", "libvpx-vp9"]),
+            "vp9",
+            true,
+            &qsv_only,
+        )
+        .unwrap();
+        assert_eq!(plan.selected, "vp9_qsv");
+        assert!(plan.hardware);
+        let plan = plan_encoder(
+            &encoders(&["av1_qsv", "libaom-av1", "libsvtav1"]),
+            "av1",
+            true,
+            &qsv_only,
+        )
+        .unwrap();
+        assert_eq!(plan.selected, "av1_qsv");
+        assert!(plan.hardware);
+        // QSV 信号没开时这两条链照样回退到软件编码器。
+        let plan = plan_encoder(
+            &encoders(&["vp9_qsv", "libvpx-vp9"]),
+            "vp9",
+            true,
+            &HardwareSignal::none(),
+        )
+        .unwrap();
+        assert_eq!(plan.selected, "libvpx-vp9");
+        assert!(!plan.hardware);
+    }
+
+    #[test]
+    fn hardware_signal_deserializes_legacy_cache_json() {
+        // 先确认真实序列化出来的键名，再按这些键写「旧版本缓存」。
+        assert_eq!(
+            serde_json::to_value(HardwareSignal::all()).unwrap(),
+            serde_json::json!({
+                "cuda": true,
+                "vaapi": true,
+                "v4l2m2m": true,
+                "videotoolbox": true,
+                "qsv": true,
+            })
+        );
+
+        // 旧版本缓存里没有 videotoolbox / qsv 两个字段：必须默认成 false 而不是报错。
+        let legacy =
+            serde_json::from_str::<HardwareSignal>(r#"{"cuda":true,"vaapi":false,"v4l2m2m":true}"#)
+                .expect("缺少 videotoolbox / qsv 的旧 JSON 必须仍能反序列化");
+        assert!(legacy.cuda);
+        assert!(!legacy.vaapi);
+        assert!(legacy.v4l2m2m);
+        assert!(!legacy.videotoolbox);
+        assert!(!legacy.qsv);
+        assert_eq!(
+            legacy.describe(),
+            "cuda=有 vaapi=无 v4l2m2m=有 videotoolbox=无 qsv=无"
+        );
+        // 旧缓存读进来后，新平台编码器仍受信号门控（默认 false → 不允许）。
+        assert!(!legacy.allows("h264_videotoolbox"));
+        assert!(!legacy.allows("h264_qsv"));
+        assert!(legacy.allows("h264_nvenc"));
+        assert!(legacy.allows("libx264"));
+
+        // 只带新字段的 JSON 同样能读，且老的三个字段按实际值还原。
+        let only_new = serde_json::from_str::<HardwareSignal>(
+            r#"{"cuda":true,"vaapi":false,"v4l2m2m":true,"videotoolbox":true,"qsv":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            only_new,
+            HardwareSignal {
+                cuda: true,
+                vaapi: false,
+                v4l2m2m: true,
+                videotoolbox: true,
+                qsv: true,
+            }
+        );
+        assert!(only_new.allows("h264_videotoolbox"));
+        assert!(only_new.allows("h264_qsv"));
+        assert!(!only_new.allows("h264_vaapi"));
+
+        // 新信号的 round-trip 不丢字段。
+        let full = HardwareSignal {
+            cuda: true,
+            vaapi: true,
+            v4l2m2m: false,
+            videotoolbox: true,
+            qsv: false,
+        };
+        let text = serde_json::to_string(&full).unwrap();
+        assert_eq!(serde_json::from_str::<HardwareSignal>(&text).unwrap(), full);
     }
 }
