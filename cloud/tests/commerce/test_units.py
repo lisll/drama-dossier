@@ -198,7 +198,8 @@ GOOD_REGISTER = {"email": "a@example.com", "code": "012345", "password": "longen
         {"code": "12345"},
         {"code": "12345a"},
         {"code": "１２３４５６"},
-        {"invite_code": "abc"},
+        # 未知字段仍要被拒；invite_code 现在是合法字段（M5a），改成超长的邀请码。
+        {"invite_code": "x" * 17},
     ],
 )
 def test_register_request_rejects(override):

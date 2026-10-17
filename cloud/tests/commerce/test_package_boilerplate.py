@@ -21,6 +21,7 @@ import pytest
 from PIL import Image
 from pypdf import PdfWriter
 
+from drama_cloud.commerce import credits
 from drama_cloud.commerce.body_limit import DEFAULT_LIMIT, PACKAGE_LIMIT
 from drama_cloud.commerce.documents.signer import MAX_SCAN_BYTES
 from drama_cloud.commerce.package_routes import PACKAGE_PER_USER, RECIPE_PER_USER
@@ -72,9 +73,12 @@ def create(client, token: str, body: dict):
 
 
 def issue(client, token: str, device: str = PC, task: str = TASK, platform: str = "universal",
-          strength: str = "medium"):
+          strength: str = "medium", episode_count: int = 2):
+    # `episode_count` 是按集计价的输入（M5a）；这些样板用例只关心限流与请求体上限，
+    # 给一个固定集数就够了。
     return client.post("/api/v1/recipes", headers=auth(token),
-                       json={"device_id": device, "task": task, "platform": platform, "strength": strength})
+                       json={"device_id": device, "task": task, "platform": platform,
+                             "strength": strength, "episode_count": episode_count})
 
 
 def consume(client, token: str, recipe_id: str, device: str = PC):
@@ -83,12 +87,13 @@ def consume(client, token: str, recipe_id: str, device: str = PC):
 
 @pytest.fixture()
 def account(client, register, pg):
-    """注册、绑定 PC、兑换一张月卡。"""
+    """注册、绑定 PC、兑换一张月卡，并给够生成报审包的积分（M5a 起要扣费）。"""
     body = register(EMAIL, PASSWORD)
     token = body["tokens"]["access_token"]
     assert activate(client, token, PC).status_code == 200
     [code] = new_cards(pg, days=30)
     assert client.post("/api/v1/cards/redeem", json={"code": code}, headers=auth(token)).status_code == 200
+    credits.grant(pg, body["user"]["id"], 1000, idempotency_key=f"seed:{EMAIL}")
     return {"id": body["user"]["id"], "token": token}
 
 

@@ -7,7 +7,7 @@ import json
 
 import pytest
 
-from drama_cloud.commerce import license_token as lt
+from drama_cloud.commerce import credits, license_token as lt
 from drama_cloud.commerce.platform_specs import PLATFORM_SPECS
 from drama_cloud.commerce.recipes import QUALITY_FLOORS, RECIPE_TTL_SECONDS, STRENGTHS, derive_params
 
@@ -21,13 +21,20 @@ PC2 = device_id("pc-2")
 TASK = "c" * 64
 
 
-def _entitled(client, register, pg, email: str, devices=(PC,)) -> dict:
+def _entitled(client, register, pg, email: str, devices=(PC,), seed_credits: int = 100) -> dict:
     body = register(email, PASSWORD)
     token = body["tokens"]["access_token"]
     for device in devices:
         assert activate(client, token, device).status_code == 200
     [code] = new_cards(pg, days=30)
     assert client.post("/api/v1/cards/redeem", json={"code": code}, headers=auth(token)).status_code == 200
+    if seed_credits:
+        # M5a 起，消费配方要扣积分。默认给够钱的额度，让这些用例只测配方本身；
+        # 余额不足的场景在 test_credits.py 与 test_recipe_billing.py 里专门测。
+        credits.grant(
+            pg, body["user"]["id"], seed_credits,
+            idempotency_key=f"test-seed:{email}", memo="测试预置",
+        )
     return {"id": body["user"]["id"], "token": token}
 
 
@@ -38,9 +45,12 @@ def account(client, register, pg):
 
 
 def issue(client, token: str, device: str = PC, task: str = TASK, platform: str = "universal",
-          strength: str = "medium"):
+          strength: str = "medium", episode_count: int = 2):
+    # `episode_count` 是按集计价的输入（M5a）。默认给 2 集，
+    # 个别用例要测价格时再显式传。
     return client.post("/api/v1/recipes", headers=auth(token),
-                       json={"device_id": device, "task": task, "platform": platform, "strength": strength})
+                       json={"device_id": device, "task": task, "platform": platform,
+                             "strength": strength, "episode_count": episode_count})
 
 
 def consume(client, token: str, recipe_id: str, device: str = PC):
@@ -75,7 +85,7 @@ def test_consume_only_once(client, pg, account):
     recipe_id = issue(client, account["token"]).json()["recipe_id"]
     first = consume(client, account["token"], recipe_id)
     assert first.status_code == 200, first.text
-    assert first.json() == {"recipe_id": recipe_id, "consumed": True}
+    assert first.json() == {"recipe_id": recipe_id, "consumed": True, "credits": 10}, first.json()
     second = consume(client, account["token"], recipe_id)
     assert second.status_code == 409
     assert second.json()["error"] == "recipe_consumed"

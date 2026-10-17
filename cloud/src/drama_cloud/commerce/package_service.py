@@ -22,7 +22,7 @@ import uuid
 from typing import Dict, List, Tuple
 
 from .. import toolchain
-from . import entitlements
+from . import credits, entitlements
 from .config import CommerceSettings
 from .db import audit
 from .documents.pdf import Font, LayoutError, render_sealed_document
@@ -70,6 +70,34 @@ class PackageService:
     def create(self, conn, ctx: AuthContext, payload: PackageRequest) -> dict:
         require_access(conn, ctx.user_id, payload.device_id)
         doc_signer = self._doc_signer(payload)
+        # ---- 计费（M5a）：先算价、预扣，再渲染 ----
+        #
+        # 为什么预扣放在渲染**之前**：渲染要跑子进程、可能几秒。先渲染再查余额，
+        # 等于让一个余额不足的请求白占 CPU 与 PDF 字体资源。
+        #
+        # 为什么不能把扣费与渲染放在同一个数据库事务里：渲染是耗时操作，
+        # 长事务会一直占着连接与锁。所以分三段，见下面的 settle / except release。
+        amount = credits.cost_for(conn, "package", len(payload.episodes))
+        # ref 会进流水与审计日志，**不能带剧名**：审计日志一直刻意只存剧名的哈希，
+        # 把明文写进 ref 等于绕过了那条规矩。这里用一次性的开销号做引用，足够对账。
+        with conn.transaction():
+            hold_key = credits.hold(
+                conn, ctx.user_id, amount, ref=f"package:{uuid.uuid4()}",
+                memo=f"报审包（{len(payload.episodes)} 集）",
+            )
+        try:
+            result = self._create_charged(conn, ctx, payload, doc_signer)
+        except BaseException:
+            # 渲染、签章、写库任何一处出错都要把钱退回去。用 BaseException 而不是 Exception：
+            # 进程被取消（KeyboardInterrupt 等）时同样不能把钱留着。
+            credits.release(conn, hold_key, memo="报审包生成失败，已退还")
+            raise
+        credits.settle(conn, hold_key)
+        result["credits"] = amount
+        return result
+
+    def _create_charged(self, conn, ctx: AuthContext, payload: PackageRequest, doc_signer) -> dict:
+        """真正生成报审包（计费在外层完成）。"""
         rendered = self._render(payload)
         package_id = str(uuid.uuid4())
         generated_at = conn.execute("SELECT now() AS now").fetchone()["now"].isoformat()

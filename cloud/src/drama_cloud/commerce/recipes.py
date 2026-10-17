@@ -23,6 +23,8 @@ from .license_token import PAYLOAD_VERSION, Signer
 from .package_service import require_access
 from .platform_specs import PLATFORM_SPECS
 from .schemas import RecipeRequest
+
+from . import credits
 from .sessions import AuthContext
 
 #: 配方有效期：签发后 24 小时内要开工。
@@ -91,19 +93,26 @@ class RecipeService:
         recipe_id = str(uuid.uuid4())
         seed = secrets.randbits(63)
         params = derive_params(payload.platform, payload.strength, seed)
+        # 价格在**签发时**定死并写库。消费时直接读这个值扣款，不重算——
+        # 否则中途改过价目表，就会出现「签发时说 25、扣钱时扣 30」。
+        required = credits.cost_for(conn, "version", payload.episode_count)
         with conn.transaction():
             row = conn.execute(
                 """
-                INSERT INTO recipes (id, user_id, device_id, task, platform, strength, seed, expires_at)
-                VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s, %s, now() + %s * interval '1 second')
+                INSERT INTO recipes
+                    (id, user_id, device_id, task, platform, strength, seed, expires_at,
+                     episode_count, credits)
+                VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s, %s, now() + %s * interval '1 second',
+                        %s, %s)
                 RETURNING floor(extract(epoch FROM issued_at))::bigint AS iat,
                           floor(extract(epoch FROM expires_at))::bigint AS exp
                 """,
                 (recipe_id, ctx.user_id, payload.device_id, payload.task, payload.platform, payload.strength,
-                 seed, RECIPE_TTL_SECONDS),
+                 seed, RECIPE_TTL_SECONDS, payload.episode_count, required),
             ).fetchone()
             audit(conn, ctx.user_id, "recipe.issue", recipe_id,
-                  {"platform": payload.platform, "strength": payload.strength})
+                  {"platform": payload.platform, "strength": payload.strength,
+                   "episodes": payload.episode_count, "credits": required})
         token = self.signer.sign_envelope("recipe", {
             "v": PAYLOAD_VERSION,
             "kid": self.signer.kid,
@@ -118,13 +127,22 @@ class RecipeService:
             "iat": row["iat"],
             "exp": row["exp"],
         })
-        return {"recipe_id": recipe_id, "token": token, "expires_at": row["exp"], "params": params}
+        return {
+            "recipe_id": recipe_id,
+            "token": token,
+            "expires_at": row["exp"],
+            "params": params,
+            # 这次要花多少积分：界面在「开始生成」的确认框里显示。
+            # 真正扣款发生在消费时（见下方 consume），这里只是提前告知。
+            "credits": required,
+            "episode_count": payload.episode_count,
+        }
 
     def consume(self, conn, ctx: AuthContext, recipe_id: str, device_id: str) -> dict:
         with conn.transaction():
             row = conn.execute(
                 """
-                SELECT device_id, consumed_at, expires_at <= now() AS expired
+                SELECT device_id, consumed_at, expires_at <= now() AS expired, credits
                 FROM recipes WHERE id = %s::uuid AND user_id = %s::uuid FOR UPDATE
                 """,
                 (recipe_id, ctx.user_id),
@@ -139,6 +157,22 @@ class RecipeService:
             if row["expired"]:
                 raise CommerceError(410, "recipe_expired", "这个处理配方已过期，请重新申请")
             require_access(conn, ctx.user_id, device_id)
+            # 扣费与「标记已消费」在**同一个事务**里：要么配方被消费且钱被扣，
+            # 要么两件都没发生。余额不足时抛 402，整个事务回滚，
+            # 配方仍然可以充值后再消费。
+            #
+            # 扣款金额来自签发时写库的 `credits`，不重算：中途改价目表不影响已签发的配方。
+            # 0007 之前签发的旧配方没有这个值（NULL），那时还没有计费，按 0 处理。
+            amount = int(row["credits"] or 0)
+            if amount > 0:
+                hold_key = credits.hold(
+                    conn, ctx.user_id, amount, ref=f"recipe:{recipe_id}",
+                    memo=f"处理配方（{recipe_id}）",
+                )
+                # 处理版本在本机执行，服务端无从判断成败（视频不上传），
+                # 所以消费即定案：立刻结算，不进入「预扣中」。
+                # 代价是处理失败也不退，界面必须在确认框里写明这一点。
+                credits.settle(conn, hold_key)
             conn.execute("UPDATE recipes SET consumed_at = now() WHERE id = %s::uuid", (recipe_id,))
-            audit(conn, ctx.user_id, "recipe.consume", recipe_id)
-        return {"recipe_id": recipe_id, "consumed": True}
+            audit(conn, ctx.user_id, "recipe.consume", recipe_id, {"credits": amount})
+        return {"recipe_id": recipe_id, "consumed": True, "credits": amount}

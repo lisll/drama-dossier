@@ -17,7 +17,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from PIL import Image
 from pypdf import PdfReader
 
-from drama_cloud.commerce import entitlements, license_token as lt, package_service
+from drama_cloud.commerce import credits, entitlements, license_token as lt, package_service
 
 from .conftest import activate, auth, device_id, new_cards
 
@@ -66,12 +66,15 @@ def create(client, token: str, body: dict):
 
 @pytest.fixture()
 def account(client, register, pg):
-    """注册、绑定 PC、兑换一张月卡。"""
+    """注册、绑定 PC、兑换一张月卡，并给够生成报审包的积分。"""
     body = register(EMAIL, PASSWORD)
     token = body["tokens"]["access_token"]
     assert activate(client, token, PC).status_code == 200
     [code] = new_cards(pg, days=30)
     assert client.post("/api/v1/cards/redeem", json={"code": code}, headers=auth(token)).status_code == 200
+    # M5a 起生成报审包要扣积分。这些用例只关心包本身，
+    # 余额不足的场景在 test_package_billing.py 里专门测。
+    credits.grant(pg, body["user"]["id"], 1000, idempotency_key=f"seed:{EMAIL}")
     return {"id": body["user"]["id"], "token": token}
 
 

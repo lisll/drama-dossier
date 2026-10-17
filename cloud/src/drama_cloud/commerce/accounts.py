@@ -13,7 +13,7 @@ from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 from psycopg import errors as pg_errors
 
-from . import codes, entitlements, sessions
+from . import codes, entitlements, invites, sessions
 from .config import CommerceSettings
 from .db import audit
 from .errors import CommerceError, unauthorized
@@ -89,7 +89,9 @@ class AccountService:
 
     # ---------- 注册与登录 ----------
 
-    def register(self, conn, email: str, code: str, password: str) -> dict:
+    def register(self, conn, email: str, code: str, password: str,
+                 invite_code: Optional[str] = None,
+                 device_id: Optional[str] = None) -> dict:
         if conn.execute("SELECT 1 FROM users WHERE email = %s", (email,)).fetchone():
             raise _email_taken()
         try:
@@ -106,6 +108,11 @@ class AccountService:
                         """,
                         (email, self._hash(password), self.settings.terms_version),
                     ).fetchone()
+                    # 邀请码由 user_id 派生，注册时就写下来，之后不会变。
+                    conn.execute(
+                        "UPDATE users SET invite_code = %s WHERE id = %s",
+                        (invites.invite_code_for(str(user["id"])), user["id"]),
+                    )
                     pair = sessions.create(conn, user["id"])
                     audit(conn, str(user["id"]), "user.register", str(user["id"]),
                           {"terms_version": self.settings.terms_version})
@@ -114,6 +121,10 @@ class AccountService:
             raise _email_taken() from error
         if verdict is not codes.Verdict.OK:
             raise codes.failure(verdict)
+        # 绑定邀请人放在注册事务**之后**：邀请码填错不该让注册失败，而且绑不上
+        # （码无效、触发防刷）时注册本身仍然要成功。
+        if invite_code:
+            invites.bind(conn, str(user["id"]), invite_code, device_id)
         return {"user": _user_view(user), "tokens": pair.payload()}
 
     def login(self, conn, email: str, password: str) -> dict:

@@ -47,7 +47,10 @@ def send_code(payload: SendCodeRequest, request: Request, conn=Depends(get_conn)
 @router.post("/auth/register", status_code=201)
 def register(payload: RegisterRequest, request: Request, conn=Depends(get_conn)):
     ratelimit.hit(conn, REGISTER_PER_IP, client_key(request))
-    return _service(request).register(conn, payload.email, payload.code, payload.password)
+    return _service(request).register(
+        conn, payload.email, payload.code, payload.password,
+        invite_code=payload.invite_code, device_id=payload.device_id,
+    )
 
 
 @router.post("/auth/login")

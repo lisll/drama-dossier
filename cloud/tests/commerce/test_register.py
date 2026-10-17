@@ -108,7 +108,8 @@ def test_concurrent_registration_hits_unique_backstop(client, mailer, pg, databa
         ({"accept_terms": "true"}, "accept_terms"),
         ({"password": "short"}, "password"),
         ({"email": "not-an-email"}, "email"),
-        ({"invite_code": "x"}, "invite_code"),
+        # 未知字段仍然要被拒（M5a 起 invite_code 已是合法字段，换一个真正不认识的）。
+        ({"nickname": "x"}, "nickname"),
     ],
 )
 def test_validation_errors_do_not_echo_input(client, override, field):
