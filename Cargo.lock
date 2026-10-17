@@ -1027,6 +1027,7 @@ dependencies = [
  "chrono",
  "clap",
  "dossier-license",
+ "dossier-media",
  "dossier-runtime",
  "ed25519-dalek",
  "serde",

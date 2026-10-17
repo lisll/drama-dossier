@@ -12,6 +12,9 @@ path = "src/bin/dossier-artifacts.rs"
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
+# 剪映草稿要把 .srt 变成字幕轨，复用 dossier-media 里已经打磨过的 SRT 解析。
+# dossier-media 只依赖 dossier-runtime，不依赖 dossier-core，不会成环。
+dossier-media = { path = "../dossier-media" }
 dossier-license = { path = "../dossier-license" }
 dossier-runtime = { path = "../dossier-runtime" }
 serde = { version = "1", features = ["derive"] }
