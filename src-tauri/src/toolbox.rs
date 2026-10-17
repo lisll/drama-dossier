@@ -43,6 +43,15 @@ fn app_bin_dir(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| format!("无法定位应用数据目录：{error}。请检查系统权限。"))
 }
 
+/// 一键安装落地的可执行文件名：Windows 必须带 `.exe`，其余平台不带。
+fn exe_name(base: &str) -> String {
+    if cfg!(target_os = "windows") {
+        format!("{base}.exe")
+    } else {
+        base.to_string()
+    }
+}
+
 /// 读取当前设置（缺失/损坏回退默认，与 `load_app_settings` 同语义）。
 pub(crate) fn read_settings(app: &AppHandle) -> Result<dossier_core::AppSettings, String> {
     let path = crate::settings_path(app)?;
@@ -57,7 +66,7 @@ pub(crate) fn resolve_ffmpeg(app: &AppHandle) -> Result<PathBuf, String> {
         }
     }
     if let Ok(bin) = app_bin_dir(app) {
-        let candidate = bin.join("ffmpeg");
+        let candidate = bin.join(exe_name("ffmpeg"));
         if candidate.is_file() {
             return Ok(candidate);
         }
@@ -76,7 +85,7 @@ pub(crate) fn resolve_ffprobe(app: &AppHandle, hint: Option<&str>) -> Result<Pat
         }
     }
     if let Ok(bin) = app_bin_dir(app) {
-        let candidate = bin.join("ffprobe");
+        let candidate = bin.join(exe_name("ffprobe"));
         if candidate.is_file() {
             return Ok(candidate);
         }
@@ -95,8 +104,8 @@ pub struct RuntimeStatus {
     pub ffmpeg: ToolReport,
     pub ffprobe: ToolReport,
     pub python: ToolReport,
-    /// 运行环境自动安装只有 macOS 有可用下载源；其余平台前端据此隐藏入口，
-    /// 避免给出「点了必然报错」的按钮。
+    /// 运行环境自动安装只在有可用下载源的平台提供（macOS / Windows）；
+    /// 其余平台前端据此隐藏入口，避免给出「点了必然报错」的按钮。
     pub install_supported: bool,
     /// 平台标识（macos / windows / linux），前端据此给出对应平台的手动安装指引。
     pub platform: String,
@@ -115,7 +124,7 @@ pub fn runtime_status(
         ffmpeg: probe_tool(&runner, "ffmpeg", &ffmpeg, &["-hide_banner", "-version"]),
         ffprobe: probe_tool(&runner, "ffprobe", &ffprobe, &["-hide_banner", "-version"]),
         python: probe_tool(&runner, "python", Path::new("python3"), &["--version"]),
-        install_supported: cfg!(target_os = "macos"),
+        install_supported: cfg!(any(target_os = "macos", target_os = "windows")),
         platform: std::env::consts::OS.to_string(),
     })
 }
@@ -843,188 +852,734 @@ pub async fn transcode_execute(
 // 一键安装运行环境
 // ---------------------------------------------------------------------------
 
-/// macOS 静态 ffmpeg 发行源：evermeet.cx。版本钉死保证可复现；
-/// 该站单连接限流（HTTP 429 / 带宽限速），因此**顺序**下载并交给 curl 重试。
-/// 注意：该站只提供 Intel（x86_64）构建（官方明确不提供 ARM 原生版），
-/// 在 Apple Silicon 上经 Rosetta 2 运行；Rosetta 缺失时自检会拦截并提示安装。
-#[cfg(target_os = "macos")]
-const EVERMEET_FFMPEG_URL: &str = "https://evermeet.cx/ffmpeg/ffmpeg-9.0.2.zip";
-#[cfg(target_os = "macos")]
-const EVERMEET_FFPROBE_URL: &str = "https://evermeet.cx/ffmpeg/ffprobe-9.0.2.zip";
-
-/// 一键安装结果。
+/// 一键安装结果（前端只用 `note`，其余字段供排查与单测）。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstallRuntimeReport {
     pub ffmpeg_path: String,
     pub ffprobe_path: String,
     pub skipped_existing: Vec<String>,
+    /// 实际用到的下载来源（来源名 + 地址），每个下载过的工具一条；全部跳过时为空。
+    ///
+    /// 新增字段：老前端忽略未知字段；`serde(default)` 让反序列化侧（测试/未来回读）也能缺省。
+    #[serde(default)]
+    pub sources_used: Vec<String>,
     pub note: String,
 }
 
-/// 用系统 curl 下载（macOS 自带，支持重试与断点续传）。
-// 只被上面 macOS 专属的 install_one 调用；不按平台门控会在 Linux/Windows
-// 上成为死代码，被 CI 的 -D warnings 拦下。
-#[cfg(target_os = "macos")]
-fn download_file(url: &str, target: &Path) -> Result<(), String> {
-    let spec = CommandSpec::new("/usr/bin/curl")
-        .arg("-fL")
-        .arg("-sS")
-        .arg("--retry")
-        .arg("4")
-        .arg("--retry-delay")
-        .arg("10")
-        .arg("--retry-all-errors")
-        .arg("--max-time")
-        .arg("1800")
-        .arg("-o")
-        .arg(target.display().to_string())
-        .arg(url);
-    let runner = SystemRunner::new();
-    let output = runner
-        .run(&spec)
-        .map_err(|error| format!("curl 启动失败：{error}"))?;
-    if output.success() {
-        return Ok(());
-    }
-    let detail = output.combined();
-    let first = detail
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("（无输出）");
-    Err(format!("下载失败（{}）：{first}", output.code_label()))
-}
+// 下载源都是**第三方站点**（evermeet.cx / gyan.dev / BtbN），包不是 FFmpeg 官方发布物。
+// 钉死版本 + 钉死 SHA-256 只能保证「下到的就是你核对过的那一版」，**不能证明来源可信**；
+// 多来源互相印证能降低风险，但不等于可信。
+//
+// 「选来源 → 下载 → 校验 → 换下一个」刻意做成与平台无关的纯逻辑（下面的 `installer`），
+// 平台差异只剩两处：用哪条命令下载/解压、可执行文件叫什么名字。这样在开发机（Linux）上
+// 就能用假的 `Downloader` 把「连不上」「哈希不符」「全部失败」这些分支跑进单测，
+// 不必真的连 Windows / macOS 网络。
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+mod installer {
+    use std::path::Path;
+    // 只有 Windows 分支（以及 Linux 单测）用到 `PathBuf`（找解压出来的 exe）；
+    // macOS 分支不用，不门控会成为未使用导入，被 CI 的 -D warnings 拦下。
+    #[cfg(any(target_os = "windows", test))]
+    use std::path::PathBuf;
 
-/// 安装单个工具：下载 zip → 解压到临时目录 → 授权 → 移到目标位置。
-/// 返回 `Ok(true)` 表示目标已存在、本次跳过。
-#[cfg(target_os = "macos")]
-fn install_one(bin_dir: &Path, name: &str, url: &str) -> Result<bool, String> {
-    let target = bin_dir.join(name);
-    if target.is_file() {
-        return Ok(true);
+    // 平台相关部分才需要的导入：Linux 非测试构建整块都不编译，Linux 测试构建则会编译
+    // 本模块，所以这些导入必须自己按平台门控，否则要么缺名字、要么成未使用项。
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    use super::{app_bin_dir, exe_name, InstallRuntimeReport};
+
+    // -----------------------------------------------------------------------
+    // 维护者维护区：固定版本 + 固定校验值
+    // -----------------------------------------------------------------------
+
+    /// macOS 静态 ffmpeg 发行源：evermeet.cx（第三方构建）。版本钉死 9.0.2 保证可复现；
+    /// 该站单连接限流（HTTP 429 / 带宽限速），因此顺序下载并交给 curl 重试。
+    /// 注意：该站只提供 Intel（x86_64）构建（官方明确不提供 ARM 原生版），
+    /// 在 Apple Silicon 上经 Rosetta 2 运行；Rosetta 缺失时自检会拦截并提示安装。
+    #[cfg(target_os = "macos")]
+    const EVERMEET_FFMPEG_URL: &str = "https://evermeet.cx/ffmpeg/ffmpeg-9.0.2.zip";
+    #[cfg(target_os = "macos")]
+    const EVERMEET_FFPROBE_URL: &str = "https://evermeet.cx/ffmpeg/ffprobe-9.0.2.zip";
+
+    /// `ffmpeg-9.0.2.zip` 的 SHA-256（小写十六进制）。
+    ///
+    /// **占位值，必须由维护者实际下载一次后填入。** 在 macOS 上取法：
+    /// `curl -fL -o f.zip https://evermeet.cx/ffmpeg/ffmpeg-9.0.2.zip && shasum -a 256 f.zip`，
+    /// 把输出的 64 位十六进制替换掉下面的 `unverified`。**不要猜、不要从别处抄**：
+    /// 写错会让所有用户装不上，只能由真正下载过的人核对。
+    /// 未填时一键安装会明确报「哈希未配置」并给出手动步骤，**绝不会跳过校验直接装**。
+    #[cfg(target_os = "macos")]
+    const EVERMEET_FFMPEG_SHA256: &str = "unverified";
+
+    /// `ffprobe-9.0.2.zip` 的 SHA-256。占位值，填法见上一条注释。
+    #[cfg(target_os = "macos")]
+    const EVERMEET_FFPROBE_SHA256: &str = "unverified";
+
+    /// Windows 来源 1：gyan.dev 的**按版本归档**地址。浮动地址 `ffmpeg-release-*`
+    /// 会随新版本滚动，钉不了哈希，所以不用它。
+    /// 校验值来源：同目录下的 `ffmpeg-9.0.2-essentials_build.zip.sha256`，已实际核对。
+    #[cfg(any(target_os = "windows", test))]
+    pub const GYAN_FFMPEG_URL: &str =
+        "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-essentials_build.zip";
+    #[cfg(any(target_os = "windows", test))]
+    pub const GYAN_FFMPEG_SHA256: &str =
+        "60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba";
+
+    /// Windows 来源 2：BtbN 的 GitHub Releases（autobuild）。
+    ///
+    /// **占位，必须由维护者固定。** BtbN 的 `latest` 是滚动标签，指向的包与其哈希每天都变，
+    /// 钉 `latest` 等于没钉。做法：挑一个具体的 autobuild 标签（形如
+    /// `autobuild-2026-01-01-12-00`），下载其中的
+    /// `ffmpeg-n9.0-*-win64-gpl-9.0.zip`（`-gpl-` 还是 `-gpl-shared-` 二选一并写清），
+    /// 算出 SHA-256，再把地址与哈希分别填进下面两个常量。
+    /// 开发期没有 Windows 也无法下载，所以这里只能是占位值；未填时该来源报「哈希未配置」。
+    #[cfg(any(target_os = "windows", test))]
+    pub const BTBN_FFMPEG_URL: &str =
+        "unfilled: 先固定到某个具体 autobuild 标签与文件名，再把下载地址填在这里";
+    #[cfg(any(target_os = "windows", test))]
+    pub const BTBN_FFMPEG_SHA256: &str = "unverified";
+
+    /// Windows 的下载来源列表：按顺序尝试，每项都是「固定版本 + 固定哈希」。
+    #[cfg(any(target_os = "windows", test))]
+    pub const WINDOWS_SOURCES: &[InstallSource] = &[
+        InstallSource {
+            label: "gyan.dev（按版本归档）",
+            url: GYAN_FFMPEG_URL,
+            sha256: GYAN_FFMPEG_SHA256,
+        },
+        InstallSource {
+            label: "BtbN GitHub Releases（autobuild）",
+            url: BTBN_FFMPEG_URL,
+            sha256: BTBN_FFMPEG_SHA256,
+        },
+    ];
+
+    // -----------------------------------------------------------------------
+    // 与平台无关：来源、下载器、切换规则
+    // -----------------------------------------------------------------------
+
+    /// 一个下载来源：固定版本 + 固定哈希，不满足就换下一项。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct InstallSource {
+        /// 给人看的来源名（写进日志、错误信息与安装报告）。
+        pub label: &'static str,
+        /// 钉死版本的压缩包地址。
+        pub url: &'static str,
+        /// 压缩包的 SHA-256（小写十六进制）；不是 64 位十六进制即视为「未配置」。
+        pub sha256: &'static str,
     }
-    let zip_path = bin_dir.join(format!("{name}.download.zip"));
-    let staging = bin_dir.join(format!("{name}.staging"));
-    let _ = std::fs::remove_dir_all(&staging);
-    let result = (|| -> Result<(), String> {
-        download_file(url, &zip_path)?;
-        std::fs::create_dir_all(&staging).map_err(|error| format!("创建解压目录失败：{error}"))?;
-        let spec = CommandSpec::new("/usr/bin/unzip")
+
+    /// 「把一个地址下载到本地文件」的能力。
+    ///
+    /// 生产实现是系统自带的 curl；测试实现用来模拟「连不上 / 内容不对 / 成功」三种情况，
+    /// 因此切换逻辑在没有网络、也没有 Windows/macOS 的机器上也能被完整验证。
+    pub trait Downloader {
+        fn download(&self, url: &str, target: &Path) -> Result<(), String>;
+    }
+
+    /// 某个来源失败的原因分类。**哈希不符比网络问题严重**（文件被换过或不完整），
+    /// 日志与错误信息里必须能区分开。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SourceFailureKind {
+        /// 连不上 / 超时 / HTTP 非 2xx。
+        Network,
+        /// 下载成功但 SHA-256 对不上（下载的文件已删除）。
+        Checksum,
+        /// 代码里的哈希还是占位值：配置错误，既不联网，也不该被「换下一个」掩盖。
+        HashUnconfigured,
+        /// 下载后本地读写失败（磁盘满、被占用等）。
+        LocalIo,
+    }
+
+    impl SourceFailureKind {
+        pub fn label(self) -> &'static str {
+            match self {
+                Self::Network => "网络或 HTTP 失败",
+                Self::Checksum => "哈希不符",
+                Self::HashUnconfigured => "哈希未配置",
+                Self::LocalIo => "本地读写失败",
+            }
+        }
+    }
+
+    /// 一个来源的失败记录。
+    #[derive(Debug, Clone)]
+    pub struct SourceFailure {
+        pub label: &'static str,
+        pub url: &'static str,
+        pub kind: SourceFailureKind,
+        pub reason: String,
+    }
+
+    /// 一次成功的来源选择。
+    #[derive(Debug, Clone)]
+    pub struct InstalledSource {
+        pub source: InstallSource,
+        /// 成功之前失败过的来源（按尝试顺序）——「换过哪几家、为什么换」不能丢。
+        pub failures: Vec<SourceFailure>,
+    }
+
+    impl InstalledSource {
+        /// 给安装报告用的一句话（界面会直接显示，所以把「换过来源」也写进去）。
+        pub fn summary(&self) -> String {
+            if self.failures.is_empty() {
+                return format!("{}（{}）", self.source.label, self.source.url);
+            }
+            let earlier = self
+                .failures
+                .iter()
+                .map(|failure| format!("{}{}", failure.label, failure.kind.label()))
+                .collect::<Vec<_>>()
+                .join("、");
+            format!(
+                "{}（{}；此前失败：{earlier}）",
+                self.source.label, self.source.url
+            )
+        }
+    }
+
+    /// 按顺序尝试每个来源：下载 → 算 SHA-256 → 与钉住值比对，失败就换下一个。
+    ///
+    /// 规则（全部写进日志与错误信息，不静默）：
+    /// - 连不上 / 超时 / HTTP 非 2xx → 记下原因，用下一个来源；
+    /// - 下载成功但**哈希不符** → 删掉下载的文件，记下「哈希不符」，用下一个来源；
+    /// - 哈希是占位值 → **立即停**并报「哈希未配置」：这是配置错误，既不能跳过校验
+    ///   直接装，也不该被后面某个来源的成功悄悄掩盖；
+    /// - 全部失败 → 错误信息逐条列出每个来源的原因，并附 `manual_steps`（手动安装步骤）。
+    pub fn try_sources(
+        downloader: &dyn Downloader,
+        sources: &[InstallSource],
+        target: &Path,
+        manual_steps: &str,
+    ) -> Result<InstalledSource, String> {
+        let mut failures: Vec<SourceFailure> = Vec::new();
+        for source in sources {
+            let expected = source.sha256.trim();
+            if !dossier_runtime::is_sha256_hex(expected) {
+                failures.push(SourceFailure {
+                    label: source.label,
+                    url: source.url,
+                    kind: SourceFailureKind::HashUnconfigured,
+                    reason: format!(
+                        "校验值仍是占位值「{expected}」，必须由维护者实际下载一次后填入"
+                    ),
+                });
+                // 不下载、不安装：占位哈希意味着没人核对过这个包。
+                return Err(config_error(&failures, manual_steps));
+            }
+            if let Err(reason) = downloader.download(source.url, target) {
+                // 半截文件不能留给下一个来源，也不能进后续解压流程。
+                let _ = std::fs::remove_file(target);
+                eprintln!("运行环境下载来源「{}」不可用：{reason}", source.label);
+                failures.push(SourceFailure {
+                    label: source.label,
+                    url: source.url,
+                    kind: SourceFailureKind::Network,
+                    reason,
+                });
+                continue;
+            }
+            let actual = match dossier_runtime::sha256_file(target) {
+                Ok(actual) => actual,
+                Err(error) => {
+                    let _ = std::fs::remove_file(target);
+                    failures.push(SourceFailure {
+                        label: source.label,
+                        url: source.url,
+                        kind: SourceFailureKind::LocalIo,
+                        reason: format!("下载后读取文件失败：{error}"),
+                    });
+                    continue;
+                }
+            };
+            if !actual.eq_ignore_ascii_case(expected) {
+                let _ = std::fs::remove_file(target);
+                eprintln!(
+                    "运行环境下载来源「{}」校验失败：SHA-256 不符（期望 {expected}，实际 {actual}），已删除下载的文件，改用下一个来源",
+                    source.label
+                );
+                failures.push(SourceFailure {
+                    label: source.label,
+                    url: source.url,
+                    kind: SourceFailureKind::Checksum,
+                    reason: format!("SHA-256 不符（期望 {expected}，实际 {actual}）"),
+                });
+                continue;
+            }
+            return Ok(InstalledSource {
+                source: *source,
+                failures,
+            });
+        }
+        Err(all_failed_error(sources.len(), &failures, manual_steps))
+    }
+
+    /// 逐条渲染失败原因（每个来源一行，带序号）。
+    fn describe_failures(failures: &[SourceFailure]) -> String {
+        failures
+            .iter()
+            .enumerate()
+            .map(|(index, failure)| {
+                format!(
+                    "\n  {}. {}（{}）—— {}：{}",
+                    index + 1,
+                    failure.label,
+                    failure.url,
+                    failure.kind.label(),
+                    failure.reason
+                )
+            })
+            .collect()
+    }
+
+    /// 全部来源都失败：必须能看出「试了哪几家、各自为什么失败」。
+    fn all_failed_error(count: usize, failures: &[SourceFailure], manual_steps: &str) -> String {
+        let labels = failures
+            .iter()
+            .map(|failure| failure.label)
+            .collect::<Vec<_>>()
+            .join("、");
+        format!(
+            "已尝试 {count} 个下载来源都失败（依次为：{labels}）：{}{manual_steps}",
+            describe_failures(failures)
+        )
+    }
+
+    /// 哈希未配置：配置错误，安装必须停下（不下载、不安装、不写设置）。
+    fn config_error(failures: &[SourceFailure], manual_steps: &str) -> String {
+        format!(
+            "哈希未配置：一键安装已停止，没有下载也没有安装（不会跳过校验直接装）。{} 个来源的情况：{}{manual_steps}",
+            failures.len(),
+            describe_failures(failures)
+        )
+    }
+
+    /// 在解压目录里找可执行文件：优先 `bin/` 下的那个
+    /// （gyan / BtbN 的包都是 `<根>/<版本目录>/bin/ffmpeg.exe`）。
+    ///
+    /// 只用文件系统、与平台无关，所以能在 Linux 上单测；真正执行解压的命令才是平台相关部分。
+    #[cfg(any(target_os = "windows", test))]
+    pub fn find_in_extracted(root: &Path, file_name: &str) -> Result<PathBuf, String> {
+        let mut stack = vec![root.to_path_buf()];
+        let mut fallback: Option<PathBuf> = None;
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir)
+                .map_err(|error| format!("读取解压目录 {} 失败：{error}", dir.display()))?;
+            for entry in entries {
+                let entry = entry.map_err(|error| format!("读取解压目录项失败：{error}"))?;
+                let path = entry.path();
+                if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                    stack.push(path);
+                    continue;
+                }
+                if path.file_name().and_then(|name| name.to_str()) != Some(file_name) {
+                    continue;
+                }
+                let in_bin = path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(|name| name.to_str())
+                    == Some("bin");
+                if in_bin {
+                    return Ok(path);
+                }
+                fallback.get_or_insert(path);
+            }
+        }
+        match fallback {
+            Some(path) => Ok(path),
+            None => Err(format!("压缩包里没有找到可执行文件 {file_name}")),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 平台相关：下载器与解压命令
+    // -----------------------------------------------------------------------
+
+    /// 系统自带工具缺失时说的话。Windows 10 1803 之前不带 `curl.exe` / `tar.exe`，
+    /// 这种系统上不能装作在装，必须明确让用户手动装。
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn missing_tool_error(tool: &str) -> String {
+        if cfg!(target_os = "windows") {
+            format!(
+                "系统版本太旧：找不到系统自带的 {tool}（Windows 10 1803 之前的系统不带它）。请手动安装 ffmpeg（含 ffprobe），步骤见本提示末尾。"
+            )
+        } else {
+            format!(
+                "找不到系统自带的 {tool}：请确认系统完整（macOS 自带 /usr/bin/curl 与 /usr/bin/unzip），或改用手动安装。"
+            )
+        }
+    }
+
+    /// 用系统自带的 curl 下载：macOS 是 `/usr/bin/curl`，Windows 是 `curl.exe`。
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    struct SystemCurl {
+        program: &'static str,
+        retries: u32,
+        retry_delay_secs: u32,
+        /// `--retry-all-errors` 需要 curl 7.71+。Windows 10 1803/1903/1909 自带的
+        /// curl 太老，加了这个参数会直接报「option not supported」，因此只在 macOS 开启。
+        retry_all_errors: bool,
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    impl Downloader for SystemCurl {
+        fn download(&self, url: &str, target: &Path) -> Result<(), String> {
+            let mut spec = dossier_runtime::CommandSpec::new(self.program)
+                .arg("-fL")
+                .arg("-sS")
+                .arg("--connect-timeout")
+                .arg("30")
+                .arg("--retry")
+                .arg(self.retries.to_string())
+                .arg("--retry-delay")
+                .arg(self.retry_delay_secs.to_string())
+                .arg("--max-time")
+                .arg("1800");
+            if self.retry_all_errors {
+                spec = spec.arg("--retry-all-errors");
+            }
+            let spec = spec.arg("-o").arg(target.display().to_string()).arg(url);
+            let runner = dossier_runtime::SystemRunner::new();
+            let output = runner.run(&spec).map_err(|error| match error {
+                dossier_runtime::CommandError::NotFound { .. } => missing_tool_error(self.program),
+                other => format!("{} 启动失败：{other}", self.program),
+            })?;
+            if output.success() {
+                return Ok(());
+            }
+            Err(format!(
+                "下载失败（{}）：{}",
+                output.code_label(),
+                first_line(&output.combined())
+            ))
+        }
+    }
+
+    /// 取输出的第一行非空内容：错误信息只要一句，别把整段进度糊给用户。
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn first_line(detail: &str) -> &str {
+        detail
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("（无输出）")
+    }
+
+    /// 用 `tar.exe` 解压 zip（Windows 10 1803+ 的 bsdtar 认 zip）。
+    #[cfg(target_os = "windows")]
+    fn extract_zip(zip: &Path, dest: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(dest).map_err(|error| format!("创建解压目录失败：{error}"))?;
+        let spec = dossier_runtime::CommandSpec::new("tar.exe")
+            .arg("-xf")
+            .arg(zip.display().to_string())
+            .arg("-C")
+            .arg(dest.display().to_string());
+        let runner = dossier_runtime::SystemRunner::new();
+        let output = runner.run(&spec).map_err(|error| match error {
+            dossier_runtime::CommandError::NotFound { .. } => missing_tool_error("tar.exe"),
+            other => format!("tar.exe 启动失败：{other}"),
+        })?;
+        if output.success() {
+            return Ok(());
+        }
+        Err(format!(
+            "解压失败（{}）：{}",
+            output.code_label(),
+            first_line(&output.combined())
+        ))
+    }
+
+    /// 用 macOS 自带的 `unzip` 解压。
+    #[cfg(target_os = "macos")]
+    fn unzip_file(zip: &Path, dest: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(dest).map_err(|error| format!("创建解压目录失败：{error}"))?;
+        let spec = dossier_runtime::CommandSpec::new("/usr/bin/unzip")
             .arg("-o")
             .arg("-q")
-            .arg(zip_path.display().to_string())
+            .arg(zip.display().to_string())
             .arg("-d")
-            .arg(staging.display().to_string());
-        let runner = SystemRunner::new();
+            .arg(dest.display().to_string());
+        let runner = dossier_runtime::SystemRunner::new();
         let output = runner
             .run(&spec)
             .map_err(|error| format!("unzip 启动失败：{error}"))?;
-        if !output.success() {
-            let detail = output.combined();
-            let first = detail
-                .lines()
-                .map(str::trim)
-                .find(|line| !line.is_empty())
-                .unwrap_or("（无输出）");
-            return Err(format!("解压失败（{}）：{first}", output.code_label()));
+        if output.success() {
+            return Ok(());
         }
-        let extracted = staging.join(name);
-        if !extracted.is_file() {
-            return Err(format!("压缩包里没有找到 {name} 可执行文件"));
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&extracted, std::fs::Permissions::from_mode(0o755))
-                .map_err(|error| format!("设置可执行权限失败：{error}"))?;
-        }
-        std::fs::rename(&extracted, &target)
-            .map_err(|error| format!("安装 {name} 失败：{error}"))?;
-        Ok(())
-    })();
-    let _ = std::fs::remove_dir_all(&staging);
-    let _ = std::fs::remove_file(&zip_path);
-    result.map(|_| false)
-}
-
-#[cfg(target_os = "macos")]
-fn install_runtime_blocking(app: &AppHandle) -> Result<InstallRuntimeReport, String> {
-    let bin_dir = app_bin_dir(app)?;
-    std::fs::create_dir_all(&bin_dir).map_err(|error| format!("创建运行环境目录失败：{error}"))?;
-
-    let mut skipped_existing = Vec::new();
-    if install_one(&bin_dir, "ffmpeg", EVERMEET_FFMPEG_URL)? {
-        skipped_existing.push("ffmpeg".into());
-    }
-    if install_one(&bin_dir, "ffprobe", EVERMEET_FFPROBE_URL)? {
-        skipped_existing.push("ffprobe".into());
+        Err(format!(
+            "解压失败（{}）：{}",
+            output.code_label(),
+            first_line(&output.combined())
+        ))
     }
 
-    let ffmpeg_path = bin_dir.join("ffmpeg");
-    let ffprobe_path = bin_dir.join("ffprobe");
+    /// 手动安装步骤：一键安装全失败、哈希未配置或系统太旧时跟着错误一起给出。
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn manual_steps(bin_dir: &Path) -> String {
+        #[cfg(target_os = "windows")]
+        let source_hint = "① 打开 https://www.gyan.dev/ffmpeg/builds/ 下载 essentials_build 的 zip（或执行「winget install Gyan.FFmpeg」）；";
+        #[cfg(target_os = "macos")]
+        let source_hint =
+            "① 在终端执行「brew install ffmpeg」（或从 evermeet.cx 下载 zip 后解压）；";
+        format!(
+            " 手动安装步骤：{source_hint}② 把压缩包里 bin 目录下的 ffmpeg{} 与 ffprobe{} 复制到 {}；③ 回到「设置 → 本机环境」点「重新检测」，也可以直接在那里指定 ffprobe 路径。",
+            if cfg!(target_os = "windows") { ".exe" } else { "" },
+            if cfg!(target_os = "windows") { ".exe" } else { "" },
+            bin_dir.display()
+        )
+    }
 
-    // 安装后自检，把「下载成功但跑不起来」拦在报告给用户之前。
-    {
-        let runner = SystemRunner::new();
-        let report = probe_tool(
-            &runner,
-            "ffmpeg",
-            &ffmpeg_path,
-            &["-hide_banner", "-version"],
-        );
-        if !report.ok {
+    // -----------------------------------------------------------------------
+    // 平台相关：安装流程
+    // -----------------------------------------------------------------------
+
+    /// 安装后收尾：自检（真跑 `-version`）+ 写回设置 + 生成报告。
+    ///
+    /// 自检放在写设置之前：跑不起来的二进制不能被写进设置，否则界面会显示「就绪」。
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn finalize_install(
+        app: &tauri::AppHandle,
+        bin_dir: &Path,
+        skipped_existing: Vec<String>,
+        sources_used: Vec<String>,
+    ) -> Result<InstallRuntimeReport, String> {
+        let ffmpeg_path = bin_dir.join(exe_name("ffmpeg"));
+        let ffprobe_path = bin_dir.join(exe_name("ffprobe"));
+
+        let runner = dossier_runtime::SystemRunner::new();
+        for (name, path) in [("ffmpeg", &ffmpeg_path), ("ffprobe", &ffprobe_path)] {
+            let report = dossier_runtime::probe::probe_tool(
+                &runner,
+                name,
+                path,
+                &["-hide_banner", "-version"],
+            );
+            if report.ok {
+                continue;
+            }
+            // 只可能在 macOS 上出现（evermeet.cx 只有 Intel 构建）。
+            #[cfg(target_os = "macos")]
             if report.detail.contains("Bad CPU type") {
                 return Err("安装完成但自检失败：CPU 架构不匹配（下载的是 Intel 版，需要 Rosetta 2）。请先在终端执行「softwareupdate --install-rosetta --agree-to-license」安装 Rosetta，再重新点击一键配置。".into());
             }
-            return Err(format!("安装完成但自检失败：{}", report.detail));
+            return Err(format!("安装完成但 {name} 自检失败：{}", report.detail));
         }
+
+        // 写回设置：只在用户没有显式配置（或配置失效）时写入，避免覆盖手工配置。
+        let settings_path = crate::settings_path(app)?;
+        let mut settings = dossier_core::load_settings(&settings_path).settings;
+        let needs_ffmpeg = settings
+            .ffmpeg_path
+            .as_ref()
+            .map(|path| !path.is_file())
+            .unwrap_or(true);
+        let needs_ffprobe = settings
+            .ffprobe_path
+            .as_ref()
+            .map(|path| !path.is_file())
+            .unwrap_or(true);
+        if needs_ffmpeg {
+            settings.ffmpeg_path = Some(ffmpeg_path.clone());
+        }
+        if needs_ffprobe {
+            settings.ffprobe_path = Some(ffprobe_path.clone());
+        }
+        if needs_ffmpeg || needs_ffprobe {
+            // 全限定调用而不是顶部导入：这一行只在 macOS/Windows 分支编译，
+            // 导入在 Linux 上会成为未使用项，被 CI 的 -D warnings 拦下。
+            dossier_core::save_settings(&settings_path, &settings)
+                .map_err(|error| format!("写入设置失败：{error}"))?;
+        }
+
+        let note = if sources_used.is_empty() {
+            format!("运行环境已就绪（安装目录：{}）", bin_dir.display())
+        } else {
+            format!(
+                "运行环境已就绪（安装目录：{}；下载来源：{}）",
+                bin_dir.display(),
+                sources_used.join("；")
+            )
+        };
+
+        Ok(InstallRuntimeReport {
+            ffmpeg_path: ffmpeg_path.display().to_string(),
+            ffprobe_path: ffprobe_path.display().to_string(),
+            skipped_existing,
+            sources_used,
+            note,
+        })
     }
 
-    // 写回设置：只在用户没有显式配置（或配置失效）时写入，避免覆盖手工配置。
-    let settings_path = crate::settings_path(app)?;
-    let mut settings = load_settings(&settings_path).settings;
-    let needs_ffmpeg = settings
-        .ffmpeg_path
-        .as_ref()
-        .map(|path| !path.is_file())
-        .unwrap_or(true);
-    let needs_ffprobe = settings
-        .ffprobe_path
-        .as_ref()
-        .map(|path| !path.is_file())
-        .unwrap_or(true);
-    if needs_ffmpeg {
-        settings.ffmpeg_path = Some(ffmpeg_path.clone());
-    }
-    if needs_ffprobe {
-        settings.ffprobe_path = Some(ffprobe_path.clone());
-    }
-    if needs_ffmpeg || needs_ffprobe {
-        // 全限定调用而不是顶部导入：这行只在 macOS 分支编译，导入在
-        // Linux/Windows 上会成为未使用项，被 CI 的 -D warnings 拦下。
-        dossier_core::save_settings(&settings_path, &settings)
-            .map_err(|error| format!("写入设置失败：{error}"))?;
+    /// 把一个解压出来的文件移到安装目录。
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn move_into_place(extracted: &Path, target: &Path, name: &str) -> Result<(), String> {
+        // 目标可能在另一个盘上（或刚被杀软占用），rename 失败就退回复制。
+        std::fs::rename(extracted, target).or_else(|error| {
+            std::fs::copy(extracted, target)
+                .map(|_| ())
+                .map_err(|copy_error| {
+                    format!("安装 {name} 失败：{error}；复制也失败：{copy_error}")
+                })
+        })
     }
 
-    Ok(InstallRuntimeReport {
-        ffmpeg_path: ffmpeg_path.display().to_string(),
-        ffprobe_path: ffprobe_path.display().to_string(),
-        skipped_existing,
-        note: format!("运行环境已就绪（安装目录：{}）", bin_dir.display()),
-    })
+    /// Windows：多来源下载 → 校验 → `tar.exe` 解压 → 取 `bin\*.exe` → 移到安装目录 → 自检。
+    #[cfg(target_os = "windows")]
+    pub fn install_runtime_blocking(
+        app: &tauri::AppHandle,
+    ) -> Result<InstallRuntimeReport, String> {
+        let bin_dir = app_bin_dir(app)?;
+        std::fs::create_dir_all(&bin_dir)
+            .map_err(|error| format!("创建运行环境目录失败：{error}"))?;
+
+        let mut skipped_existing = Vec::new();
+        let mut missing = Vec::new();
+        for base in ["ffmpeg", "ffprobe"] {
+            if bin_dir.join(exe_name(base)).is_file() {
+                skipped_existing.push(base.to_string());
+            } else {
+                missing.push(base);
+            }
+        }
+
+        let mut sources_used = Vec::new();
+        if !missing.is_empty() {
+            // gyan.dev / BtbN 的 essentials 包里 ffmpeg 与 ffprobe 都有，一个包够两个工具用。
+            let zip_path = bin_dir.join("ffmpeg.download.zip");
+            let staging = bin_dir.join("ffmpeg.staging");
+            let _ = std::fs::remove_dir_all(&staging);
+            let _ = std::fs::remove_file(&zip_path);
+
+            let downloader = SystemCurl {
+                program: "curl.exe",
+                // 多来源之间要换得快，单个来源少试几轮。
+                retries: 1,
+                retry_delay_secs: 3,
+                retry_all_errors: false,
+            };
+            let installed = try_sources(
+                &downloader,
+                WINDOWS_SOURCES,
+                &zip_path,
+                &manual_steps(&bin_dir),
+            )?;
+            sources_used.push(installed.summary());
+
+            let result = extract_zip(&zip_path, &staging).and_then(|()| {
+                for base in &missing {
+                    let file_name = exe_name(base);
+                    let extracted = find_in_extracted(&staging, &file_name)?;
+                    move_into_place(&extracted, &bin_dir.join(&file_name), &file_name)?;
+                }
+                Ok(())
+            });
+            let _ = std::fs::remove_dir_all(&staging);
+            let _ = std::fs::remove_file(&zip_path);
+            result?;
+        }
+
+        finalize_install(app, &bin_dir, skipped_existing, sources_used)
+    }
+
+    /// macOS：evermeet.cx 单一来源 + 哈希校验（哈希未配置则明确报错）。
+    /// 返回 `None` 表示目标已存在、本次跳过。
+    #[cfg(target_os = "macos")]
+    fn install_one(
+        bin_dir: &Path,
+        name: &str,
+        sources: &[InstallSource],
+    ) -> Result<Option<InstalledSource>, String> {
+        let target = bin_dir.join(name);
+        if target.is_file() {
+            return Ok(None);
+        }
+        let zip_path = bin_dir.join(format!("{name}.download.zip"));
+        let staging = bin_dir.join(format!("{name}.staging"));
+        let _ = std::fs::remove_dir_all(&staging);
+        let _ = std::fs::remove_file(&zip_path);
+
+        let downloader = SystemCurl {
+            program: "/usr/bin/curl",
+            // evermeet.cx 单连接限流（429 / 限速），单一来源需要多试几轮。
+            retries: 4,
+            retry_delay_secs: 10,
+            retry_all_errors: true,
+        };
+        let result = try_sources(&downloader, sources, &zip_path, &manual_steps(bin_dir)).and_then(
+            |installed| {
+                unzip_file(&zip_path, &staging)?;
+                let extracted = staging.join(name);
+                if !extracted.is_file() {
+                    return Err(format!(
+                        "压缩包里没有找到 {name} 可执行文件（来源：{}）",
+                        installed.source.label
+                    ));
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&extracted, std::fs::Permissions::from_mode(0o755))
+                        .map_err(|error| format!("设置可执行权限失败：{error}"))?;
+                }
+                move_into_place(&extracted, &target, name)?;
+                Ok(installed)
+            },
+        );
+        let _ = std::fs::remove_dir_all(&staging);
+        let _ = std::fs::remove_file(&zip_path);
+        result.map(Some)
+    }
+
+    /// macOS 入口：ffmpeg 与 ffprobe 各下一个包，两个都先过哈希校验。
+    #[cfg(target_os = "macos")]
+    pub fn install_runtime_blocking(
+        app: &tauri::AppHandle,
+    ) -> Result<InstallRuntimeReport, String> {
+        let bin_dir = app_bin_dir(app)?;
+        std::fs::create_dir_all(&bin_dir)
+            .map_err(|error| format!("创建运行环境目录失败：{error}"))?;
+
+        let mut skipped_existing = Vec::new();
+        let mut sources_used = Vec::new();
+        for (name, url, sha256) in [
+            ("ffmpeg", EVERMEET_FFMPEG_URL, EVERMEET_FFMPEG_SHA256),
+            ("ffprobe", EVERMEET_FFPROBE_URL, EVERMEET_FFPROBE_SHA256),
+        ] {
+            let sources = [InstallSource {
+                label: "evermeet.cx",
+                url,
+                sha256,
+            }];
+            match install_one(&bin_dir, name, &sources)? {
+                Some(installed) => sources_used.push(installed.summary()),
+                None => skipped_existing.push(name.to_string()),
+            }
+        }
+
+        finalize_install(app, &bin_dir, skipped_existing, sources_used)
+    }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Linux 上没有可靠的一键安装源（发行版包管理器才是正路），明确让用户手动装。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn install_runtime_blocking(_app: &AppHandle) -> Result<InstallRuntimeReport, String> {
-    Err("运行环境自动安装目前仅支持 macOS；请手动安装 ffmpeg（含 ffprobe）。".to_string())
+    Err("运行环境自动安装只支持 macOS 与 Windows。Linux 请用系统包管理器安装：Debian/Ubuntu 执行「sudo apt install ffmpeg」，Fedora/RHEL 执行「sudo dnf install ffmpeg」，装好后回到「设置 → 本机环境」点「重新检测」。".to_string())
 }
 
 #[tauri::command]
 pub async fn install_runtime(app: AppHandle) -> Result<InstallRuntimeReport, String> {
-    tauri::async_runtime::spawn_blocking(move || install_runtime_blocking(&app))
-        .await
-        .map_err(|error| format!("运行环境安装任务失败：{error}"))?
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        tauri::async_runtime::spawn_blocking(move || installer::install_runtime_blocking(&app))
+            .await
+            .map_err(|error| format!("运行环境安装任务失败：{error}"))?
+    }
+    // Linux 直接返回「用包管理器装」，不必开线程。
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        install_runtime_blocking(&app)
+    }
 }
 
 #[cfg(test)]
@@ -1097,5 +1652,308 @@ mod tests {
         spec = spec.arg("-version");
         let runner = SystemRunner::new();
         assert!(runner.run(&spec).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // 一键安装：多来源切换与哈希校验（与平台无关，Linux 上即可跑）
+    // -----------------------------------------------------------------------
+
+    use super::installer::{
+        find_in_extracted, try_sources, Downloader, InstallSource, SourceFailureKind,
+        WINDOWS_SOURCES,
+    };
+
+    /// 假下载内容与它的 SHA-256（用真实哈希，校验逻辑才走同一条路）。
+    const PAYLOAD_GOOD: &[u8] = b"fake-ffmpeg-package-A";
+    const HASH_GOOD: &str = "f19bab7e62f7857a9a5d63466d36088a38e504d885b47d8c483b6f4c85d9f22c";
+    /// 另一个包的内容与哈希：用它冒充「下到了别的文件」。
+    const PAYLOAD_OTHER: &[u8] = b"fake-ffmpeg-package-B";
+    const HASH_OTHER: &str = "8914e5ca5ffff8ab0f8f3f58c1787a7cd48e4f70aa254f5c160abb8f7093f52e";
+
+    /// 假下载器：按 URL 决定「连不上」还是「写入什么字节」，并记录被调用过哪些地址。
+    struct FakeDownloader {
+        plan: Vec<(&'static str, Result<&'static [u8], &'static str>)>,
+        calls: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl FakeDownloader {
+        fn new(plan: Vec<(&'static str, Result<&'static [u8], &'static str>)>) -> Self {
+            Self {
+                plan,
+                calls: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl Downloader for FakeDownloader {
+        fn download(&self, url: &str, target: &Path) -> Result<(), String> {
+            self.calls.borrow_mut().push(url.to_string());
+            // 连不上时不写文件：真实的 curl 也一样（-f 失败不落盘或只留半截）。
+            let payload = self
+                .plan
+                .iter()
+                .find(|(planned, _)| *planned == url)
+                .map(|(_, outcome)| *outcome)
+                .unwrap_or(Err("测试没有为这个地址准备结果"));
+            match payload {
+                Ok(bytes) => std::fs::write(target, bytes)
+                    .map_err(|error| format!("写入测试文件失败：{error}")),
+                Err(reason) => Err(reason.to_string()),
+            }
+        }
+    }
+
+    /// 一次性临时目录（测完删掉）。
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            let dir = std::env::temp_dir().join(format!("dossier-install-{tag}-{nanos:x}"));
+            std::fs::create_dir_all(&dir).expect("建临时目录");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn source(label: &'static str, url: &'static str, sha256: &'static str) -> InstallSource {
+        InstallSource { label, url, sha256 }
+    }
+
+    const MANUAL: &str = " 手动安装步骤：解压后把 bin 下的 ffmpeg 放进安装目录。";
+
+    #[test]
+    fn install_falls_back_to_second_source_when_first_is_unreachable() {
+        let dir = TempDir::new("fallback-network");
+        let target = dir.path().join("ffmpeg.zip");
+        let downloader = FakeDownloader::new(vec![
+            ("https://one.example/ffmpeg.zip", Err("连接超时")),
+            ("https://two.example/ffmpeg.zip", Ok(PAYLOAD_GOOD)),
+        ]);
+        let sources = [
+            source("来源一", "https://one.example/ffmpeg.zip", HASH_GOOD),
+            source("来源二", "https://two.example/ffmpeg.zip", HASH_GOOD),
+        ];
+
+        let installed =
+            try_sources(&downloader, &sources, &target, MANUAL).expect("第二个来源应当成功");
+        assert_eq!(installed.source.label, "来源二");
+        assert_eq!(installed.failures.len(), 1);
+        assert_eq!(installed.failures[0].label, "来源一");
+        assert_eq!(installed.failures[0].kind, SourceFailureKind::Network);
+        assert!(installed.failures[0].reason.contains("连接超时"));
+        // 先试一后试二，顺序不能乱。
+        assert_eq!(
+            downloader.calls(),
+            vec![
+                "https://one.example/ffmpeg.zip".to_string(),
+                "https://two.example/ffmpeg.zip".to_string()
+            ]
+        );
+        assert!(target.is_file(), "成功来源的文件要留下");
+    }
+
+    #[test]
+    fn install_switches_source_when_checksum_mismatches_and_deletes_file() {
+        let dir = TempDir::new("fallback-checksum");
+        let target = dir.path().join("ffmpeg.zip");
+        // 来源一「下载成功」，但内容是另一个包：声明 HASH_GOOD、实际是 HASH_OTHER 的内容。
+        let downloader = FakeDownloader::new(vec![
+            ("https://one.example/ffmpeg.zip", Ok(PAYLOAD_OTHER)),
+            ("https://two.example/ffmpeg.zip", Ok(PAYLOAD_GOOD)),
+        ]);
+        let sources = [
+            source("来源一", "https://one.example/ffmpeg.zip", HASH_GOOD),
+            source("来源二", "https://two.example/ffmpeg.zip", HASH_GOOD),
+        ];
+
+        let installed =
+            try_sources(&downloader, &sources, &target, MANUAL).expect("第二个来源应当成功");
+        assert_eq!(installed.source.label, "来源二");
+        assert_eq!(installed.failures.len(), 1);
+        // 哈希不符要和网络失败区分开：类别与措辞都必须写明。
+        assert_eq!(installed.failures[0].kind, SourceFailureKind::Checksum);
+        assert_eq!(installed.failures[0].kind.label(), "哈希不符");
+        assert!(installed.failures[0].reason.contains(HASH_GOOD));
+        assert!(installed.failures[0].reason.contains(HASH_OTHER));
+        let summary = installed.summary();
+        assert!(
+            summary.contains("来源二"),
+            "报告要写明实际用了哪个来源：{summary}"
+        );
+        assert!(
+            summary.contains("哈希不符"),
+            "报告要保留换来源的原因：{summary}"
+        );
+    }
+
+    #[test]
+    fn install_error_lists_every_source_failure() {
+        let dir = TempDir::new("all-failed");
+        let target = dir.path().join("ffmpeg.zip");
+        let downloader = FakeDownloader::new(vec![
+            ("https://one.example/ffmpeg.zip", Err("HTTP 503")),
+            ("https://two.example/ffmpeg.zip", Err("连接被重置")),
+        ]);
+        let sources = [
+            source("来源一", "https://one.example/ffmpeg.zip", HASH_GOOD),
+            source("来源二", "https://two.example/ffmpeg.zip", HASH_GOOD),
+        ];
+
+        let error =
+            try_sources(&downloader, &sources, &target, MANUAL).expect_err("全部失败必须报错");
+        assert!(error.contains("已尝试 2 个下载来源"), "{error}");
+        for expected in [
+            "来源一",
+            "来源二",
+            "HTTP 503",
+            "连接被重置",
+            "网络或 HTTP 失败",
+            "手动安装步骤",
+        ] {
+            assert!(
+                error.contains(expected),
+                "错误信息缺「{expected}」：{error}"
+            );
+        }
+        assert!(!target.is_file(), "全部失败后不该留下下载文件");
+    }
+
+    #[test]
+    fn install_refuses_to_run_when_hash_is_placeholder() {
+        let dir = TempDir::new("hash-unconfigured");
+        let target = dir.path().join("ffmpeg.zip");
+        // 计划里给了「下载会成功」，但哈希是占位值：必须一步都不走。
+        let downloader =
+            FakeDownloader::new(vec![("https://one.example/ffmpeg.zip", Ok(PAYLOAD_GOOD))]);
+        let sources = [
+            source("来源一", "https://one.example/ffmpeg.zip", "unverified"),
+            source("来源二", "https://two.example/ffmpeg.zip", HASH_GOOD),
+        ];
+
+        let error =
+            try_sources(&downloader, &sources, &target, MANUAL).expect_err("占位哈希必须报错");
+        assert!(error.contains("哈希未配置"), "{error}");
+        assert!(!target.is_file(), "哈希未配置时不能下载/落盘");
+        assert!(downloader.calls().is_empty(), "哈希未配置时不该联网");
+        // 同一份占位哈希也要被当成非法：不是 64 位十六进制一律算未配置。
+        let empty = try_sources(
+            &downloader,
+            &[source("来源一", "https://one.example/ffmpeg.zip", "")],
+            &target,
+            MANUAL,
+        )
+        .expect_err("空哈希同样算未配置");
+        assert!(empty.contains("哈希未配置"), "{empty}");
+    }
+
+    #[test]
+    fn install_reports_which_source_succeeded() {
+        let dir = TempDir::new("first-source-ok");
+        let target = dir.path().join("ffmpeg.zip");
+        let downloader =
+            FakeDownloader::new(vec![("https://one.example/ffmpeg.zip", Ok(PAYLOAD_GOOD))]);
+        let sources = [source(
+            "gyan.dev",
+            "https://one.example/ffmpeg.zip",
+            HASH_GOOD,
+        )];
+
+        let installed = try_sources(&downloader, &sources, &target, MANUAL).expect("应当成功");
+        assert_eq!(installed.source.label, "gyan.dev");
+        assert!(installed.failures.is_empty());
+        // 一次成功不该去试第二个来源。
+        assert_eq!(downloader.calls().len(), 1);
+        let summary = installed.summary();
+        assert!(summary.contains("gyan.dev"));
+        assert!(summary.contains("https://one.example/ffmpeg.zip"));
+    }
+
+    #[test]
+    fn windows_source_list_keeps_gyan_first_and_pins_every_hash() {
+        // 来源顺序是承诺：gyan.dev 在前（已知可用），BtbN 在后。
+        assert_eq!(WINDOWS_SOURCES.len(), 2);
+        assert!(WINDOWS_SOURCES[0].label.contains("gyan.dev"));
+        assert!(WINDOWS_SOURCES[0]
+            .url
+            .starts_with("https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-"));
+        // 已核对的哈希必须保持原值，不许被顺手改掉。
+        assert_eq!(
+            WINDOWS_SOURCES[0].sha256,
+            "60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba"
+        );
+        // 每个来源要么带合法哈希，要么是明确的占位值：不能出现「看着像哈希但其实不合法」的值，
+        // 那会被当成未配置而让所有人装不上，或者更糟——被当成通过。
+        for source in WINDOWS_SOURCES {
+            let pinned = dossier_runtime::is_sha256_hex(source.sha256);
+            let placeholder =
+                source.sha256 == "unverified" || source.sha256.starts_with("unfilled:");
+            assert!(
+                pinned || placeholder,
+                "来源「{}」的哈希既不是 64 位十六进制也不是明确占位值：{}",
+                source.label,
+                source.sha256
+            );
+            assert!(!source.url.is_empty(), "来源「{}」缺地址", source.label);
+            // 地址还是占位、哈希却填了：说明只填了一半，装上会静默跳过这一家。
+            if source.url.starts_with("unfilled:") {
+                assert!(
+                    !pinned,
+                    "来源「{}」地址还是占位，哈希却已是真实值，请两处一起补齐",
+                    source.label
+                );
+            }
+        }
+        // BtbN 当前是占位（维护者需固定到具体 autobuild 标签并填入哈希）：
+        // 填好地址与哈希后这里自然变为 false，断言不会成为填坑的阻碍。
+        assert!(
+            WINDOWS_SOURCES[1].url.starts_with("unfilled:")
+                || dossier_runtime::is_sha256_hex(WINDOWS_SOURCES[1].sha256),
+            "BtbN 这一项要么两处都是占位，要么地址与哈希都填好"
+        );
+    }
+
+    #[test]
+    fn extracted_binary_is_found_under_bin_directory() {
+        // gyan / BtbN 的包结构都是 <根>/<版本目录>/bin/ffmpeg.exe。
+        let dir = TempDir::new("find-in-extracted");
+        let root = dir.path();
+        let nested_bin = root.join("ffmpeg-9.0.2-essentials_build").join("bin");
+        std::fs::create_dir_all(&nested_bin).expect("建解压目录");
+        std::fs::write(nested_bin.join("ffmpeg.exe"), b"exe").expect("写假可执行文件");
+        std::fs::write(nested_bin.join("ffprobe.exe"), b"exe").expect("写假可执行文件");
+        // 根目录放一个同名文件：不能选它，`bin/` 下的才是要的那个。
+        std::fs::write(root.join("ffmpeg.exe"), b"wrong").expect("写干扰文件");
+
+        let found = find_in_extracted(root, "ffmpeg.exe").expect("应当找到 bin/ffmpeg.exe");
+        assert_eq!(
+            found.file_name().and_then(|name| name.to_str()),
+            Some("ffmpeg.exe")
+        );
+        assert_eq!(
+            found
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str()),
+            Some("bin")
+        );
+        let missing = find_in_extracted(root, "nonexistent.exe").expect_err("没有就该报错");
+        assert!(missing.contains("nonexistent.exe"), "{missing}");
     }
 }

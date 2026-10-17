@@ -5,17 +5,20 @@
 | 模块 | 责任 | 禁止事项 |
 |---|---|---|
 | `crates/dossier-core` | 领域模型、目录扫描、ffprobe 解析、检查规则、报审包文档生成与组装（`render_documents` / `assemble_package`）、验签、转码建议、报审包差异、平台档案、剪映草稿；处理版本的模板与滤镜图（`version.rs`：`VersionTemplate` / `build_version_graph` / `build_cover_args`、画质统计解析、`版本说明.json` 与处理台账记录的结构） | 不依赖 Tauri/GUI，不做网络请求（与服务端通信在 `src-tauri/src/account/`）；`transcode` 只产出建议，不执行转码；`version.rs` 纯计算，不碰文件系统、不跑进程 |
-| `crates/dossier-inpaint` | 硬字幕与角标擦除管线（学习原型）：帧 IO、掩码、检测/修复后端编排、结果自动校验、桌面入口的命令拼装 | 不做 DRM 绕过，不处理他人作品的版权标识；桌面端只能经 `erase.rs` 拼参数，不另写一套规则 |
+| `crates/dossier-inpaint` | 硬字幕与角标擦除管线（学习原型）：帧 IO、掩码、检测/修复后端编排、结果自动校验、静止区域检测（`still.rs`）、桌面入口的命令拼装 | 不做 DRM 绕过，不处理他人作品的版权标识；桌面端只能经 `erase.rs` 拼参数，不另写一套规则 |
 | `tools/model_worker` | 模型侧 worker：DBNet 检测、E2FGVI / LaMa / ProPainter 修复（`--serve` 常驻） | 不决定「改哪些像素」；不碰整帧回贴 |
-| `src-tauri` | 桌面窗口、IPC 命令、文件夹选择、打包；处理版本的命令层与任务队列、编码执行层（`version.rs`：权属声明 / 模板 / 计划预览 / 开始生成与队列执行器；`jobs.rs`：持久化队列与状态机；`encode.rs`：统一编码参数、可中断子进程、硬件失败退软件） | 不把业务规则写在命令层（`erase.rs` / `dossier.rs` 只做参数适配）；队列不懂视频、执行器不懂队列状态机 |
+| `src-tauri` | 桌面窗口、IPC 命令、文件夹选择、打包；处理版本的命令层与任务队列、编码执行层（`version.rs`：权属声明 / 模板 / 计划预览 / 开始生成与队列执行器；`jobs.rs`：持久化队列与状态机；`encode.rs`：统一编码参数、可中断子进程、硬件失败退软件）；区域擦除的桌面入口（`erase_batch.rs`：取帧 / 自动识别 / 对比预览 / 批量入队） | 不把业务规则写在命令层（`erase.rs` / `dossier.rs` / `erase_batch.rs` 只做参数适配）；队列不懂视频、执行器不懂队列状态机 |
 | `src` | 桌面 WebView UI | 不绕过 Rust 命令访问文件系统 |
 | `cloud/` | 云端制作系统（学习原型）：配方、任务队列、媒体处理模块、控制面 API 与 Web 客户端 | 不引入 GPU 依赖；不在配方里执行任意命令（模块走白名单）；桌面壳方案见 `cloud/docs/PACKAGING_GUIDE.md` |
 
 `dossier-inpaint` 与报审材料链路相互独立，是命令行运行的学习原型：区域/时间窗配置 →
 逐帧时序掩码 → inpaint 修复 → **输出帧自动校验**（残留 / 闪烁 / 接缝 / 一致性 / SSIM）→
 处理日志 + 确认流退出码（0 通过 / 3 需抽查 / 2 校验失败 / 1 执行错误）。
+区域怎么来有两条路：人工给 `--roi`，或者先跑 `--detect-only` 由 `still.rs` 找出「位置固定、
+内容不变」的区域（四条判据 + 默认阈值见该文件头注释），结果当作 `--roi` 交给同一条管线，
+擦除主流程一行都不用改。
 接入方式与交换机协议见 [SUBTITLE_REMOVAL.md](SUBTITLE_REMOVAL.md)；
-角标 / 水印场景的 ROI 取法、掩码规则与编码策略见
+角标 / 水印场景的 ROI 取法、自动识别的判据与编码策略见
 [WATERMARK_REMOVAL.md](WATERMARK_REMOVAL.md)。
 
 擦除管线的三条工程约定：
@@ -48,6 +51,11 @@
 | `erase_status` | `toolPath` | 查询擦除工具是否可用 |
 | `plan_erase` | `request`, `toolPath` | 只拼装命令供预览，不执行 |
 | `run_erase` | `request`, `toolPath`, `timeoutSeconds` | 执行擦除并回传确认流结论 |
+| `video_frame` | `path`, `seconds`, `maxWidth` | 取某一秒的画面，等比缩到 `maxWidth`（默认 720、宽高取偶数）后返回 JPEG 的 data URL |
+| `detect_still_regions` | `path`, `samples`, `toolPath` | 调 `dossier-inpaint --detect-only` 找「位置固定、内容不变」的候选区域（`samples` 夹到 2–600），只做检测、不产视频 |
+| `erase_preview` | `input`, `seconds`, `startSec`, `durationSec`, `regions`, `toolPath` | 只擦一小段（默认 `seconds - 2` 起、4 秒）并取同一时刻的帧，返回擦除后的 JPEG data URL 供左右对比 |
+| `erase_batch_start` | `request` | 门槛（权利确认 / 至少一个区域 / 至少一集）→ 逐集算哈希 → 台账留痕 → 入队，返回 `JobView` |
+| `pick_scan_file` | 无 | 选已盖章的扫描件（`png` / `jpg` / `jpeg` / `pdf`，单份 ≤ 5 MB） |
 | `transcode_advice` | `root`, `name`, `target`, `ffprobePath` | 转码建议 + 批处理脚本（不执行） |
 | `diff_report_packages` | `leftDir`, `rightDir` | 两份报审包清单差异 |
 | `platform_profiles` | 无 | 内置平台档案（学习示例） |
@@ -67,6 +75,10 @@
 | `job_terminate` | `id` | 终止：杀掉正在跑的子进程并删掉这一集的半成品 |
 
 Rust 命令使用 snake_case，Tauri 会把 JavaScript 的 camelCase 参数映射到对应 Rust 参数。
+
+**擦除任务走任务队列，`kind = erase`**：`erase_batch_start` 只做门槛检查与入队，
+真正逐集执行由 `erase_batch::EraseRunner` 注册到 `JobQueue` 的 `erase` 执行器完成，
+所以暂停、终止、续跑与其他任务共用同一套状态机。
 
 `rules` 为可选的 `ChecklistRules`；缺省时使用内置默认阈值。设置持久化由 `dossier-core` 的 `settings` 模块负责：文件缺失或损坏时回退默认值并带回告警，写入采用临时文件替换。
 
@@ -113,6 +125,24 @@ Rust 命令使用 snake_case，Tauri 会把 JavaScript 的 camelCase 参数映�
 （`dossier-license::version_task::verify_consumed`），**不再验有效期**——配方已经在服务端消费过，
 再限时间没有意义；参数和种子固定在配方里，所以反复续跑产出的文件和第一次完全相同。
 执行器每集开工前还会重算一次源文件哈希，避免「申请配方时用 A、处理时换成 B」。
+
+区域擦除（`src-tauri/src/erase_batch.rs` + `crates/dossier-inpaint/src/still.rs`）：
+
+```text
+当前剧第 1 集的某一秒
+  → video_frame：ffmpeg 取一帧，等比缩到 720 宽，返回 JPEG data URL（坐标仍按原始分辨率保存）
+  → detect_still_regions：dossier-inpaint --detect-only --report-json
+       取样 min(采样帧数, 总帧数) 帧，逐像素算帧间方差 / 极差 / 边缘梯度，
+       聚成连通块后交给 stable_rois 合并，输出候选框（带 score）
+  → 人在画布上确认：新建 / 移动 / 缩放，左右对比（erase_preview 只擦 4 秒再取同一时刻的帧）
+  → erase_batch_start：勾选权利确认 → 逐集算 SHA-256 → 写入台账 processing.jsonl → 入队（kind = erase）
+  → 队列执行器 EraseRunner 逐集调 dossier-inpaint（每集开工前重算源文件哈希）
+  → 每集 <擦除输出>/<分集主名>.mp4 + results/<集名>.json
+  → 收尾写 <擦除输出>/擦除报告.json，并把「擦除完成」再记一次台账
+```
+
+`--detect-only` 是**预定位**而不是检测器：它不写视频、不跑修复、不做校验，退出码恒为 0
+（没找到候选也算成功，`candidates` 是空数组）；给了 `--output` 会直接报错，避免被误解成「顺便也擦一遍」。
 
 ## 质量门槛
 
