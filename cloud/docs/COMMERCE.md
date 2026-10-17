@@ -1,14 +1,16 @@
 # 账号与授权服务（drama_cloud.commerce）
 
-这个服务管两件事：账号（注册、登录、邮件验证码、令牌），和授权（卡密兑换、使用权、电脑绑定、
-可以离线验证的授权凭证）。它和媒体控制面（`drama-cloud`）分开部署：处理任务再重，也不拖慢登录。
-数据库用 PostgreSQL，因为卡密兑换、抢设备名额和以后的支付回调都需要可靠的并发事务。
+这个服务管三件事：账号（注册、登录、邮件验证码、令牌），授权（卡密兑换、使用权、电脑绑定、
+可以离线验证的授权凭证），和积分（账本、按集计价、充值支付、邀请奖励）。它和媒体控制面（`drama-cloud`）
+分开部署：处理任务再重，也不拖慢登录。数据库用 PostgreSQL，因为卡密兑换、抢设备名额和支付回调都需要可靠的并发事务。
 
 - M1（已完成）：邮件验证码、注册、登录、刷新与吊销令牌、重设密码、修改密码、集中限流、审计日志。
 - M2：卡密批量生成与兑换、使用权、电脑绑定与解绑、授权凭证的签发与刷新、管理命令。
 - 桌面端接入（钥匙串、本机机器码、本地验签、离线提示）在 M3。
-- M4a（本期）：报审包（`POST /packages`）与处理配方（`POST /recipes`、`/recipes/{id}/consume`），
+- M4a：报审包（`POST /packages`）与处理配方（`POST /recipes`、`/recipes/{id}/consume`），
   三种签名用途前缀隔离；处理配方接桌面界面在 M4b。
+- M5a（本期）：积分账本与按集计价（3.7）、充值订单与支付渠道抽象（3.8）、邀请码与防刷（3.7）。
+  报审包与处理配方在这一期开始扣积分；真实收款渠道仍只有占位实现。
 
 ## 1. 本地开发
 
@@ -20,6 +22,7 @@ export DRAMA_COMMERCE_DSN='postgresql://drama:drama-dev-only@127.0.0.1:5432/dram
 export DRAMA_COMMERCE_CODE_SECRET='<至少 32 个字符的随机串>'   # 例如 python3 -c 'import secrets;print(secrets.token_urlsafe(48))'
 export DRAMA_COMMERCE_SMTP_HOST=127.0.0.1 DRAMA_COMMERCE_SMTP_PORT=1025 DRAMA_COMMERCE_SMTP_SECURITY=plain
 export DRAMA_COMMERCE_LICENSE_KEY_FILE="$HOME/.config/drama-commerce/license-dev.pem"
+export DRAMA_COMMERCE_MOCK_PAY_SECRET='<随便一个固定串，模拟支付用它签回调>'   # 不配时 mock 渠道报「未配置」
 
 .venv/bin/drama-commerce keygen "$DRAMA_COMMERCE_LICENSE_KEY_FILE"   # 只做一次；打印的 public_key 给桌面端
 .venv/bin/drama-commerce migrate          # 建表；重复执行没有副作用
@@ -31,6 +34,9 @@ export DRAMA_COMMERCE_LICENSE_KEY_FILE="$HOME/.config/drama-commerce/license-dev
 
 - 验证码邮件发到 Mailpit，不会发出真实邮件。打开 <http://127.0.0.1:8025> 查看。
 - 验证码在数据库里存的是用 `CODE_SECRET` 算的 HMAC。换了这个密钥，之前发出的验证码全部失效。
+- 想跑通充值：配了 `DRAMA_COMMERCE_MOCK_PAY_SECRET` 之后，在客户端的「积分与充值」里选档位下单，
+  会拿到一个指向本服务 `/pay/mock/checkout?out_trade_no=…` 的地址；在那个页面上点按钮即可发出真实格式的回调。
+  本地开发不需要配 `DRAMA_COMMERCE_PUBLIC_BASE_URL`（Mock 会用本次请求的来源补成完整地址，客户端可以直接点开）。
 - 停止：`docker compose -f compose.dev.yaml down`；连数据一起删掉加 `-v`。
 - compose 里的账号密码是开发专用的固定值，不能用在任何对外环境。
 - 私钥和导出的卡密 CSV 都放在仓库目录外面：`.gitignore` 没有排除它们，放进仓库很容易被误提交。
@@ -59,9 +65,15 @@ export DRAMA_COMMERCE_LICENSE_KEY_FILE="$HOME/.config/drama-commerce/license-dev
 | `DRAMA_COMMERCE_UNBIND_WINDOW_DAYS` | 否 | 解绑次数的统计周期，单位天（1..365，默认 30） |
 | `DRAMA_COMMERCE_PDF_FONT` | 否 | 报审包 PDF 用的中文字体（`.otf` / `.ttf` / `.ttc` 文件路径）。不设时按常见系统路径找 Noto Sans CJK SC；**找不到字体服务拒绝启动** |
 | `DRAMA_COMMERCE_ARTIFACTS_BIN` | 否 | `dossier-artifacts` 可执行文件路径。不设时按 PATH → `target/release` → `target/debug` 查找（见 `toolchain.py`） |
+| `DRAMA_COMMERCE_PUBLIC_BASE_URL` | 否 | 本服务的对外地址（例如 `https://drama.example.com`），用来拼支付回调地址。Mock 支付不需要它；真实渠道缺它时下单报「未配置对外地址」 |
+| `DRAMA_COMMERCE_MOCK_PAY_SECRET` | 否 | 模拟支付回调的 HMAC-SHA256 签名密钥。留空时 mock 渠道报「未配置」——空密钥等于谁都能伪造回调，所以开发环境也要显式配一个固定串 |
+| `DRAMA_COMMERCE_ALIPAY_APP_ID` / `_PRIVATE_KEY` / `_PUBLIC_KEY` | 否 | 支付宝沙箱凭证。缺任何一项时报 `payment_not_configured` 并列出缺的是哪几个变量 |
+| `DRAMA_COMMERCE_ALIPAY_GATEWAY` | 否 | 支付宝网关地址，不设时用代码里钉住的沙箱网关 |
+| `DRAMA_COMMERCE_WECHAT_MCH_ID` / `_API_V3_KEY` / `_PRIVATE_KEY` / `_SERIAL_NO` | 否 | 微信支付凭证。个人主体申请不了商户号，本期只留接口 |
 
 配置缺失或非法时，服务拒绝启动，报错里只出现变量名，不出现变量值。
-`migrate`、`cleanup`、`cards` 只需要 `DRAMA_COMMERCE_DSN`；`keygen`、`keyinfo` 不读任何配置。
+`migrate`、`cleanup`、`cards`、`credits` 只需要 `DRAMA_COMMERCE_DSN`；`keygen`、`keyinfo` 不读任何配置。
+支付凭证只在用到对应渠道时才检查：没配好不影响服务启动，只让那个渠道报「未配置」。
 报审包与处理配方相关的接口还会用到上面两项：字体缺失时**启动**就失败；`dossier-artifacts`
 缺失时启动不失败，但 `POST /packages` 会返回 503 `service_unavailable`。
 
@@ -222,17 +234,20 @@ export DRAMA_COMMERCE_LICENSE_KEY_FILE="$HOME/.config/drama-commerce/license-dev
 | 400 | `wrong_password` | 修改密码时当前密码不对；注销时密码不对 |
 | 401 | `invalid_credentials` | 邮箱或密码不正确（两种情况不区分） |
 | 401 | `unauthorized` | 没带令牌、令牌无效或已过期、会话已吊销（包括这台电脑被解绑） |
+| 402 | `insufficient_credits` | 积分不足：消费配方或生成报审包预扣时都可能返回；附带 `required`（需要多少）和 `balance`（当前多少）。事务回滚，配方 / 报审包都没有开始处理 |
 | 403 | `device_not_bound` | 刷新凭证：这台电脑没绑定到当前账号，或已被解绑；生成报审包、签发 / 消费配方时也是这个含义 |
 | 403 | `entitlement_required` | 账号还没有使用权，或者使用权已到期（生成报审包、签发 / 消费配方的共同前提） |
 | 403 | `wrong_device` | 消费配方：这个配方不是发给这台电脑的 |
 | 404 | `email_not_registered` | 重设密码：邮箱没注册 |
 | 404 | `card_not_found` / `device_not_found` | 卡密不存在 / 要解绑的电脑不存在或已解绑 |
 | 404 | `recipe_not_found` | 消费配方：找不到这个配方（别人的配方和不存在的配方回同一个错误，不透露配方 ID 是否存在） |
+| 404 | `tier_not_found` / `order_not_found` | 充值档位不存在或已下架 / 找不到这笔订单（别人的订单同样回这个错误） |
 | 409 | `email_taken` | 注册：邮箱已被占用 |
 | 409 | `card_used` / `card_revoked` | 卡密已被别人用过 / 所在批次已作废 |
 | 409 | `already_lifetime` | 账号已经是永久授权，不需要再兑换（卡不会被用掉） |
 | 409 | `device_limit` | 名额满了；附带 `devices`、`device_limit`、`unbind_quota` |
 | 409 | `recipe_consumed` | 消费配方：这个配方已经用过了，要重新申请 |
+| 409 | `amount_mismatch` | 支付回调的金额与订单不一致，已拒绝入账 |
 | 410 | `recipe_expired` | 消费配方：这个配方已过期，要重新申请 |
 | 413 | `payload_too_large` | 请求体太大：一般接口上限 1 MiB；`POST /packages` 上限 1 MiB + 4 份扫描件（见 3.5）。在解析 JSON 之前就拒绝 |
 | 422 | `invalid_request` | 参数校验失败；报审包还包括「文档内容太长压到签章位」这类排版错误，`message` 是 Rust 侧给的中文说明 |
@@ -240,15 +255,18 @@ export DRAMA_COMMERCE_LICENSE_KEY_FILE="$HOME/.config/drama-commerce/license-dev
 | 429 | `rate_limited` | 太频繁；`Retry-After` 响应头给出要等的秒数 |
 | 429 | `unbind_limit` | 本周期解绑次数用完；附带 `unbind_quota`，`Retry-After` 给出要等的秒数（可能是好几天） |
 | 503 | `mail_unavailable` / `service_unavailable` | 发信失败（可立即重试） / 数据库不可用；报审包还包括服务端缺少 `dossier-artifacts`、工具运行失败或超时、签章服务未实现 |
+| 503 | `price_missing` / `invite_not_configured` / `payment_not_configured` | 缺少计价规则 / 邀请奖励配置丢了 / 支付渠道没配好（Mock 缺签名密钥、真实渠道缺凭证或对外地址、Mock 渠道查单） |
 
 ### 3.5 报审包
 
 | 方法 | 路径 | 请求体 / 参数 | 成功 |
 | --- | --- | --- | --- |
-| POST | `/packages` | 见下 | 200 `{"package_id", "manifest", "signature", "files"}` |
+| POST | `/packages` | 见下 | 200 `{"package_id", "manifest", "signature", "credits", "files"}` |
 
 三个前提缺一不可：**登录**（没带令牌或令牌失效是 401 `unauthorized`，见 3.4）、`device_id` 是当前账号
 绑定且未解绑的电脑（否则 403 `device_not_bound`）、账号有**有效使用权**（否则 403 `entitlement_required`）。
+另外积分要够：集数越多扣得越多，不够时在预扣阶段就返回 402 `insufficient_credits`，不开始渲染；
+渲染或签章失败会把预扣的积分退还（见 3.7）。
 
 请求体（字段 snake_case，多一个不认识的字段一律 422）：
 
@@ -275,16 +293,17 @@ export DRAMA_COMMERCE_LICENSE_KEY_FILE="$HOME/.config/drama-commerce/license-dev
 扫描件按**文件头**判断类型（不信扩展名）：PDF 原样检查后返回（不能加密、不能是空文件），
 PNG / JPEG 铺满一页 A4；页数必须与原文档一致，否则 422 `scan_invalid`。
 
-服务端做的事：检查前提 → 调 `dossier-artifacts render-package` 生成文本文件与排版模型 →
+服务端做的事：检查前提 → 算价并预扣积分（见 3.7）→ 调 `dossier-artifacts render-package` 生成文本文件与排版模型 →
 把两份文档画成 A4 PDF 并盖章 → 拼清单 `drama-dossier/package@2`、用 Ed25519 签名
-（用途前缀 `package-manifest`）→ 在一个事务里记一行 `packages` 和一条审计日志 → 返回。
+（用途前缀 `package-manifest`）→ 在一个事务里记一行 `packages` 和一条审计日志 → 结算积分 → 返回。
 
-返回：
+返回里多一个 `credits`（这次扣了多少积分）：
 
 ```json
 {"package_id": "<UUID>",
  "manifest": "<manifest.json 的原样字符串>",
  "signature": "{\"kid\": \"…\", \"sig\": \"…\"}",
+ "credits": "<本次扣掉的积分>",
  "files": [{"path": "01_剧集信息/剧名.txt", "content": "<base64>"}]}
 ```
 
@@ -335,13 +354,15 @@ PNG / JPEG 铺满一页 A4；页数必须与原文档一致，否则 422 `scan_i
 
 | 方法 | 路径 | 请求体 | 成功 |
 | --- | --- | --- | --- |
-| POST | `/recipes` | `device_id`、`task`、`platform`、`strength` | 200 `{"recipe_id", "token", "expires_at", "params"}` |
-| POST | `/recipes/{recipe_id}/consume` | `device_id` | 200 `{"recipe_id", "consumed": true}` |
+| POST | `/recipes` | `device_id`、`task`、`platform`、`strength`、`episode_count` | 200 `{"recipe_id", "token", "expires_at", "params", "credits", "episode_count"}` |
+| POST | `/recipes/{recipe_id}/consume` | `device_id` | 200 `{"recipe_id", "consumed": true, "credits"}` |
 
 - 两个接口都要求登录、这台电脑绑定在当前账号上、使用权有效（与 3.5 同样的三个前提）。
 - 请求字段：`device_id` 是 64 位小写十六进制机器码；`task` 是**任务描述的哈希**，64 位小写十六进制；
   `platform` 只能是 `universal`（只生成一套通用版本，见 3.6 的平台规格）；
-  `strength` 只能是 `light` / `medium` / `heavy`。
+  `strength` 只能是 `light` / `medium` / `heavy`；
+  `episode_count` 是这次要处理的集数（1..500），**由桌面端报上来**——服务端只收到任务哈希、看不到集数，
+  而计价按集算（见 3.7）。
 
 **任务哈希（`task`）**：由桌面端计算后传给服务端；服务端只把它绑进配方并原样回填，**不解析也不校验内容**。
 规则（`dossier-license::version_task`）：
@@ -370,9 +391,14 @@ PNG / JPEG 铺满一页 A4；页数必须与原文档一致，否则 422 `scan_i
 
 **只能消费一次**：由服务端记账。消费时先锁住这一行，再按顺序检查——找不到（别人的配方也是这个结果）
 → `recipe_not_found`（404）→ 机器码不对 `wrong_device`（403）→ 已消费 `recipe_consumed`（409）
-→ 已过期 `recipe_expired`（410）→ 再查一次使用权（403 `entitlement_required`）→ 记 `consumed_at`。
+→ 已过期 `recipe_expired`（410）→ 再查一次使用权（403 `entitlement_required`）→ 扣积分 → 记 `consumed_at`。
 第二次消费一定失败；只靠本地记录挡不住重放（把本地记录删掉就能再用一次），所以必须在服务端记账。
 `recipes` 表里记着 `seed` 和平台 / 强度，配合 `derive_params` 就能算出同样的参数，处理结果可以复现。
+
+**扣费**：签发时按 `episode_count` 算好 `credits` 写库，消费时按这个值扣（不重算，理由见 3.7）。
+扣费与「标记已消费」在同一个事务里，先 `hold` 再立刻 `settle`——消费即定案。余额不足返回
+402 `insufficient_credits`（附带 `required` 与 `balance`），整个事务回滚，配方仍然可以充值后再消费。
+处理在本机执行、服务端看不到结果，所以**处理失败不退积分**，界面要在确认框里写明。
 
 #### 各强度的参数上下限
 
@@ -414,6 +440,233 @@ PNG / JPEG 铺满一页 A4；页数必须与原文档一致，否则 422 `scan_i
 
 状态：**待复核**——抖音、视频号没有官方原文，其余是二手转述，M4b 前需按官方帮助中心再核一次。
 
+### 3.7 积分
+
+积分是付费功能的计量单位：处理版本和报审包都按**集**收费。设计目标是「任何一笔积分变动都能从流水推回来」。
+
+#### 账本设计
+
+`credit_ledger` 只有插入，没有修改和删除（应用层没有任何 UPDATE / DELETE 它的代码路径）。**余额一律由
+`SUM(delta)` 算出来，不存可变的 `balance` 字段**：
+
+- 余额是钱。存一个可变字段，就意味着「余额」和「流水」是两份独立数据，算错一次之后再也没法从流水推回正确余额，
+  对账时也说不清哪一边对；
+- 代价是查一次余额要扫一次索引（`credit_ledger_user_time`），用户量级小，可接受。
+
+`delta` 是整数（正数加、负数扣），单位是积分，**不用浮点**。五种 `kind`：
+
+| `kind` | 含义 | 方向 |
+| --- | --- | --- |
+| `grant` | 充值到账（支付回调入账）、管理员手动加分 | 正 |
+| `hold` | 预扣 | 负 |
+| `release` | 预扣退还（报审包生成失败） | 正 |
+| `reward` | 邀请奖励（邀请人得 `invite:` 键、被邀请人得 `invitee:` 键，各一条） | 正 |
+| `expire` | 悬挂过久的预扣被自动回收 | 正 |
+
+`settled_state` 只有 `hold` 才有，三种状态：
+
+- `reserved` 预扣中：钱已经从余额里减掉了，但还没定案；
+- `settled` 已消费：预扣的那笔钱就是花掉了，**不再写新流水**；
+- `released` 已退还：原 hold 标成退还，并**另外写一条正的 `release` / `expire` 流水**。
+
+为什么失败要写新流水，而不是把 hold 删掉或改成 0：账本只增不改，「退过钱」这件事本身必须留下痕迹，
+否则事后看不出一笔钱进来过又出去过。数据库层还有一条约束：`(kind = 'hold') = (settled_state IS NOT NULL)`，
+非 `hold` 的流水不许带状态。
+
+`hold` 里**先锁用户行、再动流水**（`lock_user`）：余额检查与写入之间不能有别人插进来。`settle` / `release`
+只动流水、不需要用户行锁，但加锁顺序照样固定，才不会互相等死。`release_stale_holds` 用
+`FOR UPDATE SKIP LOCKED` 扫描，整个扫描与改写在一个事务里完成——不在事务里的话锁立刻释放，
+两个并发调用会挑中同一批行。
+
+#### 计价
+
+价目表 `price_rules` 一个计价对象一行，目前两个对象：`version`（处理版本）、`package`（报审包）。
+计价单位只有 `episode`（集），初始值是**每个对象每集 5 积分**，`min_units` 是 1（不足一集也按一集算）。
+价目表的初始值是迁移里写死的种子数据，后台改价留到 M7；表里查不到规则时返回 503 `price_missing`，
+**不会默认成 0**（那等于免费），也不猜一个数。
+
+- 处理版本：`cost_for("version", episode_count)`。集数由桌面端报上来（服务端只收到任务哈希，看不到集数），
+  上限 500，和报审包一致。
+- 报审包：`cost_for("package", len(episodes))`。集数就是请求里 `episodes` 的条数（最多 500）。
+
+**价格在签发时定死**：`POST /recipes` 算出 `required` 后，把它和集数一起写进 `recipes.credits` / `episode_count`；
+消费时直接读这个值扣款，**不重算**。否则中途改过价目表，就会出现「签发时说 25、扣钱时扣 30」。
+0007 之前签发的旧配方这两列是 NULL（那时还没有计费），按 0 处理，只参与审计。
+
+`credits.quote()` 是「只算价、不扣钱」的辅助函数（返回 `required` / `balance` / `enough`），
+`price_per_unit()` 只查单个计价对象的单价；目前没有把它们暴露成接口。界面上的预估价是桌面端按「每集 5 积分」
+自己乘出来的，确认框里同时写明「准确数额以服务端签发时为准」——以 `POST /recipes` 返回的 `credits` 为准。
+
+#### 扣费时机
+
+两个付费功能的定案时点不同，这是刻意的：
+
+**处理版本：消费即定案。** 扣费发生在 `POST /recipes/{id}/consume` 里，和「标记配方已消费」在**同一个事务**：
+先 `hold` 再立刻 `settle`，要么配方被消费且钱被扣，要么两件都没发生。余额不足时 `hold` 抛 402，
+整个事务回滚，配方**仍然可以充值后再消费**。
+
+失败不退，原因写在代码注释里：**处理在本机执行，视频不上传，服务端无从判断成败**，留着「预扣中」等一个永远不会
+到来的结算只会让钱悬挂。界面必须在确认框里写明这一点（见 3.6 与用户手册）。
+
+**报审包：三段式（hold → 渲染 → settle / release）。** 渲染要跑子进程、可能几秒，所以：
+
+1. 先算价、在**独立事务**里 `hold`（预扣）。放在渲染之前，避免余额不足的请求白占 CPU 与字体资源；
+2. 再渲染、签章、写库（`_create_charged`）。渲染耗时，不能和扣费挤在同一个长事务里占着连接与锁；
+3. 全部成功才 `settle`；渲染、签章、写库任何一处出错（`except BaseException`，进程被取消也算）走 `release` 退还。
+
+预扣的 `ref` 用一次性的 `package:<uuid>` 而不是剧名——`ref` 会进流水和审计日志，而审计日志一直刻意只存剧名的哈希。
+
+#### 预扣超时回收
+
+`HOLD_TTL_SECONDS = 2 × 3600`，即 **2 小时**：超过这么久还没结算的 `reserved` 视为放弃，自动退还
+（写一条 `expire` 正数流水并把原 hold 标 `released`）。
+
+- 它**只用于报审包**这类服务端自己执行的任务。处理版本的预扣与结算在同一个事务里，不存在悬挂状态。
+- 回收是**查余额时顺带做的**：`balance()` 与 `hold()` 都先按 `user_id` 回收这个人的悬挂预扣再算余额，
+  否则用户看到的余额里有一笔其实早该退回来的钱，会以为积分丢了。
+- 进程崩溃、服务重启留下的 `reserved` 由管理员兜底：`drama-commerce credits expire`（见 5.3）扫全库回收。
+
+#### 接口
+
+| 方法 | 路径 | 认证 | 成功 | 典型错误 |
+| --- | --- | --- | --- | --- |
+| GET | `/credits` | Bearer | 200 `{"balance", "history"}`，`history` 是最近 **20** 条 | 429 `rate_limited` |
+| GET | `/credits/history` | Bearer | 200 `{"items"}`，`limit` 默认 50、夹在 1..200 | 429 `rate_limited` |
+| GET | `/invites` | Bearer | 200 `{"code", "invited", "rewards", "earnedCredits", "inviterCredits", "inviteeCredits", "maxRewards"}` | 503 `invite_not_configured` |
+
+`GET /credits` 与 `GET /invites` 共用一个限流桶（`credits:balance`，每账号每小时 240 次），
+`GET /credits/history` 单独一个（每账号每小时 120 次）。
+
+流水条目：`{"delta", "kind", "ref", "settledState", "memo", "createdAt"}`，新到旧。它只用于展示，
+不参与任何判断——判断一律看 `SUM(delta)`。
+
+`GET /credits` 一次就把余额和最近流水都返回，界面上少一次往返。
+
+#### 邀请
+
+四道防刷闸，缺一不可（`invites.py` 的模块注释与 0009 迁移）：
+
+1. **一个账号只能被邀请一次**：`users.invited_by` 只写一次，重复绑定不覆盖；
+2. **同一台电脑最多给一个账号当邀请来源**：用已有的 `devices.device_id`（机器码）判断，不引入新指纹。
+   只看「被邀请过」的账号，正常用户自己一台电脑绑自己一个账号不受影响；
+3. **被邀请人真的付过钱才发奖励**：注册就发等于白送，刷号成本几乎为零；
+4. **每个邀请人有奖励次数上限**：防止有人用一批小号互相邀请。
+
+邀请码由 `user_id` 派生（`SHA-256("invite:" + user_id)` 的前 10 位十六进制，大写），可复现、不需要额外存储。
+注册时可以带 `invite_code`（最长 16 字符）和 `device_id`；**码填错或触发防刷都不会让注册失败**，
+只是不绑，触发防刷的会记审计日志（`invite.same_device`、`invite.self`）。
+
+奖励配置在 `invite_settings`（单行表）：**邀请人 50 积分、被邀请人 20 积分、每人最多 20 次**。
+配置行缺失时报 503 `invite_not_configured`——宁可报错，也不按 0 发。
+
+发放时机：支付回调入账成功后调 `invites.grant_on_first_payment()`。它**自己再查一次**这个账号有没有
+`status = 'paid'` 的订单，不信任调用方——这个方法一旦被误调用就是白送积分，多查一次 SQL 比信任调用方便宜。
+幂等键是 `invite:<被邀请人>`（邀请人侧）和 `invitee:<被邀请人>`（被邀请人侧），
+所以重复触发（多次付费、重复调用）只发一次。发放时把邀请人这一份的数量写进 `invite_rewards.credits`
+（`/invites` 的 `earnedCredits` 是它的合计），之后改配置不影响已经发出去的奖励。
+
+### 3.8 支付
+
+支付只做一件事：把「渠道说这笔钱到账了」变成一条 `grant` 流水。订单表 `payment_orders` 记原因
+（谁、什么时候、买了多少积分、渠道侧单号），账本记结果。
+
+#### 渠道抽象
+
+`PaymentProvider`（`payments/base.py`）四个方法：`create()` 下单返回「怎么去付」、`parse_notify()` 把回调变成
+`PaymentEvent`（**先验签再取数据**）、`ack()` 按渠道要求应答、`query()` 主动查单。
+
+一条硬规则：**任何渠道的实现都不许自己改账本。** 入账只有一条路 `payments.service.handle_event()`，
+渠道实现只负责「把渠道的报文变成 `PaymentEvent`」。一个渠道要能用，必须**同时**满足「代码里有实现」
+和「配置里有凭证」；缺任何一样都显式报 `NotConfigured`（`payment_not_configured`），绝不降级成「假装成功」。
+
+| 渠道 | 状态 | 说明 |
+| --- | --- | --- |
+| `mock` | 可用 | 本地模拟收银台，没有商户号也能把「下单 → 支付 → 回调 → 入账」整条链路跑通 |
+| `alipay` | 占位 | 凭证齐了也不下单：签名算法还没实现，`create` / `parse_notify` / `query` 一律抛「还没实现」 |
+| `wechat` | 占位 | 个人主体申请不了商户号，且 APIv3 没有官方沙箱，只留接口 |
+
+**Mock 的签名方式**：本地 HMAC-SHA256，签名头是 `X-Mock-Signature`，签名对象是回调报文的原始字节，
+比较用 `hmac.compare_digest`（防时序侧信道）。**关键设计是回调走和真实渠道完全相同的代码路径**，
+唯一不同的只是签名算法（本地 HMAC，而不是 RSA2 / AES-GCM 解密）——这样才真的测到验签、金额校验和重复回调去重。
+
+下单返回的跳转地址指向本服务自己的模拟收银台 `/pay/mock/checkout?out_trade_no=…`。地址由 `public_base_url` 拼成；
+没配时用**本次请求的来源**（`request.base_url`）补成完整地址——客户端要把它渲染成可点的链接，
+只给相对路径等于让用户点不开、本地闭环走不下去。这个路由不进 `/openapi.json`。收银台上四个按钮——
+「支付成功」「重复回调」（发一份**逐字节相同**的报文，才测得到幂等）「支付超时」「伪造金额」（改大一分再签名）——
+都只是把页面上展示的那份报文带着签名 POST 到真实的 `/api/v1/payments/mock/notify`，
+入账仍然走 `handle_event()` 那一条路。页面不存会话状态，报文与签名是服务端渲染时算好放进 `data-` 属性的。
+没配 `mock_pay_secret` 时收银台不显示（构造 provider 就抛「未配置」），而不是显示一个点了没用的假页面。
+
+Mock **没有渠道侧可查**：`query()` 直接报「模拟支付没有渠道侧可查单」，
+不假装「查到未支付」——那会让对账以为真的查过了。
+
+**`public_base_url` 的作用**：支付渠道是**主动把通知推到我们的服务**的，所以回调地址必须能从公网访问。
+`notify_url_for()` 用 `public_base_url` + `/api/v1/payments/{channel}/notify` 拼地址；
+没配时 Mock 用相对路径，真实渠道**明确报错**（「没有配置对外地址，支付渠道无法把结果推回来」），
+而不是拼一个假地址让人以为配好了。接支付宝沙箱时本机开发得用内网穿透。
+
+#### 订单
+
+`POST /payments/orders` 按档位下单，订单里的**金额与积分在下单时定死**，之后改档位不影响已有订单。
+订单号是「时间前缀 + 12 位随机十六进制」，全局唯一，回调按它去重。订单有效期 `ORDER_TTL_SECONDS = 2 × 3600`，
+即 2 小时，和支付宝 / 微信的默认有效期一致。
+
+下单时渠道报错（没配好 / 网络）会把订单标成 `closed` 而不是删掉：留一行「曾经尝试过但渠道没成功」对排查有用，
+删掉会让对账少一条记录；也不能留着 `created`——那会让「待支付」的统计永远包含一笔根本付不了的订单。
+
+订单状态：`created` 待支付 / `paid` 已支付 / `closed` 已关闭 / `refunded` 已退款。
+已支付的订单必须有 `paid_at` 和渠道单号（数据库 CHECK 约束）——否则这一行说不清钱到底到没到。
+
+充值档位 `recharge_tiers`（下架的不出现在列表里，但历史订单仍然对得上），初始三档：
+
+| 档位 | 售价 | 到账积分 |
+| --- | --- | --- |
+| `tier-100` | 1000 分（10 元） | 100 |
+| `tier-500` | 5000 分（50 元） | 550 |
+| `tier-2000` | 20000 分（200 元） | 2400 |
+
+金额是**示例价**（1 积分 = 1 分钱，量大再给一点优惠），正式上线前按实际定价改，改价留到 M7。
+
+#### 回调的三条硬规则
+
+1. **只在「已验签的 `PaymentEvent`」上入账。** `handle_event()` 不接受回调原文，调用方必须先把渠道回调变成
+   `PaymentEvent`；验签失败一律拒绝，返回渠道要求的失败应答让它重投。
+2. **订单锁 + 账本幂等键，两层去重。** 渠道会重复投递回调：先 `SELECT … FOR UPDATE` 锁订单行看状态，
+   已经是 `paid` 就直接返回（`already: true`、`credited: 0`）；即使这一层漏了，账本的
+   `idempotency_key = "order:<订单号>"` 唯一约束也会挡住第二次入账。
+3. **金额与订单号必须对得上。** 回调金额和订单金额不一致，通常意味着有人在伪造，一律拒绝并记审计日志。
+
+两种拒绝都要**留痕后再拒绝**，而且审计写在**独立事务**里（`_audit_alone`）：拒绝时我们会 `raise`，
+写在同一个事务里会被异常一起回滚掉，而「有人拿错金额来撞接口」恰恰最需要留痕。
+
+| 情况 | 审计动作 | 结果 |
+| --- | --- | --- |
+| 订单号不存在 | `payment.unknown_order` | 抛 404 `order_not_found`；回调路由接住后按渠道要求回**失败应答**（Mock 是 400），不入账 |
+| 金额不符 | `payment.amount_mismatch` | 抛 409 `amount_mismatch`；同样回失败应答，不入账 |
+| `closed` / `refunded` 事件 | `payment.closed` / `payment.refunded`，**只更新订单状态、不动账本** | 回成功应答，`credited: 0` |
+| 首次入账成功 | `payment.paid`，随后触发邀请奖励 | 回成功应答，`X-Credited` 响应头给出这次到账的积分 |
+
+#### 接口
+
+| 方法 | 路径 | 认证 | 成功 | 典型错误 |
+| --- | --- | --- | --- | --- |
+| GET | `/payments/tiers` | Bearer | 200 `{"items": [{"id", "amountFen", "credits"}]}` | — |
+| POST | `/payments/orders` | Bearer | 200 `{"outTradeNo", "channel", "checkout": {"kind", "payload"}, "amountFen", "credits", "expiresAt"}` | 404 `tier_not_found`；503 `payment_not_configured` |
+| GET | `/payments/orders/{out_trade_no}` | Bearer | 200 订单详情（含 `status`、`paidAt`、`createdAt`、`expiresAt`） | 404 `order_not_found` |
+| POST | `/payments/orders/{out_trade_no}/reconcile` | Bearer | 200 `{"status", "credited", "already"}`：订单已是 `paid` 时是 `already: true`、`credited: 0`，否则是 `handle_event` 的结果 | 404 `order_not_found`；503 `payment_not_configured` |
+| POST | `/payments/{channel}/notify` | **无**（靠验签） | 按渠道要求应答：Mock 200 `{"ok":true}`、支付宝 200 `success`、微信 204 无正文 | 验签失败 / 订单不存在 / 金额不符都回失败应答，不入账 |
+
+- 请求体只有两个字段：`tier_id`（1..32 字符）和 `channel`（`mock` / `alipay` / `wechat`）。
+  **金额与积分由服务端按档位决定，客户端不能传。**
+- `checkout.kind` 是 `redirect`（跳转收银台）或 `qrcode`（展示二维码内容），`payload` 是跳转地址或二维码里要放的字符串。
+- 查单**只能查自己的订单**：别人的订单和不存在的订单回同一个 404，不透露单号是否存在。
+- `reconcile` 是用户点「我已完成支付」时的兜底（回调可能因网络或服务重启丢失）。它先看订单状态，
+  已支付就直接返回 `already: true`；否则调 `provider.query()`，查不到就**如实说「还没付」，不猜、不手动置为已付**。
+  Mock 渠道没有渠道侧可查，这一步会返回 503 `payment_not_configured` 并说明原因。
+- `/payments/{channel}/notify` **不要登录**：渠道不会带我们的令牌，只能靠验签确认来源。顺序是
+  先限流（按来源 IP）、再取 provider（没配好报 503）、再验签、最后才入账。验签失败只记日志
+  （日志里不含报文内容，可能含敏感信息）并回失败应答。
+
 ## 4. 安全规则
 
 - **密码**：argon2id，参数用 argon2-cffi 的默认值（RFC 9106 低内存档：t=3、m=64 MiB、p=4）。
@@ -447,6 +700,10 @@ PNG / JPEG 铺满一页 A4；页数必须与原文档一致，否则 422 `scan_i
   | 生成报审包 | 每账号每小时 30 次 |
   | 签发处理配方 | 每账号每小时 60 次 |
   | 消费处理配方 | 每账号每小时 120 次 |
+  | 查余额、查邀请码与奖励 | 合计每账号每小时 240 次（两个接口共用一个计数桶） |
+  | 查积分流水 | 每账号每小时 120 次 |
+  | 下单、主动查单 | 合计每账号每小时 30 次；`GET /payments/tiers` 不限流 |
+  | 支付渠道回调 | 每来源 IP 每小时 300 次（渠道会重投，但不会一秒几十次） |
 
   限流键是 IP、邮箱的 HMAC，数据库里不出现明文。卡密有 80 位随机数，靠猜是猜不中的，
   兑换的限流不是为了防猜，而是挡住脚本刷接口。
@@ -473,9 +730,20 @@ PNG / JPEG 铺满一页 A4；页数必须与原文档一致，否则 422 `scan_i
   机器码是桌面端自己算的，改过的客户端可以冒用别的机器码，服务端分辨不出来：
   名额限制挡的是随手共享账号，挡不住有意破解；解绑次数上限和审计日志用来限制、发现「轮流换电脑」。
 - **审计日志**：注册、登录、退出、重设密码、修改密码、注销、刷新令牌重放，以及生成和作废卡密批次、兑换卡密、
-  绑定和解绑电脑、生成报审包、签发和消费配方都会记录。只记 ID、计数、卡的类型和天数、电脑平台、
+  绑定和解绑电脑、生成报审包、签发和消费配方、积分与支付、邀请都会记录。只记 ID、计数、卡的类型和天数、电脑平台、
   使用权的前后变化，不记邮箱、令牌、验证码、卡密、授权凭证和 IP。
   卡密批次的操作人记 `--by`，没给就记当前系统用户名。
+- **积分与支付**：账本只增不改，余额由 `SUM(delta)` 算，没有可被算错的第二份数据。
+  每一次加减都留审计动作（`credit.grant` / `credit.hold` / `credit.settle` / `credit.release` / `credit.expire`，
+  明细只有金额、`ref` 和笔数）。入账只有 `payments.service.handle_event()` 一条路，渠道实现不许自己改账本。
+  回调先验签再取数据，验签失败一律不入账；订单锁 + 账本幂等键两层去重；回调金额与订单不符一律拒绝并记审计
+  （`payment.unknown_order` / `payment.amount_mismatch`，写在独立事务里，不会被随后的异常回滚掉）。
+  签名密钥与渠道凭证只从环境变量读，不进仓库也不进日志；Mock 缺签名密钥时报「未配置」而不是用空密钥签名。
+- **积分流水不记内容**：`ref` 只放订单号、配方编号或一次性的开销号，不放剧名——
+  报审包的预扣用 `package:<uuid>` 而不是剧名，否则等于绕过了「审计日志只存剧名哈希」那条规矩。
+- **邀请防刷**：一个账号只能被邀请一次、同一台电脑最多给一个账号当邀请来源、被邀请人真的付过钱才发、
+  每个邀请人的奖励次数有上限。`grant_on_first_payment()` 自己再查一次「有没有已支付订单」，
+  不信任调用方；发奖走账本幂等键，重复触发不会重发。
 - 所有时间判断都用数据库的 `now()`，不依赖应用服务器的时钟；授权凭证的签发和到期时间也取数据库时间。
 
 ## 5. 运维
@@ -495,7 +763,9 @@ PNG / JPEG 铺满一页 A4；页数必须与原文档一致，否则 422 `scan_i
   它缺失时服务能启动，但 `POST /packages` 会返回 503 `service_unavailable`。
 - `drama-commerce cleanup`：清理过期的验证码、令牌、会话和限流计数，建议每天跑一次（cron 或 systemd timer）。
   审计日志、卡密、电脑绑定、报审包记录和处理配方记录都不在这里清理：解绑次数要从绑定历史里数。
-  会话被清掉后，绑定上记的会话变成空，绑定本身不受影响。
+  积分账本、支付订单和邀请记录同样不清理。会话被清掉后，绑定上记的会话变成空，绑定本身不受影响。
+- 悬挂的预扣（`reserved` 超过 2 小时）靠两种途径回收：查余额时顺带（每账号）、`credits expire` 扫全库（见 5.3）。
+  想让它无人值守地兜底，把 `credits expire` 也排进 cron。
 - 对外部署：必须在反向代理上终止 HTTPS，并把 `DRAMA_COMMERCE_TRUSTED_PROXIES` 设成实际的代理层数，
   否则限流拿到的都是代理的地址。SMTP 用 `starttls` 或 `ssl`。
 - `/docs`、`/openapi.json` 是 FastAPI 自带的接口文档，对外部署时可以在反向代理上屏蔽。
@@ -537,6 +807,26 @@ drama-commerce cards revoke --batch <批次 ID> --yes        # 作废这一批�
 - **CSV 是卡密明文的唯一副本**：丢了找不回来；泄露了用 `revoke` 作废整批。
   目标文件已存在就拒绝生成；写库失败不会留下明文文件。
 - `revoke` 不影响已经兑换的卡，已经加上的使用权照常有效。
+
+### 5.3 积分
+
+```bash
+drama-commerce credits balance  --email a@example.com           # 查一个账号的可用积分
+drama-commerce credits grant    --email a@example.com --amount 500 --memo 测试积分 --by 张三
+drama-commerce credits history  --user-id <UUID> --limit 50     # 最近的流水（新到旧，每行一个 JSON）
+drama-commerce credits expire                                   # 回收悬挂超过 2 小时的预扣，打印回收笔数
+```
+
+- 四个子命令都只需要 `DRAMA_COMMERCE_DSN`。账号用 `--email` 或 `--user-id` 二选一指定；
+  邮箱找不到时报用法错误（退出码 2）。
+- `balance` 打印 `{"user_id", "balance"}`。它和接口里的查余额走同一个函数，会先回收这个人的悬挂预扣再求和。
+- `grant` 打印 `{"user_id", "balance"}`（加完之后的余额）。没充值渠道时的发测试积分就用它。
+  **幂等**：幂等键是 `admin:<操作人>:<用户>:<金额>:<备注>`，所以同一条命令重复执行不会重复加分，
+  而不同的人给同一用户加同样金额也不会被误判成重复。`--amount` 必须大于 0。
+- `history` 每行打印一条流水，字段与 `GET /credits/history` 的条目一致。
+- `expire` 不带账号参数，扫全库回收 `kind = 'hold'` 且 `settled_state = 'reserved'` 且已超过
+  `HOLD_TTL_SECONDS` 的记录，打印 `{"released": N}`。进程崩溃、服务重启后留下的悬挂预扣靠它兜底。
+- 退出码：0 成功；2 参数、配置或数据库错误。
 
 ## 6. 测试
 
