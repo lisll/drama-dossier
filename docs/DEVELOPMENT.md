@@ -73,6 +73,8 @@
 | `job_pause` | `id` | 暂停：排队中立刻停，运行中做完当前这一集再停 |
 | `job_resume` | `id` | 继续：已暂停 / 已终止 / 失败的任务重新排队，核对已完成产物后跳过对得上的集 |
 | `job_terminate` | `id` | 终止：杀掉正在跑的子进程并删掉这一集的半成品 |
+| `client_config` | 无 | 拉公开的客户端配置（公告 / 功能开关 / 版本策略）。**不需要登录**；失败时返回 `{unavailable: true, reason}` 而不是抛错，因为前端有安全默认值（空公告 / 开关全开 / 不强制更新） |
+| `report_client_error` | `code`, `location` | 上报一条诊断信息。**由前端决定要不要报**（设置里的开关默认关）；这里用 `sanitize_short` 只保留字母数字、下划线与短横线并截断到 64 字符，失败不打扰用户 |
 
 Rust 命令使用 snake_case，Tauri 会把 JavaScript 的 camelCase 参数映射到对应 Rust 参数。
 
@@ -299,7 +301,15 @@ cd cloud && PYTHONPATH=src ../.venv/bin/python -m pytest tests/ -q
 ./.venv/bin/python cloud/tests/e2e_m5a.py           # 积分与支付
 ./.venv/bin/python cloud/tests/e2e_m5b.py           # 服务端处理（上传续传 / 扣费 / 隔离 / 到期删除）
 ./.venv/bin/python cloud/tests/e2e_m5b_identity.py  # 一套登录进两个服务
+./.venv/bin/python cloud/tests/e2e_m7.py            # 管理后台 + 客户端配置 + 错误上报（M7）
 ```
+
+`cloud/tests/e2e_m7.py` 需要本机已跑着 `cloud/compose.dev.yaml` 的 PostgreSQL
+（默认 `postgresql://drama:drama-dev-only@127.0.0.1:5432/postgres`，脚本里写死了这个管理员 DSN）。
+它建一个随机库、生成临时私钥、跑迁移、用 CLI 建管理员、起服务，然后逐步断言：
+管理员登录 → 默认配置不拦人 → 改版本策略 → 发公告 → 关一个开关 → 用户端公开配置跟着变
+→ 公开配置里没有用户数据 → 普通用户令牌进不了管理接口 → 错误上报（含敏感字段被拒、同一错误只累加计数）
+→ 停用管理员后会话立刻失效。跑完删掉临时库，不动既有数据。
 
 ### 媒体控制面的环境变量（M5b）
 
@@ -321,6 +331,87 @@ drama-cloud serve --tls-cert cert.pem --tls-key key.pem   # HTTPS；只给一个
 drama-cloud cleanup    # 过期产物 + 过期素材（真删文件、留元数据）+ 放弃的分片上传 + 回收过期租约
 ```
 
+### M7 新增：管理后台与运营数据
+
+#### 新增的环境变量（commerce 侧）
+
+| 变量 | 说明 |
+| --- | --- |
+| `DRAMA_COMMERCE_LICENSE_KEY_FILE_SECONDARY` | 次签名私钥的文件路径（密钥轮换过渡期用）。留空表示不做轮换；配了之后启动日志会打一条 warning 把两把私钥的 `kid` 都写出来。流程见 [`KEY_ROTATION.md`](KEY_ROTATION.md) |
+| `DRAMA_COMMERCE_INTERNAL_SECRET` | 已有变量（M5b），M7 期间与部署编排一起用；留空时 `/internal/*` 一律 404 |
+
+**没有**新增 `DRAMA_COMMERCE_REQUIRE_TLS` 这类开关：commerce 的 `serve` 只接受
+`--host` / `--port` / `--log-level`（`commerce/cli.py:43-49`），不支持 HTTPS，对外 TLS 由反向代理终结。
+强制 TLS 的开关只有媒体控制面的 `DRAMA_CLOUD_REQUIRE_TLS`。
+
+#### 新增的表（迁移 0011 / 0012）
+
+| 迁移 | 表 |
+| --- | --- |
+| `0011_admins.sql` | `admins`、`admin_sessions`、`admin_tokens` |
+| `0012_ops_content.sql` | `announcements`、`feature_flags`、`version_policy`、`client_errors` |
+
+`feature_flags.key` 是 `CHECK` 白名单（`signup` / `recharge` / `server_processing` / `version_task`），
+`version_policy` 是单行表（`id` 固定 1），种子数据把四个开关默认设成开、版本策略设成 `0.0.0`。
+`migrate` 必须在 `serve` 之前跑：`serve` 启动时检查迁移，缺了直接拒绝启动。
+
+#### 新增的测试
+
+```bash
+cd cloud
+export COMMERCE_TEST_DSN='postgresql://drama:drama-dev-only@127.0.0.1:5432/postgres'
+.venv/bin/pytest tests/commerce -q
+```
+
+| 文件 | 验什么 |
+| --- | --- |
+| `tests/commerce/test_admins.py` | 管理员会话、令牌前缀、两种令牌互不通用、停用即刻失效、审计不记邮箱、登录限流、`/admin` 页面 |
+| `tests/commerce/test_admin_views.py` | 七个视图的鉴权、分页上限、设备只给前 12 位、卡密无明文、订单状态白名单、公告增改删、四个开关、版本策略校验、写操作进审计 |
+| `tests/commerce/test_client_config.py` | 公开可读、默认不拦人、不含用户数据、生效窗口与排序、开关与版本策略反映到配置、限流 |
+| `tests/commerce/test_client_errors.py` | 免登录上报、多传字段 422、表里没有敏感列、带斜杠的 `location` 清空、只累加计数、后台查看要管理员令牌 |
+| `tests/commerce/test_key_rotation.py` | 双私钥语义：默认主钥、`with_secondary` 用次钥、两把都信任、退役后旧钥被拒、没配次钥却要求用它签会报错 |
+| `tests/commerce/test_signing_purposes.py` | Rust 的 `Purpose::context()` 与 Python 的 `PURPOSE_CONTEXTS` 逐字节对拍 |
+
+密钥轮换那组测试逐条验什么，见 [`KEY_ROTATION.md`](KEY_ROTATION.md) 第 7 节。
+
+#### 部署与开发的 compose 区别
+
+| | `cloud/compose.dev.yaml` | `cloud/compose.deploy.yaml` |
+| --- | --- | --- |
+| 起什么 | 只有 `postgres` + `mailpit` | `postgres` + `commerce` + `media` + `caddy` |
+| 应用进程 | **不容器化**，本机 `drama-commerce serve` 跑，改代码立刻生效 | 容器化，靠 `command` 区分两个服务 |
+| 端口 | 只绑 `127.0.0.1` | 只有 `caddy` 暴露 80 / 443 |
+| 密码与密钥 | 固定的开发值，进仓库 | 从 `.env` 读，缺了拒绝启动；私钥目录只读挂载 |
+| 数据 | 一次性，`down -v` 就清空 | 磁盘卷，备份脚本能直接打包 |
+| TLS | 不需要 | Caddy + 自签证书 |
+
+**为什么分开**：开发要「改一行立刻看到效果」，所以应用不进容器；部署要「别人能用、密钥不进仓库」，
+所以密码外部注入、对外只有一个入口。一份 compose 同时满足两头只会两头不讨好。
+完整部署步骤见 [`../cloud/docs/DEPLOYMENT.md`](../cloud/docs/DEPLOYMENT.md)。
+
+#### 本地调试管理接口（curl）
+
+先建一个管理员（密码从 stdin 读，至少 12 个字符）：
+
+```bash
+.venv/bin/drama-commerce admin create --email ops@example.com
+```
+
+拿 `adm_` 令牌并调接口：
+
+```bash
+TOKEN=$(curl -s -X POST http://127.0.0.1:8100/api/v1/admin/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"ops@example.com","password":"你的密码"}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
+
+curl -s http://127.0.0.1:8100/api/v1/admin/me -H "Authorization: Bearer $TOKEN"
+curl -s 'http://127.0.0.1:8100/api/v1/admin/users?limit=5' -H "Authorization: Bearer $TOKEN"
+curl -s http://127.0.0.1:8100/api/v1/client/config          # 公开接口，不用令牌
+```
+
+管理后台页面在 <http://127.0.0.1:8100/admin>（令牌存 `sessionStorage`，关标签页就失效）。
+更多排查用的 curl 写法与各视图返回的字段见 [`../cloud/docs/ADMIN_GUIDE.md`](../cloud/docs/ADMIN_GUIDE.md)。
+
 ### 模块边界与约定
 
 - `plan.py` 只做「配方 → 可执行计划」，不碰磁盘；
@@ -334,4 +425,6 @@ drama-cloud cleanup    # 过期产物 + 过期素材（真删文件、留元数�
   不要在每个查询里各写一遍 JOIN——漏一处就是一条数据泄露（`tests/test_isolation.py` 有越权矩阵）。
 
 文档索引：`cloud/docs/ARCHITECTURE.md`、`RECIPE_SCHEMA.md`、`PROCESSING_PIPELINE.md`、
-`API_SPEC.md`、`DATABASE_SCHEMA.md`、`COMMERCE.md`、`PACKAGING_GUIDE.md`、`TEST_PLAN.md`。
+`API_SPEC.md`、`DATABASE_SCHEMA.md`、`COMMERCE.md`、`PACKAGING_GUIDE.md`、`TEST_PLAN.md`、
+`ADMIN_GUIDE.md`（管理后台操作）、`DEPLOYMENT.md`（单机部署与备份恢复）；
+根目录的 `docs/KEY_ROTATION.md`（签名密钥轮换）。

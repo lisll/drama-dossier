@@ -65,6 +65,9 @@ DramaDossier 是一个本地优先的桌面应用，用于把散落在磁盘上�
 - **报审包差异对比**：读两份 `manifest.json`，列出改稿前后的新增 / 移除 / 修改文件。
 - **平台材料要求（示例档案）**：内置少量投放形态档案，逐集对照时长、画幅、码率、编码与必需材料。
 - **剪映草稿导入 / 导出**：把分集顺序与时长交接给剪辑工具，或把草稿时间线读回来核对。
+- **管理后台（M7）**：服务端自带一个网页管理后台（页面在 `/admin`，接口在 `/api/v1/admin/*`），七个视图：用户、卡密批次、订单、积分流水、设备、公告、开关与版本。前五个只读（改余额要走 CLI，改订单状态更不该允许），公告与开关和版本策略可写。管理员是**独立的表与会话**，令牌前缀 `adm_`，登录限流比用户更紧，**没有注册入口**——只能用 `drama-commerce admin create` 创建。见 [cloud/docs/ADMIN_GUIDE.md](cloud/docs/ADMIN_GUIDE.md)。
+- **公告与功能开关（M7）**：桌面端启动时从公开接口 `GET /api/v1/client/config`（不需要登录、不含用户数据）拉公告、四个功能开关与版本策略。拉不到时按**空公告、开关全开、不强制更新**降级——服务端挂了不该让所有客户端变砖。开关只管界面入口，服务端仍会校验。
+- **自动更新（M7）**：管理后台填版本策略（最低支持版本 / 最新版本 / 下载地址 / 整文件 SHA-256 / Ed25519 签名）。客户端启动时拉一次，低于最低支持版本时顶部横幅变成红色「这个版本已停止支持」，否则只在有新版本时给黄色提示；点「下载并校验升级包」后校验**大小 + SHA-256 + 签名**两层都不省，任何一步不过就删文件并如实报错。最后一步把安装包**交给系统**（启动安装器 / 打开 dmg），重启由安装器完成——程序不自己替换正在运行的二进制。签名留空时客户端拒绝安装。
 - **字幕与角标擦除实验（学习用）**：独立的 `dossier-inpaint` 管线，用 DBNet 定位字幕、时序模型（E2FGVI）重建像素；同一管线也可固定方形 ROI 擦除**自有素材**的角标/水印（小 mask 场景精度最高）。桌面端「区域擦除」提供**自动识别静止区域 + 画布拖框 + 左右对比 + 批量**（批量走任务队列，可暂停 / 终止 / 续跑）。见 [硬字幕擦除](docs/SUBTITLE_REMOVAL.md) 与 [角标 / 水印擦除](docs/WATERMARK_REMOVAL.md)。
 
 ## 产品界面
@@ -185,9 +188,10 @@ DramaDossier 是一个本地优先的桌面应用，用于把散落在磁盘上�
 │   │   ├── version.rs           # 处理版本：权属声明 / 模板 / 计划预览 / 开始生成与队列执行器
 │   │   ├── jobs.rs              # 持久化任务队列：状态机、暂停 / 终止 / 续跑
 │   │   ├── encode.rs            # 编码执行层：统一编码参数、可中断子进程、硬件失败退软件
-│   │   ├── erase.rs             # 擦除入口命令（预览 / 执行）
-│   │   ├── erase_batch.rs       # 区域擦除：取帧 / 自动识别 / 对比预览 / 批量入队（kind=erase）
-│   │   └── dossier.rs           # 转码建议 / 差异对比 / 平台档案 / 剪映草稿命令
+│   │       ├── erase.rs         # 擦除入口命令（预览 / 执行）
+│   │       ├── erase_batch.rs   # 区域擦除：取帧 / 自动识别 / 对比预览 / 批量入队（kind=erase）
+│   │       ├── updater.rs       # 自动更新：检查元信息（必须 https、三样齐全）、下载后验大小 + SHA-256 + Ed25519 签名、交给系统安装
+│   │       └── dossier.rs       # 转码建议 / 差异对比 / 平台档案 / 剪映草稿命令
 │   ├── tauri.conf.json          # 窗口、bundle 和打包配置
 │   ├── capabilities/            # Tauri capability 配置
 │   └── icons/                   # Windows / macOS 图标
@@ -201,18 +205,33 @@ DramaDossier 是一个本地优先的桌面应用，用于把散落在磁盘上�
 │   ├── src/drama_cloud/         # API / CLI / Worker / 配方 / 处理模块
 │   │   ├── migrations/          # 媒体控制面的表结构（编号 SQL，M5b 起用 PostgreSQL）
 │   │   ├── commerce/            # 账号、授权与积分服务：credits / payments / invites / internal_routes 等
+│   │   │   ├── admins.py        # 管理员账号与会话（独立表、adm_ 令牌、8 小时、CLI 创建）
+│   │   │   ├── admin_routes.py  # /api/v1/admin/{login,logout,me} 与管理员认证依赖
+│   │   │   ├── admin_views.py   # 七个视图：用户 / 卡密批次 / 订单 / 流水 / 设备 / 公告 / 开关与版本
+│   │   │   ├── admin_page.py    # GET /admin 发静态页面
+│   │   │   ├── client_config.py # GET /api/v1/client/config（公开：公告 + 开关 + 版本策略）
+│   │   │   ├── client_errors.py  # POST /api/v1/client/errors（公开、白名单四字段、计数不逐条存）
+│   │   │   └── web/admin.html   # 管理后台前端（原生 JS，令牌存 sessionStorage）
 │   │   ├── identity.py          # 拿访问令牌向 commerce 内省「这是谁」
 │   │   ├── credit_client.py     # 向 commerce 预扣 / 结算 / 退还积分
 │   │   ├── uploads.py           # 分片上传与断点续传
 │   │   └── tls.py               # 启动时的传输安全校验
+│   ├── Caddyfile                # 部署时的反代路由表（对外唯一入口，终结 TLS，/internal/* 显式 404）
+│   ├── Dockerfile               # 部署镜像：同一个镜像跑 commerce 与 media，靠 command 区分
+│   ├── compose.dev.yaml         # 开发用：只有 PG + Mailpit，只绑 127.0.0.1，密码是固定开发值
+│   ├── compose.deploy.yaml      # 部署用：PG + commerce + media + Caddy，密码与私钥从 .env 读
+│   ├── scripts/                 # initdb.sql（建媒体库）/ backup.sh / restore.sh
 │   ├── recipes/                 # 内置配方（7 份，含 drama-logo-erase 擦除配方）
 │   ├── docs/                    # 架构、配方、管线、API、数据库、打包、测试、擦除确认流
 │   │   ├── COMMERCE.md          # 账号与授权服务的接口、配置、积分与支付
+│   │   ├── ADMIN_GUIDE.md       # 管理后台操作手册：建管理员、七个视图、两类客诉怎么查、安全边界
+│   │   ├── DEPLOYMENT.md        # 部署手册：两套 compose 的区别、Caddy 路由、备份恢复、更新流程
 │   │   └── INPAINT_REVIEW_FLOW.md  # 确认流：自动校验 + 分支A 重试 + 分支B 人工复核
-│   └── tests/                   # pytest，以及两个端到端脚本（e2e_m5a / e2e_m5b）
+│   └── tests/                   # pytest，以及端到端脚本（e2e_m5a / e2e_m5b / e2e_m7）
 ├── docs/
 │   ├── BUILD.md                 # 构建与发布说明
 │   ├── DEVELOPMENT.md           # 开发规范与模块边界
+│   ├── KEY_ROTATION.md          # 授权签名密钥的轮换流程、过渡期与回退
 │   ├── MATERIAL_SPEC.md         # 素材与报审包数据规格
 │   ├── PROJECT_REVIEW.md        # 全项目复盘、缺口清单与验证记录
 │   ├── RUNTIME.md               # Tier 1/2/3：运行时、后期与长任务能力层
@@ -407,6 +426,8 @@ PDF 盖**占位章**（灰色虚线框 +「样章 · 未签署 · 无法律效�
 | `credits_overview` / `recharge_tiers` / `create_recharge_order` / `reconcile_recharge` / `invite_status` | 积分余额与流水、充值档位、下单、「我已完成支付」时主动查单、我的邀请码与奖励战绩 |
 | `server_upload_start` / `server_upload_status` / `server_upload_chunks` / `server_upload_complete` / `server_upload_abort` | 服务端处理：开上传会话（先算整文件 SHA-256）、查已收分片（断点续传前用）、传完缺的块、完成、放弃 |
 | `server_submit_task` / `server_task` / `server_cancel_task` / `server_artifact` | 服务端处理：提交（服务端预扣积分）、查状态、取消（退还预扣）、取产物的短时下载链接 |
+| `client_config` | 拉公开的客户端配置（公告 / 功能开关 / 版本策略）。**不需要登录**，失败时返回 `{unavailable: true, reason}` 而不是抛错——前端有安全默认值 |
+| `report_client_error` | 上报一条诊断信息（错误码 + 出错模块）。**由前端决定要不要报**（设置里的开关默认关），这里只做字段白名单最后一道把关；失败不打扰用户 |
 
 Rust command 使用 snake_case，JavaScript 调用时使用 camelCase 参数。命令层返回中文可读错误，前端只做展示和用户输入适配。
 任务状态变化推 `job-progress` 事件，算任务哈希时推 `task-progress` 事件，上传每传完一块推 `server-upload-progress` 事件。
@@ -473,6 +494,31 @@ Rust command 使用 snake_case，JavaScript 调用时使用 camelCase 参数。�
 - `internal_routes.py` — **内部接口**（只给同机房的其他服务用）：`/internal/introspect` 把访问令牌换成「这是谁」，
   `/internal/credits/*` 供媒体控制面预扣 / 结算 / 退还积分。用共享密钥 `X-Internal-Secret` 认证；
   **密钥留空时这些路由一律 404**，不是「不鉴权就放行」。
+- `admins.py` / `admin_routes.py` / `admin_views.py` / `admin_page.py` / `web/admin.html` — **管理后台**（M7）。
+  管理员是独立的表（不给 `users` 加 `is_admin`）、独立的会话与令牌，前缀 `adm_`、有效期 8 小时；
+  与用户令牌**互不通用**（拿用户令牌调 `/api/v1/admin/*` 一律 401）。**没有注册入口**，只能用
+  `drama-commerce admin create` 创建，密码至少 12 个字符、从标准输入读。停用不删除，且立刻吊销全部会话。
+  七个视图前五个只读、公告与开关和版本策略可写；分页上限 200；设备只给机器码前 12 位；卡密不返回明文。
+- `client_config.py` — **公开**的 `GET /api/v1/client/config`：公告 + 四个功能开关 + 版本策略。
+  不需要登录（桌面端启动时可能还没登录），所以里面**绝不能有用户数据**；限流 600 次/小时。
+- `client_errors.py` — **公开**的 `POST /api/v1/client/errors`：只收 `code` / `app_version` / `platform` / `location`
+  四个字段（白名单，多传的整条 422），带斜杠的 `location` 清空，同一错误只累加 `occurrences` 不逐条存；
+  限流 300 次/小时。后台查看挂在 `/api/v1/admin/client-errors`。
+- `license_token.py` 的 `Signer` 支持**主私钥 + 次私钥**两把（`DRAMA_COMMERCE_LICENSE_KEY_FILE_SECONDARY`），
+  用于密钥轮换的过渡期；没配次私钥却要求用它签会直接报错。流程见 [docs/KEY_ROTATION.md](docs/KEY_ROTATION.md)。
+
+M7 新增的服务端命令（`drama-commerce`，都只需要 `DRAMA_COMMERCE_DSN`）：
+
+| 命令 | 作用 |
+| --- | --- |
+| `admin create --email <EMAIL>` | 新建管理员。**密码从标准输入读**（不走命令行参数），至少 12 个字符；同一邮箱已存在会报 409，不覆盖密码 |
+| `admin disable --email <EMAIL>` | 停用（不删除，审计日志还要引用）。同时立刻吊销该管理员全部会话 |
+| `admin enable --email <EMAIL>` | 恢复被停用的管理员（人休假回来、或停错人）。不存在报 404，本来没停用报 409 |
+| `admin list` | 列出全部管理员：`id`、`email`、创建时间、是否停用 |
+| `release sign <FILE>` | 给升级包算 SHA-256 并签名，输出可直接填进版本策略的 `sha256` / `signature` / `key_id` |
+
+桌面端对应的两个 IPC 命令是 `client_config`（拉公告 / 开关 / 版本策略，公开、失败不抛错）与
+`report_client_error`（上报错误码 + 出错模块，默认关闭、由前端开关决定是否发）。
 
 ### 媒体控制面（`drama_cloud`，M5b 起用 PostgreSQL）
 
@@ -803,6 +849,17 @@ cargo tauri build
 4. 真实剧目扫描与检查结果；
 5. 生成包能否打开且 manifest 哈希正确。
 
+### 服务端部署
+
+整套服务（两个服务 + PostgreSQL + Caddy）在一台机器上部署的完整步骤、两套 compose 的区别、
+备份与恢复、更新流程与已知限制，见 [cloud/docs/DEPLOYMENT.md](cloud/docs/DEPLOYMENT.md)。
+管理后台的日常操作见 [cloud/docs/ADMIN_GUIDE.md](cloud/docs/ADMIN_GUIDE.md)，
+签名密钥轮换见 [docs/KEY_ROTATION.md](docs/KEY_ROTATION.md)。
+
+CI 里的签名步骤刻意**不用** `continue-on-error`：签名失败必须让构建红掉，
+否则会出现「以为签了，其实没签」的包被发布出去。只有「没配证书」这一种情况才跳过——
+那时会打一条 `::warning` 明确提示本次产物未签名（Windows 会弹 SmartScreen，macOS 要右键「打开」）。
+
 ### GitHub Release
 
 1. 更新 `Cargo.toml`、`src-tauri/Cargo.toml` 和 `src-tauri/tauri.conf.json` 中的版本；
@@ -854,7 +911,11 @@ DramaDossier 通过外部 `ffprobe` 读取媒体信息，不重新分发 FFmpeg�
 
 - 应用不上传素材文件（生成报审包只发文件名、大小、SHA-256 与探测规格）；
 - 账号、使用权、设备绑定记录与积分流水保存在服务端；充值目前只有本地模拟支付，不涉及真实资金；
-- 不包含遥测；
+- **默认不包含遥测**：唯一的诊断上报是设置里「出错时上报诊断信息」这个开关，**默认关闭**；
+  打开后也只发错误码、应用版本、操作系统与出错模块（如「上传」「积分」），
+  不发邮箱、文件路径、剧名或视频内容——错误消息本身也不发（它可能带路径或剧名）。
+  服务端同样按白名单四字段收，表里没有能放路径或邮箱的列；
+- 每次启动会拉一次公开的客户端配置（公告 / 功能开关 / 版本要求），不需要登录、不带账号信息；
 - 不执行下载的可执行文件；
 - 只读取用户显式选择的目录及其子目录；
 - 生成文件只写入用户确认或约定的输出位置。
