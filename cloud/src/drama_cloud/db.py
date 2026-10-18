@@ -1,235 +1,47 @@
-"""SQLite 数据层。
+"""PostgreSQL 数据层（M5b 起；此前是 SQLite）。
 
-设计文档建议 PostgreSQL；本机没有 PG 服务，改用 SQLite。差异被限制在这个文件与
-`docs/DATABASE_SCHEMA.md` 里：DDL 只用到两边都有的类型（TEXT/INTEGER/REAL），
-换 PG 时只需要把 `AUTOINCREMENT` 换成 `GENERATED ... AS IDENTITY`、把 `?` 占位符换成 `%s`。
+设计文档建议 PostgreSQL。M5b 之前本机没有 PG 服务，走的是 SQLite；
+现在媒体控制面要支持多人使用、按用户隔离、可靠的并发事务，迁到 PG。
+
+**为什么另起一套表结构而不并进 commerce 的库**：两者部署方式、生命周期、
+备份策略都不同，硬合会牵动 commerce 已有的十个迁移与全部测试，风险大于收益。
+分工是：账号、卡密、积分、支付在 commerce 库（`commerce/migrations/`）；
+任务、素材、产物、复核队列在本库（`migrations/`）。
+
+**读写约定**（都封在这个文件里，调用方不用自己拼 SQL）：
+
+* `connect()` 返回 psycopg 连接，`row_factory=dict_row`，所以 `row["col"]` 到处都能用；
+* `transaction(conn)` 用 psycopg 自带的事务（比 SQLite 的 `BEGIN IMMEDIATE` 更可靠）；
+* JSON 一律以 TEXT 存，读写都过 `json_dump`/`json_load`；
+* 时间以 ISO 8601 字符串存（TEXT），与迁移前的数据格式一致，不做无收益的类型切换。
 """
 
 from __future__ import annotations
 
 import contextlib
 import json
-import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
+import psycopg
+from psycopg.rows import dict_row
+
 from .config import Settings
 
-#: 文档 §9 的核心实体。JSON 字段一律以 TEXT 存储，读写都经过 json_dump/json_load，
-#: 这样将来迁到 PG 的 jsonb 时不需要改调用点。
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS users (
-    id            TEXT PRIMARY KEY,
-    name          TEXT NOT NULL,
-    role          TEXT NOT NULL CHECK (role IN ('admin', 'operator', 'viewer')),
-    token_hash    TEXT NOT NULL UNIQUE,
-    created_at    TEXT NOT NULL
-);
+#: 迁移文件目录。编号 SQL，按文件名排序执行，只跑一次。
+MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 
-CREATE TABLE IF NOT EXISTS projects (
-    id            TEXT PRIMARY KEY,
-    name          TEXT NOT NULL,
-    owner_id      TEXT NOT NULL REFERENCES users(id),
-    created_at    TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS assets (
-    id                 TEXT PRIMARY KEY,
-    project_id         TEXT NOT NULL REFERENCES projects(id),
-    name               TEXT NOT NULL,
-    storage_key        TEXT NOT NULL,
-    sha256             TEXT NOT NULL,
-    size_bytes         INTEGER NOT NULL,
-    probe_json         TEXT,
-    source_declaration TEXT,
-    lifecycle          TEXT NOT NULL DEFAULT 'ready'
-                       CHECK (lifecycle IN ('uploading', 'ready', 'rejected', 'deleted')),
-    created_at         TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_assets_project ON assets(project_id);
-
-CREATE TABLE IF NOT EXISTS recipes (
-    id                TEXT PRIMARY KEY,
-    name              TEXT NOT NULL,
-    purpose           TEXT NOT NULL,
-    published_version INTEGER,
-    created_at        TEXT NOT NULL
-);
-
--- 每次发布生成不可变版本：同一 (recipe_id, version) 不允许被覆盖。
-CREATE TABLE IF NOT EXISTS recipe_versions (
-    recipe_id            TEXT NOT NULL REFERENCES recipes(id),
-    version              INTEGER NOT NULL,
-    status               TEXT NOT NULL
-                         CHECK (status IN ('draft', 'reviewing', 'published', 'deprecated', 'revoked')),
-    content_json         TEXT NOT NULL,
-    content_sha256       TEXT NOT NULL,
-    schema_version       TEXT NOT NULL,
-    min_worker_version   TEXT NOT NULL,
-    required_capabilities TEXT NOT NULL,
-    rollout_percent      INTEGER NOT NULL DEFAULT 100,
-    reviewed_by          TEXT,
-    published_at         TEXT,
-    created_at           TEXT NOT NULL,
-    PRIMARY KEY (recipe_id, version)
-);
-
--- 状态取值见 tasks/state.py 的 TaskState；这里用 CHECK 兜底，防止绕过状态机写入。
-CREATE TABLE IF NOT EXISTS tasks (
-    id                     TEXT PRIMARY KEY,
-    project_id             TEXT NOT NULL REFERENCES projects(id),
-    state                  TEXT NOT NULL CHECK (state IN (
-                               'PENDING', 'QUEUED', 'RUNNING', 'VERIFYING', 'SUCCEEDED',
-                               'RETRY_WAITING', 'CANCEL_REQUESTED', 'CANCELLED', 'FAILED')),
-    priority               INTEGER NOT NULL DEFAULT 100,
-    idempotency_key        TEXT UNIQUE,
-    billing_quote_id       TEXT,
-    input_asset_ids        TEXT NOT NULL,
-    recipe_id              TEXT NOT NULL,
-    recipe_version         INTEGER NOT NULL,
-    recipe_sha256          TEXT NOT NULL,
-    -- 配方快照：任务创建时冻结，执行期间不跟随发布指针变化（§6.1）。
-    recipe_snapshot_json   TEXT NOT NULL DEFAULT '{}',
-    -- 解析后的 ProcessingPlan（步骤、参数、输入角色），Worker 直接照它执行。
-    plan_json              TEXT NOT NULL DEFAULT '{}',
-    required_capabilities  TEXT NOT NULL DEFAULT '[]',
-    target_json            TEXT NOT NULL,
-    user_params_json       TEXT NOT NULL DEFAULT '{}',
-    cancel_requested       INTEGER NOT NULL DEFAULT 0,
-    attempts               INTEGER NOT NULL DEFAULT 0,
-    progress_json          TEXT NOT NULL DEFAULT '{}',
-    next_run_at            TEXT,
-    lease_owner            TEXT,
-    lease_expires_at       TEXT,
-    error_class            TEXT,
-    error_message          TEXT,
-    result_json            TEXT,
-    created_at             TEXT NOT NULL,
-    started_at             TEXT,
-    finished_at            TEXT,
-    updated_at             TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state, priority, created_at);
-
-CREATE TABLE IF NOT EXISTS task_attempts (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id       TEXT NOT NULL REFERENCES tasks(id),
-    attempt       INTEGER NOT NULL,
-    worker_id     TEXT,
-    started_at    TEXT NOT NULL,
-    finished_at   TEXT,
-    error_class   TEXT,
-    error_message TEXT,
-    UNIQUE (task_id, attempt)
-);
-
--- 阶段级检查点：第一版不恢复任意 FFmpeg 进程的内部状态，只记录阶段产物与指纹。
-CREATE TABLE IF NOT EXISTS task_checkpoints (
-    task_id        TEXT NOT NULL REFERENCES tasks(id),
-    stage          TEXT NOT NULL,
-    input_sha256   TEXT NOT NULL,
-    recipe_version INTEGER NOT NULL,
-    engine_version TEXT NOT NULL,
-    params_digest  TEXT NOT NULL,
-    artifact_key   TEXT,
-    artifact_sha256 TEXT,
-    completed      INTEGER NOT NULL DEFAULT 0,
-    updated_at     TEXT NOT NULL,
-    PRIMARY KEY (task_id, stage)
-);
-
-CREATE TABLE IF NOT EXISTS artifacts (
-    id            TEXT PRIMARY KEY,
-    task_id       TEXT NOT NULL REFERENCES tasks(id),
-    kind          TEXT NOT NULL,
-    storage_key   TEXT NOT NULL,
-    sha256        TEXT NOT NULL,
-    size_bytes    INTEGER NOT NULL,
-    media_json    TEXT,
-    quality_json  TEXT,
-    retain_until  TEXT,
-    created_at    TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id);
-
--- 确认流的人工复核队列（分支B）。
--- 自动校验失败（且自动重试已用尽）或只拿到 warn 结论时，任务会在这里排一条待复核记录；
--- 复核者可以标记通过/失败，也可以修正 mask 后重跑（重跑会产生一个新任务，本记录转 superseded）。
-CREATE TABLE IF NOT EXISTS review_queue (
-    id            TEXT PRIMARY KEY,
-    task_id       TEXT NOT NULL REFERENCES tasks(id),
-    -- 关联的可交付产物；自动校验失败时通常为空（没有可放行的成品）。
-    artifact_id   TEXT,
-    reason        TEXT NOT NULL,
-    severity      TEXT NOT NULL CHECK (severity IN ('info', 'warn', 'high')),
-    status        TEXT NOT NULL DEFAULT 'pending'
-                  CHECK (status IN ('pending', 'approved', 'rejected', 'superseded')),
-    detail_json   TEXT,
-    claimed_by    TEXT,
-    created_at    TEXT NOT NULL,
-    decided_by    TEXT,
-    decided_at    TEXT,
-    decision_note TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_review_status ON review_queue(status, created_at);
-CREATE INDEX IF NOT EXISTS idx_review_task ON review_queue(task_id);
-
-CREATE TABLE IF NOT EXISTS audit_events (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts         TEXT NOT NULL,
-    actor      TEXT NOT NULL,
-    action     TEXT NOT NULL,
-    subject    TEXT,
-    detail_json TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_events(ts);
-
--- 学习原型的积分账本：只记录本地 quote→task→settle，不连接支付网关或设备指纹。
-CREATE TABLE IF NOT EXISTS billing_accounts (
-    user_id      TEXT PRIMARY KEY REFERENCES users(id),
-    balance      INTEGER NOT NULL DEFAULT 0 CHECK (balance >= 0),
-    updated_at   TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS billing_quotes (
-    id           TEXT PRIMARY KEY,
-    user_id      TEXT NOT NULL REFERENCES users(id),
-    units        INTEGER NOT NULL CHECK (units > 0),
-    unit_cost    INTEGER NOT NULL CHECK (unit_cost > 0),
-    amount       INTEGER NOT NULL CHECK (amount > 0),
-    status       TEXT NOT NULL CHECK (status IN ('issued', 'reserved', 'settled', 'released', 'expired')),
-    task_id      TEXT,
-    expires_at   TEXT NOT NULL,
-    created_at   TEXT NOT NULL,
-    updated_at   TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_billing_quotes_user ON billing_quotes(user_id, created_at);
-
-CREATE TABLE IF NOT EXISTS billing_ledger (
-    idempotency_key TEXT PRIMARY KEY,
-    user_id         TEXT NOT NULL REFERENCES users(id),
-    quote_id        TEXT,
-    task_id         TEXT,
-    delta           INTEGER NOT NULL,
-    kind            TEXT NOT NULL CHECK (kind IN ('grant', 'hold', 'release')),
-    created_at      TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_billing_ledger_user ON billing_ledger(user_id, created_at);
+#: 迁移记账表。commerce 那边用的是同一种做法（`schema_migrations`）。
+_MIGRATIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version    TEXT PRIMARY KEY,
+    applied_at TEXT NOT NULL
+)
 """
 
-#: 旧库升级用：库已存在时 `CREATE TABLE IF NOT EXISTS` 不会补列，所以显式声明要补的列。
-#: 学习原型直接用 ALTER TABLE ADD COLUMN（SQLite 允许），换 PG 时这里替换成迁移工具。
-MIGRATIONS = {
-    "tasks": {
-        "billing_quote_id": "TEXT",
-        "recipe_snapshot_json": "TEXT NOT NULL DEFAULT '{}'",
-        "plan_json": "TEXT NOT NULL DEFAULT '{}'",
-        "required_capabilities": "TEXT NOT NULL DEFAULT '[]'",
-        "progress_json": "TEXT NOT NULL DEFAULT '{}'",
-        "started_at": "TEXT",
-        "finished_at": "TEXT",
-    },
-}
+
+class MigrationError(RuntimeError):
+    """迁移失败。消息里只出现文件名与数据库给的原因。"""
 
 
 def now_iso() -> str:
@@ -246,51 +58,87 @@ def json_load(value, default=None):
     return json.loads(value)
 
 
-def connect(settings: Settings) -> sqlite3.Connection:
+def connect(settings: Settings) -> psycopg.Connection:
+    """打开一个连接。调用方负责关闭（或用 `with connect(...) as conn`）。"""
+    if not settings.dsn:
+        raise RuntimeError(
+            "没有配置数据库：请设置 DRAMA_CLOUD_DSN（PostgreSQL 连接串），"
+            "开发环境见 cloud/docs/DEVELOPMENT.md"
+        )
     settings.ensure_dirs()
-    conn = sqlite3.connect(str(settings.db_path), timeout=30.0, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=30000")
+    conn = psycopg.connect(settings.dsn, row_factory=dict_row, autocommit=True)
     return conn
 
 
-def _ensure_columns(conn: sqlite3.Connection) -> None:
-    """给已存在的表补上后加的列，避免学习者每次改 schema 都要删库重建。"""
-    for table, columns in MIGRATIONS.items():
-        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-        for name, ddl in columns.items():
-            if name not in existing:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+def _applied(conn) -> set:
+    rows = conn.execute(f"SELECT version FROM schema_migrations").fetchall()
+    return {row["version"] for row in rows}
 
 
-def init_db(settings: Settings) -> Path:
-    conn = connect(settings)
-    try:
-        conn.executescript(SCHEMA)
-        _ensure_columns(conn)
-    finally:
-        conn.close()
-    return settings.db_path
+def migrate(dsn: str) -> list:
+    """执行尚未应用的迁移，返回本次应用的文件名。
+
+    幂等：已应用的跳过；每个迁移在**独立事务**里执行并记进 `schema_migrations`，
+    所以中途失败不会留下半套表。
+    """
+    applied = []
+    MIGRATIONS_DIR.mkdir(parents=True, exist_ok=True)
+    files = sorted(MIGRATIONS_DIR.glob("*.sql"))
+    with psycopg.connect(dsn, row_factory=dict_row, autocommit=True) as conn:
+        conn.execute(_MIGRATIONS_TABLE)
+        done = _applied(conn)
+        for path in files:
+            version = path.name
+            if version in done:
+                continue
+            sql = path.read_text(encoding="utf-8")
+            try:
+                with conn.transaction():
+                    conn.execute(sql)
+                    conn.execute(
+                        "INSERT INTO schema_migrations (version, applied_at) VALUES (%s, %s)",
+                        (version, now_iso()),
+                    )
+            except psycopg.Error as error:
+                raise MigrationError(f"迁移 {version} 失败：{error}") from error
+            applied.append(version)
+    return applied
+
+
+def init_db(settings: Settings) -> str:
+    """建库（执行迁移）并返回连接串。可重复执行。"""
+    if not settings.dsn:
+        raise RuntimeError("没有配置数据库：请设置 DRAMA_CLOUD_DSN")
+    settings.ensure_dirs()
+    migrate(settings.dsn)
+    return settings.dsn
+
+
+def pending(settings: Settings) -> list:
+    """还有哪些迁移没跑（给 CLI 与健康检查看）。"""
+    if not settings.dsn:
+        return [path.name for path in sorted(MIGRATIONS_DIR.glob("*.sql"))]
+    with psycopg.connect(settings.dsn, row_factory=dict_row, autocommit=True) as conn:
+        conn.execute(_MIGRATIONS_TABLE)
+        done = _applied(conn)
+    return [p.name for p in sorted(MIGRATIONS_DIR.glob("*.sql")) if p.name not in done]
 
 
 @contextlib.contextmanager
-def transaction(conn: sqlite3.Connection):
-    """显式事务。调度器与任务服务都依赖它保证状态迁移的原子性。"""
-    conn.execute("BEGIN IMMEDIATE")
-    try:
+def transaction(conn):
+    """显式事务。调度器与任务服务都依赖它保证状态迁移的原子性。
+
+    psycopg 的 `conn.transaction()` 在进入时 BEGIN、正常退出时 COMMIT、
+    异常时 ROLLBACK。连接本身是 autocommit，所以嵌套调用会变成 SAVEPOINT，
+    行为与原来的 `BEGIN IMMEDIATE` 一致且更安全（不会有人忘了 COMMIT）。
+    """
+    with conn.transaction():
         yield conn
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-    else:
-        conn.execute("COMMIT")
 
 
 def audit(conn, actor: str, action: str, subject: str = "", detail=None) -> None:
     """写审计记录（配方发布/回滚、任务取消、权限变化等关键操作）。"""
     conn.execute(
-        "INSERT INTO audit_events (ts, actor, action, subject, detail_json) VALUES (?,?,?,?,?)",
+        "INSERT INTO audit_events (ts, actor, action, subject, detail_json) VALUES (%s,%s,%s,%s,%s)",
         (now_iso(), actor, action, subject, json_dump(detail) if detail is not None else None),
     )

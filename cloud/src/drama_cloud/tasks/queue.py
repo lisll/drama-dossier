@@ -120,10 +120,10 @@ class TaskQueue:
                 """
                 SELECT id, priority, attempts, required_capabilities, recipe_id, recipe_version
                   FROM tasks
-                 WHERE state IN (?, ?)
-                   AND (next_run_at IS NULL OR next_run_at <= ?)
+                 WHERE state IN (%s, %s)
+                   AND (next_run_at IS NULL OR next_run_at <= %s)
                  ORDER BY priority ASC, created_at ASC
-                 LIMIT ?
+                 LIMIT %s
                 """,
                 (*[str(s) for s in CLAIMABLE_STATES], now, CANDIDATE_BATCH),
             ).fetchall()
@@ -137,9 +137,9 @@ class TaskQueue:
                 updated = conn.execute(
                     """
                     UPDATE tasks
-                       SET state = ?, attempts = ?, lease_owner = ?, lease_expires_at = ?,
-                           started_at = COALESCE(started_at, ?), updated_at = ?
-                     WHERE id = ? AND state IN (?, ?)
+                       SET state = %s, attempts = %s, lease_owner = %s, lease_expires_at = %s,
+                           started_at = COALESCE(started_at, %s), updated_at = %s
+                     WHERE id = %s AND state IN (%s, %s)
                     """,
                     (
                         str(TaskState.RUNNING),
@@ -157,9 +157,17 @@ class TaskQueue:
                     continue
                 conn.execute(
                     """
-                    INSERT OR REPLACE INTO task_attempts
+                    INSERT INTO task_attempts
                         (task_id, attempt, worker_id, started_at, finished_at, error_class, error_message)
-                    VALUES (?, ?, ?, ?, NULL, NULL, NULL)
+                    VALUES (%s, %s, %s, %s, NULL, NULL, NULL)
+                    -- 原来是 `INSERT OR REPLACE`（SQLite 专有）。PG 用 upsert 表达同一语义：
+                    -- 同一个 (task_id, attempt) 已存在时覆盖开始时间与 worker。
+                    ON CONFLICT (task_id, attempt) DO UPDATE SET
+                        worker_id = excluded.worker_id,
+                        started_at = excluded.started_at,
+                        finished_at = NULL,
+                        error_class = NULL,
+                        error_message = NULL
                     """,
                     (row["id"], attempt, worker_id, now),
                 )
@@ -178,8 +186,8 @@ class TaskQueue:
         now = now_iso()
         changed = conn.execute(
             """
-            UPDATE tasks SET lease_expires_at = ?, updated_at = ?
-             WHERE id = ? AND lease_owner = ? AND state IN (?, ?)
+            UPDATE tasks SET lease_expires_at = %s, updated_at = %s
+             WHERE id = %s AND lease_owner = %s AND state IN (%s, %s)
             """,
             (
                 _iso_after(self.settings.lease_seconds),
@@ -194,7 +202,7 @@ class TaskQueue:
 
     def lease_valid(self, conn, task_id: str, worker_id: str) -> bool:
         row = conn.execute(
-            "SELECT lease_owner, lease_expires_at FROM tasks WHERE id = ?", (task_id,)
+            "SELECT lease_owner, lease_expires_at FROM tasks WHERE id = %s", (task_id,)
         ).fetchone()
         if row is None or row["lease_owner"] != worker_id:
             return False
@@ -207,7 +215,7 @@ class TaskQueue:
         rows = conn.execute(
             """
             SELECT id, attempts, error_class FROM tasks
-             WHERE state IN (?, ?) AND lease_expires_at IS NOT NULL AND lease_expires_at < ?
+             WHERE state IN (%s, %s) AND lease_expires_at IS NOT NULL AND lease_expires_at < %s
             """,
             (str(TaskState.RUNNING), str(TaskState.VERIFYING), now),
         ).fetchall()
@@ -229,8 +237,8 @@ class TaskQueue:
                 fields["finished_at"] = now_iso()
             transition(conn, row["id"], target, allowed_from=None, fields=fields)
             conn.execute(
-                "UPDATE task_attempts SET finished_at = ?, error_class = ?, error_message = ? "
-                "WHERE task_id = ? AND attempt = ? AND finished_at IS NULL",
+                "UPDATE task_attempts SET finished_at = %s, error_class = %s, error_message = %s "
+                "WHERE task_id = %s AND attempt = %s AND finished_at IS NULL",
                 (now, str(ErrorClass.WORKER_LOST), "租约过期", row["id"], attempts),
             )
             recovered += 1
@@ -246,7 +254,7 @@ class TaskQueue:
 
     def depth(self, conn) -> int:
         row = conn.execute(
-            "SELECT COUNT(*) AS n FROM tasks WHERE state IN (?, ?)",
+            "SELECT COUNT(*) AS n FROM tasks WHERE state IN (%s, %s)",
             (str(TaskState.QUEUED), str(TaskState.RETRY_WAITING)),
         ).fetchone()
         return int(row["n"])
@@ -255,6 +263,6 @@ class TaskQueue:
 def set_progress(conn, task_id: str, payload: dict) -> None:
     """把阶段进度写回任务（API 查询用），不改变状态。"""
     conn.execute(
-        "UPDATE tasks SET progress_json = ?, updated_at = ? WHERE id = ?",
+        "UPDATE tasks SET progress_json = %s, updated_at = %s WHERE id = %s",
         (json_dump(payload), now_iso(), task_id),
     )

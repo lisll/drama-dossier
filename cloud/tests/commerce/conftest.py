@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 from psycopg import sql
 from psycopg.conninfo import make_conninfo
 
+from ..pg import temporary_database
 from drama_cloud.commerce import cards
 from drama_cloud.commerce.api import create_app
 from drama_cloud.commerce.config import CommerceSettings, SmtpSettings
@@ -32,8 +33,7 @@ from drama_cloud.commerce.license_token import Signer, generate_key_file
 from drama_cloud.commerce.mailer import MailError
 
 TEST_DSN_ENV = "COMMERCE_TEST_DSN"
-CODE_SECRET = "test-code-secret-0123456789abcdef-xyz"
-#: Mock 支付回调的签名密钥（测试用固定值）。
+CODE_SECRET = "test-code-secret-0123456789abcdef-xyz"#: Mock 支付回调的签名密钥（测试用固定值）。
 MOCK_PAY_SECRET = "test-mock-pay-secret-0123456789"
 #: 测试用的低开销参数，只为跑得快；生产用 argon2-cffi 的默认参数。
 FAST_HASHER = PasswordHasher(time_cost=1, memory_cost=8, parallelism=1)
@@ -54,21 +54,6 @@ def extract_code(text: str) -> str:
 
 def auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
-
-
-@contextlib.contextmanager
-def temporary_database():
-    admin_dsn = os.environ.get(TEST_DSN_ENV)
-    if not admin_dsn:
-        pytest.skip(f"需要 PostgreSQL：设置 {TEST_DSN_ENV}（见 cloud/docs/COMMERCE.md）")
-    name = "commerce_test_" + secrets.token_hex(4)
-    with psycopg.connect(admin_dsn, autocommit=True) as admin:
-        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
-    try:
-        yield make_conninfo(admin_dsn, dbname=name)
-    finally:
-        with psycopg.connect(admin_dsn, autocommit=True) as admin:
-            admin.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(name)))
 
 
 @pytest.fixture(scope="session")
@@ -102,7 +87,7 @@ def pg(pool):
         # 积分相关测试依赖它，而且「缺价目」本身是另一种要单独测的状态。
         conn.execute(
             "INSERT INTO price_rules (subject, credits_per_unit, min_units) VALUES"
-            " ('version', 5, 1), ('package', 5, 1)"
+            " ('version', 5, 1), ('package', 5, 1), ('server_version', 5, 1)"
         )
         # 充值档位同理。
         conn.execute(

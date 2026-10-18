@@ -46,7 +46,7 @@ def cluster_capabilities(settings: Settings) -> List[str]:
 def create_project(conn, name: str, owner_id: str, actor: str = "system") -> str:
     project_id = new_id("prj")
     conn.execute(
-        "INSERT INTO projects (id, name, owner_id, created_at) VALUES (?,?,?,?)",
+        "INSERT INTO projects (id, name, owner_id, created_at) VALUES (%s,%s,%s,%s)",
         (project_id, name, owner_id, now_iso()),
     )
     audit(conn, actor, "project.create", project_id, {"name": name})
@@ -55,7 +55,7 @@ def create_project(conn, name: str, owner_id: str, actor: str = "system") -> str
 
 def ensure_default_project(conn, owner_id: str, name: str = "默认项目") -> str:
     row = conn.execute(
-        "SELECT id FROM projects WHERE owner_id = ? ORDER BY created_at LIMIT 1", (owner_id,)
+        "SELECT id FROM projects WHERE owner_id = %s ORDER BY created_at LIMIT 1", (owner_id,)
     ).fetchone()
     if row:
         return row["id"]
@@ -100,7 +100,7 @@ def register_asset(
         """
         INSERT INTO assets (id, project_id, name, storage_key, sha256, size_bytes,
                             probe_json, source_declaration, lifecycle, created_at)
-        VALUES (?,?,?,?,?,?,NULL,?, 'ready', ?)
+        VALUES (%s,%s,%s,%s,%s,%s,NULL,%s, 'ready', %s)
         """,
         (asset_id, project_id, name, key, stat.sha256, stat.size_bytes,
          json_dump(declaration), now_iso()),
@@ -118,7 +118,7 @@ def register_asset(
 
 
 def set_asset_probe(conn, asset_id: str, summary: dict) -> None:
-    conn.execute("UPDATE assets SET probe_json = ? WHERE id = ?", (json_dump(summary), asset_id))
+    conn.execute("UPDATE assets SET probe_json = %s WHERE id = %s", (json_dump(summary), asset_id))
 
 
 def load_plan_inputs(conn, asset_ids: Sequence[str]) -> List[PlanInput]:
@@ -126,7 +126,7 @@ def load_plan_inputs(conn, asset_ids: Sequence[str]) -> List[PlanInput]:
     result: List[PlanInput] = []
     for asset_id in asset_ids:
         row = conn.execute(
-            "SELECT id, storage_key, sha256, name, source_declaration FROM assets WHERE id = ?",
+            "SELECT id, storage_key, sha256, name, source_declaration FROM assets WHERE id = %s",
             (asset_id,),
         ).fetchone()
         if row is None:
@@ -149,7 +149,7 @@ def load_plan_inputs(conn, asset_ids: Sequence[str]) -> List[PlanInput]:
 
 def _next_version(conn, recipe_id: str) -> int:
     row = conn.execute(
-        "SELECT COALESCE(MAX(version), 0) AS v FROM recipe_versions WHERE recipe_id = ?",
+        "SELECT COALESCE(MAX(version), 0) AS v FROM recipe_versions WHERE recipe_id = %s",
         (recipe_id,),
     ).fetchone()
     return int(row["v"]) + 1
@@ -170,7 +170,7 @@ def publish_recipe(
     recipe_id = recipe.recipe_id
     version = recipe.version
     existing = conn.execute(
-        "SELECT content_sha256 FROM recipe_versions WHERE recipe_id = ? AND version = ?",
+        "SELECT content_sha256 FROM recipe_versions WHERE recipe_id = %s AND version = %s",
         (recipe_id, version),
     ).fetchone()
     if existing is not None:
@@ -186,7 +186,7 @@ def publish_recipe(
     conn.execute(
         """
         INSERT INTO recipes (id, name, purpose, published_version, created_at)
-        VALUES (?,?,?,?,?)
+        VALUES (%s,%s,%s,%s,%s)
         ON CONFLICT(id) DO UPDATE SET name = excluded.name, purpose = excluded.purpose
         """,
         (recipe_id, recipe_id, recipe.preset.mode, None, now_iso()),
@@ -196,7 +196,7 @@ def publish_recipe(
         INSERT INTO recipe_versions (recipe_id, version, status, content_json, content_sha256,
                                      schema_version, min_worker_version, required_capabilities,
                                      rollout_percent, reviewed_by, published_at, created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """,
         (
             recipe_id,
@@ -215,7 +215,7 @@ def publish_recipe(
     )
     if status == "published":
         conn.execute(
-            "UPDATE recipes SET published_version = ? WHERE id = ?", (version, recipe_id)
+            "UPDATE recipes SET published_version = %s WHERE id = %s", (version, recipe_id)
         )
     audit(
         conn,
@@ -238,17 +238,17 @@ def set_recipe_status(conn, recipe_id: str, version: int, status: str, actor: st
     if status not in RECIPE_STATUSES:
         raise WorkError(ErrorClass.PARAM_OUT_OF_RANGE, f"未知配方状态：{status}")
     row = conn.execute(
-        "SELECT status FROM recipe_versions WHERE recipe_id = ? AND version = ?",
+        "SELECT status FROM recipe_versions WHERE recipe_id = %s AND version = %s",
         (recipe_id, version),
     ).fetchone()
     if row is None:
         raise WorkError(ErrorClass.PARAM_OUT_OF_RANGE, f"配方版本不存在：{recipe_id}@{version}")
     conn.execute(
-        "UPDATE recipe_versions SET status = ? WHERE recipe_id = ? AND version = ?",
+        "UPDATE recipe_versions SET status = %s WHERE recipe_id = %s AND version = %s",
         (status, recipe_id, version),
     )
     pointer = conn.execute(
-        "SELECT published_version FROM recipes WHERE id = ?", (recipe_id,)
+        "SELECT published_version FROM recipes WHERE id = %s", (recipe_id,)
     ).fetchone()
     if status in ("revoked", "deprecated") and pointer and pointer["published_version"] == version:
         rollback_to(conn, recipe_id, actor=actor)
@@ -262,19 +262,19 @@ def rollback_to(conn, recipe_id: str, version: Optional[int] = None, actor: str 
         row = conn.execute(
             """
             SELECT version FROM recipe_versions
-             WHERE recipe_id = ? AND status = 'published'
+             WHERE recipe_id = %s AND status = 'published'
              ORDER BY version DESC LIMIT 1
             """,
             (recipe_id,),
         ).fetchone()
         if row is None:
-            conn.execute("UPDATE recipes SET published_version = NULL WHERE id = ?", (recipe_id,))
+            conn.execute("UPDATE recipes SET published_version = NULL WHERE id = %s", (recipe_id,))
             audit(conn, actor, "recipe.rollback", recipe_id, {"version": None})
             return {"recipe_id": recipe_id, "published_version": None}
         version = int(row["version"])
     else:
         row = conn.execute(
-            "SELECT status FROM recipe_versions WHERE recipe_id = ? AND version = ?",
+            "SELECT status FROM recipe_versions WHERE recipe_id = %s AND version = %s",
             (recipe_id, version),
         ).fetchone()
         if row is None:
@@ -283,7 +283,7 @@ def rollback_to(conn, recipe_id: str, version: Optional[int] = None, actor: str 
             raise WorkError(
                 ErrorClass.PARAM_OUT_OF_RANGE, f"版本 {version} 状态为 {row['status']}，不能作为发布指针"
             )
-    conn.execute("UPDATE recipes SET published_version = ? WHERE id = ?", (version, recipe_id))
+    conn.execute("UPDATE recipes SET published_version = %s WHERE id = %s", (version, recipe_id))
     audit(conn, actor, "recipe.rollback", recipe_id, {"version": version})
     return {"recipe_id": recipe_id, "published_version": version}
 
@@ -297,7 +297,7 @@ def resolve_recipe(
     """解析配方：不给版本就用发布指针，并按灰度比例判断是否放行。"""
     if version is None:
         row = conn.execute(
-            "SELECT published_version FROM recipes WHERE id = ?", (recipe_id,)
+            "SELECT published_version FROM recipes WHERE id = %s", (recipe_id,)
         ).fetchone()
         if row is None or row["published_version"] is None:
             raise WorkError(ErrorClass.PARAM_OUT_OF_RANGE, f"配方 {recipe_id} 没有已发布版本")
@@ -306,7 +306,7 @@ def resolve_recipe(
         """
         SELECT version, status, content_json, content_sha256, required_capabilities,
                rollout_percent, min_worker_version, reviewed_by, published_at
-          FROM recipe_versions WHERE recipe_id = ? AND version = ?
+          FROM recipe_versions WHERE recipe_id = %s AND version = %s
         """,
         (recipe_id, version),
     ).fetchone()
@@ -343,7 +343,7 @@ def list_recipe_versions(conn, recipe_id: Optional[str] = None) -> List[dict]:
             SELECT rv.recipe_id, rv.version, rv.status, rv.content_sha256, rv.rollout_percent,
                    rv.min_worker_version, rv.published_at, r.name, r.purpose, r.published_version
               FROM recipe_versions rv JOIN recipes r ON r.id = rv.recipe_id
-             WHERE rv.recipe_id = ? ORDER BY rv.version DESC
+             WHERE rv.recipe_id = %s ORDER BY rv.version DESC
             """,
             (recipe_id,),
         ).fetchall()
@@ -413,19 +413,24 @@ def create_task(
     actor: str = "system",
     billing_quote_id: Optional[str] = None,
     billing_user_id: Optional[str] = None,
+    credit_ref: Optional[str] = None,
 ) -> dict:
-    """创建任务：锁定配方快照 → 构造计划 → 入队（幂等键保证不重复创建）。"""
+    """创建任务：锁定配方快照 → 构造计划 → 入队（幂等键保证不重复创建）。
+
+    `credit_ref` 非空表示这个任务在 commerce 的积分账本里已经预扣过，
+    终态时按它结算或退还（见 `settle_task_billing`）。
+    """
     if not asset_ids:
         raise WorkError(ErrorClass.PARAM_OUT_OF_RANGE, "任务至少需要一份输入素材")
 
     if idempotency_key:
         row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ?", (idempotency_key,)
+            "SELECT id FROM tasks WHERE idempotency_key = %s", (idempotency_key,)
         ).fetchone()
         if row is not None:
             if billing_quote_id:
                 quote = conn.execute(
-                    "SELECT status, task_id, user_id FROM billing_quotes WHERE id = ?",
+                    "SELECT status, task_id, user_id FROM billing_quotes WHERE id = %s",
                     (billing_quote_id,),
                 ).fetchone()
                 if (quote is None or quote["task_id"] != row["id"]
@@ -448,11 +453,12 @@ def create_task(
     with transaction(conn):
         conn.execute(
             """
-            INSERT INTO tasks (id, project_id, state, priority, idempotency_key, billing_quote_id, input_asset_ids,
+            INSERT INTO tasks (id, project_id, state, priority, idempotency_key, billing_quote_id, credit_ref,
+                               input_asset_ids,
                                recipe_id, recipe_version, recipe_sha256, recipe_snapshot_json,
                                plan_json, required_capabilities, target_json, user_params_json,
                                progress_json, created_at, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """,
             (
                 task_id,
@@ -461,6 +467,7 @@ def create_task(
                 int(priority),
                 idempotency_key,
                 billing_quote_id,
+                credit_ref,
                 json_dump(list(asset_ids)),
                 recipe.recipe_id,
                 recipe.version,
@@ -488,12 +495,43 @@ def create_task(
 
 
 def settle_task_billing(conn, task_id: str, success: bool, actor: str = "system") -> Optional[dict]:
-    """按任务终态自动结算已保留报价；无报价的老任务保持兼容。"""
+    """按任务终态结算。
+
+    两条路，取决于这个任务当初是怎么扣的费：
+
+    * `credit_ref` 非空 → 走 commerce 的积分账本（服务端处理，M5b-4）。
+      成功结算、失败退还，都用这个 ref。
+    * `billing_quote_id` 非空 → 走本地 `billing.py` 的老账本（既有调用与测试）。
+
+    两者互斥；都没有则不扣费，返回 None。
+    """
     row = conn.execute(
-        "SELECT t.billing_quote_id, t.project_id, p.owner_id FROM tasks t "
-        "JOIN projects p ON p.id = t.project_id WHERE t.id = ?", (task_id,)
+        "SELECT t.billing_quote_id, t.credit_ref, t.project_id, p.owner_id FROM tasks t "
+        "JOIN projects p ON p.id = t.project_id WHERE t.id = %s", (task_id,)
     ).fetchone()
-    if row is None or not row["billing_quote_id"]:
+    if row is None:
+        return None
+
+    if row["credit_ref"]:
+        from ..config import load_settings
+        from ..credit_client import CreditClient
+
+        # 结算发生在 Worker 的进程里，这里没有 create_task 传下来的 settings，
+        # 所以按当前部署配置重建一份（只读环境变量，不碰数据库）。
+        settings = load_settings()
+        client = CreditClient(settings.commerce_url, settings.internal_secret)
+        ref = row["credit_ref"]
+        outcome = client.settle(ref) if success else client.release(ref, memo="任务未完成，已退还")
+        # 结算/退还失败要留痕：钱的事必须能查。这里写审计，不改任务状态。
+        audit(
+            conn, actor,
+            "credit.settle" if success else "credit.release",
+            task_id,
+            {"ref": ref, "ok": outcome.ok, "detail": outcome.detail},
+        )
+        return {"ref": ref, "ok": outcome.ok, "detail": outcome.detail}
+
+    if not row["billing_quote_id"]:
         return None
     from ..billing import settle_quote
 
@@ -502,7 +540,7 @@ def settle_task_billing(conn, task_id: str, success: bool, actor: str = "system"
 
 def request_cancel(conn, task_id: str, actor: str = "system") -> dict:
     """请求取消：置取消标记并迁移状态；执行中的任务在步骤边界协作退出。"""
-    row = conn.execute("SELECT state FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    row = conn.execute("SELECT state FROM tasks WHERE id = %s", (task_id,)).fetchone()
     if row is None:
         raise WorkError(ErrorClass.PARAM_OUT_OF_RANGE, f"任务不存在：{task_id}")
     if row["state"] in {str(s) for s in TERMINAL_STATES}:
@@ -530,7 +568,7 @@ def request_cancel(conn, task_id: str, actor: str = "system") -> dict:
 
 def retry_task(conn, task_id: str, settings: Settings, actor: str = "system") -> dict:
     """对失败任务发起重试：清空重试计数并重新入队。"""
-    row = conn.execute("SELECT state FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    row = conn.execute("SELECT state FROM tasks WHERE id = %s", (task_id,)).fetchone()
     if row is None:
         raise WorkError(ErrorClass.PARAM_OUT_OF_RANGE, f"任务不存在：{task_id}")
     if row["state"] not in (str(TaskState.FAILED), str(TaskState.CANCELLED)):
@@ -542,20 +580,44 @@ def retry_task(conn, task_id: str, settings: Settings, actor: str = "system") ->
     with transaction(conn):
         conn.execute(
             "UPDATE tasks SET attempts = 0, error_class = NULL, error_message = NULL, "
-            "cancel_requested = 0, result_json = NULL, finished_at = NULL WHERE id = ?",
+            "cancel_requested = 0, result_json = NULL, finished_at = NULL WHERE id = %s",
             (task_id,),
         )
         # FAILED/CANCELLED 都是终态，必须先显式回到 RETRY_WAITING 才能重新入队。
         conn.execute(
-            "UPDATE tasks SET state = ? WHERE id = ?", (str(TaskState.RETRY_WAITING), task_id)
+            "UPDATE tasks SET state = %s WHERE id = %s", (str(TaskState.RETRY_WAITING), task_id)
         )
         queue.enqueue(conn, task_id)
         audit(conn, actor, "task.retry", task_id, {})
     return get_task(conn, task_id)
 
 
+def task_owner(conn, task_id: str) -> Optional[str]:
+    """任务的归属用户 id。任务不存在时返回 None。
+
+    隔离的**唯一入口**：所有「按 id 取任务/产物」的路由都先过这里，
+    免得每个查询各写一遍 JOIN，漏一处就是一个越权洞。
+    """
+    row = conn.execute(
+        "SELECT p.owner_id FROM tasks t JOIN projects p ON p.id = t.project_id WHERE t.id = %s",
+        (task_id,),
+    ).fetchone()
+    return str(row["owner_id"]) if row else None
+
+
+def ensure_task_access(conn, task_id: str, owner_id: str, *, allow_admin: bool = False) -> None:
+    """确认 `owner_id` 能访问这个任务，否则按「不存在」处理。
+
+    **不区分「不存在」与「不是你的」**：两种情况回同一个错误码。
+    区分开会让人可以拿任务 id 探测别人有没有这个任务。
+    """
+    actual = task_owner(conn, task_id)
+    if actual is None or (actual != owner_id and not allow_admin):
+        raise WorkError(ErrorClass.NOT_FOUND, f"任务不存在：{task_id}")
+
+
 def get_task(conn, task_id: str, include_plan: bool = False) -> dict:
-    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    row = conn.execute("SELECT * FROM tasks WHERE id = %s", (task_id,)).fetchone()
     if row is None:
         raise WorkError(ErrorClass.PARAM_OUT_OF_RANGE, f"任务不存在：{task_id}")
     detail = {
@@ -596,26 +658,42 @@ def _review_summary(conn, task_id: str):
     return review.review_summary(conn, task_id)
 
 
-def list_tasks(conn, state: Optional[str] = None, limit: int = 50) -> List[dict]:
+def list_tasks(
+    conn,
+    state: Optional[str] = None,
+    limit: int = 50,
+    owner_id: Optional[str] = None,
+) -> List[dict]:
+    """列任务。
+
+    `owner_id` 是隔离的关键：传了就只返回这个用户项目下的任务。
+    不传表示「不按用户过滤」，只给内部调用（调度器、运维脚本）用。
+    """
+    columns = (
+        "SELECT t.id, t.state, t.priority, t.recipe_id, t.recipe_version, t.attempts,"
+        " t.created_at, t.updated_at FROM tasks t"
+        " JOIN projects p ON p.id = t.project_id"
+    )
+    clauses = []
+    params: list = []
+    if owner_id is not None:
+        clauses.append("p.owner_id = %s")
+        params.append(owner_id)
     if state:
-        rows = conn.execute(
-            "SELECT id, state, priority, recipe_id, recipe_version, attempts, created_at, updated_at "
-            "FROM tasks WHERE state = ? ORDER BY created_at DESC LIMIT ?",
-            (state, int(limit)),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT id, state, priority, recipe_id, recipe_version, attempts, created_at, updated_at "
-            "FROM tasks ORDER BY created_at DESC LIMIT ?",
-            (int(limit),),
-        ).fetchall()
+        clauses.append("t.state = %s")
+        params.append(state)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    params.append(int(limit))
+    rows = conn.execute(
+        f"{columns}{where} ORDER BY t.created_at DESC LIMIT %s", tuple(params)
+    ).fetchall()
     return [dict(row) for row in rows]
 
 
 def attempts_for(conn, task_id: str) -> List[dict]:
     rows = conn.execute(
         "SELECT attempt, worker_id, started_at, finished_at, error_class, error_message "
-        "FROM task_attempts WHERE task_id = ? ORDER BY attempt",
+        "FROM task_attempts WHERE task_id = %s ORDER BY attempt",
         (task_id,),
     ).fetchall()
     return [dict(row) for row in rows]
@@ -652,7 +730,7 @@ def register_artifact(
         """
         INSERT INTO artifacts (id, task_id, kind, storage_key, sha256, size_bytes,
                                media_json, quality_json, retain_until, created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """,
         (
             artifact_id,
@@ -683,7 +761,7 @@ def register_artifact(
 def list_artifacts(conn, task_id: str) -> List[dict]:
     rows = conn.execute(
         "SELECT id, kind, storage_key, sha256, size_bytes, media_json, quality_json, "
-        "retain_until, created_at FROM artifacts WHERE task_id = ? ORDER BY created_at",
+        "retain_until, created_at FROM artifacts WHERE task_id = %s ORDER BY created_at",
         (task_id,),
     ).fetchall()
     return [
@@ -702,8 +780,31 @@ def list_artifacts(conn, task_id: str) -> List[dict]:
     ]
 
 
+def artifact_owner(conn, artifact_id: str) -> Optional[str]:
+    """产物归属的用户 id（经任务 → 项目）。不存在时返回 None。"""
+    row = conn.execute(
+        "SELECT p.owner_id FROM artifacts a"
+        " JOIN tasks t ON t.id = a.task_id"
+        " JOIN projects p ON p.id = t.project_id"
+        " WHERE a.id = %s",
+        (artifact_id,),
+    ).fetchone()
+    return str(row["owner_id"]) if row else None
+
+
+def ensure_artifact_access(conn, artifact_id: str, owner_id: str) -> None:
+    """确认 `owner_id` 能取这个产物，否则按「不存在」处理。
+
+    这是最要紧的一处隔离：产物就是成品视频。知道 artifact_id 就能下载别人的成品，
+    等于整个「按用户隔离」没做。
+    """
+    actual = artifact_owner(conn, artifact_id)
+    if actual is None or actual != owner_id:
+        raise WorkError(ErrorClass.NOT_FOUND, f"产物不存在：{artifact_id}")
+
+
 def get_artifact(conn, artifact_id: str) -> dict:
-    row = conn.execute("SELECT * FROM artifacts WHERE id = ?", (artifact_id,)).fetchone()
+    row = conn.execute("SELECT * FROM artifacts WHERE id = %s", (artifact_id,)).fetchone()
     if row is None:
         raise WorkError(ErrorClass.PARAM_OUT_OF_RANGE, f"产物不存在：{artifact_id}")
     return {
@@ -721,21 +822,106 @@ def get_artifact(conn, artifact_id: str) -> dict:
 
 
 def cleanup_expired_artifacts(conn, storage: LocalStorage) -> int:
-    """按保留期限清理产物（§7.3「按生命周期策略清理」）。"""
+    """按保留期限清理产物（§7.3「按生命周期策略清理」）。
+
+    产物本身可以连元数据一起删：它是「这次处理出来的东西」，
+    删掉不影响任何对账（扣费记录在积分账本里，不依赖产物行）。
+    """
     rows = conn.execute(
-        "SELECT id, storage_key FROM artifacts WHERE retain_until IS NOT NULL AND retain_until < ?",
+        "SELECT id, storage_key FROM artifacts WHERE retain_until IS NOT NULL AND retain_until < %s",
         (now_iso(),),
     ).fetchall()
     for row in rows:
         storage.delete(row["storage_key"])
-        conn.execute("DELETE FROM artifacts WHERE id = ?", (row["id"],))
+        conn.execute("DELETE FROM artifacts WHERE id = %s", (row["id"],))
     return len(rows)
+
+
+def cleanup_expired_assets(conn, storage: LocalStorage, settings: Settings) -> int:
+    """按保留期限清理素材：**真删文件**，保留元数据行。
+
+    为什么不连元数据一起删（和产物不同）：素材行上有 `sha256` 与大小，
+    审计与「这个哈希的素材我曾经收过吗」这类排查要它们；而文件内容才是
+    隐私政策要求到期删除的东西。所以：
+
+    * 删磁盘文件；
+    * `lifecycle` 改成 `deleted`；
+    * 清空文件名与权属声明（那才是可能含敏感信息的内容）；
+    * 留 `sha256`、`size_bytes`、`created_at`。
+
+    幂等：已经 `deleted` 的不再处理。
+    """
+    if settings.asset_retention_days <= 0:
+        return 0
+    cutoff = _days_ago(settings.asset_retention_days)
+    rows = conn.execute(
+        "SELECT id, storage_key, name, probe_json FROM assets"
+        " WHERE lifecycle = 'ready' AND created_at < %s",
+        (cutoff,),
+    ).fetchall()
+    removed = 0
+    for row in rows:
+        storage.delete(row["storage_key"])
+        with transaction(conn):
+            conn.execute(
+                "UPDATE assets SET lifecycle = 'deleted', name = '', source_declaration = NULL,"
+                " probe_json = NULL WHERE id = %s",
+                (row["id"],),
+            )
+            audit(conn, "system", "lifecycle.asset_expired", row["id"], {
+                "previous_name_sha256": _sha256_text(row["name"] or ""),
+            })
+        removed += 1
+    return removed
+
+
+def cleanup_abandoned_uploads(conn, storage: LocalStorage, settings: Settings) -> int:
+    """清理长时间没动的分片上传：删分片目录、会话标 aborted。
+
+    用户在「传了一半」之后关掉客户端很常见，那些分片会一直占磁盘。
+    """
+    if settings.upload_retention_days <= 0:
+        return 0
+    cutoff = _days_ago(settings.upload_retention_days)
+    rows = conn.execute(
+        "SELECT id FROM upload_sessions WHERE status = 'open' AND updated_at < %s",
+        (cutoff,),
+    ).fetchall()
+    removed = 0
+    for row in rows:
+        # 分片目录与会话同 id；删目录用 storage 的越界保护之外的方式：
+        # uploads_dir 不在对象存储根目录下，直接删子目录即可。
+        directory = settings.uploads_dir / row["id"]
+        if directory.is_dir():
+            import shutil
+
+            shutil.rmtree(directory, ignore_errors=True)
+        with transaction(conn):
+            conn.execute(
+                "UPDATE upload_sessions SET status = 'aborted', updated_at = %s WHERE id = %s",
+                (now_iso(), row["id"]),
+            )
+            audit(conn, "system", "lifecycle.upload_abandoned", row["id"], {})
+        removed += 1
+    return removed
+
+
+def _days_ago(days: int) -> str:
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) - timedelta(days=days)).replace(microsecond=0).isoformat()
+
+
+def _sha256_text(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def get_checkpoints(conn, task_id: str) -> List[dict]:
     rows = conn.execute(
         "SELECT stage, input_sha256, recipe_version, engine_version, params_digest, artifact_key, "
-        "artifact_sha256, completed, updated_at FROM task_checkpoints WHERE task_id = ? "
+        "artifact_sha256, completed, updated_at FROM task_checkpoints WHERE task_id = %s "
         "ORDER BY updated_at",
         (task_id,),
     ).fetchall()

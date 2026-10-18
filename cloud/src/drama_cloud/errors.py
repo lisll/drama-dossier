@@ -31,6 +31,9 @@ class ErrorClass(str, enum.Enum):
     # 次数用尽后按「转人工复核」处理，而不是直接判死。
     QUALITY_RETRYABLE = "quality_retryable"
     CANCELLED = "cancelled"
+    #: 资源不存在，或存在但不属于当前用户（M5b 的按用户隔离）。
+    #: 两种情况刻意用同一个值：分开会让人能拿 id 探测别人有没有这个资源。
+    NOT_FOUND = "not_found"
     INTERNAL = "internal"
 
     def __str__(self) -> str:  # 避免 Python 3.9 打印成 "ErrorClass.X"

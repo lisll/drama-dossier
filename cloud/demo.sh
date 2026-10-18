@@ -41,9 +41,17 @@ echo "==> 队列概览"
 
 if [[ "${HTTP}" == "1" ]]; then
   echo
-  echo "==> 初始化并启动 API（Ctrl-C 退出）"
-  ADMIN_TOKEN="$("${PYTHON}" -m drama_cloud.cli initdb --admin demo 2>/dev/null | tail -1)"
-  echo "管理员令牌：${ADMIN_TOKEN}"
-  echo "打开 http://127.0.0.1:8000/ 并把上面的令牌粘进「访问令牌」输入框。"
+  echo "==> 准备 API 演示"
+  # M5b 起认证走 commerce 内省：API 需要一个 commerce 地址与内部密钥，
+  # 令牌也从 commerce 登录拿，不再是本地 initdb 打印的那串。
+  if [[ -z "${DRAMA_CLOUD_COMMERCE_URL}" || -z "${DRAMA_CLOUD_INTERNAL_SECRET}" ]]; then
+    echo "跳过 HTTP 演示：没有配置 commerce。"
+    echo "需要这两个变量（值见 cloud/docs/COMMERCE.md）："
+    echo "  export DRAMA_CLOUD_COMMERCE_URL=http://127.0.0.1:8100"
+    echo "  export DRAMA_CLOUD_INTERNAL_SECRET=<与 commerce 的 DRAMA_COMMERCE_INTERNAL_SECRET 相同>"
+    echo "然后用桌面端（或 curl 调 /api/v1/auth/login）登录 commerce 拿访问令牌。"
+    exit 0
+  fi
+  echo "把 commerce 登录得到的访问令牌粘进 http://127.0.0.1:8000/ 的「访问令牌」输入框。"
   "${PYTHON}" -m drama_cloud.cli serve --host 127.0.0.1 --port 8000
 fi

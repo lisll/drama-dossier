@@ -82,7 +82,7 @@ def test_heartbeat_renews_the_lease_from_its_own_thread(conn, settings, storage,
     claimed = worker.queue.claim(conn, worker.worker_id, worker.capabilities)
     assert claimed is not None
     before = conn.execute(
-        "SELECT lease_expires_at FROM tasks WHERE id = ?", (task["id"],)
+        "SELECT lease_expires_at FROM tasks WHERE id = %s", (task["id"],)
     ).fetchone()["lease_expires_at"]
 
     with Heartbeat(worker, conn, task["id"]) as beat:
@@ -90,7 +90,7 @@ def test_heartbeat_renews_the_lease_from_its_own_thread(conn, settings, storage,
         assert beat.lost is False
 
     after = conn.execute(
-        "SELECT lease_expires_at FROM tasks WHERE id = ?", (task["id"],)
+        "SELECT lease_expires_at FROM tasks WHERE id = %s", (task["id"],)
     ).fetchone()["lease_expires_at"]
     assert after > before, "心跳没有推进租约（心跳线程多半在跨线程用主连接）"
 
@@ -128,7 +128,7 @@ def test_cancel_is_cooperative_and_never_marks_half_done_as_success(
 
     def cancelling_probe(ctx, params):
         # 模拟「取消请求在第一个阶段执行期间到达」。
-        conn.execute("UPDATE tasks SET cancel_requested = 1 WHERE id = ?", (task["id"],))
+        conn.execute("UPDATE tasks SET cancel_requested = 1 WHERE id = %s", (task["id"],))
         return {}
 
     with patch_module("media.probe", cancelling_probe):
@@ -168,7 +168,7 @@ def test_retryable_failure_then_reuse_and_success(conn, settings, storage, proje
     assert list(work_dir.glob("encoded*")), "编码阶段产物应当被保留下来"
 
     # 退避时间清零点相当于「等到了下一次可执行时间」。
-    conn.execute("UPDATE tasks SET next_run_at = NULL WHERE id = ?", (task["id"],))
+    conn.execute("UPDATE tasks SET next_run_at = NULL WHERE id = %s", (task["id"],))
     with patch_module("media.encode", counting_encode):
         assert Worker(settings, worker_id="wrk_r2").run_once() is True
 
@@ -264,13 +264,13 @@ def test_lease_loss_does_not_clobber_new_owner(conn, settings, storage, project,
 
     # 模拟：旧 Worker 还在跑，但租约已经易主给新 Worker。
     conn.execute(
-        "UPDATE tasks SET lease_owner = 'wrk_new' WHERE id = ?", (task["id"],)
+        "UPDATE tasks SET lease_owner = 'wrk_new' WHERE id = %s", (task["id"],)
     )
     worker = Worker(settings, worker_id="wrk_old")
     worker.execute(conn, task["id"], claimed.attempt)
 
     row = conn.execute(
-        "SELECT state, lease_owner, error_class FROM tasks WHERE id = ?", (task["id"],)
+        "SELECT state, lease_owner, error_class FROM tasks WHERE id = %s", (task["id"],)
     ).fetchone()
     assert row["lease_owner"] == "wrk_new", "状态与租约都不能被旧 Worker 改写"
     assert row["state"] == str(TaskState.RUNNING)
@@ -302,7 +302,7 @@ def test_user_params_override_and_snapshot_is_frozen(conn, settings, storage, pr
         user_params={"encode": {"crf": 30}}, actor="test",
     )
     plan = json.loads(conn.execute(
-        "SELECT plan_json FROM tasks WHERE id = ?", (task["id"],)
+        "SELECT plan_json FROM tasks WHERE id = %s", (task["id"],)
     ).fetchone()["plan_json"])
     encode_step = next(s for s in plan["steps"] if s["module"] == "media.encode")
     assert encode_step["params"]["crf"] == 30

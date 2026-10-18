@@ -67,7 +67,7 @@ def test_transition_is_persisted_and_validated(conn, settings, storage, project)
     assert task["state"] == "QUEUED"
 
     transition(conn, task["id"], TaskState.RUNNING)
-    row = conn.execute("SELECT state, updated_at FROM tasks WHERE id = ?", (task["id"],)).fetchone()
+    row = conn.execute("SELECT state, updated_at FROM tasks WHERE id = %s", (task["id"],)).fetchone()
     assert row["state"] == "RUNNING"
 
     with pytest.raises(WorkError) as error:

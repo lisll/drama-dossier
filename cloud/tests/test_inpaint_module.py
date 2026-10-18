@@ -390,7 +390,7 @@ def test_quality_retry_escalates_then_succeeds(conn, settings, storage, project,
     # 还有重试额度时不进人工队列。
     assert review_service.list_reviews(conn, task_id=task["id"]) == []
 
-    conn.execute("UPDATE tasks SET next_run_at = NULL WHERE id = ?", (task["id"],))
+    conn.execute("UPDATE tasks SET next_run_at = NULL WHERE id = %s", (task["id"],))
     assert Worker(worker_settings, worker_id="wrk_b").run_once() is True
     detail = service.get_task(conn, task["id"])
     assert detail["state"] == "SUCCEEDED", detail["error"]
@@ -413,7 +413,7 @@ def test_exhausted_quality_retry_goes_to_review_queue(conn, settings, storage, p
 
     for index in range(3):
         assert Worker(worker_settings, worker_id=f"wrk_{index}").run_once() is True
-        conn.execute("UPDATE tasks SET next_run_at = NULL WHERE id = ?", (task["id"],))
+        conn.execute("UPDATE tasks SET next_run_at = NULL WHERE id = %s", (task["id"],))
 
     detail = service.get_task(conn, task["id"])
     assert detail["state"] == "FAILED"

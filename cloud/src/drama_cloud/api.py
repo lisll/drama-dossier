@@ -31,7 +31,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import Field
 
 from . import __version__
-from .auth import ROLE_RANK, Principal, resolve_token
+from .auth import ROLE_RANK, Principal, principal_for_email
+from .identity import IntrospectUnavailable, introspect
 from . import billing
 from .base import StrictModel
 from .config import Settings, load_settings
@@ -48,6 +49,7 @@ from .tasks.queue import TaskQueue
 
 #: 错误分类 → HTTP 状态码。让客户端能区分「我传错了」和「系统暂时不行」。
 _STATUS_BY_CLASS = {
+    ErrorClass.NOT_FOUND: 404,
     ErrorClass.PARAM_OUT_OF_RANGE: 400,
     ErrorClass.RECIPE_SCHEMA_INVALID: 422,
     ErrorClass.INPUT_CORRUPT: 422,
@@ -75,6 +77,22 @@ class UploadRequest(StrictModel):
     filename: str
     project_id: Optional[str] = None
     ttl_seconds: int = Field(900, ge=60, le=86400)
+
+
+class ChunkedUploadRequest(StrictModel):
+    """开一个分片上传会话（M5b-2）。
+
+    客户端要**先算出**整文件大小与 sha256 再开会话：服务端在完成时用它校验拼接结果。
+    """
+
+    name: str
+    role: str = "video"
+    filename: str
+    size_bytes: int = Field(ge=0)
+    #: 整文件 sha256，64 位小写十六进制。用正则约束，省掉路由里的手写校验。
+    sha256: str = Field(pattern="^[0-9a-f]{64}$")
+    project_id: Optional[str] = None
+    chunk_size: int = Field(default=8 * 1024 * 1024, ge=1024, le=64 * 1024 * 1024)
 
 
 class TaskRequest(StrictModel):
@@ -197,19 +215,34 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             conn.close()
 
     def principal_from_header(authorization: Optional[str]) -> Principal:
-        """只认 `Authorization: Bearer <用户令牌>`。"""
+        """只认 `Authorization: Bearer <commerce 访问令牌>`（M5b 起改用内省）。
+
+        三种结果要分开：
+        * 令牌有效 → 返回 Principal（角色由本库的 media_admins 白名单决定）；
+        * 令牌无效 → 401；
+        * 问不到 commerce → 503。**不能**当成 401（那会让人以为要重新登录），
+          更不能放行。
+        """
         if not authorization or not authorization.lower().startswith("bearer "):
             raise HTTPException(
                 401, detail={"error": "unauthorized", "message": "需要 Authorization: Bearer 令牌"}
             )
+        token = authorization[7:].strip()
+        try:
+            identity = introspect(
+                settings.commerce_url, settings.internal_secret, token
+            )
+        except IntrospectUnavailable as error:
+            raise HTTPException(
+                503, detail={"error": "service_unavailable", "message": str(error)}
+            ) from error
+        if identity is None:
+            raise HTTPException(401, detail={"error": "unauthorized", "message": "令牌无效"})
         conn = connect(settings)
         try:
-            principal = resolve_token(conn, authorization[7:].strip())
+            return principal_for_email(conn, identity.user_id, identity.email)
         finally:
             conn.close()
-        if principal is None:
-            raise HTTPException(401, detail={"error": "unauthorized", "message": "令牌无效"})
-        return principal
 
     def current_principal(request: Request, authorization: Optional[str] = Header(None)) -> Principal:
         """用户令牌只认 `Authorization: Bearer` 请求头，不接受 `?token=`。
@@ -235,10 +268,21 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
         return dependency
 
+    def _credit_client():
+        from .credit_client import CreditClient
+
+        return CreditClient(settings.commerce_url, settings.internal_secret)
+
     def project_for(conn, principal: Principal, project_id: Optional[str]) -> str:
         if project_id:
-            row = conn.execute("SELECT id FROM projects WHERE id = ?", (project_id,)).fetchone()
+            # **必须校验归属**：只按 id 查会把项目当成公开资源，
+            # 任何登录用户都能往别人的项目里塞素材。
+            row = conn.execute(
+                "SELECT id FROM projects WHERE id = %s AND owner_id = %s",
+                (project_id, principal.user_id),
+            ).fetchone()
             if row is None:
+                # 别人的项目和不存在的项目回同一个错误：不透露项目是否存在。
                 raise HTTPException(404, detail={"error": "not_found", "message": "项目不存在"})
             return row["id"]
         return service.ensure_default_project(conn, principal.user_id)
@@ -372,10 +416,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         quote = billing.get_quote(conn, quote_id)
         if quote["user_id"] != principal.user_id:
             raise HTTPException(403, detail={"error": "forbidden", "message": "报价不属于当前用户"})
-        task = conn.execute("SELECT state, project_id FROM tasks WHERE id = ?", (payload.task_id,)).fetchone()
+        task = conn.execute("SELECT state, project_id FROM tasks WHERE id = %s", (payload.task_id,)).fetchone()
         if task is None:
             raise HTTPException(404, detail={"error": "not_found", "message": "任务不存在"})
-        project = conn.execute("SELECT owner_id FROM projects WHERE id = ?", (task["project_id"],)).fetchone()
+        project = conn.execute("SELECT owner_id FROM projects WHERE id = %s", (task["project_id"],)).fetchone()
         if project is None or project["owner_id"] != principal.user_id:
             raise HTTPException(403, detail={"error": "forbidden", "message": "任务不属于当前用户"})
         if task["state"] == "SUCCEEDED":
@@ -477,13 +521,111 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             staging.unlink(missing_ok=True)
         return {"asset": asset}
 
+    # ---------- 分片上传与断点续传（M5b-2） ----------
+
+    def _session_view(session) -> dict:
+        """给客户端的会话状态：够它决定「还该传哪几块」。"""
+        from . import uploads as uploads_service
+
+        total = uploads_service.chunk_count(session.declared_size, session.chunk_size)
+        return {
+            "upload_id": session.id,
+            "status": session.status,
+            "chunk_size": session.chunk_size,
+            "total_chunks": total,
+            "received": sorted(session.received),
+            "missing": uploads_service.missing_chunks(session),
+            "asset_id": session.asset_id,
+        }
+
+    @app.post("/api/v1/assets/uploads", status_code=201)
+    def create_chunked_upload(
+        payload: ChunkedUploadRequest,
+        principal: Principal = Depends(require_role("operator")),
+        conn=Depends(get_conn),
+    ):
+        """开一个分片上传会话。返回 upload_id 与每块大小。"""
+        from . import uploads as uploads_service
+
+        if payload.role not in service.ASSET_ROLES:
+            raise HTTPException(400, detail={"error": "bad_role", "message": f"未知角色 {payload.role}"})
+        project_id = project_for(conn, principal, payload.project_id)
+        session = uploads_service.create(
+            conn, storage, project_id, principal.user_id, payload.name,
+            payload.filename, payload.size_bytes, payload.sha256, payload.chunk_size,
+        )
+        return _session_view(session)
+
+    @app.get("/api/v1/assets/uploads/{upload_id}")
+    def chunked_upload_status(
+        upload_id: str,
+        principal: Principal = Depends(require_role("operator")),
+        conn=Depends(get_conn),
+    ):
+        """查已收到哪些块。断点续传靠它：只补 `missing` 里的块。"""
+        from . import uploads as uploads_service
+
+        session = uploads_service.get_owned(conn, upload_id, principal.user_id)
+        return _session_view(session)
+
+    @app.put("/api/v1/assets/uploads/{upload_id}/chunks/{index}")
+    async def put_chunk(
+        upload_id: str,
+        index: int,
+        request: Request,
+        principal: Principal = Depends(require_role("operator")),
+        conn=Depends(get_conn),
+    ):
+        """上传一块。同一 index 再传会覆盖（断点续传就是重传缺的块）。
+
+        要求 Bearer 而不是短时令牌：分片请求次数多、体积可控，
+        用登录态最直接，也省得客户端为每块换令牌。
+        """
+        from . import uploads as uploads_service
+
+        session = uploads_service.get_owned(conn, upload_id, principal.user_id)
+        data = await request.body()
+        session = uploads_service.write_chunk(conn, storage, session, index, data)
+        return _session_view(session)
+
+    @app.post("/api/v1/assets/uploads/{upload_id}/complete")
+    def complete_chunked_upload(
+        upload_id: str,
+        principal: Principal = Depends(require_role("operator")),
+        conn=Depends(get_conn),
+    ):
+        """拼接 + 校验整文件哈希 + 建素材行。返回新建的 asset。"""
+        from . import uploads as uploads_service
+
+        session = uploads_service.get_owned(conn, upload_id, principal.user_id)
+        asset_id = uploads_service.complete(conn, storage, session)
+        return {"upload": _session_view(uploads_service.get(conn, upload_id)), "asset_id": asset_id}
+
+    @app.delete("/api/v1/assets/uploads/{upload_id}", status_code=204)
+    def abort_chunked_upload(
+        upload_id: str,
+        principal: Principal = Depends(require_role("operator")),
+        conn=Depends(get_conn),
+    ):
+        """放弃上传：删掉已传的分片，不留在磁盘上。"""
+        from . import uploads as uploads_service
+
+        session = uploads_service.get_owned(conn, upload_id, principal.user_id)
+        uploads_service.abort(conn, storage, session)
+        return None
+
     @app.get("/api/v1/assets")
     def list_assets(
         principal: Principal = Depends(require_role("viewer")), conn=Depends(get_conn)
     ):
+        # 只列自己项目下的素材。
         rows = conn.execute(
-            "SELECT id, project_id, name, sha256, size_bytes, source_declaration, created_at "
-            "FROM assets WHERE lifecycle = 'ready' ORDER BY created_at DESC LIMIT 200"
+            "SELECT a.id, a.project_id, a.name, a.sha256, a.size_bytes,"
+            " a.source_declaration, a.created_at"
+            " FROM assets a JOIN projects p ON p.id = a.project_id"
+            " WHERE a.lifecycle = 'ready' AND p.owner_id = %s"
+            " ORDER BY a.created_at DESC LIMIT 200",
+            (principal.user_id,),
         ).fetchall()
         return {
             "assets": [
@@ -506,20 +648,76 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     ):
         project_id = project_for(conn, principal, payload.project_id)
         idempotency_key = idempotency_header or payload.idempotency_key
-        return service.create_task(
-            conn,
-            settings,
-            project_id=project_id,
-            asset_ids=payload.asset_ids,
-            recipe_id=payload.recipe_id,
-            recipe_version=payload.recipe_version,
-            user_params=payload.user_params,
-            priority=payload.priority,
-            idempotency_key=idempotency_key,
-            actor=principal.user_id,
-            billing_quote_id=payload.billing_quote_id,
-            billing_user_id=principal.user_id if payload.billing_quote_id else None,
-        )
+
+        # ---- 扣费（M5b-4）：先预扣，再建任务 ----
+        #
+        # 为什么预扣在**建任务之前**：没扣到钱就不该占队列资源。
+        # 为什么不能在建任务的同一个事务里做：扣费要发 HTTP 到 commerce，
+        # 那是另一个服务、另一个数据库，不能塞进本地事务。
+        # 代价是「扣到了但建任务失败」需要退还，见下面的 except。
+        credit_ref = None
+        credits_client = _credit_client()
+        if credits_client.configured:
+            from .credit_client import CreditsUnavailable, InsufficientCredits
+
+            # 幂等先查一次：同一个 Idempotency-Key 再来一次时，**不能再扣一次**。
+            # create_task 内部也会做幂等（返回既有任务），但那时钱已经扣出去了，
+            # 所以这一步必须在扣费之前。
+            if idempotency_key:
+                existing = conn.execute(
+                    "SELECT t.id FROM tasks t JOIN projects p ON p.id = t.project_id"
+                    " WHERE t.idempotency_key = %s AND p.owner_id = %s",
+                    (idempotency_key, principal.user_id),
+                ).fetchone()
+                if existing is not None:
+                    return service.get_task(conn, existing["id"], include_plan=True)
+            # 按集计价：一个素材一集（服务端处理就是逐集跑）。
+            units = max(1, len(payload.asset_ids))
+            try:
+                amount = credits_client.cost("server_version", units)
+                credit_ref = f"server_task:{idempotency_key or service.new_id('task')}"
+                credits_client.hold(
+                    principal.user_id, amount, credit_ref,
+                    memo=f"服务端处理（{units} 集）",
+                )
+            except InsufficientCredits as error:
+                raise HTTPException(
+                    402,
+                    detail={
+                        "error": "insufficient_credits",
+                        "message": error.message,
+                        "required": error.required,
+                        "balance": error.balance,
+                    },
+                ) from error
+            except CreditsUnavailable as error:
+                # 问不到账号服务就不放行：绝不能让任务「先跑着、回头再扣」。
+                raise HTTPException(
+                    503, detail={"error": "service_unavailable", "message": str(error)}
+                ) from error
+
+        try:
+            return service.create_task(
+                conn,
+                settings,
+                project_id=project_id,
+                asset_ids=payload.asset_ids,
+                recipe_id=payload.recipe_id,
+                recipe_version=payload.recipe_version,
+                user_params=payload.user_params,
+                priority=payload.priority,
+                idempotency_key=idempotency_key,
+                actor=principal.user_id,
+                billing_quote_id=payload.billing_quote_id,
+                billing_user_id=principal.user_id if payload.billing_quote_id else None,
+                credit_ref=credit_ref,
+            )
+        except BaseException:
+            # 建任务失败（参数错、配额、数据库）就把预扣退回去。
+            # 用 BaseException 而不是 Exception：进程被取消时也不能把钱留下。
+            if credit_ref:
+                credits_client.release(credit_ref, memo="建任务失败，已退还")
+            raise
 
     @app.get("/api/v1/tasks")
     def list_tasks_endpoint(
@@ -528,7 +726,13 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         principal: Principal = Depends(require_role("viewer")),
         conn=Depends(get_conn),
     ):
-        return {"tasks": service.list_tasks(conn, state=state, limit=limit)}
+        # 只列自己的任务。admin 也不跨用户列：管理视图走单独的审计接口，
+        # 常规列表混进别人的任务只会让人误以为那是自己的。
+        return {
+            "tasks": service.list_tasks(
+                conn, state=state, limit=limit, owner_id=principal.user_id
+            )
+        }
 
     @app.get("/api/v1/tasks/{task_id}")
     def get_task_endpoint(
@@ -537,6 +741,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         principal: Principal = Depends(require_role("viewer")),
         conn=Depends(get_conn),
     ):
+        # 别人的任务与不存在的任务回同一个 404，不透露 id 是否存在。
+        service.ensure_task_access(conn, task_id, principal.user_id)
         detail = service.get_task(conn, task_id, include_plan=include_plan)
         detail["attempts_detail"] = service.attempts_for(conn, task_id)
         detail["checkpoints"] = service.get_checkpoints(conn, task_id)
@@ -548,6 +754,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         principal: Principal = Depends(require_role("operator")),
         conn=Depends(get_conn),
     ):
+        service.ensure_task_access(conn, task_id, principal.user_id)
         return service.request_cancel(conn, task_id, actor=principal.user_id)
 
     @app.post("/api/v1/tasks/{task_id}/retry")
@@ -556,6 +763,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         principal: Principal = Depends(require_role("operator")),
         conn=Depends(get_conn),
     ):
+        service.ensure_task_access(conn, task_id, principal.user_id)
         return service.retry_task(conn, task_id, settings, actor=principal.user_id)
 
     # ---------- 配方 ----------
@@ -625,9 +833,18 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         principal: Principal = Depends(require_role("viewer")),
         conn=Depends(get_conn),
     ):
+        # 产物就是成品视频：必须先确认归属，再签发下载令牌。
+        service.ensure_artifact_access(conn, artifact_id, principal.user_id)
         artifact = service.get_artifact(conn, artifact_id)
         token = storage.sign_payload(
-            {"scope": "artifact", "artifact_id": artifact_id}, ttl_seconds=900
+            {
+                "scope": "artifact",
+                "artifact_id": artifact_id,
+                # 令牌绑定归属：短时令牌是无状态签名，谁拿到都能用，
+                # 所以必须把 owner 签进去，下载时再核一次。
+                "owner": principal.user_id,
+            },
+            ttl_seconds=900,
         )
         artifact["download_url"] = f"/api/v1/artifacts/{artifact_id}/download?token={token}"
         artifact["download_expires_in"] = 900
@@ -653,9 +870,13 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             payload = storage.verify_payload(token, scope="artifact")
             if payload.get("artifact_id") != artifact_id:
                 raise HTTPException(403, detail={"error": "forbidden", "message": "下载令牌与产物不匹配"})
+            # 令牌里的 owner 必须与产物的真实归属一致：令牌签发之后归属若变了
+            # （理论上不会，但数据库被直接改过就会），这层能挡住。
+            service.ensure_artifact_access(conn, artifact_id, str(payload.get("owner") or ""))
         else:
             principal = principal_from_header(authorization)
             limiter.check(f"{principal.user_id}:{request.url.path}")
+            service.ensure_artifact_access(conn, artifact_id, principal.user_id)
         artifact = service.get_artifact(conn, artifact_id)
         path = storage.local_path(artifact["storage_key"])
         if not path.exists():
@@ -678,7 +899,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         conn=Depends(get_conn),
     ):
         return {"reviews": review_service.list_reviews(
-            conn, status=status, task_id=task_id, limit=limit
+            conn, status=status, task_id=task_id, limit=limit, owner_id=principal.user_id
         )}
 
     @app.get("/api/v1/reviews/{review_id}")
@@ -687,6 +908,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         principal: Principal = Depends(require_role("viewer")),
         conn=Depends(get_conn),
     ):
+        review_service.ensure_review_access(conn, review_id, principal.user_id)
         return review_service.get_review(conn, review_id)
 
     @app.post("/api/v1/reviews/{review_id}/claim")
@@ -695,6 +917,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         principal: Principal = Depends(require_role("operator")),
         conn=Depends(get_conn),
     ):
+        review_service.ensure_review_access(conn, review_id, principal.user_id)
         return review_service.claim(conn, review_id, actor=principal.user_id)
 
     @app.post("/api/v1/reviews/{review_id}/decision")
@@ -705,6 +928,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         conn=Depends(get_conn),
     ):
         """标记通过 / 标记失败。只改复核记录与审计，不改任务状态。"""
+        review_service.ensure_review_access(conn, review_id, principal.user_id)
         return review_service.decide(
             conn, review_id, payload.decision, note=payload.note, actor=principal.user_id
         )
@@ -737,7 +961,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     ):
         rows = conn.execute(
             "SELECT id, ts, actor, action, subject, detail_json FROM audit_events "
-            "ORDER BY id DESC LIMIT ?",
+            "ORDER BY id DESC LIMIT %s",
             (limit,),
         ).fetchall()
         return {"events": [dict(row) for row in rows]}
@@ -771,7 +995,32 @@ def _dir_size(root: Path) -> int:
     return total
 
 
-app = create_app()
+class _LazyApp:
+    """惰性创建的 ASGI 应用。
+
+    以前这里是 `app = create_app()`，导入模块就建应用。M5b 起建应用需要数据库
+    连接串（`DRAMA_CLOUD_DSN`），导入时失败会让「只想 import 一下」的代码
+    （测试、脚本、文档工具）全部报错。
+
+    这个代理保留 `uvicorn drama_cloud.api:app` 的用法：真正被当应用使用时才创建。
+    """
+
+    def __init__(self):
+        self._app = None
+
+    def _resolve(self):
+        if self._app is None:
+            self._app = create_app()
+        return self._app
+
+    async def __call__(self, scope, receive, send):
+        await self._resolve()(scope, receive, send)
+
+    def __getattr__(self, name):
+        return getattr(self._resolve(), name)
+
+
+app = _LazyApp()
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
@@ -781,5 +1030,5 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     args = list(argv) if argv is not None else sys.argv[1:]
     host = args[0] if args else "127.0.0.1"
     port = int(args[1]) if len(args) > 1 else 8000
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    uvicorn.run(create_app(), host=host, port=port, log_level="info")
     return 0

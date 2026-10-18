@@ -76,7 +76,7 @@ def _seed_recipes(conn) -> int:
         if recipe is None:
             continue
         existing = conn.execute(
-            "SELECT 1 FROM recipe_versions WHERE recipe_id = ? AND version = ?",
+            "SELECT 1 FROM recipe_versions WHERE recipe_id = %s AND version = %s",
             (recipe.recipe_id, recipe.version),
         ).fetchone()
         if existing:

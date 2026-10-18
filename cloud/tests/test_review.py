@@ -14,18 +14,29 @@ from .helpers import make_task
 
 
 @pytest.fixture()
-def client(settings, conn):
+def client(settings, conn, fake_commerce):
     return TestClient(create_app(settings))
 
 
-def tokens(conn) -> dict:
-    from drama_cloud.auth import create_user
+def tokens(conn, fake_commerce, project=None) -> dict:
+    """三种角色的令牌（身份来自假 commerce，角色由本地白名单决定）。
 
-    return {
-        "admin": create_user(conn, "admin", role="admin", actor="test"),
-        "operator": create_user(conn, "op", role="operator", actor="test"),
-        "viewer": create_user(conn, "viewer", role="viewer", actor="test"),
-    }
+    传 `project` 时 operator 就是**项目属主**：隔离生效后，
+    「读自己的复核记录」必须用属主的身份。
+    """
+    cache_key = f"_review_tokens_{'project' if project else 'plain'}"
+    cached = getattr(fake_commerce, cache_key, None)
+    if cached is not None:
+        return cached
+    admin = fake_commerce.user(conn, "admin@example.com", "admin")
+    viewer = fake_commerce.user(conn, "viewer@example.com", "viewer")
+    if project is not None:
+        operator = fake_commerce.token("tester@example.com")
+    else:
+        operator = fake_commerce.user(conn, "op@example.com", "operator")
+    result = {"admin": admin, "operator": operator, "viewer": viewer}
+    setattr(fake_commerce, cache_key, result)
+    return result
 
 
 def auth(token: str) -> dict:
@@ -36,8 +47,8 @@ def failed_task(conn, settings, storage, project_id) -> str:
     """造一个「自动校验失败」的任务：没有产物、只有一份待复核记录。"""
     task = make_task(conn, settings, storage, project_id, recipe_id="drama.logo.erase")
     conn.execute(
-        "UPDATE tasks SET state = 'FAILED', error_class = ?, error_message = ?, "
-        "attempts = 3, finished_at = '2026-01-01T00:00:00+00:00' WHERE id = ?",
+        "UPDATE tasks SET state = 'FAILED', error_class = %s, error_message = %s, "
+        "attempts = 3, finished_at = '2026-01-01T00:00:00+00:00' WHERE id = %s",
         (str(ErrorClass.QUALITY_RETRYABLE), "擦除确认流未通过", task["id"]),
     )
     return task["id"]
@@ -81,7 +92,7 @@ def test_review_lifecycle_reject_then_rerun(conn, settings, storage, project):
     assert original["review"]["status"] == "superseded"
 
     events = [row["action"] for row in conn.execute(
-        "SELECT action FROM audit_events WHERE subject = ? ORDER BY id", (item["id"],)
+        "SELECT action FROM audit_events WHERE subject = %s ORDER BY id", (item["id"],)
     ).fetchall()]
     assert events == ["review.enqueue", "review.claim", "review.reject", "review.rerun"]
 
@@ -121,24 +132,35 @@ def test_worker_reports_are_visible_on_the_task(conn, settings, storage, project
 # ---------- API ----------
 
 
-def test_review_endpoints_and_roles(client, conn, settings, storage, project):
+def test_review_endpoints_and_roles(client, conn, settings, storage, project, fake_commerce):
+    """复核队列的读、裁决、重跑，以及角色边界。
+
+    M5b 起按用户隔离：这里用项目属主（operator）来读自己的复核记录；
+    viewer 是**另一个用户**，它看不到这条记录（404），而不是 403——
+    按「不存在」处理才不泄露别人的记录是否存在。
+    """
     project_id, _, _ = project
-    token = tokens(conn)
+    token = tokens(conn, fake_commerce, project)
     task_id = failed_task(conn, settings, storage, project_id)
     item = review_service.create_review(
         conn, task_id, review_service.REASON_AUTO_FAILED, severity="high", actor="worker"
     )
 
-    listing = client.get("/api/v1/reviews", headers=auth(token["viewer"]),
+    listing = client.get("/api/v1/reviews", headers=auth(token["operator"]),
                          params={"status": "pending"})
     assert listing.status_code == 200
     assert [row["id"] for row in listing.json()["reviews"]] == [item["id"]]
 
     assert client.get(f"/api/v1/reviews/{item['id']}",
-                      headers=auth(token["viewer"])).status_code == 200
+                      headers=auth(token["operator"])).status_code == 200
+
+    # 别的用户看不到这条记录（按不存在处理）。
+    assert client.get(f"/api/v1/reviews/{item['id']}",
+                      headers=auth(token["viewer"])).status_code == 404
+
     # 裁决是运维动作，只读角色不能做。
     assert client.post(f"/api/v1/reviews/{item['id']}/decision", headers=auth(token["viewer"]),
-                       json={"decision": "reject"}).status_code == 403
+                       json={"decision": "reject"}).status_code in (403, 404)
 
     rerun = client.post(f"/api/v1/reviews/{item['id']}/rerun", headers=auth(token["operator"]),
                         json={"user_params": {"probe": {}}, "note": "再跑一次"})
@@ -151,12 +173,12 @@ def test_review_endpoints_and_roles(client, conn, settings, storage, project):
     assert status["reviews_pending"] == 0
 
 
-def test_task_endpoint_exposes_review_projection(client, conn, settings, storage, project):
+def test_task_endpoint_exposes_review_projection(client, conn, settings, storage, project, fake_commerce):
     project_id, _, _ = project
-    token = tokens(conn)
+    token = tokens(conn, fake_commerce, project)
     task_id = failed_task(conn, settings, storage, project_id)
     review_service.create_review(conn, task_id, review_service.REASON_AUTO_FAILED)
 
-    body = client.get(f"/api/v1/tasks/{task_id}", headers=auth(token["viewer"])).json()
+    body = client.get(f"/api/v1/tasks/{task_id}", headers=auth(token["operator"])).json()
     assert body["review"]["pending"] == 1
     assert body["review"]["pending_ids"]

@@ -32,6 +32,13 @@ class Settings:
     max_concurrency: int = 0
     #: 产物保留天数；0 表示不自动清理。
     artifact_retention_days: int = 0
+    #: 素材（上传的视频）保留天数；0 表示不自动清理（M5b-5）。
+    #:
+    #: 隐私政策模板给的默认期限是 30 天。到期后 `cleanup` 会**真删文件**，
+    #: 只保留元数据行（哈希、大小）供对账与审计，连文件名一起清空。
+    asset_retention_days: int = 30
+    #: 未完成的分片上传（用户传了一半就跑了）保留天数，到期连分片一起删。
+    upload_retention_days: int = 7
     #: Worker 声明的能力集，用于配方兼容性检查。
     capabilities: tuple = ()
     #: 擦除工具（Rust 侧 `dossier-inpaint`）路径；留空时按 PATH → 仓库 target/ 自动查找。
@@ -53,15 +60,23 @@ class Settings:
     runtime_root: Optional[Path] = None
     #: 运行时清单路径同时供工具链能力探测与 RuntimeManager 使用。
     runtime_manifest: Optional[str] = None
-
-    @property
-    def db_path(self) -> Path:
-        return self.home / "drama_cloud.sqlite3"
+    #: commerce 的地址（例如 `http://127.0.0.1:8100`）。媒体控制面靠它做令牌内省。
+    #: 留空时任何需要登录的请求都会 503——不会退回「不鉴权」。
+    commerce_url: Optional[str] = None
+    #: commerce 内部接口的共享密钥（与 `DRAMA_COMMERCE_INTERNAL_SECRET` 同一个值）。
+    internal_secret: Optional[str] = None
+    #: PostgreSQL 连接串（M5b 起；此前是本地 SQLite 文件）。
+    dsn: Optional[str] = None
 
     @property
     def storage_dir(self) -> Path:
         """输入素材、中间产物与最终产物的根目录。"""
         return self.home / "storage"
+
+    @property
+    def uploads_dir(self) -> Path:
+        """分片上传的临时目录（M5b-2）。未完成的上传在这里攒分片。"""
+        return self.home / "uploads"
 
     @property
     def work_dir(self) -> Path:
@@ -73,7 +88,7 @@ class Settings:
         return self.home / "exports"
 
     def ensure_dirs(self) -> None:
-        for path in (self.home, self.storage_dir, self.work_dir, self.exports_dir):
+        for path in (self.home, self.storage_dir, self.uploads_dir, self.work_dir, self.exports_dir):
             path.mkdir(parents=True, exist_ok=True)
 
     @property
@@ -97,6 +112,15 @@ def load_settings(**overrides) -> Settings:
         "artifacts_bin": os.environ.get("DRAMA_CLOUD_ARTIFACTS_BIN") or None,
         "runtime_bin": os.environ.get("DRAMA_CLOUD_RUNTIME_BIN") or None,
         "runtime_manifest": os.environ.get("DRAMA_CLOUD_RUNTIME_MANIFEST") or None,
+        # M5b：认证改成向 commerce 内省令牌。这两个都不配时，任何需要登录的
+        # 请求都会 503（而不是退回不鉴权）。
+        "commerce_url": os.environ.get("DRAMA_CLOUD_COMMERCE_URL") or None,
+        "internal_secret": os.environ.get("DRAMA_CLOUD_INTERNAL_SECRET") or None,
+        "dsn": os.environ.get("DRAMA_CLOUD_DSN") or None,
+        # 保留期（天）。0 表示不自动清理。
+        "artifact_retention_days": int(os.environ.get("DRAMA_CLOUD_ARTIFACT_RETENTION_DAYS") or 0),
+        "asset_retention_days": int(os.environ.get("DRAMA_CLOUD_ASSET_RETENTION_DAYS") or 30),
+        "upload_retention_days": int(os.environ.get("DRAMA_CLOUD_UPLOAD_RETENTION_DAYS") or 7),
         # shlex 而不是 split：worker 脚本路径可能带空格，配引号即可。
         "inpaint_worker_args": tuple(shlex.split(raw_worker_args)) if raw_worker_args else (),
         "runtime_root": Path(os.environ.get("DRAMA_CLOUD_RUNTIME_ROOT") or (home / "runtime")),

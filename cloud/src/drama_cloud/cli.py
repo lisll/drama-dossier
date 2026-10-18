@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from . import __version__
-from .auth import create_user
+from .auth import add_admin
 from .config import Settings, load_settings
 from .db import connect, init_db
 from .errors import WorkError
@@ -70,15 +70,17 @@ def cmd_initdb(args) -> int:
     print(f"存储根目录：{settings.storage_dir}")
     conn = connect(settings)
     try:
-        token = None
         if args.admin:
-            token = create_user(conn, args.admin, role="admin", actor="cli")
+            # M5b 起认证走 commerce 内省：管理员由**邮箱**白名单决定，
+            # 不再在这个库里创建用户、也不再打印令牌。
+            add_admin(conn, args.admin, actor="cli")
+            print(f"已把 {args.admin.strip().lower()} 加入管理员白名单。")
+            print("用这个邮箱登录桌面端后，访问媒体控制面即具备管理员权限。")
+            print("（需要配好 DRAMA_CLOUD_COMMERCE_URL 与 DRAMA_CLOUD_INTERNAL_SECRET）")
         users = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
-        print(f"当前用户数：{users}")
-        if token:
-            # 令牌固定打印在最后一行，方便脚本用 `| tail -1` 取。
-            print(f"管理员 {args.admin} 已创建。令牌（只显示一次，请立即保存）：")
-            print(token)
+        admins = conn.execute("SELECT COUNT(*) AS n FROM media_admins").fetchone()["n"]
+        print(f"当前历史用户数：{users}")
+        print(f"当前管理员白名单：{admins}")
     finally:
         conn.close()
     return 0
@@ -104,7 +106,7 @@ def cmd_seed(args) -> int:
                 failed += 1
                 continue
             existing = conn.execute(
-                "SELECT content_sha256 FROM recipe_versions WHERE recipe_id = ? AND version = ?",
+                "SELECT content_sha256 FROM recipe_versions WHERE recipe_id = %s AND version = %s",
                 (recipe.recipe_id, recipe.version),
             ).fetchone()
             if existing is not None:
@@ -193,14 +195,36 @@ def cmd_user_create(args) -> int:
 
 
 def cmd_serve(args) -> int:
+    import os
+
     import uvicorn
+
+    from .tls import TlsConfigError, require_tls_from_env, resolve_tls
 
     settings = _settings(args)
     init_db(settings)
     from .api import create_app
 
+    # TLS 配置先算出来：配错要在**启动时**就失败，而不是跑起来才发现是明文。
+    try:
+        tls = resolve_tls(
+            args.tls_cert,
+            args.tls_key,
+            required=require_tls_from_env(os.environ.get("DRAMA_CLOUD_REQUIRE_TLS")),
+        )
+    except TlsConfigError as error:
+        raise SystemExit(f"TLS 配置不正确：{error}") from error
+
     application = create_app(settings)
-    uvicorn.run(application, host=args.host, port=args.port, log_level=args.log_level)
+    if tls is None:
+        print("注意：以明文 HTTP 启动（本机开发用）。对外提供服务请配 --tls-cert/--tls-key。")
+        uvicorn.run(application, host=args.host, port=args.port, log_level=args.log_level)
+    else:
+        print(f"以 HTTPS 启动：证书 {tls.cert}，私钥 {tls.key}")
+        uvicorn.run(
+            application, host=args.host, port=args.port, log_level=args.log_level,
+            **tls.uvicorn_kwargs(),
+        )
     return 0
 
 
@@ -283,7 +307,7 @@ def _resolve_cli_token(conn, args) -> str:
         )
     # CLI 本地使用：用库里已有的第一个 operator/admin 作为操作主体。
     stored = conn.execute(
-        "SELECT token_hash FROM users WHERE id = ?", (row["id"],)
+        "SELECT token_hash FROM users WHERE id = %s", (row["id"],)
     ).fetchone()
     return _TOKEN_SHORTCUT + stored["token_hash"]
 
@@ -296,14 +320,14 @@ _TOKEN_SHORTCUT = "__local__:"
 def _principal_from_token(conn, token: str) -> dict:
     if token.startswith(_TOKEN_SHORTCUT):
         row = conn.execute(
-            "SELECT id, name, role FROM users WHERE token_hash = ?",
+            "SELECT id, name, role FROM users WHERE token_hash = %s",
             (token[len(_TOKEN_SHORTCUT):],),
         ).fetchone()
     else:
         from .auth import hash_token
 
         row = conn.execute(
-            "SELECT id, name, role FROM users WHERE token_hash = ?", (hash_token(token),)
+            "SELECT id, name, role FROM users WHERE token_hash = %s", (hash_token(token),)
         ).fetchone()
     if row is None:
         raise SystemExit("令牌无效")
@@ -550,11 +574,16 @@ def cmd_cleanup(args) -> int:
     conn = connect(settings)
     try:
         removed = service.cleanup_expired_artifacts(conn, storage)
+        assets = service.cleanup_expired_assets(conn, storage, settings)
+        uploads = service.cleanup_abandoned_uploads(conn, storage, settings)
         queue = TaskQueue(settings)
         recovered = queue.reclaim_expired(conn)
     finally:
         conn.close()
-    print(f"清理过期产物 {removed} 个；回收过期租约任务 {recovered} 个")
+    print(
+        f"清理过期产物 {removed} 个；过期素材 {assets} 个（文件已删、元数据保留）；"
+        f"放弃的分片上传 {uploads} 个；回收过期租约任务 {recovered} 个"
+    )
     return 0
 
 
@@ -641,8 +670,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="store_true", help="显示版本并退出")
     sub = parser.add_subparsers(dest="command")
 
-    p = sub.add_parser("initdb", help="初始化数据库并可选创建管理员")
-    p.add_argument("--admin", help="创建该名字的管理员并打印一次性令牌")
+    p = sub.add_parser("initdb", help="初始化数据库并可选加入管理员")
+    p.add_argument("--admin", metavar="EMAIL", help="把该邮箱加入管理员白名单（用桌面端账号登录后即为管理员）")
     p.set_defaults(func=cmd_initdb)
 
     p = sub.add_parser("seed", help="发布内置配方")
@@ -675,6 +704,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--log-level", default="info")
+    p.add_argument("--tls-cert", help="HTTPS 证书文件（PEM）。与 --tls-key 必须成对给出")
+    p.add_argument("--tls-key", help="HTTPS 私钥文件（PEM）。与 --tls-cert 必须成对给出")
     p.set_defaults(func=cmd_serve)
 
     p = sub.add_parser("run-worker", help="启动媒体 Worker")

@@ -229,7 +229,7 @@ class Worker:
                 },
             )
             conn.execute(
-                "UPDATE task_attempts SET finished_at = ? WHERE task_id = ? AND attempt = ?",
+                "UPDATE task_attempts SET finished_at = %s WHERE task_id = %s AND attempt = %s",
                 (now_iso(), task_id, attempt),
             )
             set_progress(conn, task_id, {"stage": "succeeded", "steps": [s.__dict__ for s in steps]})
@@ -250,7 +250,7 @@ class Worker:
     # ---------- 各阶段 ----------
 
     def _load_task(self, conn, task_id: str) -> dict:
-        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        row = conn.execute("SELECT * FROM tasks WHERE id = %s", (task_id,)).fetchone()
         if row is None:
             raise WorkError(ErrorClass.PARAM_OUT_OF_RANGE, f"任务不存在：{task_id}")
         return {
@@ -360,7 +360,7 @@ class Worker:
             if not self.queue.heartbeat(conn, task["id"], self.worker_id):
                 raise LeaseLost("心跳续租失败，任务已被重新分配")
 
-        state = conn.execute("SELECT state FROM tasks WHERE id = ?", (task["id"],)).fetchone()["state"]
+        state = conn.execute("SELECT state FROM tasks WHERE id = %s", (task["id"],)).fetchone()["state"]
         if state == str(TaskState.RUNNING):
             # 配方没有质量门禁步骤时，也要在登记产物前经过 VERIFYING。
             transition(conn, task["id"], TaskState.VERIFYING,
@@ -375,7 +375,7 @@ class Worker:
 
     def _checkpoint_row(self, conn, task_id: str, stage: str):
         return conn.execute(
-            "SELECT * FROM task_checkpoints WHERE task_id = ? AND stage = ?", (task_id, stage)
+            "SELECT * FROM task_checkpoints WHERE task_id = %s AND stage = %s", (task_id, stage)
         ).fetchone()
 
     #: 只有「产出文件的阶段」才有资格被复用。像 media.probe / timeline.user_edits 这类
@@ -428,7 +428,7 @@ class Worker:
             INSERT INTO task_checkpoints (task_id, stage, input_sha256, recipe_version,
                                           engine_version, params_digest, artifact_key,
                                           artifact_sha256, completed, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,1,?)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,1,%s)
             ON CONFLICT(task_id, stage) DO UPDATE SET
                 input_sha256 = excluded.input_sha256,
                 recipe_version = excluded.recipe_version,
@@ -550,13 +550,13 @@ class Worker:
         覆盖到别的 Worker 正在执行的任务上。
         """
         row = conn.execute(
-            "SELECT lease_owner, state FROM tasks WHERE id = ?", (task_id,)
+            "SELECT lease_owner, state FROM tasks WHERE id = %s", (task_id,)
         ).fetchone()
         return bool(row) and row["lease_owner"] == self.worker_id
 
     def _cancelled(self, conn, task_id: str) -> bool:
         row = conn.execute(
-            "SELECT cancel_requested FROM tasks WHERE id = ?", (task_id,)
+            "SELECT cancel_requested FROM tasks WHERE id = %s", (task_id,)
         ).fetchone()
         return bool(row and row["cancel_requested"])
 
@@ -584,7 +584,7 @@ class Worker:
     def _fail(self, conn, task_id: str, attempt: int, error_class: ErrorClass,
               detail: str, steps: List[StepOutcome], work_dir: Path, context=None) -> None:
         self._record_attempt_error(conn, task_id, attempt, error_class, detail)
-        current = conn.execute("SELECT state FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        current = conn.execute("SELECT state FROM tasks WHERE id = %s", (task_id,)).fetchone()
         if current is None:
             return
         if not self._owns(conn, task_id):
@@ -602,7 +602,7 @@ class Worker:
         if target == str(TaskState.RETRY_WAITING) and error_class is ErrorClass.QUALITY_RETRYABLE:
             # 分支A：质量类重试不是「原地重跑」，而是换参数（加大 mask / 换更强后端）重算。
             # 既然上游画面会变，任何已完成的编码检查点都不再可信，必须整体重做。
-            conn.execute("DELETE FROM task_checkpoints WHERE task_id = ?", (task_id,))
+            conn.execute("DELETE FROM task_checkpoints WHERE task_id = %s", (task_id,))
         set_progress(conn, task_id, {
             "stage": "retry_waiting" if target == str(TaskState.RETRY_WAITING) else "failed",
             "steps": [s.__dict__ for s in steps],
@@ -722,8 +722,8 @@ class Worker:
     def _record_attempt_error(self, conn, task_id: str, attempt: int,
                               error_class: ErrorClass, detail: str) -> None:
         conn.execute(
-            "UPDATE task_attempts SET finished_at = ?, error_class = ?, error_message = ? "
-            "WHERE task_id = ? AND attempt = ?",
+            "UPDATE task_attempts SET finished_at = %s, error_class = %s, error_message = %s "
+            "WHERE task_id = %s AND attempt = %s",
             (now_iso(), str(error_class), detail[:2000], task_id, attempt),
         )
 

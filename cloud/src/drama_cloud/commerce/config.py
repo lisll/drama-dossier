@@ -80,6 +80,12 @@ class CommerceSettings:
     wechat_api_v3_key: Optional[str] = field(default=None, repr=False)
     wechat_private_key: Optional[str] = field(default=None, repr=False)
     wechat_serial_no: Optional[str] = None
+    #: 内部接口（`/internal/*`）的共享密钥。
+    #:
+    #: 这些接口只给同机房的其他服务调用（例如媒体控制面来校验访问令牌），
+    #: 不该走公网。留空即**关闭**这些路由：没配密钥时它们一律 404，
+    #: 免得有人以为「没配就是不用鉴权」。
+    internal_secret: str = field(default="", repr=False)
 
 
 def _get(env: Mapping[str, str], name: str) -> str:
@@ -178,4 +184,5 @@ def load_settings(env: Optional[Mapping[str, str]] = None) -> CommerceSettings:
         wechat_api_v3_key=_get(env, "WECHAT_API_V3_KEY") or None,
         wechat_private_key=_get(env, "WECHAT_PRIVATE_KEY") or None,
         wechat_serial_no=_get(env, "WECHAT_SERIAL_NO") or None,
+        internal_secret=_get(env, "INTERNAL_SECRET"),
     )

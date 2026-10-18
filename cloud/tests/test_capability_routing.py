@@ -12,8 +12,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
+import os
 import stat
 from pathlib import Path
 
@@ -212,7 +214,7 @@ def make_finished_task(conn, project_id: str) -> str:
     conn.execute(
         "INSERT INTO tasks (id, project_id, state, priority, input_asset_ids, recipe_id, "
         "recipe_version, recipe_sha256, target_json, created_at, updated_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
         (task_id, project_id, "SUCCEEDED", 100, "[]", "test.recipe", 1, "a" * 64, "{}", now, now),
     )
     conn.commit()
@@ -245,11 +247,30 @@ def artifacts_tool(tmp_path, monkeypatch):
 
 
 def run_check(settings, *task_ids: str, json_flag: bool = False):
+    """跑 `artifacts check` 子命令。
+
+    M5b 起 CLI 从环境变量 `DRAMA_CLOUD_DSN` 取数据库地址，所以这里把测试用的
+    临时库 DSN 塞进环境——`--home` 只决定目录，不决定库。
+    """
     argv = ["--home", str(settings.home), "artifacts", "check", *task_ids]
     if json_flag:
         argv.append("--json")
     args = build_parser().parse_args(argv)
-    return cmd_artifacts_check(args)
+    with monkeypatch_dsn(settings.dsn):
+        return cmd_artifacts_check(args)
+
+
+@contextlib.contextmanager
+def monkeypatch_dsn(dsn):
+    previous = os.environ.get("DRAMA_CLOUD_DSN")
+    os.environ["DRAMA_CLOUD_DSN"] = dsn or ""
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("DRAMA_CLOUD_DSN", None)
+        else:
+            os.environ["DRAMA_CLOUD_DSN"] = previous
 
 
 def test_artifacts_check_passes_the_stamps_to_the_tool(settings, conn, storage, project,

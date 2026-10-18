@@ -9,7 +9,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from drama_cloud.api import create_app
-from drama_cloud.auth import create_user
 from drama_cloud.tasks.runner import Worker
 
 from .conftest import requires_ffmpeg
@@ -18,16 +17,38 @@ RECIPES_DIR = Path(__file__).resolve().parents[1] / "recipes"
 
 
 @pytest.fixture()
-def client(settings, conn):
+def client(settings, conn, fake_commerce):
     return TestClient(create_app(settings))
 
 
-def tokens(conn) -> dict:
-    return {
-        "admin": create_user(conn, "admin", role="admin", actor="test"),
-        "operator": create_user(conn, "op", role="operator", actor="test"),
-        "viewer": create_user(conn, "viewer", role="viewer", actor="test"),
-    }
+def tokens(conn, fake_commerce, project=None) -> dict:
+    """三种角色的令牌。
+
+    M5b 起身份来自 commerce（假 commerce 在这里扮演它）：`fake_commerce.user`
+    会登记身份并按角色写好白名单，返回可直接用的令牌。
+
+    **传 project 时，operator 用该项目的属主**：隔离生效后，
+    「别人创建的任务」本来就该 404，所以老测试里「operator 建任务、viewer 读」
+    必须换成「同一个人」或「两个都是 admin」。传 `project` 时：
+    - operator = 项目属主（能建任务、看自己的）；
+    - viewer = 项目属主本人但按 viewer 白名单？不行——白名单按邮箱，一邮箱一角色。
+      所以这里 viewer 仍是另一个用户，凡是「viewer 读 operator 的任务」的用例
+      都改用了同一 token 或断言 404。见各测试内的注释。
+    """
+    cache_key = f"_tokens_{'project' if project else 'plain'}"
+    cached = getattr(fake_commerce, cache_key, None)
+    if cached is not None:
+        return cached
+    admin = fake_commerce.user(conn, "admin@example.com", "admin")
+    viewer = fake_commerce.user(conn, "viewer@example.com", "viewer")
+    if project is not None:
+        # operator 就是项目属主：这样「建任务 → 读任务 → 取产物」是同一个人。
+        operator = fake_commerce.token("tester@example.com")
+    else:
+        operator = fake_commerce.user(conn, "op@example.com", "operator")
+    result = {"admin": admin, "operator": operator, "viewer": viewer}
+    setattr(fake_commerce, cache_key, result)
+    return result
 
 
 def auth(token: str) -> dict:
@@ -44,48 +65,48 @@ def test_missing_and_bad_token(client):
     assert client.get("/api/v1/auth/whoami", headers=auth("nope")).status_code == 401
 
 
-def test_user_token_only_accepted_in_header(client, conn):
+def test_user_token_only_accepted_in_header(client, conn, fake_commerce):
     # 长期用户令牌放在网址里会被写进访问日志，所以 ?token= 不再被接受。
-    token = create_user(conn, "header-only", role="viewer", actor="test")
+    token = tokens(conn, fake_commerce)["viewer"]
     assert client.get("/api/v1/auth/whoami", params={"token": token}).status_code == 401
     assert client.get("/api/v1/auth/whoami", headers=auth(token)).status_code == 200
 
 
-def test_whoami(client, conn):
-    token = tokens(conn)["operator"]
+def test_whoami(client, conn, fake_commerce):
+    token = tokens(conn, fake_commerce)["operator"]
     body = client.get("/api/v1/auth/whoami", headers=auth(token)).json()
     assert body["role"] == "operator"
 
 
-def test_viewer_cannot_create_task(client, conn):
-    token = tokens(conn)["viewer"]
+def test_viewer_cannot_create_task(client, conn, fake_commerce):
+    token = tokens(conn, fake_commerce)["viewer"]
     response = client.post("/api/v1/tasks", headers=auth(token), json={
         "asset_ids": ["ast_x"], "recipe_id": "drama.no_edit.generic",
     })
     assert response.status_code == 403
 
 
-def test_viewer_cannot_publish_recipe(client, conn):
-    token = tokens(conn)["viewer"]
+def test_viewer_cannot_publish_recipe(client, conn, fake_commerce):
+    token = tokens(conn, fake_commerce)["viewer"]
     response = client.post("/api/v1/recipes", headers=auth(token), json={"recipe": {}})
     assert response.status_code == 403
 
 
-def test_operator_cannot_publish_recipe(client, conn):
-    token = tokens(conn)["operator"]
+def test_operator_cannot_publish_recipe(client, conn, fake_commerce):
+    token = tokens(conn, fake_commerce)["operator"]
     response = client.post("/api/v1/recipes", headers=auth(token), json={"recipe": {}})
     assert response.status_code == 403
 
 
-def test_admin_publishes_recipe_and_viewer_reads_it(client, conn):
-    token = tokens(conn)["admin"]
+def test_admin_publishes_recipe_and_viewer_reads_it(client, conn, fake_commerce):
+    token = tokens(conn, fake_commerce)["admin"]
     payload = json.loads((RECIPES_DIR / "drama-no-edit-generic.json").read_text(encoding="utf-8"))
     published = client.post("/api/v1/recipes", headers=auth(token),
                             json={"recipe": payload, "reviewed_by": "admin"})
     assert published.status_code == 201, published.text
     assert published.json()["version"] == 1
 
-    viewer = tokens(conn)["viewer"]
+    viewer = tokens(conn, fake_commerce)["viewer"]
     resolved = client.get("/api/v1/recipes/resolve?recipe_id=drama.no_edit.generic",
                           headers=auth(viewer)).json()
     assert resolved["version"] == 1
@@ -95,27 +116,27 @@ def test_admin_publishes_recipe_and_viewer_reads_it(client, conn):
     assert client.get("/api/v1/recipes/resolve?recipe_id=nope", headers=auth(viewer)).status_code == 400
 
 
-def test_recipe_schema_endpoint(client, conn):
-    token = tokens(conn)["viewer"]
+def test_recipe_schema_endpoint(client, conn, fake_commerce):
+    token = tokens(conn, fake_commerce)["viewer"]
     schema = client.get("/api/v1/recipes/schema.json", headers=auth(token)).json()
     assert "properties" in schema and "pipeline" in schema["properties"]
 
 
-def test_seeded_recipes_are_listed(client, conn, project):
-    token = tokens(conn)["viewer"]
+def test_seeded_recipes_are_listed(client, conn, project, fake_commerce):
+    token = tokens(conn, fake_commerce)["viewer"]
     rows = client.get("/api/v1/recipes", headers=auth(token)).json()["recipes"]
     assert any(row["recipe_id"] == "drama.no_edit.generic" for row in rows)
 
 
-def test_upload_session_rejects_bad_role(client, conn):
-    token = tokens(conn)["operator"]
+def test_upload_session_rejects_bad_role(client, conn, fake_commerce):
+    token = tokens(conn, fake_commerce)["operator"]
     response = client.post("/api/v1/uploads", headers=auth(token),
                            json={"name": "x", "role": "root", "filename": "a.mp4"})
     assert response.status_code == 400
 
 
-def test_upload_requires_the_matching_token(client, conn):
-    token = tokens(conn)["operator"]
+def test_upload_requires_the_matching_token(client, conn, fake_commerce):
+    token = tokens(conn, fake_commerce)["operator"]
     session = client.post("/api/v1/uploads", headers=auth(token),
                           json={"name": "x", "role": "video", "filename": "a.mp4"}).json()
     wrong = client.put(session["upload_url"] + "?token=bogus", content=b"data")
@@ -127,10 +148,13 @@ def test_upload_requires_the_matching_token(client, conn):
 
 
 @requires_ffmpeg
-def test_full_http_flow(client, conn, settings, tiny_video, project, tmp_path):
-    """上传 → 建任务 → 跑 Worker → 查状态 → 取产物 → 下载。"""
-    operator = tokens(conn)["operator"]
-    viewer = tokens(conn)["viewer"]
+def test_full_http_flow(client, conn, settings, tiny_video, project, tmp_path, fake_commerce):
+    """上传 → 建任务 → 跑 Worker → 查状态 → 取产物 → 下载。
+
+    M5b 起任务与产物按用户隔离，所以整条链路用**同一个人**（项目属主）。
+    跨用户的读取由 `test_isolation.py` 的越权矩阵覆盖。
+    """
+    operator = tokens(conn, fake_commerce, project)["operator"]
 
     session = client.post("/api/v1/uploads", headers=auth(operator), json={
         "name": "第 1 集", "role": "video", "filename": "tiny.mp4",
@@ -150,12 +174,12 @@ def test_full_http_flow(client, conn, settings, tiny_video, project, tmp_path):
 
     assert Worker(settings, worker_id="wrk_api").run_once() is True
 
-    detail = client.get(f"/api/v1/tasks/{task_id}", headers=auth(viewer)).json()
+    detail = client.get(f"/api/v1/tasks/{task_id}", headers=auth(operator)).json()
     assert detail["state"] == "SUCCEEDED"
     assert detail["checkpoints"] and detail["attempts_detail"]
 
     artifact = next(a for a in detail["artifacts"] if a["kind"] == "output")
-    info = client.get(f"/api/v1/artifacts/{artifact['id']}", headers=auth(viewer)).json()
+    info = client.get(f"/api/v1/artifacts/{artifact['id']}", headers=auth(operator)).json()
     assert info["sha256"] == artifact["sha256"]
     assert info["download_url"].startswith(f"/api/v1/artifacts/{artifact['id']}/download?token=")
 
@@ -169,8 +193,8 @@ def test_full_http_flow(client, conn, settings, tiny_video, project, tmp_path):
     assert client.get(f"/api/v1/artifacts/{artifact['id']}/download").status_code == 401
 
 
-def test_idempotency_header_creates_one_task(client, conn, project):
-    operator = tokens(conn)["operator"]
+def test_idempotency_header_creates_one_task(client, conn, project, fake_commerce):
+    operator = tokens(conn, fake_commerce, project)["operator"]
     session = client.post("/api/v1/uploads", headers=auth(operator), json={
         "name": "x", "role": "video", "filename": "a.mp4",
     }).json()
@@ -184,16 +208,16 @@ def test_idempotency_header_creates_one_task(client, conn, project):
     assert first.json()["id"] == second.json()["id"]
 
 
-def test_task_creation_rejects_missing_asset(client, conn, project):
-    operator = tokens(conn)["operator"]
+def test_task_creation_rejects_missing_asset(client, conn, project, fake_commerce):
+    operator = tokens(conn, fake_commerce, project)["operator"]
     response = client.post("/api/v1/tasks", headers=auth(operator), json={
         "asset_ids": ["ast_missing"], "recipe_id": "drama.no_edit.generic",
     })
     assert response.status_code == 400
 
 
-def test_task_creation_rejects_unknown_recipe(client, conn, project):
-    operator = tokens(conn)["operator"]
+def test_task_creation_rejects_unknown_recipe(client, conn, project, fake_commerce):
+    operator = tokens(conn, fake_commerce, project)["operator"]
     session = client.post("/api/v1/uploads", headers=auth(operator), json={
         "name": "x", "role": "video", "filename": "a.mp4",
     }).json()
@@ -204,8 +228,8 @@ def test_task_creation_rejects_unknown_recipe(client, conn, project):
     assert response.status_code == 400
 
 
-def test_cancel_and_retry_endpoints(client, conn, project):
-    operator = tokens(conn)["operator"]
+def test_cancel_and_retry_endpoints(client, conn, project, fake_commerce):
+    operator = tokens(conn, fake_commerce, project)["operator"]
     session = client.post("/api/v1/uploads", headers=auth(operator), json={
         "name": "x", "role": "video", "filename": "a.mp4",
     }).json()
@@ -222,30 +246,30 @@ def test_cancel_and_retry_endpoints(client, conn, project):
     assert retried.status_code == 200 and retried.json()["state"] == "QUEUED"
 
 
-def test_draft_recipe_is_not_resolvable(client, conn, project):
-    viewer = tokens(conn)["viewer"]
+def test_draft_recipe_is_not_resolvable(client, conn, project, fake_commerce):
+    viewer = tokens(conn, fake_commerce)["viewer"]
     # 内置的 C11 配方是 draft，不应被发布指针指向。
     response = client.get("/api/v1/recipes/resolve?recipe_id=drama.commentary.rebuild",
                           headers=auth(viewer))
     assert response.status_code == 400
 
 
-def test_audit_is_admin_only(client, conn, project):
-    viewer = tokens(conn)["viewer"]
-    admin = tokens(conn)["admin"]
+def test_audit_is_admin_only(client, conn, project, fake_commerce):
+    viewer = tokens(conn, fake_commerce)["viewer"]
+    admin = tokens(conn, fake_commerce)["admin"]
     assert client.get("/api/v1/audit", headers=auth(viewer)).status_code == 403
     assert client.get("/api/v1/audit", headers=auth(admin)).status_code == 200
 
 
-def test_system_status_lists_modules(client, conn):
-    token = tokens(conn)["viewer"]
+def test_system_status_lists_modules(client, conn, fake_commerce):
+    token = tokens(conn, fake_commerce)["viewer"]
     body = client.get("/api/v1/system/status", headers=auth(token)).json()
     assert "media.encode" in body["modules"]
     assert body["worker_version"] and body["engine_version"]
     assert body["queue_depth"] == 0
 
 
-def test_rate_limit_returns_429(settings, conn):
+def test_rate_limit_returns_429(settings, conn, fake_commerce):
     """把桶容量压到 3，验证限流生效。"""
     from drama_cloud.api import create_app
 
@@ -253,7 +277,7 @@ def test_rate_limit_returns_429(settings, conn):
     app.state.limiter.capacity = 3.0
     app.state.limiter.refill = 0.0
     client = TestClient(app)
-    token = tokens(conn)["viewer"]
+    token = tokens(conn, fake_commerce)["viewer"]
     codes = [client.get("/api/v1/auth/whoami", headers=auth(token)).status_code for _ in range(6)]
     assert 429 in codes
     assert codes[-1] == 429

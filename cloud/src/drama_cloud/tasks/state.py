@@ -104,7 +104,7 @@ def is_terminal(state: str) -> bool:
 
 
 def _fetch_state(conn, task_id: str) -> str:
-    row = conn.execute("SELECT state FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    row = conn.execute("SELECT state FROM tasks WHERE id = %s", (task_id,)).fetchone()
     if row is None:
         raise WorkError(ErrorClass.PARAM_OUT_OF_RANGE, f"任务不存在：{task_id}")
     return row["state"]
@@ -137,11 +137,11 @@ def transition(
             f"非法状态迁移：{current} → {target}（服务端校验拒绝）",
         )
 
-    assignments = ["state = ?", "updated_at = ?"]
+    assignments = ["state = %s", "updated_at = %s"]
     values = [str(target), now_iso()]
     for key, value in (fields or {}).items():
-        assignments.append(f"{key} = ?")
+        assignments.append(f"{key} = %s")
         values.append(value)
     values.append(task_id)
-    conn.execute(f"UPDATE tasks SET {', '.join(assignments)} WHERE id = ?", values)
+    conn.execute(f"UPDATE tasks SET {', '.join(assignments)} WHERE id = %s", values)
     return str(target)
