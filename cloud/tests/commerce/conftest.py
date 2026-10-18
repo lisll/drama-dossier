@@ -38,6 +38,9 @@ MOCK_PAY_SECRET = "test-mock-pay-secret-0123456789"
 #: 测试用的低开销参数，只为跑得快；生产用 argon2-cffi 的默认参数。
 FAST_HASHER = PasswordHasher(time_cost=1, memory_cost=8, parallelism=1)
 TABLES = (
+    # M7：管理员与运营内容
+    "admin_tokens", "admin_sessions", "admins",
+    "announcements", "feature_flags", "version_policy", "client_errors",
     "invite_rewards", "invite_settings", "payment_orders", "recharge_tiers",
     "credit_ledger", "price_rules",
     "audit_log", "rate_limits", "refresh_tokens", "access_tokens", "sessions", "email_codes",
@@ -99,6 +102,16 @@ def pg(pool):
         conn.execute(
             "INSERT INTO invite_settings (inviter_credits, invitee_credits, max_rewards)"
             " VALUES (50, 20, 20)"
+        )
+        # M7：版本策略与功能开关也是迁移里的种子数据，被 TRUNCATE 清掉了要补回去。
+        # 版本策略默认「不强制、不提示」——刚上线就把所有人拦住是最糟的默认。
+        conn.execute("INSERT INTO version_policy (id) VALUES (1)")
+        conn.execute(
+            "INSERT INTO feature_flags (key, enabled, note) VALUES"
+            " ('signup', true, '注册开关'),"
+            " ('recharge', true, '充值入口'),"
+            " ('server_processing', true, '服务端处理'),"
+            " ('version_task', true, '本机处理版本')"
         )
         yield conn
 

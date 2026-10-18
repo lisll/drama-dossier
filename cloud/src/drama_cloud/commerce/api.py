@@ -17,7 +17,19 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from psycopg_pool import ConnectionPool
 
-from . import auth_routes, credits_routes, internal_routes, license_routes, mock_checkout, package_routes
+from . import (
+    admin_page,
+    admin_routes,
+    admin_views,
+    auth_routes,
+    client_config,
+    client_errors,
+    credits_routes,
+    internal_routes,
+    license_routes,
+    mock_checkout,
+    package_routes,
+)
 from .accounts import AccountService
 from .body_limit import BodyLimitMiddleware
 from .config import CommerceSettings, load_settings
@@ -70,7 +82,10 @@ def create_app(
     """应用工厂。测试可以注入连接池、发信器和低开销的密码哈希器。"""
     settings = settings or load_settings()
     # 先加载签名私钥：私钥有问题就在打开连接池之前报错。
-    signer = Signer.from_pem_file(settings.license_key_file)
+    signer = Signer.from_pem_file(
+        settings.license_key_file,
+        secondary_path=settings.license_key_file_secondary,
+    )
     # 报审包 PDF 的中文字体：找不到就拒绝启动，不生成一份方块字的 PDF。
     font = load_font(settings.pdf_font)
     owns_pool = pool is None
@@ -143,6 +158,15 @@ def create_app(
     app.include_router(mock_checkout.router)
     # 内部接口（只给同机房的其他服务用）。没配 INTERNAL_SECRET 时一律 404。
     app.include_router(internal_routes.router)
+    # 管理后台（M7）：接口在 /api/v1/admin/*，页面在 /admin。
+    app.include_router(admin_routes.router)
+    app.include_router(admin_views.router)
+    app.include_router(admin_page.router)
+    # 桌面端的公开配置（公告 / 开关 / 版本策略）。不需要登录，不含用户数据。
+    app.include_router(client_config.router)
+    # 客户端错误上报（M7-6）：公开但限流，只收白名单字段。后台查看挂在 /admin 下。
+    app.include_router(client_errors.router)
+    app.include_router(client_errors.admin_router)
     # 最外层：在路由、认证、JSON 解析之前就挡住超大请求体。
     app.add_middleware(BodyLimitMiddleware)
     return app

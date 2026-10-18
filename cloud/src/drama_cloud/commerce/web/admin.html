@@ -1,0 +1,614 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>剧备 · 管理后台</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel2: #1e222b; --line: #2a2f3a;
+    --fg: #e6e9ef; --muted: #9aa4b2; --accent: #4f8cff; --ok: #3ddc97;
+    --warn: #ffb454; --err: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.6 system-ui, -apple-system, "Noto Sans CJK SC", sans-serif;
+  }
+  .hidden { display: none !important; }
+  input, select, textarea, button {
+    font: inherit; color: inherit; background: var(--panel2);
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px;
+  }
+  input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); }
+  button { cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.ghost { background: transparent; }
+  button.danger { border-color: var(--err); color: var(--err); background: transparent; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; white-space: nowrap; }
+  td { word-break: break-all; }
+  .muted { color: var(--muted); }
+  .err { color: var(--err); }
+
+  /* 登录页 */
+  #login-view { max-width: 360px; margin: 12vh auto; }
+  #login-view h1 { font-size: 20px; margin-bottom: 8px; }
+  #login-view label { display: block; margin: 12px 0; }
+  #login-view input { width: 100%; }
+
+  /* 主界面 */
+  #app { display: grid; grid-template-columns: 180px 1fr; min-height: 100vh; }
+  aside { border-right: 1px solid var(--line); padding: 16px 10px; }
+  aside h1 { font-size: 15px; margin: 0 0 16px 6px; }
+  aside button {
+    display: block; width: 100%; text-align: left; border: none;
+    background: transparent; padding: 8px 10px; border-radius: 6px; margin-bottom: 2px;
+  }
+  aside button.active { background: var(--panel2); color: var(--accent); }
+  main { padding: 20px 24px; }
+  main h2 { font-size: 17px; margin: 0 0 4px; }
+  .toolbar { display: flex; gap: 8px; align-items: center; margin: 12px 0; flex-wrap: wrap; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
+  .pager { display: flex; gap: 8px; align-items: center; margin-top: 12px; }
+  .form-row { display: flex; gap: 10px; margin: 10px 0; flex-wrap: wrap; }
+  .form-row label { display: flex; flex-direction: column; gap: 4px; }
+  .toast {
+    position: fixed; right: 20px; bottom: 20px; background: var(--panel2);
+    border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    padding: 10px 14px; border-radius: 6px; max-width: 420px;
+  }
+  .toast.err { border-left-color: var(--err); }
+</style>
+</head>
+<body>
+
+<!-- 登录 -->
+<section id="login-view">
+  <h1>管理后台</h1>
+  <p class="muted">管理员账号由运维用命令行创建，这里没有注册入口。</p>
+  <form id="login-form" novalidate>
+    <label>邮箱<input id="login-email" type="email" autocomplete="username" required /></label>
+    <label>密码<input id="login-password" type="password" autocomplete="current-password" required /></label>
+    <p id="login-error" class="err hidden" role="alert"></p>
+    <button type="submit" class="primary" id="login-submit">登录</button>
+  </form>
+</section>
+
+<!-- 主界面 -->
+<section id="app" class="hidden">
+  <aside>
+    <h1>剧备 · 后台</h1>
+    <button data-view="users" class="active">用户</button>
+    <button data-view="batches">卡密批次</button>
+    <button data-view="orders">订单</button>
+    <button data-view="ledger">积分流水</button>
+    <button data-view="devices">设备</button>
+    <button data-view="announcements">公告</button>
+    <button data-view="flags">开关与版本</button>
+    <button id="logout" style="margin-top:16px;color:var(--muted)">退出登录</button>
+  </aside>
+  <main>
+    <h2 id="view-title">用户</h2>
+    <p id="view-hint" class="muted"></p>
+
+    <!-- 通用表格视图（用户/卡密/订单/流水/设备） -->
+    <section id="table-view">
+      <div class="toolbar">
+        <input id="filter" placeholder="按邮箱筛选（可留空）" />
+        <button id="reload" class="ghost">刷新</button>
+        <span id="total" class="muted"></span>
+      </div>
+      <div class="card" style="overflow:auto">
+        <table>
+          <thead id="table-head"></thead>
+          <tbody id="table-body"></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button id="prev" class="ghost">上一页</button>
+        <span id="page-info" class="muted"></span>
+        <button id="next" class="ghost">下一页</button>
+      </div>
+    </section>
+
+    <!-- 公告 -->
+    <section id="announcement-view" class="hidden">
+      <div class="card">
+        <strong>新增公告</strong>
+        <div class="form-row">
+          <label>标题<input id="ann-title" maxlength="120" /></label>
+          <label>级别
+            <select id="ann-level"><option value="info">普通</option><option value="warn">提醒</option></select>
+          </label>
+          <label>排序（小在前）<input id="ann-order" type="number" value="100" min="0" max="10000" /></label>
+        </div>
+        <label style="display:block;margin:10px 0">正文
+          <textarea id="ann-body" rows="3" style="width:100%" maxlength="2000"></textarea>
+        </label>
+        <button id="ann-create" class="primary">发布</button>
+        <p id="ann-error" class="err hidden" role="alert"></p>
+      </div>
+      <div class="card" style="margin-top:12px;overflow:auto">
+        <table>
+          <thead><tr><th>排序</th><th>级别</th><th>标题</th><th>正文</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody id="ann-list"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 开关与版本策略 -->
+    <section id="flag-view" class="hidden">
+      <div class="card">
+        <strong>功能开关</strong>
+        <p class="muted">开关只影响界面入口；服务端仍会校验。藏起来不等于放行。</p>
+        <table><thead><tr><th>开关</th><th>状态</th><th>说明</th><th>操作</th></tr></thead>
+          <tbody id="flag-list"></tbody></table>
+      </div>
+      <div class="card" style="margin-top:12px">
+        <strong>版本策略</strong>
+        <p class="muted">低于「最低支持版本」的客户端会被拦住；「最新版本」只做提示。
+          下载地址留空表示暂不提供升级包。</p>
+        <div class="form-row">
+          <label>最低支持版本<input id="ver-min" placeholder="1.0.0" /></label>
+          <label>最新版本<input id="ver-latest" placeholder="1.2.0" /></label>
+        </div>
+        <label style="display:block;margin:10px 0">下载地址
+          <input id="ver-url" style="width:100%" placeholder="https://…/DramaDossier_1.2.0.exe" />
+        </label>
+        <div class="form-row">
+          <label>整文件 sha256<input id="ver-sha" style="width:420px" placeholder="留空表示未上传包" /></label>
+        </div>
+        <label style="display:block;margin:10px 0">签名（base64url，留空则客户端拒绝安装）
+          <input id="ver-sig" style="width:100%" />
+        </label>
+        <label style="display:block;margin:10px 0">更新说明
+          <textarea id="ver-notes" rows="2" style="width:100%" maxlength="2000"></textarea>
+        </label>
+        <button id="ver-save" class="primary">保存</button>
+        <p id="ver-error" class="err hidden" role="alert"></p>
+      </div>
+    </section>
+  </main>
+</section>
+
+<div id="toast" class="toast hidden" role="status"></div>
+
+<script>
+"use strict";
+
+// 管理后台前端：原生 JS，无构建链。
+// 令牌存 sessionStorage 而不是 localStorage：关掉标签页就失效，
+// 管理后台不该在共用电脑上长期留着登录状态。
+const TOKEN_KEY = "drama_admin_token";
+const API = "/api/v1/admin";
+
+const state = {
+  view: "users",
+  page: 0,
+  pageSize: 50,
+  filter: "",
+  token: sessionStorage.getItem(TOKEN_KEY) || "",
+};
+
+const $ = (selector) => document.querySelector(selector);
+const esc = (value) =>
+  String(value ?? "").replace(/[&<>'"]/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[c],
+  );
+
+let toastTimer = null;
+function toast(message, isError = false) {
+  const node = $("#toast");
+  node.textContent = message;
+  node.classList.toggle("err", isError);
+  node.classList.remove("hidden");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => node.classList.add("hidden"), 4000);
+}
+
+async function api(path, options = {}) {
+  const response = await fetch(API + path, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...(state.token ? { Authorization: `Bearer ${state.token}` } : {}),
+      ...(options.headers || {}),
+    },
+  });
+  if (response.status === 401) {
+    // 令牌失效：退回登录页，别让人对着空白表格发呆。
+    state.token = "";
+    sessionStorage.removeItem(TOKEN_KEY);
+    showLogin("登录已失效，请重新登录");
+    throw new Error("未登录");
+  }
+  const text = await response.text();
+  const body = text ? JSON.parse(text) : null;
+  if (!response.ok) {
+    const message = (body && (body.message || body.error)) || `请求失败（${response.status}）`;
+    throw new Error(message);
+  }
+  return body;
+}
+
+function showLogin(message) {
+  $("#app").classList.add("hidden");
+  $("#login-view").classList.remove("hidden");
+  const error = $("#login-error");
+  if (message) {
+    error.textContent = message;
+    error.classList.remove("hidden");
+  } else {
+    error.classList.add("hidden");
+  }
+}
+
+function showApp() {
+  $("#login-view").classList.add("hidden");
+  $("#app").classList.remove("hidden");
+}
+
+// ---------- 登录 ----------
+
+$("#login-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = $("#login-submit");
+  button.disabled = true;
+  try {
+    const response = await fetch(API + "/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: $("#login-email").value.trim(),
+        password: $("#login-password").value,
+      }),
+    });
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.message || "登录失败");
+    state.token = body.token;
+    sessionStorage.setItem(TOKEN_KEY, body.token);
+    $("#login-password").value = "";
+    showApp();
+    await switchView("users");
+  } catch (error) {
+    const node = $("#login-error");
+    node.textContent = error.message;
+    node.classList.remove("hidden");
+  } finally {
+    button.disabled = false;
+  }
+});
+
+$("#logout").addEventListener("click", async () => {
+  try {
+    await api("/logout", { method: "POST" });
+  } catch (error) {
+    // 令牌已经无效也没关系，本地清掉即可。
+  }
+  state.token = "";
+  sessionStorage.removeItem(TOKEN_KEY);
+  showLogin();
+});
+
+// ---------- 视图切换 ----------
+
+const VIEWS = {
+  users: { title: "用户", hint: "邮箱、余额、使用权到期、在用设备数。邮箱是个人信息，仅管理员可见。" },
+  batches: { title: "卡密批次", hint: "每批的总量与已兑换数。数据库里只有卡密摘要，明文只在导出那一刻存在。" },
+  orders: { title: "订单", hint: "状态为「待支付」的订单说明用户点了下单但没付款——这是「为什么没到账」最常见的原因。" },
+  ledger: { title: "积分流水", hint: "账本只增不改；余额由这些行的 delta 求和算出。" },
+  devices: { title: "设备", hint: "只显示机器码前 12 位，够辨认、不泄露完整标识。" },
+  announcements: { title: "公告", hint: "桌面端首页轮播读这里。" },
+  flags: { title: "开关与版本", hint: "" },
+};
+
+function switchView(name) {
+  state.view = name;
+  state.page = 0;
+  document.querySelectorAll("aside button[data-view]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.view === name);
+  });
+  $("#view-title").textContent = VIEWS[name].title;
+  $("#view-hint").textContent = VIEWS[name].hint;
+  const isTable = ["users", "batches", "orders", "ledger", "devices"].includes(name);
+  $("#table-view").classList.toggle("hidden", !isTable);
+  $("#announcement-view").classList.toggle("hidden", name !== "announcements");
+  $("#flag-view").classList.toggle("hidden", name !== "flags");
+  if (isTable) return loadTable();
+  if (name === "announcements") return loadAnnouncements();
+  if (name === "flags") return loadFlags();
+}
+
+document.querySelectorAll("aside button[data-view]").forEach((button) => {
+  button.addEventListener("click", () => switchView(button.dataset.view));
+});
+
+// ---------- 通用表格 ----------
+
+const COLUMNS = {
+  users: [
+    ["邮箱", (row) => row.email],
+    ["余额", (row) => row.balance],
+    ["使用权", (row) => (row.entitlement ? `${row.entitlement}${row.expiresAt ? " · " + row.expiresAt.slice(0, 10) : ""}` : "无")],
+    ["设备", (row) => row.deviceCount],
+    ["注册时间", (row) => row.createdAt.slice(0, 19).replace("T", " ")],
+  ],
+  batches: [
+    ["名称", (row) => row.name],
+    ["类型", (row) => (row.kind === "lifetime" ? "永久" : `${row.days} 天`)],
+    ["总量", (row) => row.total],
+    ["已兑换", (row) => row.redeemed],
+    ["未兑换", (row) => row.remaining],
+    ["状态", (row) => (row.revoked ? "已作废" : "有效")],
+    ["创建", (row) => row.createdAt.slice(0, 10)],
+  ],
+  orders: [
+    ["订单号", (row) => row.outTradeNo],
+    ["邮箱", (row) => row.email],
+    ["金额", (row) => (row.amountFen / 100).toFixed(2) + " 元"],
+    ["积分", (row) => row.credits],
+    ["渠道", (row) => row.channel],
+    ["状态", (row) => row.status],
+    ["创建", (row) => row.createdAt.slice(0, 19).replace("T", " ")],
+  ],
+  ledger: [
+    ["邮箱", (row) => row.email],
+    ["变动", (row) => row.delta],
+    ["类型", (row) => row.kind],
+    ["引用", (row) => row.ref || ""],
+    ["状态", (row) => row.settledState || ""],
+    ["备注", (row) => row.memo || ""],
+    ["时间", (row) => row.createdAt.slice(0, 19).replace("T", " ")],
+  ],
+  devices: [
+    ["邮箱", (row) => row.email],
+    ["名称", (row) => row.name],
+    ["平台", (row) => row.platform],
+    ["机器码前 12 位", (row) => row.deviceIdPrefix],
+    ["版本", (row) => row.appVersion],
+    ["绑定", (row) => row.boundAt.slice(0, 10)],
+    ["状态", (row) => (row.unboundAt ? `已解绑（${row.unbindReason}）` : "在用")],
+  ],
+};
+
+const ENDPOINTS = {
+  users: "/users",
+  batches: "/card-batches",
+  orders: "/orders",
+  ledger: "/ledger",
+  devices: "/devices",
+};
+
+async function loadTable() {
+  const view = state.view;
+  const columns = COLUMNS[view];
+  $("#table-head").innerHTML = `<tr>${columns.map(([title]) => `<th>${esc(title)}</th>`).join("")}</tr>`;
+  const params = new URLSearchParams({
+    limit: String(state.pageSize),
+    offset: String(state.page * state.pageSize),
+  });
+  // 用户/卡密/订单不吃 email 参数；流水与设备支持按邮箱筛。
+  if (state.filter && ["ledger", "devices"].includes(view)) params.set("email", state.filter);
+  if (state.filter && view === "users") params.set("keyword", state.filter);
+  try {
+    const body = await api(`${ENDPOINTS[view]}?${params}`);
+    const items = body.items || [];
+    $("#total").textContent = body.total != null ? `共 ${body.total} 个用户` : "";
+    $("#table-body").innerHTML = items.length
+      ? items
+          .map(
+            (row) =>
+              `<tr>${columns
+                .map(([, read]) => `<td>${esc(read(row))}</td>`)
+                .join("")}</tr>`,
+          )
+          .join("")
+      : `<tr><td colspan="${columns.length}" class="muted">没有数据。</td></tr>`;
+    $("#page-info").textContent = `第 ${state.page + 1} 页`;
+    $("#prev").disabled = state.page === 0;
+    $("#next").disabled = items.length < state.pageSize;
+  } catch (error) {
+    if (error.message !== "未登录") toast(error.message, true);
+  }
+}
+
+$("#reload").addEventListener("click", () => loadTable());
+$("#filter").addEventListener("change", (event) => {
+  state.filter = event.target.value.trim();
+  state.page = 0;
+  loadTable();
+});
+$("#prev").addEventListener("click", () => {
+  if (state.page > 0) {
+    state.page -= 1;
+    loadTable();
+  }
+});
+$("#next").addEventListener("click", () => {
+  state.page += 1;
+  loadTable();
+});
+
+// ---------- 公告 ----------
+
+async function loadAnnouncements() {
+  try {
+    const body = await api("/announcements");
+    $("#ann-list").innerHTML = body.items.length
+      ? body.items
+          .map(
+            (row) => `<tr>
+              <td>${esc(row.sortOrder)}</td>
+              <td>${row.level === "warn" ? "提醒" : "普通"}</td>
+              <td>${esc(row.title)}</td>
+              <td>${esc(row.body.slice(0, 60))}${row.body.length > 60 ? "…" : ""}</td>
+              <td>${row.active ? "显示中" : "已停用"}</td>
+              <td>
+                <button class="ghost" data-toggle="${esc(row.id)}" data-active="${row.active}">
+                  ${row.active ? "停用" : "启用"}
+                </button>
+                <button class="danger" data-delete="${esc(row.id)}">删除</button>
+              </td>
+            </tr>`,
+          )
+          .join("")
+      : `<tr><td colspan="6" class="muted">还没有公告。</td></tr>`;
+    document.querySelectorAll("[data-toggle]").forEach((button) => {
+      button.addEventListener("click", () => toggleAnnouncement(button.dataset.toggle));
+    });
+    document.querySelectorAll("[data-delete]").forEach((button) => {
+      button.addEventListener("click", () => deleteAnnouncement(button.dataset.delete));
+    });
+  } catch (error) {
+    if (error.message !== "未登录") toast(error.message, true);
+  }
+}
+
+$("#ann-create").addEventListener("click", async () => {
+  const error = $("#ann-error");
+  error.classList.add("hidden");
+  try {
+    await api("/announcements", {
+      method: "POST",
+      body: JSON.stringify({
+        title: $("#ann-title").value.trim(),
+        body: $("#ann-body").value.trim(),
+        level: $("#ann-level").value,
+        sort_order: Number($("#ann-order").value) || 100,
+        active: true,
+      }),
+    });
+    $("#ann-title").value = "";
+    $("#ann-body").value = "";
+    toast("公告已发布");
+    await loadAnnouncements();
+  } catch (exception) {
+    error.textContent = exception.message;
+    error.classList.remove("hidden");
+  }
+});
+
+async function toggleAnnouncement(id) {
+  try {
+    // 先把当前状态读出来再取反：后台没有「只改一个字段」的接口，
+    // 为了不让「停用」把正文清空，这里读完整行再整体提交。
+    const listing = await api("/announcements");
+    const row = listing.items.find((item) => item.id === id);
+    if (!row) throw new Error("公告已不存在");
+    await api(`/announcements/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        title: row.title,
+        body: row.body,
+        level: row.level,
+        sort_order: row.sortOrder,
+        active: !row.active,
+      }),
+    });
+    await loadAnnouncements();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function deleteAnnouncement(id) {
+  if (!confirm("确定删除这条公告？")) return;
+  try {
+    await api(`/announcements/${id}`, { method: "DELETE" });
+    toast("已删除");
+    await loadAnnouncements();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+// ---------- 开关与版本策略 ----------
+
+const FLAG_LABELS = {
+  signup: "注册",
+  recharge: "充值",
+  server_processing: "服务端处理",
+  version_task: "本机处理版本",
+};
+
+async function loadFlags() {
+  try {
+    const [flags, policy] = await Promise.all([api("/flags"), api("/version-policy")]);
+    $("#flag-list").innerHTML = flags.items
+      .map(
+        (row) => `<tr>
+          <td>${esc(FLAG_LABELS[row.key] || row.key)}</td>
+          <td>${row.enabled ? "开" : "关"}</td>
+          <td class="muted">${esc(row.note)}</td>
+          <td><button class="ghost" data-flag="${esc(row.key)}" data-enabled="${row.enabled}">
+            ${row.enabled ? "关掉" : "打开"}</button></td>
+        </tr>`,
+      )
+      .join("");
+    document.querySelectorAll("[data-flag]").forEach((button) => {
+      button.addEventListener("click", () => setFlag(button.dataset.flag, button.dataset.enabled === "true"));
+    });
+    $("#ver-min").value = policy.minSupported;
+    $("#ver-latest").value = policy.latest;
+    $("#ver-url").value = policy.downloadUrl;
+    $("#ver-sha").value = policy.downloadSha256;
+    $("#ver-sig").value = policy.downloadSig;
+    $("#ver-notes").value = policy.notes;
+  } catch (error) {
+    if (error.message !== "未登录") toast(error.message, true);
+  }
+}
+
+async function setFlag(key, enabled) {
+  try {
+    await api(`/flags/${key}`, {
+      method: "PUT",
+      body: JSON.stringify({ enabled: !enabled, note: "" }),
+    });
+    toast("开关已保存");
+    await loadFlags();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+$("#ver-save").addEventListener("click", async () => {
+  const error = $("#ver-error");
+  error.classList.add("hidden");
+  try {
+    await api("/version-policy", {
+      method: "PUT",
+      body: JSON.stringify({
+        min_supported: $("#ver-min").value.trim(),
+        latest: $("#ver-latest").value.trim(),
+        download_url: $("#ver-url").value.trim(),
+        download_sha256: $("#ver-sha").value.trim(),
+        download_sig: $("#ver-sig").value.trim(),
+        notes: $("#ver-notes").value.trim(),
+      }),
+    });
+    toast("版本策略已保存");
+  } catch (exception) {
+    error.textContent = exception.message;
+    error.classList.remove("hidden");
+  }
+});
+
+// ---------- 启动 ----------
+
+(async () => {
+  if (!state.token) return showLogin();
+  try {
+    await api("/me");
+    showApp();
+    await switchView("users");
+  } catch (error) {
+    // api() 在 401 时已经切回登录页。
+  }
+})();
+</script>
+</body>
+</html>

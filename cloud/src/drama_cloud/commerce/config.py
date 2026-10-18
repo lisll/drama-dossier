@@ -38,6 +38,10 @@ class CommerceSettings:
     smtp: SmtpSettings
     #: 授权签名私钥（Ed25519 PEM）的文件路径。私钥本身不进环境变量，也不进日志。
     license_key_file: str
+    #: 次私钥（M7-5 密钥轮换的过渡期用）。留空表示不做轮换。
+    #: 过渡期内：服务端可以用次私钥签（让只认旧公钥的客户端仍能验证），
+    #: 同时新公钥随新版客户端一起发出去。详见 docs/KEY_ROTATION.md。
+    license_key_file_secondary: Optional[str] = None
     product_name: str = "剧备 DramaDossier"
     terms_version: str = "2026-10-draft"
     #: 前面有几层可信的反向代理。0 表示直接面向客户端，不读 X-Forwarded-For。
@@ -161,6 +165,7 @@ def load_settings(env: Optional[Mapping[str, str]] = None) -> CommerceSettings:
         code_secret=code_secret,
         smtp=smtp,
         license_key_file=license_key_file,
+        license_key_file_secondary=_get(env, "LICENSE_KEY_FILE_SECONDARY") or None,
         product_name=_get(env, "PRODUCT_NAME") or CommerceSettings.product_name,
         terms_version=_get(env, "TERMS_VERSION") or CommerceSettings.terms_version,
         trusted_proxies=_int(env, "TRUSTED_PROXIES", 0, 0, 5),

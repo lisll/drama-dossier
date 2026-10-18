@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import getpass
+import hashlib
 import json
 import os
 import secrets
@@ -244,6 +245,116 @@ def cmd_credits_expire(args) -> int:
     return 0
 
 
+# ---------- 管理员（M7-1） ----------
+#
+# 管理后台没有注册入口：注册入口本身就是攻击面。管理员只能从这里创建。
+# 密码**从标准输入读**，不走命令行参数——命令行参数会进 shell 历史与进程列表。
+
+def _read_password(prompt: str, confirm: bool) -> str:
+    import getpass
+    import sys
+
+    if not sys.stdin.isatty():
+        # 非交互（脚本/CI）：从 stdin 读一行。文档里要写明这一点，
+        # 免得有人以为管道输入也行却看不到提示。
+        line = sys.stdin.readline().strip()
+        if not line:
+            raise UsageError("没有从标准输入读到密码")
+        return line
+    first = getpass.getpass(prompt)
+    if confirm:
+        again = getpass.getpass("再输一次：")
+        if first != again:
+            raise UsageError("两次输入的密码不一致")
+    return first
+
+
+def cmd_release_sign(args) -> int:
+    """给升级包签名（M7-4）。
+
+    输出三样东西（打印成 JSON，好让部署脚本直接取）：
+    `sha256`、`signature`、`size_bytes`。把它们填进管理后台的版本策略即可。
+
+    为什么要单独一条命令：客户端校验升级包时会验 Ed25519 签名，
+    签不出来就无法提供可用的升级包。让人「自己算」等于把最要紧的一步交给手工。
+    """
+    from .license_token import Signer
+
+    key_file = load_settings().license_key_file
+    path = Path(args.file)
+    try:
+        payload = path.read_bytes()
+    except OSError as error:
+        raise UsageError(f"读不到升级包 {path}（{error.strerror}）") from error
+    signer = Signer.from_pem_file(key_file)
+    digest = hashlib.sha256(payload).hexdigest()
+    signature = signer.sign_detached("release", payload)
+    print(json.dumps(
+        {
+            "file": str(path),
+            "size_bytes": len(payload),
+            "sha256": digest,
+            "signature": signature,
+            "key_id": signer.kid,
+        },
+        ensure_ascii=False,
+        indent=2,
+    ))
+    return 0
+
+
+def cmd_admin_create(args) -> int:
+    from .admins import AdminService
+
+    password = _read_password("管理员密码（至少 12 个字符）：", confirm=True)
+    operator = _operator(args)
+    with connect(load_dsn()) as conn:
+        admin_id = AdminService().create(conn, args.email, password, actor=operator)
+    print(json.dumps({"admin_id": admin_id, "email": args.email.lower()}, ensure_ascii=False))
+    return 0
+
+
+def cmd_admin_disable(args) -> int:
+    from .admins import AdminService
+
+    operator = _operator(args)
+    with connect(load_dsn()) as conn:
+        AdminService().disable(conn, args.email, actor=operator)
+    print(json.dumps({"disabled": args.email.lower()}, ensure_ascii=False))
+    return 0
+
+
+def cmd_admin_enable(args) -> int:
+    from .admins import AdminService
+
+    operator = _operator(args)
+    with connect(load_dsn()) as conn:
+        AdminService().enable(conn, args.email, actor=operator)
+    print(json.dumps({"enabled": args.email.lower()}, ensure_ascii=False))
+    return 0
+
+
+def cmd_admin_list(args) -> int:
+    with connect(load_dsn()) as conn:
+        rows = conn.execute(
+            "SELECT id, email, created_at, disabled_at FROM admins ORDER BY created_at"
+        ).fetchall()
+    print(json.dumps(
+        [
+            {
+                "id": str(row["id"]),
+                "email": row["email"],
+                "created_at": row["created_at"].isoformat(),
+                "disabled": row["disabled_at"] is not None,
+            }
+            for row in rows
+        ],
+        ensure_ascii=False,
+        indent=2,
+    ))
+    return 0
+
+
 def _user_id_of(conn, args) -> str:
     """把 --email / --user-id 解析成用户 ID；两种都没给就报用法错误。"""
     if args.user_id:
@@ -336,6 +447,35 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = credit_sub.add_parser("expire", help="回收悬挂超过 2 小时的预扣（也可以交给 cleanup 定时跑）")
     p.set_defaults(func=cmd_credits_expire)
+
+    admin_parser = sub.add_parser("admin", help="管理员：创建、停用、列出（管理后台没有注册入口）")
+    admin_sub = admin_parser.add_subparsers(dest="admin_command", required=True)
+
+    p = admin_sub.add_parser("create", help="新建管理员（密码从标准输入读，不走命令行参数）")
+    p.add_argument("--email", required=True, help="管理员邮箱（小写）")
+    p.add_argument("--by", help="操作人，记进审计日志（默认是当前系统用户）")
+    p.set_defaults(func=cmd_admin_create)
+
+    p = admin_sub.add_parser("disable", help="停用管理员（不删除，审计日志还要引用）")
+    p.add_argument("--email", required=True, help="管理员邮箱")
+    p.add_argument("--by", help="操作人")
+    p.set_defaults(func=cmd_admin_disable)
+
+    p = admin_sub.add_parser("enable", help="恢复被停用的管理员")
+    p.add_argument("--email", required=True, help="管理员邮箱")
+    p.add_argument("--by", help="操作人")
+    p.set_defaults(func=cmd_admin_enable)
+
+    p = admin_sub.add_parser("list", help="列出全部管理员")
+    p.set_defaults(func=cmd_admin_list)
+
+    p = sub.add_parser("release", help="升级包：给安装包签名（M7 自动更新用）")
+    release_sub = p.add_subparsers(dest="release_command", required=True)
+    sign_parser = release_sub.add_parser(
+        "sign", help="给一个安装包算 sha256 并签名，输出可直接填进版本策略"
+    )
+    sign_parser.add_argument("file", help="安装包路径（.exe / .msi / .dmg / .pkg）")
+    sign_parser.set_defaults(func=cmd_release_sign)
     return parser
 
 
