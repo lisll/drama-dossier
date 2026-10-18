@@ -51,7 +51,7 @@ def create_review(
     if severity not in SEVERITIES:
         raise WorkError(ErrorClass.PARAM_OUT_OF_RANGE, f"未知严重度：{severity}")
     existing = conn.execute(
-        "SELECT * FROM review_queue WHERE task_id = ? AND reason = ? AND status = 'pending'",
+        "SELECT * FROM review_queue WHERE task_id = %s AND reason = %s AND status = 'pending'",
         (task_id, reason),
     ).fetchone()
     if existing is not None:
@@ -62,7 +62,7 @@ def create_review(
         """
         INSERT INTO review_queue (id, task_id, artifact_id, reason, severity, status,
                                   detail_json, claimed_by, created_at)
-        VALUES (?,?,?,?,?, 'pending', ?, NULL, ?)
+        VALUES (%s,%s,%s,%s,%s, 'pending', %s, NULL, %s)
         """,
         (review_id, task_id, artifact_id, reason, severity,
          json_dump(detail or {}), now_iso()),
@@ -90,7 +90,7 @@ def _row_to_dict(row) -> dict:
 
 
 def get_review(conn, review_id: str) -> dict:
-    row = conn.execute("SELECT * FROM review_queue WHERE id = ?", (review_id,)).fetchone()
+    row = conn.execute("SELECT * FROM review_queue WHERE id = %s", (review_id,)).fetchone()
     if row is None:
         raise WorkError(ErrorClass.PARAM_OUT_OF_RANGE, f"复核记录不存在：{review_id}")
     return _row_to_dict(row)
@@ -101,22 +101,47 @@ def list_reviews(
     status: Optional[str] = None,
     task_id: Optional[str] = None,
     limit: int = 100,
+    owner_id: Optional[str] = None,
 ) -> List[dict]:
+    """列复核记录。
+
+    `owner_id` 传了就只返回这个用户项目下的记录；不传表示不过滤（内部调用）。
+    复核记录里带着任务 id 与失败细节，跨用户看到就等于泄露别人的处理内容。
+    """
     clauses, values = [], []
     if status:
         if status not in REVIEW_STATUSES:
             raise WorkError(ErrorClass.PARAM_OUT_OF_RANGE, f"未知复核状态：{status}")
-        clauses.append("status = ?")
+        clauses.append("r.status = %s")
         values.append(status)
     if task_id:
-        clauses.append("task_id = ?")
+        clauses.append("r.task_id = %s")
         values.append(task_id)
+    if owner_id is not None:
+        clauses.append("p.owner_id = %s")
+        values.append(owner_id)
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     rows = conn.execute(
-        f"SELECT * FROM review_queue{where} ORDER BY created_at DESC LIMIT ?",  # noqa: S608
+        "SELECT r.* FROM review_queue r"
+        " JOIN tasks t ON t.id = r.task_id"
+        " JOIN projects p ON p.id = t.project_id"
+        f"{where} ORDER BY r.created_at DESC LIMIT %s",  # noqa: S608
         (*values, int(limit)),
     ).fetchall()
     return [_row_to_dict(row) for row in rows]
+
+
+def ensure_review_access(conn, review_id: str, owner_id: str) -> None:
+    """确认这条复核记录属于 `owner_id`，否则按「不存在」处理。"""
+    row = conn.execute(
+        "SELECT p.owner_id FROM review_queue r"
+        " JOIN tasks t ON t.id = r.task_id"
+        " JOIN projects p ON p.id = t.project_id"
+        " WHERE r.id = %s",
+        (review_id,),
+    ).fetchone()
+    if row is None or str(row["owner_id"]) != owner_id:
+        raise WorkError(ErrorClass.NOT_FOUND, f"复核记录不存在：{review_id}")
 
 
 def pending_for_task(conn, task_id: str) -> List[dict]:
@@ -160,14 +185,14 @@ def claim(conn, review_id: str, actor: str) -> dict:
             f"复核记录 {review_id} 已被 {row['claimed_by']} 认领",
         )
     conn.execute(
-        "UPDATE review_queue SET claimed_by = ? WHERE id = ?", (actor, review_id)
+        "UPDATE review_queue SET claimed_by = %s WHERE id = %s", (actor, review_id)
     )
     audit(conn, actor, "review.claim", review_id, {})
     return get_review(conn, review_id)
 
 
 def _fetch(conn, review_id: str):
-    row = conn.execute("SELECT * FROM review_queue WHERE id = ?", (review_id,)).fetchone()
+    row = conn.execute("SELECT * FROM review_queue WHERE id = %s", (review_id,)).fetchone()
     if row is None:
         raise WorkError(ErrorClass.PARAM_OUT_OF_RANGE, f"复核记录不存在：{review_id}")
     return row
@@ -191,8 +216,8 @@ def decide(conn, review_id: str, decision: str, note: str = "", actor: str = "sy
         )
     status = "approved" if decision == "approve" else "rejected"
     conn.execute(
-        "UPDATE review_queue SET status = ?, decided_by = ?, decided_at = ?, "
-        "decision_note = ?, claimed_by = COALESCE(claimed_by, ?) WHERE id = ?",
+        "UPDATE review_queue SET status = %s, decided_by = %s, decided_at = %s, "
+        "decision_note = %s, claimed_by = COALESCE(claimed_by, %s) WHERE id = %s",
         (status, actor, now_iso(), note, actor, review_id),
     )
     audit(conn, actor, f"review.{decision}", review_id,
@@ -222,7 +247,7 @@ def rerun(
             f"复核记录 {review_id} 已是 {row['status']}，不能再发起重跑",
         )
     original = conn.execute(
-        "SELECT * FROM tasks WHERE id = ?", (row["task_id"],)
+        "SELECT * FROM tasks WHERE id = %s", (row["task_id"],)
     ).fetchone()
     if original is None:
         raise WorkError(ErrorClass.PARAM_OUT_OF_RANGE, f"原任务不存在：{row['task_id']}")
@@ -249,8 +274,8 @@ def rerun(
         actor=f"{actor}:review-rerun",
     )
     conn.execute(
-        "UPDATE review_queue SET status = 'superseded', decided_by = ?, decided_at = ?, "
-        "decision_note = ?, claimed_by = COALESCE(claimed_by, ?) WHERE id = ?",
+        "UPDATE review_queue SET status = 'superseded', decided_by = %s, decided_at = %s, "
+        "decision_note = %s, claimed_by = COALESCE(claimed_by, %s) WHERE id = %s",
         (
             actor,
             now_iso(),
