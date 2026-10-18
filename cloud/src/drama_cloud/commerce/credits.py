@@ -32,11 +32,24 @@ from .errors import CommerceError
 HOLD_TTL_SECONDS = 2 * 3600
 
 #: 目前支持的计价对象。
-SUBJECTS = ("version", "package")
+SUBJECTS = ("version", "package", "server_version")
 
 
 def _idempotency_key(kind: str, ref: str) -> str:
     return f"{kind}:{ref}"
+
+
+def hold_key_for(conn, ref: str) -> Optional[str]:
+    """按业务引用找回某笔预扣的幂等键；没有这笔预扣时返回 None。
+
+    「服务端处理」的控制面只知道自己的 `ref`（例如 `server_task:<task_id>`），
+    不知道我们内部的幂等键格式，所以给它这个入口去结算/退还。
+    """
+    key = _idempotency_key("hold", ref)
+    row = conn.execute(
+        "SELECT 1 FROM credit_ledger WHERE idempotency_key = %s AND kind = 'hold'", (key,)
+    ).fetchone()
+    return key if row else None
 
 
 def balance(conn, user_id: str) -> int:
@@ -156,6 +169,15 @@ def hold(
         raise CommerceError(422, "invalid_request", "预扣数量必须大于 0")
     if not ref.strip():
         raise CommerceError(422, "invalid_request", "预扣需要一个业务引用")
+    key = _idempotency_key("hold", ref)
+    # 幂等：同一个 ref 再来一次直接返回已有键，不再扣一次。
+    # 调用方（媒体控制面）会在网络抖动时重试预扣，这一步必须安全。
+    existing = conn.execute(
+        "SELECT settled_state FROM credit_ledger WHERE idempotency_key = %s AND kind = 'hold'",
+        (key,),
+    ).fetchone()
+    if existing is not None:
+        return key
     lock_user(conn, user_id)
     # 先回收悬挂的旧预扣，再判断余额：否则用户可能因为几笔早就该退回的钱而「余额不足」。
     # 这里已经在用户行锁内，回收只碰这个人的流水，不会和别人抢。
@@ -168,7 +190,6 @@ def hold(
             f"积分不足：需要 {amount} 积分，当前 {current} 积分",
             extra={"required": amount, "balance": current},
         )
-    key = _idempotency_key("hold", ref)
     _insert(
         conn,
         user_id=user_id,
