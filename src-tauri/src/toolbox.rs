@@ -161,29 +161,63 @@ fn runtime_status_inner(
     let ffmpeg = resolve_ffmpeg(app)?;
     let ffprobe = resolve_ffprobe(app, ffprobe_path)?;
     let runner = SystemRunner::new();
-    // Windows 的解释器名是 python（py 是启动器兜底），macOS/Linux 是 python3。
-    // `python` 若只是微软商店占位符，probe_tool 会按 9009 判为未找到，此时再试 py。
-    let python_report = {
-        let name = "python";
-        let primary = if cfg!(windows) {
-            probe_tool(&runner, name, Path::new("python"), &["--version"])
-        } else {
-            probe_tool(&runner, name, Path::new("python3"), &["--version"])
-        };
-        if primary.ok || !cfg!(windows) {
-            primary
-        } else {
-            probe_tool(&runner, name, Path::new("py"), &["-3", "--version"])
-        }
-    };
+    // 只探解释器版本（秒级）；torch/onnxruntime 导入太慢，留给擦除页自查。
+    let python_report = probe_python(app, &runner);
     Ok(RuntimeStatus {
-        // 只探解释器版本（秒级）；torch/onnxruntime 导入太慢，留给擦除页自查。
         ffmpeg: probe_tool(&runner, "ffmpeg", &ffmpeg, &["-hide_banner", "-version"]),
         ffprobe: probe_tool(&runner, "ffprobe", &ffprobe, &["-hide_banner", "-version"]),
         python: python_report,
         install_supported: cfg!(any(target_os = "macos", target_os = "windows")),
         platform: std::env::consts::OS.to_string(),
     })
+}
+
+/// 探测 Python 解释器：设置里的绝对路径优先，随后 PATH 上的候选名。
+/// Windows 候选是 `python` → `py -3`（商店占位符会以 9009 被判未找到）；
+/// macOS/Linux 是 `python3`。
+fn probe_python(app: &AppHandle, runner: &SystemRunner) -> ToolReport {
+    let name = "python";
+    if let Some(path) = configured_python(app) {
+        let report = probe_tool(runner, name, &path, &["--version"]);
+        if report.ok {
+            return report;
+        }
+    }
+    let primary = if cfg!(windows) {
+        probe_tool(runner, name, Path::new("python"), &["--version"])
+    } else {
+        probe_tool(runner, name, Path::new("python3"), &["--version"])
+    };
+    if primary.ok || !cfg!(windows) {
+        primary
+    } else {
+        probe_tool(runner, name, Path::new("py"), &["-3", "--version"])
+    }
+}
+
+/// 设置里配置的 Python 路径（存在才返回）。
+fn configured_python(app: &AppHandle) -> Option<PathBuf> {
+    read_settings(app)
+        .ok()?
+        .python_path
+        .filter(|path| path.is_file())
+}
+
+/// 为擦除 worker 解析一个可用的 Python 解释器；失败时给可行动的指引。
+pub(crate) fn resolve_python(app: &AppHandle) -> Result<PathBuf, String> {
+    if let Some(path) = configured_python(app) {
+        return Ok(path);
+    }
+    let runner = SystemRunner::new();
+    let report = probe_python(app, &runner);
+    if report.ok {
+        return Ok(PathBuf::from(report.program));
+    }
+    Err(format!(
+        "未找到可用的 Python 解释器（{}）。请安装 Python 3 并加入 PATH，\
+         或在 Windows 上使用「一键配置运行环境」自动安装。",
+        report.detail
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1070,6 +1104,15 @@ const EVERMEET_FFPROBE_URL: &str = "https://evermeet.cx/ffmpeg/ffprobe-9.0.2.zip
 #[cfg(target_os = "windows")]
 const GYAN_FFMPEG_URL: &str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
 
+/// Windows 一键配置的第 3 个组件：官方 CPython 3.11.9（amd64）安装器，约 25MB。
+/// 静默装进应用数据目录，不装启动器、不改系统 PATH；升级 Python 大版本时换这里的钉版号。
+#[cfg(target_os = "windows")]
+const PYTHON_INSTALLER_URL: &str =
+    "https://www.python.org/ftp/python/3.11.9/amd64/python-3.11.9-amd64.exe";
+/// 静默安装实测 1~2 分钟，给足超时防网络/杀软拖慢时误杀。
+#[cfg(target_os = "windows")]
+const PYTHON_INSTALL_TIMEOUT_SECS: u64 = 600;
+
 /// 一键安装结果。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1325,6 +1368,114 @@ fn persist_tool_paths(
     Ok(())
 }
 
+/// 构造官方安装器的静默安装参数：装进应用私有目录、不动系统 PATH、不装启动器，
+/// 对用户零打扰。升级 Python 大版本时这里的开关要一起核对。
+#[cfg(target_os = "windows")]
+fn python_install_args(target_dir: &Path) -> Vec<String> {
+    vec![
+        "/quiet".into(),
+        "/norestart".into(),
+        "InstallAllUsers=0".into(),
+        format!("TargetDir={}", target_dir.display()),
+        "Include_launcher=0".into(),
+        "PrependPath=0".into(),
+        "AssociateFiles=0".into(),
+        "Shortcuts=0".into(),
+        "Include_doc=0".into(),
+        "Include_test=0".into(),
+    ]
+}
+
+/// 把装好的 Python 路径写回设置。走到这里时 `configured_python` 已确认没有可用配置，
+/// 直接写不会覆盖用户手工配置。
+#[cfg(target_os = "windows")]
+fn persist_python_path(app: &AppHandle, python_exe: &Path) -> Result<(), String> {
+    let settings_path = crate::settings_path(app)?;
+    let mut settings = load_settings(&settings_path).settings;
+    settings.python_path = Some(python_exe.to_path_buf());
+    dossier_core::save_settings(&settings_path, &settings)
+        .map_err(|error| format!("写入设置失败：{error}"))
+}
+
+/// Windows：一键配置的第 3 步——确保有可用的 Python 解释器（AI 擦除的 worker 用）。
+/// 返回 `Ok(true)` 表示本次新装了 Python；`Ok(false)` 表示已有可用解释器、本轮跳过。
+/// 失败时返回 Err，由调用方决定是否软处理（Python 缺失不影响转码）。
+#[cfg(target_os = "windows")]
+fn install_python_windows(app: &AppHandle, bin_dir: &Path) -> Result<bool, String> {
+    // 1) 设置里已配置且可用（一键配置重入、或上轮装过）→ 跳过。
+    if configured_python(app).is_some() {
+        emit_install_progress(app, "python", "finished", "已存在，跳过", Some(0), 0);
+        return Ok(false);
+    }
+    // 2) PATH 上有真实解释器（探测会拦掉微软商店占位符的 9009）→ 不必重复安装。
+    let runner = SystemRunner::new();
+    if probe_python(app, &runner).ok {
+        emit_install_progress(
+            app,
+            "python",
+            "finished",
+            "系统已有 Python，跳过安装",
+            Some(0),
+            0,
+        );
+        return Ok(false);
+    }
+    // 3) 下载官方安装器（~25MB）→ 静默安装到应用数据目录 → 自检 → 写回设置。
+    let target_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法定位应用数据目录：{error}。请检查系统权限。"))?
+        .join("python");
+    let python_exe = target_dir.join("python.exe");
+    let installer_path = bin_dir.join("python-installer.exe");
+    let result = (|| -> Result<(), String> {
+        download_file(app, "python", PYTHON_INSTALLER_URL, &installer_path)?;
+        emit_install_progress(
+            app,
+            "python",
+            "installing",
+            "正在静默安装（1~2 分钟）",
+            None,
+            0,
+        );
+        let spec = CommandSpec::new(installer_path.display().to_string())
+            .args(python_install_args(&target_dir))
+            .timeout(std::time::Duration::from_secs(PYTHON_INSTALL_TIMEOUT_SECS));
+        let output = runner
+            .run(&spec)
+            .map_err(|error| format!("安装器启动失败：{error}"))?;
+        if !output.success() {
+            let combined = output.combined();
+            let detail = combined
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or("（无输出）");
+            return Err(format!("静默安装失败（{}）：{detail}", output.code_label()));
+        }
+        // 安装器返回 0 不完全等于「解释器能用」，以直接自检为准。
+        let report = probe_tool(&runner, "python", &python_exe, &["--version"]);
+        if !report.ok {
+            return Err(format!("安装后自检失败：{}", report.detail));
+        }
+        persist_python_path(app, &python_exe)?;
+        Ok(())
+    })();
+    // 安装器是一次性文件，无论成败都清掉，不在 bin 目录留 ~25MB 垃圾。
+    let _ = std::fs::remove_file(&installer_path);
+    match result {
+        Ok(()) => {
+            emit_install_progress(app, "python", "finished", "完成", Some(0), 0);
+            crate::logging::log_event(
+                "环境",
+                format!("Python 自动安装成功：{}", python_exe.display()),
+            );
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// 安装包内置的运行环境目录：Windows 安装包由 CI 预置 ffmpeg/ffprobe
 /// （见 .github/workflows/build-windows.yml），装好后**运行时零下载**。
 /// Tauri v2 的 resources 按「相对 tauri.conf.json 的路径」原样落盘：
@@ -1481,12 +1632,25 @@ fn install_runtime_blocking(app: &AppHandle) -> Result<InstallRuntimeReport, Str
     self_check_installed(app, &ffmpeg_path)?;
     persist_tool_paths(app, &ffmpeg_path, &ffprobe_path)?;
 
+    // Python 是 AI 擦除的依赖，不是转码的：装失败只追加提示，不拖垮 ffmpeg 的成果。
+    let mut python_note = String::new();
+    match install_python_windows(app, &bin_dir) {
+        Ok(true) => {
+            python_note = "（已自动安装 Python 3.11 到应用数据目录，供 AI 擦除使用）".into()
+        }
+        Ok(false) => skipped_existing.push("python".into()),
+        Err(error) => {
+            python_note = format!("（Python 自动安装未成功：{error}）");
+            crate::logging::log_event("环境", format!("Python 自动安装失败：{error}"));
+        }
+    }
+
     Ok(InstallRuntimeReport {
         ffmpeg_path: ffmpeg_path.display().to_string(),
         ffprobe_path: ffprobe_path.display().to_string(),
         skipped_existing,
         note: format!(
-            "运行环境已就绪（安装目录：{}）{bundled_note}",
+            "运行环境已就绪（安装目录：{}）{bundled_note}{python_note}",
             bin_dir.display()
         ),
     })
@@ -1586,5 +1750,28 @@ mod tests {
         spec = spec.arg("-version");
         let runner = SystemRunner::new();
         assert!(runner.run(&spec).is_err());
+    }
+
+    /// Windows 一键配置的 Python 静默参数：必须安静、必须落在指定目录、
+    /// 必须不碰系统 PATH / 启动器（对用户零打扰的关键约束）。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn python_install_args_point_at_target_dir_and_stay_quiet() {
+        let args = python_install_args(Path::new(r"C:\Apps\Dossier\python"));
+        assert!(
+            args.contains(&"/quiet".to_string()),
+            "缺少 /quiet：{args:?}"
+        );
+        assert!(args.contains(&"/norestart".to_string()));
+        assert!(
+            args.contains(&"TargetDir=C:\\Apps\\Dossier\\python".to_string()),
+            "TargetDir 拼错：{args:?}"
+        );
+        assert!(args.contains(&"InstallAllUsers=0".to_string()));
+        assert!(
+            args.contains(&"PrependPath=0".to_string()),
+            "绝不能改系统 PATH"
+        );
+        assert!(args.contains(&"Include_launcher=0".to_string()));
     }
 }

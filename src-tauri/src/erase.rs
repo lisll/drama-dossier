@@ -144,6 +144,13 @@ pub fn plan_erase(
             .display()
             .to_string(),
     );
+    // Python 解释器同理：设置里配过（Windows 一键配置装好）或 PATH 上有就注入，
+    // 没有则交由 dossier-inpaint 的校验给出提示（不在这里硬失败）。
+    if request.worker_program.is_none() {
+        if let Ok(python) = crate::toolbox::resolve_python(&app) {
+            request.worker_program = Some(python.display().to_string());
+        }
+    }
     let tool = locate(tool_path.as_deref())?;
     build_plan(&request, &tool)
 }
@@ -195,6 +202,12 @@ fn run_erase_blocking(
             .display()
             .to_string(),
     );
+    // Python 解释器同理：与 plan_erase 保持同一条命令，注入逻辑一致。
+    if request.worker_program.is_none() {
+        if let Ok(python) = crate::toolbox::resolve_python(app) {
+            request.worker_program = Some(python.display().to_string());
+        }
+    }
 
     let tool = locate(tool_path.as_deref())?;
     let plan = build_plan(&request, &tool)?;

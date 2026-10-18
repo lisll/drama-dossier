@@ -21,6 +21,9 @@ pub struct AppSettings {
     pub ffprobe_path: Option<PathBuf>,
     /// ffmpeg 可执行文件路径；`None` 表示从 `PATH` 查找（一键安装的运行环境写在这里）。
     pub ffmpeg_path: Option<PathBuf>,
+    /// Python 解释器路径（AI 擦除的 worker 用）；`None` 表示从 `PATH` 查找。
+    /// Windows 一键配置会静默安装官方 Python 到应用目录并写在这里。
+    pub python_path: Option<PathBuf>,
     /// 默认输出目录（**产物根目录**）；`None` 表示产物写在剧目目录内。
     ///
     /// 非空时按 `<该目录>/<剧名>/<产物名>` 落盘，见 [`resolve_product_dir`]。
@@ -315,6 +318,7 @@ mod tests {
             }),
             ffprobe_path: Some(PathBuf::from("/opt/ffmpeg/bin/ffprobe")),
             ffmpeg_path: Some(PathBuf::from("/opt/ffmpeg/bin/ffmpeg")),
+            python_path: Some(PathBuf::from("C:/Apps/runtime/python/python.exe")),
             output_dir: Some(PathBuf::from("/tmp/报审输出")),
             library_root: Some(PathBuf::from("/tmp/素材库")),
             ai_template: Some("你是短剧报审材料撰写助手…".to_string()),
