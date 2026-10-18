@@ -67,6 +67,7 @@ export DRAMA_COMMERCE_MOCK_PAY_SECRET='<随便一个固定串，模拟支付用�
 | `DRAMA_COMMERCE_ARTIFACTS_BIN` | 否 | `dossier-artifacts` 可执行文件路径。不设时按 PATH → `target/release` → `target/debug` 查找（见 `toolchain.py`） |
 | `DRAMA_COMMERCE_PUBLIC_BASE_URL` | 否 | 本服务的对外地址（例如 `https://drama.example.com`），用来拼支付回调地址。Mock 支付不需要它；真实渠道缺它时下单报「未配置对外地址」 |
 | `DRAMA_COMMERCE_MOCK_PAY_SECRET` | 否 | 模拟支付回调的 HMAC-SHA256 签名密钥。留空时 mock 渠道报「未配置」——空密钥等于谁都能伪造回调，所以开发环境也要显式配一个固定串 |
+| `DRAMA_COMMERCE_INTERNAL_SECRET` | 否 | `/internal/*` 内部接口的共享密钥（M5b）。与媒体控制面的 `DRAMA_CLOUD_INTERNAL_SECRET` 必须是**同一个值**。**留空等于关闭这些路由**：没配时它们一律 404，而不是「不鉴权就放行」。只在同机房内网里传，不该出现在公网 |
 | `DRAMA_COMMERCE_ALIPAY_APP_ID` / `_PRIVATE_KEY` / `_PUBLIC_KEY` | 否 | 支付宝沙箱凭证。缺任何一项时报 `payment_not_configured` 并列出缺的是哪几个变量 |
 | `DRAMA_COMMERCE_ALIPAY_GATEWAY` | 否 | 支付宝网关地址，不设时用代码里钉住的沙箱网关 |
 | `DRAMA_COMMERCE_WECHAT_MCH_ID` / `_API_V3_KEY` / `_PRIVATE_KEY` / `_SERIAL_NO` | 否 | 微信支付凭证。个人主体申请不了商户号，本期只留接口 |
@@ -74,6 +75,8 @@ export DRAMA_COMMERCE_MOCK_PAY_SECRET='<随便一个固定串，模拟支付用�
 配置缺失或非法时，服务拒绝启动，报错里只出现变量名，不出现变量值。
 `migrate`、`cleanup`、`cards`、`credits` 只需要 `DRAMA_COMMERCE_DSN`；`keygen`、`keyinfo` 不读任何配置。
 支付凭证只在用到对应渠道时才检查：没配好不影响服务启动，只让那个渠道报「未配置」。
+`DRAMA_COMMERCE_INTERNAL_SECRET` 也不影响启动：留空时服务照常起来，只是 `/internal/*` 一律 404
+（媒体控制面那边会看到「账号服务的计费接口不可用」并返回 503）。
 报审包与处理配方相关的接口还会用到上面两项：字体缺失时**启动**就失败；`dossier-artifacts`
 缺失时启动不失败，但 `POST /packages` 会返回 503 `service_unavailable`。
 
@@ -480,14 +483,25 @@ PNG / JPEG 铺满一页 A4；页数必须与原文档一致，否则 422 `scan_i
 
 #### 计价
 
-价目表 `price_rules` 一个计价对象一行，目前两个对象：`version`（处理版本）、`package`（报审包）。
+价目表 `price_rules` 一个计价对象一行，目前三个对象：`version`（处理版本）、`package`（报审包）、
+`server_version`（服务端处理，M5b-4）。后者的种子数据在 `0010_server_version_price.sql`：
+`credits_per_unit = 5`、`min_units = 1`，**与本地处理版本同价**——服务端只是替用户跑同一件事，
+差别在谁的机器出力；等真有机房/GPU 成本要摊，再按实际情况调那一行。
+
 计价单位只有 `episode`（集），初始值是**每个对象每集 5 积分**，`min_units` 是 1（不足一集也按一集算）。
 价目表的初始值是迁移里写死的种子数据，后台改价留到 M7；表里查不到规则时返回 503 `price_missing`，
 **不会默认成 0**（那等于免费），也不猜一个数。
 
+代码里的清单是 `credits.SUBJECTS = ("version", "package", "server_version")`：
+`cost_for()` 先用它挡掉不认识的计价对象（422 `invalid_request`），再去查 `price_rules`。
+数据库那层只挡空串（`0010` 把 `0006` 的 `CHECK (subject IN (...))` 换成了 `CHECK (subject <> '')`），
+理由是「在数据库里维护一份取值清单，每次加价目都要改迁移，且容易与代码里的清单不同步」。
+
 - 处理版本：`cost_for("version", episode_count)`。集数由桌面端报上来（服务端只收到任务哈希，看不到集数），
   上限 500，和报审包一致。
 - 报审包：`cost_for("package", len(episodes))`。集数就是请求里 `episodes` 的条数（最多 500）。
+- 服务端处理：`cost_for("server_version", 集数)`，由媒体控制面通过 `/internal/credits/cost` 问价，
+  **客户端不能传价格**。媒体控制面按 `max(1, 素材数)` 算 `units`——服务端处理就是逐集跑。
 
 **价格在签发时定死**：`POST /recipes` 算出 `required` 后，把它和集数一起写进 `recipes.credits` / `episode_count`；
 消费时直接读这个值扣款，**不重算**。否则中途改过价目表，就会出现「签发时说 25、扣钱时扣 30」。
@@ -499,7 +513,7 @@ PNG / JPEG 铺满一页 A4；页数必须与原文档一致，否则 422 `scan_i
 
 #### 扣费时机
 
-两个付费功能的定案时点不同，这是刻意的：
+三个付费功能的定案时点不同，这是刻意的：
 
 **处理版本：消费即定案。** 扣费发生在 `POST /recipes/{id}/consume` 里，和「标记配方已消费」在**同一个事务**：
 先 `hold` 再立刻 `settle`，要么配方被消费且钱被扣，要么两件都没发生。余额不足时 `hold` 抛 402，
@@ -516,12 +530,26 @@ PNG / JPEG 铺满一页 A4；页数必须与原文档一致，否则 422 `scan_i
 
 预扣的 `ref` 用一次性的 `package:<uuid>` 而不是剧名——`ref` 会进流水和审计日志，而审计日志一直刻意只存剧名的哈希。
 
+**服务端处理（M5b-4）：预扣 → 跑任务 → 结算 / 退还，由媒体控制面驱动。** 与服务端自己执行的报审包不同，
+这条链路的每一步都是**另一个服务**来调的，走 3.9 的内部接口：
+
+1. 建任务**之前**先 `hold`。没扣到钱就不该占队列资源；`ref` 是 `server_task:<幂等键或一次性 id>`；
+2. 预扣成功才建任务；建任务失败（参数错、配额、数据库）就把预扣退回去，
+   媒体控制面用 `except BaseException` 兜住，进程被取消时也不把钱留下；
+3. 任务终态时按 `credit_ref` 结算或退还：成功 `settle`，失败/取消 `release`。
+
+「视频在服务端跑」让退还成为可能——服务端知道任务到底成没成。但**结算/退还这一步本身也可能失败**
+（commerce 连不上）：此时媒体控制面**不把已经成功的任务判成失败**，而是把失败显式返回并写进审计
+（`credit.settle` / `credit.release`），留给人工对账。把「钱没结算成功」变成任务失败，
+用户会以为视频没做出来，而真实情况是视频好了、账没对上。
+
 #### 预扣超时回收
 
 `HOLD_TTL_SECONDS = 2 × 3600`，即 **2 小时**：超过这么久还没结算的 `reserved` 视为放弃，自动退还
 （写一条 `expire` 正数流水并把原 hold 标 `released`）。
 
-- 它**只用于报审包**这类服务端自己执行的任务。处理版本的预扣与结算在同一个事务里，不存在悬挂状态。
+- `release_stale_holds` 扫的是「所有 `kind='hold' AND settled_state='reserved'` 且超时的行」，不按 `ref` 区分，
+  所以报审包与**服务端处理**的悬挂预扣都靠它兜底。处理版本的预扣与结算在同一个事务里，不存在悬挂状态。
 - 回收是**查余额时顺带做的**：`balance()` 与 `hold()` 都先按 `user_id` 回收这个人的悬挂预扣再算余额，
   否则用户看到的余额里有一笔其实早该退回来的钱，会以为积分丢了。
 - 进程崩溃、服务重启留下的 `reserved` 由管理员兜底：`drama-commerce credits expire`（见 5.3）扫全库回收。
@@ -564,6 +592,21 @@ PNG / JPEG 铺满一页 A4；页数必须与原文档一致，否则 422 `scan_i
 幂等键是 `invite:<被邀请人>`（邀请人侧）和 `invitee:<被邀请人>`（被邀请人侧），
 所以重复触发（多次付费、重复调用）只发一次。发放时把邀请人这一份的数量写进 `invite_rewards.credits`
 （`/invites` 的 `earnedCredits` 是它的合计），之后改配置不影响已经发出去的奖励。
+
+#### 媒体库自己的 `billing_*` 表为什么保留
+
+媒体控制面（`drama-cloud`）库里还有一套 `billing_accounts` / `billing_quotes` / `billing_ledger`。
+它和这里的 `credit_ledger` 是**两本账，不是两套真相**：
+
+- **服务端处理的扣费走 commerce 积分**（就是本节讲的这本账）。报审包、本机处理版本扣的也是它，
+  所以用户只有一个余额、一份流水，不会看到「服务端处理扣了 A、报审包扣了 B」。
+  媒体控制面通过 3.9 的内部接口调用，`ref` 形如 `server_task:<task_id>`，审计里的操作人是 `media-server`。
+- **媒体库的 `billing_*` 表保留为「可独立运行的账本」**：CLI 与既有测试在用，也让媒体控制面能在
+  没有 commerce 的环境里单独跑通（学习原型要能单独演示一条任务链路）。
+- **两条路互斥**：任务上有 `credit_ref` 就走 commerce，有 `billing_quote_id` 就走本地账本
+  （`settle_task_billing` 按这个顺序判断），两者都有时以 `credit_ref` 为准，两者都空则不扣费。
+- **为什么不干脆删掉本地那套**：删掉要改 CLI、测试与任务创建路径，收益只是少两张表；
+  而且「同一份代码两种部署形态都能跑」本身是学习原型想要的性质。
 
 ### 3.8 支付
 
@@ -666,6 +709,90 @@ Mock **没有渠道侧可查**：`query()` 直接报「模拟支付没有渠道�
 - `/payments/{channel}/notify` **不要登录**：渠道不会带我们的令牌，只能靠验签确认来源。顺序是
   先限流（按来源 IP）、再取 provider（没配好报 503）、再验签、最后才入账。验签失败只记日志
   （日志里不含报文内容，可能含敏感信息）并回失败应答。
+
+### 3.9 内部接口（给同机房的其他服务用）
+
+前缀 `/internal`，**不在 OpenAPI 文档里**（`include_in_schema=False`）。这些接口只给同机房的服务调用
+（目前只有媒体控制面 `drama-cloud`），不该走公网。
+
+**为什么需要它**：桌面端的登录状态在 commerce 里，媒体控制面自己**没有账号体系**。
+与其让用户登录两次、再人工对齐两套用户，不如让它拿桌面端已有的访问令牌来问一句「这是谁」；
+扣费同理——两边共用一个余额，用户才不会看到两个数对不上。
+
+#### 调用方认证
+
+| 请求头 | 用途 |
+| --- | --- |
+| `X-Internal-Secret` | 共享密钥，与 `DRAMA_COMMERCE_INTERNAL_SECRET` 同一个值 |
+| `X-Access-Token` | 待验证的访问令牌（**只在 `/internal/introspect` 用**） |
+
+- 用自定义头而不是 `Authorization`，免得和「用户令牌」的 Bearer 语义混在一起。
+- 比较走 `hmac.compare_digest`（恒定时间），和验签一样认真——否则可以从响应时间反推密钥。
+- **密钥留空时这些路由一律 404**，不是「放行」。理由写在 `internal_routes.py` 的模块注释里：
+  留空若等于不鉴权，一次配置遗漏就会让任何人都能拿令牌换用户身份。
+- 待验证的访问令牌走**请求头**，不进请求体：请求体会被框架记进错误日志，令牌不该出现在日志里。
+- 只返回 `user_id` 与 `email`，不返回令牌、密码摘要、设备等任何其他东西。
+
+#### 限流
+
+两类接口各有一个独立的桶，按调用方来源计数，**每分钟 6000 次**：
+
+| 规则 | 用于 |
+| --- | --- |
+| `internal:introspect` | `/internal/introspect` |
+| `internal:credits` | `/internal/credits/*` |
+
+调用方是服务而不是人，所以给得比面向用户的接口宽；但仍然要限，否则一个死循环的客户端就能打爆这里。
+
+#### 两类接口
+
+**一、令牌内省**
+
+| 方法 | 路径 | 请求 | 成功 | 典型错误 |
+| --- | --- | --- | --- | --- |
+| POST | `/internal/introspect` | 头部 `X-Internal-Secret`、`X-Access-Token` | 200 `{"user_id", "email"}` | 401 `unauthorized`（密钥不对 / 令牌无效、过期、已吊销 / 用户已注销）；404（没配密钥）；422 `invalid_request`（缺访问令牌） |
+
+令牌无效、过期、已吊销，以及「令牌有效但用户已被注销」，这几件事在这个接口里**回同一个 401**：
+调用方该做的事都是「让用户重新登录」，区分开只会多透露一点信息。
+
+**二、积分**（媒体控制面做「服务端处理」时用）
+
+| 方法 | 路径 | 请求体 | 成功 | 典型错误 |
+| --- | --- | --- | --- | --- |
+| POST | `/internal/credits/balance` | `{"user_id"}` | 200 `{"balance"}` | 401 / 404 |
+| POST | `/internal/credits/cost` | `{"subject", "units"}` | 200 `{"subject", "units", "required"}` | 422 `invalid_request`（不认识的 subject / units ≤ 0）；503 `price_missing` |
+| POST | `/internal/credits/hold` | `{"user_id", "amount", "ref", "memo"?}` | 200 `{"hold_key", "balance"}` | 402 `insufficient_credits`（与对外接口同一个错误码）；401 / 404 |
+| POST | `/internal/credits/settle` | `{"ref", "memo"?}` | 200 `{"settled": true}` | 404 `hold_not_found`；409 `hold_closed` |
+| POST | `/internal/credits/release` | `{"ref", "memo"?}` | 200 `{"released": true}` | 404 `hold_not_found`；409 `hold_closed` |
+
+几条要点：
+
+- **算价只由服务端决定**：`/credits/cost` 收的是 `subject` 与 `units`，调用方（哪怕是媒体控制面）
+  传不了价格，只能问「这些单位要多少积分」。
+- **`hold` 的幂等键由 `ref` 派生**（`hold_key_for(conn, ref)` 查的是 `hold:<ref>`）。
+  同一个 `ref` 重复调用不会重复扣：媒体控制面在建任务这一步会重试，必须能安全重放。
+- **`settle` / `release` 用 `ref` 找回预扣**，找不到就**如实回 404 `hold_not_found`**，
+  而不是假装结算了（例如任务在扣费之前就失败了）。重复结算 / 重复退还都是幂等的（直接返回）；
+  方向反了（已退还又要结算）则 409 `hold_closed`。
+- **`hold` 在调用方已开的事务里执行**（`with conn.transaction():`）：余额检查与写入之间不能有人插进来。
+- 审计记录的操作人是 `media-server`，所以事后能从 `audit_events.actor` 分清「这笔是媒体控制面扣的」。
+
+#### 与媒体控制面的约定
+
+媒体控制面那边对应的两个模块是 `identity.py`（内省）与 `credit_client.py`（积分）。它们在调用侧要分清三件事：
+
+| 结果 | 媒体控制面怎么做 |
+| --- | --- |
+| 有效（200） | 继续；`user_id` 用作任务归属与扣费对象 |
+| 明确无效（401 / 404） | 内省返回 `None` → 给客户端 401；404 另外记一条 error 日志（那是部署问题：没配 `INTERNAL_SECRET`） |
+| **问不到**（网络错、超时、5xx、报文不符） | 抛 `IntrospectUnavailable` → 给客户端 503 |
+
+第三种必须单独区分：把「问不到」当成「令牌无效」会让人以为要重新登录；把「问不到」当成「有效」等于没鉴权。
+**两者都不能做。** 内省超时是 5 秒，扣费超时是 8 秒——都是同步动作，宁可让用户重试也不要挂很久。
+
+扣费侧同理：预扣阶段问不到 commerce 就**直接让请求失败**（503），绝不放行「先跑着、回头再扣」，
+那会变成免费算力。结算 / 退还阶段问不到则返回 `CreditOutcome(ok=False)` 而不抛异常——任务已经跑完了，
+这时候把失败升级成「任务失败」会误导用户（见 3.7 的「扣费时机」）。
 
 ## 4. 安全规则
 

@@ -280,26 +280,58 @@ cargo test -p drama-dossier --lib e2e -- --ignored
 
 ## 云端制作系统（`cloud/`）
 
-与桌面报审链路相互独立，Python 3.9 + FastAPI，运行目录 `cloud/var/`（可整体删除）。
+与桌面报审链路相互独立，Python + FastAPI。**M5b 起媒体控制面用 PostgreSQL**（此前是 `cloud/var/` 下的 SQLite 文件）。
 
 ```bash
 python3.9 -m venv .venv && ./.venv/bin/pip install -e cloud[dev]
 
-# 测试（215 个：单元 / 模块 / 集成 / 接口）
+# 需要真 PostgreSQL：媒体控制面与 commerce 各用一套库（两个服务各有自己的表）
+export COMMERCE_TEST_DSN='postgresql://drama:drama-dev-only@127.0.0.1:5432/postgres'
+
+# 测试（单元 / 模块 / 集成 / 接口 / 两个服务的内部接口）
 cd cloud && PYTHONPATH=src ../.venv/bin/python -m pytest tests/ -q
 
 # 端到端演示：造素材 → 4 条配方 → 门禁 → 取产物
 ./cloud/demo.sh
 ./cloud/demo.sh --http     # 另外演示 API + Web 客户端
+
+# 两个端到端脚本（真进程 + 真 HTTP + 真 PostgreSQL，库名随机、跑完自删）
+./.venv/bin/python cloud/tests/e2e_m5a.py           # 积分与支付
+./.venv/bin/python cloud/tests/e2e_m5b.py           # 服务端处理（上传续传 / 扣费 / 隔离 / 到期删除）
+./.venv/bin/python cloud/tests/e2e_m5b_identity.py  # 一套登录进两个服务
 ```
 
-模块边界与约定：
+### 媒体控制面的环境变量（M5b）
+
+| 变量 | 说明 |
+| --- | --- |
+| `DRAMA_CLOUD_DSN` | 媒体控制面自己的 PostgreSQL 连接串（不是 commerce 那个库） |
+| `DRAMA_CLOUD_COMMERCE_URL` | commerce 的地址，例如 `http://127.0.0.1:8100`。**不配时任何需要登录的请求返回 503**，不会退回不鉴权 |
+| `DRAMA_CLOUD_INTERNAL_SECRET` | 与 commerce 的 `DRAMA_COMMERCE_INTERNAL_SECRET` **必须相同**，用于调用内部接口 |
+| `DRAMA_CLOUD_ASSET_RETENTION_DAYS` | 素材保留天数，默认 30；0 表示不自动清理 |
+| `DRAMA_CLOUD_UPLOAD_RETENTION_DAYS` | 放弃的分片上传保留天数，默认 7 |
+| `DRAMA_CLOUD_ARTIFACT_RETENTION_DAYS` | 产物保留天数，默认 0（不清理） |
+| `DRAMA_CLOUD_REQUIRE_TLS` | 置 1 时拒绝以明文启动；取值写错（如 `ture`）会直接报错，不静默当成「没要求」 |
+
+### 常用命令（M5b 新增）
+
+```bash
+drama-cloud initdb --admin you@example.com    # 把某个邮箱加入管理员白名单（不再是「创建用户并打印令牌」）
+drama-cloud serve --tls-cert cert.pem --tls-key key.pem   # HTTPS；只给一个会启动失败
+drama-cloud cleanup    # 过期产物 + 过期素材（真删文件、留元数据）+ 放弃的分片上传 + 回收过期租约
+```
+
+### 模块边界与约定
 
 - `plan.py` 只做「配方 → 可执行计划」，不碰磁盘；
 - `modules/*` 只往 `ctx.plan` 里追加内容，**只有 `media.encode` 物化文件**；
 - 状态迁移只能经 `tasks/state.py` 的 `transition()`，API 层不直接写 `tasks.state`；
 - 配方模块名是白名单字面量，参数模型 `extra="forbid"`，不存在「配方里塞命令」的路径；
-- 新增模块必须同时给出：注册项（`requires`/`produces`/`capability`）、参数模型与单元测试。
+- 新增模块必须同时给出：注册项（`requires`/`produces`/`capability`）、参数模型与单元测试；
+- **表结构只能改迁移文件**（`cloud/src/drama_cloud/migrations/*.sql`），不要改已应用的迁移：
+  已应用的记在 `schema_migrations` 里，改了不会重跑。加字段就新建一个编号更大的文件；
+- **按用户隔离只有一处入口**：取任务 / 产物 / 复核记录前必须过 `ensure_task_access` 一类函数，
+  不要在每个查询里各写一遍 JOIN——漏一处就是一条数据泄露（`tests/test_isolation.py` 有越权矩阵）。
 
 文档索引：`cloud/docs/ARCHITECTURE.md`、`RECIPE_SCHEMA.md`、`PROCESSING_PIPELINE.md`、
-`API_SPEC.md`、`DATABASE_SCHEMA.md`、`PACKAGING_GUIDE.md`、`TEST_PLAN.md`。
+`API_SPEC.md`、`DATABASE_SCHEMA.md`、`COMMERCE.md`、`PACKAGING_GUIDE.md`、`TEST_PLAN.md`。

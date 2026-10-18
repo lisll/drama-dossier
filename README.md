@@ -60,6 +60,7 @@ DramaDossier 是一个本地优先的桌面应用，用于把散落在磁盘上�
 - **合规边界明确**：不伪造签名、印章、时间戳或权属证明。
 - **处理版本（需要联网）**：按服务端签发的配方，给一部剧生成一套通用处理版本（片头片尾、字幕、调色、水印、AI 标识），带 SSIM / PSNR 画质检测和可暂停、可终止、可续跑的任务队列。
 - **积分与充值（需要联网）**：生成报审包与处理版本按集扣积分（一个视频 5 积分）。积分是**只增不改的流水账本**，余额由流水求和算出来，没有可被算错的第二份数据；报审包三段式扣费（预扣 → 生成 → 结算，失败自动退还），处理版本在消费配方时一次扣定（失败不退，因为视频只在本机处理、服务端看不到结果）。充值走**本地模拟支付**，没有商户号也能把「下单 → 支付 → 回调 → 入账」整条链路跑通；另带邀请码与双方奖励（被邀请人首次付费后才发）。
+- **服务端处理（需要联网，M5b）**：把一集视频**分片上传**到媒体控制面（默认 8 MiB 一块，最多 10000 块），由服务端排队跑完，产物在服务端、再下载回来。上传前先算整文件 SHA-256，服务端拼好后核对，对不上不登记成素材；断了重来时只补缺的块（断点续传）。扣费走同一本积分账：建任务前**预扣**、成功才结算、失败或被取消时**退还预扣**。任务与产物**按用户隔离**——别人的 id 即使被猜到也一律当作不存在。
 - **转码建议**：对照目标规格逐集判断是否需要转码、为什么，并生成可审阅的 `ffmpeg` 批处理脚本（只建议，不自动执行）。
 - **报审包差异对比**：读两份 `manifest.json`，列出改稿前后的新增 / 移除 / 修改文件。
 - **平台材料要求（示例档案）**：内置少量投放形态档案，逐集对照时长、画幅、码率、编码与必需材料。
@@ -198,12 +199,17 @@ DramaDossier 是一个本地优先的桌面应用，用于把散落在磁盘上�
 │       └── fetch_models.sh      # 模型获取（权重不入库）
 ├── cloud/                       # 云端制作系统（学习原型，Python）
 │   ├── src/drama_cloud/         # API / CLI / Worker / 配方 / 处理模块
-│   │   └── commerce/            # 账号、授权与积分服务：credits / payments / invites 等
+│   │   ├── migrations/          # 媒体控制面的表结构（编号 SQL，M5b 起用 PostgreSQL）
+│   │   ├── commerce/            # 账号、授权与积分服务：credits / payments / invites / internal_routes 等
+│   │   ├── identity.py          # 拿访问令牌向 commerce 内省「这是谁」
+│   │   ├── credit_client.py     # 向 commerce 预扣 / 结算 / 退还积分
+│   │   ├── uploads.py           # 分片上传与断点续传
+│   │   └── tls.py               # 启动时的传输安全校验
 │   ├── recipes/                 # 内置配方（7 份，含 drama-logo-erase 擦除配方）
 │   ├── docs/                    # 架构、配方、管线、API、数据库、打包、测试、擦除确认流
 │   │   ├── COMMERCE.md          # 账号与授权服务的接口、配置、积分与支付
 │   │   └── INPAINT_REVIEW_FLOW.md  # 确认流：自动校验 + 分支A 重试 + 分支B 人工复核
-│   └── tests/                   # 215 个测试
+│   └── tests/                   # pytest，以及两个端到端脚本（e2e_m5a / e2e_m5b）
 ├── docs/
 │   ├── BUILD.md                 # 构建与发布说明
 │   ├── DEVELOPMENT.md           # 开发规范与模块边界
@@ -399,9 +405,11 @@ PDF 盖**占位章**（灰色虚线框 +「样章 · 未签署 · 无法律效�
 | `version_plan` / `version_start` | 预览处理计划（不联网、不扣次数）/ 申请并消费配方后入队 |
 | `job_list` / `job_pause` / `job_resume` / `job_terminate` | 任务的列出、暂停、继续、终止 |
 | `credits_overview` / `recharge_tiers` / `create_recharge_order` / `reconcile_recharge` / `invite_status` | 积分余额与流水、充值档位、下单、「我已完成支付」时主动查单、我的邀请码与奖励战绩 |
+| `server_upload_start` / `server_upload_status` / `server_upload_chunks` / `server_upload_complete` / `server_upload_abort` | 服务端处理：开上传会话（先算整文件 SHA-256）、查已收分片（断点续传前用）、传完缺的块、完成、放弃 |
+| `server_submit_task` / `server_task` / `server_cancel_task` / `server_artifact` | 服务端处理：提交（服务端预扣积分）、查状态、取消（退还预扣）、取产物的短时下载链接 |
 
 Rust command 使用 snake_case，JavaScript 调用时使用 camelCase 参数。命令层返回中文可读错误，前端只做展示和用户输入适配。
-任务状态变化推 `job-progress` 事件，算任务哈希时推 `task-progress` 事件。
+任务状态变化推 `job-progress` 事件，算任务哈希时推 `task-progress` 事件，上传每传完一块推 `server-upload-progress` 事件。
 
 ### `jobs` — 持久化任务队列
 
@@ -462,6 +470,28 @@ Rust command 使用 snake_case，JavaScript 调用时使用 camelCase 参数。�
   订单锁 + 账本幂等键两层去重、金额必须与订单一致、回调必须已验签，拒绝时用独立事务写审计。
 - `invites.py` — 邀请码与防刷。邀请码由账号 ID 派生；四道闸（一个账号只能被邀请一次、同一台电脑最多给一个
   账号当邀请来源、被邀请人首次付费后才发奖励、每个邀请人有奖励次数上限），发奖走账本幂等键，重复触发只发一次。
+- `internal_routes.py` — **内部接口**（只给同机房的其他服务用）：`/internal/introspect` 把访问令牌换成「这是谁」，
+  `/internal/credits/*` 供媒体控制面预扣 / 结算 / 退还积分。用共享密钥 `X-Internal-Secret` 认证；
+  **密钥留空时这些路由一律 404**，不是「不鉴权就放行」。
+
+### 媒体控制面（`drama_cloud`，M5b 起用 PostgreSQL）
+
+跑视频任务的那个服务，与 commerce **分库部署**（账号与钱在一处、任务与产物在另一处）。
+硬合会把 commerce 已有的迁移与测试全部牵动，收益为零，所以两套表结构各自独立。
+M5b 新增的模块：
+
+- `db.py` — psycopg 3 数据层。表结构在 `migrations/*.sql`（编号 SQL，按文件名顺序执行，
+  已应用的记进 `schema_migrations`，重复执行无副作用）。
+- `identity.py` — 把访问令牌交给 commerce 内省。**三种结果分开处理**：令牌有效 / 无效（401）/
+  问不到 commerce（503）。把「问不到」当成任一种都是错的——当成无效会让人以为要重新登录，
+  当成有效等于没鉴权。
+- `auth.py` — 身份来自 commerce（邮箱），本库只按 `media_admins` / `media_viewers` 白名单定角色
+  （默认 operator）。刻意不看 commerce 的任何角色字段，避免那边普通用户在这边成了管理员。
+- `uploads.py` — 分片上传与断点续传。分片落在 `home/uploads/<upload_id>/`，完成时按序拼接并校验整文件
+  sha256；不符就删分片、会话标 `aborted`，绝不产出「对不上的可用素材」。
+- `credit_client.py` — 调 commerce 的计费内部接口。结算 / 退还失败时**不抛异常而是返回结果**：
+  此时视频可能已经做好了，把「账没对上」变成「视频失败」会误导用户；两种情况都要能查，所以走审计。
+- `tls.py` — 启动时的传输安全校验。只给证书或只给私钥一律启动失败（「以为开了 TLS 其实没开」最危险）。
 
 ### `src` — WebView UI
 

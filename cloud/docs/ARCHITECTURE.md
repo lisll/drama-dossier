@@ -13,13 +13,16 @@
 │   Web 客户端（src/drama_cloud/web/index.html）                            │
 │     · 令牌登录 · 直传素材 · 选配方建任务 · 轮询状态 · 取产物下载            │
 │   CLI（drama-cloud ...）                                                  │
-│     · initdb / seed / submit --wait / task / status / demo                │
+│     · initdb / seed / submit --wait / task / status / cleanup / demo       │
 └───────────────────────────────┬──────────────────────────────────────────┘
-                                │ HTTPS + Bearer 令牌
+                                │ HTTPS（可开） + Bearer 令牌
 ┌───────────────────────────────▼──────────────────────────────────────────┐
 │ 控制面 API（api.py，FastAPI）                                             │
-│   认证与角色（viewer < operator < admin）· 主体级限流 · 幂等键             │
-│   上传会话（短时签名令牌）· 配方发布/解析 · 任务创建/查询/取消/重试         │
+│   identity.py  拿访问令牌向 commerce 的 /internal/introspect 换出用户身份  │
+│   认证与角色（viewer < operator < admin，角色只由本地白名单决定）            │
+│   主体级限流 · 幂等键 · 分片上传（uploads.py）                             │
+│   配方发布/解析 · 任务创建/查询/取消/重试                                  │
+│   credit_client.py  建任务前向 commerce 预扣，终态时结算或退还             │
 │   —— 只做校验与状态迁移，不跑任何媒体处理                                   │
 └───────────────────────────────┬──────────────────────────────────────────┘
                                 │ 同一进程内调用 service 层
@@ -52,21 +55,25 @@
 
 | 进程 | 启动方式 | 职责 |
 | --- | --- | --- |
-| API 服务 | `drama-cloud serve` | HTTP 控制面 + Web 客户端静态页 |
+| API 服务 | `drama-cloud serve`（可加 `--tls-cert` / `--tls-key`） | HTTP(S) 控制面 + Web 客户端静态页 |
 | Worker | `drama-cloud run-worker` | 抢任务、跑 ffmpeg、登记产物；可起多个，队列保证不重复 |
-| 调度回收 | `drama-cloud cleanup`（可 cron） | 回收过期租约、清理过期产物 |
+| 调度回收 | `drama-cloud cleanup`（可 cron） | 回收过期租约、清理过期产物 / 过期素材 / 放弃的分片上传 |
 | CLI | `drama-cloud <cmd>` | 运维与演示；与 API 共用同一套 service 层 |
 
 API 与 Worker **通过数据库解耦**：Worker 不反向调用 API，API 也不需要知道有多少个 Worker。
 因此 Worker 可以单独重启、扩缩容，客户端升级不会影响媒体处理环境（对应设计文档 §8.2 的要求）。
 
-`cloud/var/` 是运行目录，全部可删（删掉即回到出厂状态）：
+这四个进程之外还有一个**独立的账号服务**（`drama_cloud.commerce`），它自己的部署与数据库见
+`COMMERCE.md`；媒体控制面只在登录内省与扣费两处调用它，分工与代价见 §10。
+
+`cloud/var/` 是运行目录，全部可删（删掉即回到出厂状态）。M5b 起数据库搬到 PostgreSQL，
+由 `DRAMA_CLOUD_DSN` 指向，不再落在 `cloud/var/` 里：
 
 ```text
 cloud/var/
-├── drama_cloud.sqlite3    # 数据库（WAL 模式）
 ├── secret.key             # 签名密钥（0600，首次运行自动生成）
 ├── storage/               # 对象存储根：assets/ 与 artifacts/
+├── uploads/               # 分片上传的临时目录，按 upload_id 分目录（完成或放弃后删掉）
 ├── work/                  # Worker 执行期临时目录，按 task_id 分目录
 └── exports/               # CLI 导出用
 ```
@@ -91,7 +98,12 @@ config ── errors ── db ── storage
 | --- | --- | --- |
 | `config.py` | 路径布局、心跳/租约/超时/并发/保留期 | 不做业务判断 |
 | `errors.py` | 错误分类（决定是否重试）、退避公式 | 不决定任务最终状态 |
-| `db.py` | DDL、连接、事务、审计、旧库补列 | 不做业务校验 |
+| `db.py` | PostgreSQL 连接、编号 SQL 迁移与 `schema_migrations` 记账、事务、审计 | 不做业务校验 |
+| `migrations/*.sql` | 媒体控制面的表结构（编号迁移，见 `DATABASE_SCHEMA.md`） | 不含业务逻辑 |
+| `identity.py` | 拿访问令牌向 commerce 内省换身份；区分「无效」与「问不到」 | 不判断角色，不建用户 |
+| `credit_client.py` | 调 commerce 的内部积分接口做预扣 / 结算 / 退还 | 不记账、不判断该不该收费 |
+| `uploads.py` | 分片上传会话、写分片、缺块查询、拼接与整文件校验、放弃 | 不建任务、不扣费 |
+| `tls.py` | 启动时算 TLS 配置，半开 / 文件不可读 / 要求 TLS 却没给参数一律失败 | 不碰 uvicorn 之外的运行时 |
 | `storage.py` | 对象读写、短时签名令牌 | 不判断素材是否可用 |
 | `recipes/registry.py` | 模块白名单与参数模型 | 不执行任何模块 |
 | `recipes/schema.py` | 配方结构 / 白名单 / 参数 / 依赖闭包 / 策略校验 | 不碰磁盘 |
@@ -99,7 +111,7 @@ config ── errors ── db ── storage
 | `modules/*` | 各能力的具体实现 | 只有 `media.encode` 物化文件 |
 | `tasks/state.py` | 状态机与迁移校验 | 不写业务字段 |
 | `tasks/queue.py` | 抢占、租约、心跳、退避、失联回收 | 不执行任务 |
-| `tasks/service.py` | 配方版本、任务、产物、审计的业务规则 | 不跑 ffmpeg |
+| `tasks/service.py` | 配方版本、任务、产物、审计的业务规则；归属隔离；保留期清理 | 不跑 ffmpeg |
 | `tasks/runner.py` | 执行、检查点、质量类重试与复核入队 | 不改变业务规则 |
 | `tasks/review.py` | 人工复核队列（认领/裁决/修正重跑） | 不跑 ffmpeg |
 | `api.py` | HTTP 边界：认证、授权、限流、错误码映射 | 不实现业务规则 |
@@ -190,7 +202,7 @@ config ── errors ── db ── storage
 | 队列用数据库而不是 Redis | 本机无 Redis；文档本身也要求「关键任务状态仍以数据库为准」，避免两套真相 |
 | 检查点只做阶段级 | 文档明确「不尝试恢复任意 FFmpeg 进程的内部状态」；只有产出文件的阶段才允许复用 |
 | 取消是协作式的 | 在阶段边界检查 `cancel_requested`，不用信号打断 ffmpeg，避免留下半个文件 |
-| 长任务进度流两端都要接 | 只有生产端（工具写 JSONL）或只有消费端（界面读）都不算能力：`run_streaming` 按字节偏移增量读并丢弃半行，回调线程自建 SQLite 连接写进度 |
+| 长任务进度流两端都要接 | 只有生产端（工具写 JSONL）或只有消费端（界面读）都不算能力：`run_streaming` 按字节偏移增量读并丢弃半行，回调线程自建数据库连接写进度 |
 | 产物一致性规则只写一份 | 擦除产出 `<输出>.stamp.json`，由 Rust 侧 `dossier-artifacts check` 汇总判定；云端 `artifacts check` 只搬运戳记并**透传退出码**，不重写第二套规则 |
 
 ## 6. C1–C12 覆盖情况
@@ -215,9 +227,12 @@ config ── errors ── db ── storage
 
 | 设计文档建议 | 本实现 | 原因与影响 |
 | --- | --- | --- |
-| PostgreSQL | SQLite（WAL + `BEGIN IMMEDIATE`） | 本机无 PG 服务。差异被限制在 `db.py`：只用 TEXT/INTEGER/REAL，JSON 存 TEXT。迁移点：`AUTOINCREMENT`→`GENERATED AS IDENTITY`、`?`→`%s` |
-| Celery + Redis | SQLite 持久化队列 + 租约/心跳 | 本机无 Redis。抢占语义用事务实现：`UPDATE ... WHERE state IN (...) AND id = ?` 的 rowcount 决定谁抢到 |
+| PostgreSQL | 已迁到 PostgreSQL（psycopg 3 + 编号 SQL 迁移） | M5b 起要支持多人、按用户隔离与可靠的并发事务，SQLite 的 `BEGIN IMMEDIATE` 不够用。差异仍集中在 `db.py`：JSON 与时间继续以 TEXT 存，换 `jsonb`/`timestamptz` 不需要改调用点 |
+| Celery + Redis | 数据库持久化队列 + 租约/心跳 | 本机无 Redis。抢占语义用事务实现：`UPDATE ... WHERE state IN (...) AND id = %s` 的 rowcount 决定谁抢到 |
 | S3 兼容对象存储 | 本地文件系统，保留同一套接口语义 | 本机无对象存储。`storage.py` 是唯一替换点；上传会话与下载授权已经是短时签名令牌 |
+| 一次性上传整个文件 | 分片上传 + 断点续传（默认 8 MiB 一块，最多 10000 块） | 一部剧的素材动辄几个 GB，一次性 PUT 断了就得从头再来。分片落在 `home/uploads/<upload_id>/`，完成时按序拼接并校验整文件 sha256 |
+| 只走 HTTPS | `serve` 默认明文，给 `--tls-cert` / `--tls-key` 就能直接起 HTTPS | 本机开发用自签证书，所以两个开关都不能省。配错（只给一个、文件读不到、要求 TLS 却没给）在**启动时**就失败，不悄悄退回明文 |
+| 账号自己做在控制面里 | 媒体控制面不存账号，用桌面端的 commerce 访问令牌向 `/internal/introspect` 换身份 | 只有一处登录，两边 `user_id` 天然一致；角色仍由本库的 `media_admins` / `media_viewers` 白名单决定，不看 commerce 的角色字段 |
 | Tauri / Electron 桌面客户端 | API 自带的 Web 客户端 | 本机 glib2 版本低于 Tauri 2 要求，装不了。见 `PACKAGING_GUIDE.md` |
 | Prometheus / Grafana 监控（可选） | `GET /api/v1/system/status` + `audit_events` 表 + `drama-cloud status` | 学习原型不引入监控栈；指标口径已在状态端点里固定下来 |
 | 阶段 3–5 的完整交付 | 阶段 1/2 完成，阶段 3/4 的功能模块已实现并可组合执行 | 见 §8 |
@@ -236,9 +251,13 @@ config ── errors ── db ── storage
 
 1. **无 GPU**：光流插帧没有对应模块；`video.inpaint` 的 `inpainter=worker` / `detector=worker`
    只完成了接线，本机没有 onnxruntime 与模型权重，模型路径无法端到端验证（`column` 基线可跑通）。
-2. **单机存储**：`storage.py` 用本地磁盘，没有分片上传、没有副本，也没有多机共享。
-3. **无 TLS**：`serve` 默认监听 `127.0.0.1` 的明文 HTTP。对外暴露必须放到反向代理后面并启用 TLS（设计文档 §10 的硬要求）。
-4. **限流是单进程内存**：多实例部署要换成集中式计数器。
+2. **存储仍是单机本地磁盘**：`storage.py` 用本地文件系统，没有副本，也没有多机共享。
+   分片上传与断点续传已有（`uploads.py`），但分片同样落在这台机器的 `home/uploads/` 下，
+   换机器就续不上。
+3. **TLS 要显式开启**：`serve` 默认监听 `127.0.0.1` 的明文 HTTP。给了 `--tls-cert` / `--tls-key`
+   就直接起 HTTPS，但证书本身不在这里签发、也不做 ACME 续期；部署方要求必须 TLS 时用
+   `DRAMA_CLOUD_REQUIRE_TLS=1`，此时不给证书会拒绝启动。对外暴露仍建议放到反向代理后面。
+4. **限流是单进程内存**：多实例部署要换成集中式计数器（commerce 那边的限流在数据库里，两侧口径不同）。
 5. **ASR 已接线但本机跑不通**：`subtitle.asr`（Whisper → SRT）已实现并有假工具测试，
    但本机没有 whisper 与模型权重，能力标签会如实缺席——C11 的转写目前仍可由参数直接提供。
    同理，`audio.separate`（demucs）、`subtitle.ocr`（tesseract）、`audio.timestretch` 的
@@ -247,3 +266,42 @@ config ── errors ── db ── storage
 6. **时间线不含音频**：`_segment_args` 对每个片段同时做 `[i:a]`，所以多片段剪辑要求素材带音轨。
 7. **桌面壳未接新能力**：`src-tauri` 因 glib 版本编译不过，本轮新增的模块与命令
    （`video.render` / `subtitle.asr` / … 与 `artifacts check`）只在 CLI 与 API 可用。
+8. **服务端处理依赖另外两样东西**：没有 PostgreSQL（`DRAMA_CLOUD_DSN`）起不来，
+   没有 `DRAMA_CLOUD_COMMERCE_URL` 与 `DRAMA_CLOUD_INTERNAL_SECRET` 时任何需要登录的请求都返回 503
+   ——不会退回「不鉴权」。commerce 挂掉时媒体控制面也跟着不可用（见 §10）。
+
+## 10. 两个服务的分工
+
+M5b 起这一带有**两个服务、两套库**，它们各自负责不同的事：
+
+| | commerce（`drama_cloud.commerce`） | 媒体控制面（`drama_cloud`） |
+| --- | --- | --- |
+| 管什么 | 账号（注册/登录/令牌）、卡密与使用权、积分账本、支付与邀请 | 任务、素材、产物、人工复核队列 |
+| 库 | commerce 自己的 PostgreSQL schema（`commerce/migrations/`） | 另一套 PostgreSQL schema（`migrations/`） |
+| 谁调谁 | 被调用方：只提供 `/internal/*` 给同机房服务用 | 调用方：靠 `identity.py` 内省令牌、靠 `credit_client.py` 扣费 |
+| 起不来的后果 | 登录、充值、兑换全部不可用 | 需要登录的请求一律 503，不会退化成「不鉴权」 |
+
+**为什么分成两个服务**：处理任务再重也不该拖慢登录，两者的部署方式、生命周期和备份策略本来就不一样；
+而且合成一套会牵动 commerce 那一整套迁移与测试，风险大于收益（`db.py` 的模块注释）。
+
+**为什么分成两套库**（而不是同一套 PostgreSQL 里的不同 schema 之外再合表）：两边的 `users` 不是同一种东西。
+commerce 的 `users.id` 是 `uuid`，媒体控制面的 `users.id` 是 TEXT（应用层生成的字符串 id），
+硬塞进一张表会直接撞在类型上——`cloud/tests/e2e_m5b.py` 里那条注释就是为了钉住这件事。
+媒体控制面保留的 `users` 表现在只是 commerce 身份的**镜像**：`id` 用 commerce 的 `user_id`，
+`name` 用邮箱，`token_hash` 填 `commerce:<user_id>` 这个永远不会被真实令牌命中的占位值（`auth.py`）。
+
+**代价**，都是明确的：
+
+1. **扣费不能进本地事务**。`hold` 要发 HTTP 到 commerce，那是另一个进程、另一个数据库，
+   所以预扣只能放在**建任务之前**；代价是「扣到了但建任务失败」必须退还，
+   `POST /api/v1/tasks` 用 `except BaseException` 兜住这一步（进程被取消时也不能把钱留下）。
+   没扣到钱就不该占队列资源，这是把预扣前置的理由。
+2. **钱还是同一本账**。服务端处理扣的是 commerce 的 `credit_ledger`，与报审包、本机处理版本共用一个余额；
+   媒体库自己的 `billing_*` 表保留为「可独立运行的账本」（CLI 与既有测试在用），
+   两条路互斥：任务上有 `credit_ref` 走 commerce，有 `billing_quote_id` 走本地，两者都空就不扣费。
+3. **结算 / 退还失败只能留痕**。任务已经跑完时 commerce 可能连不上，这时**不把任务判成失败**
+   （视频确实做出来了），而是把失败显式返回并写进审计（`credit.settle` / `credit.release`），
+   由人工对账。静默吞掉会让钱悄悄消失。
+4. **多一个必须配的环境变量**。`DRAMA_CLOUD_COMMERCE_URL` 与 `DRAMA_CLOUD_INTERNAL_SECRET` 两个都配了才算接上；
+   少一个时内省与扣费都按「服务不可用」处理（503），而不是放行。
+5. **两个服务都要备份**。账在 commerce，产物与素材在这里，只备份一边都还原不出完整状态。
