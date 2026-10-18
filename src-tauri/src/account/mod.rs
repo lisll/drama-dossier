@@ -15,6 +15,7 @@ use tauri::{AppHandle, Emitter, Manager};
 pub mod api;
 pub mod commands;
 pub mod gate;
+pub mod server_jobs;
 pub mod session;
 pub mod store;
 

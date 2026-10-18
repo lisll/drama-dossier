@@ -144,6 +144,7 @@
           <button class="nav-item" data-module="library">剧目库</button>
           <button class="nav-item" data-module="generate">生成报审包</button>
           <button class="nav-item" data-module="version">处理版本</button>
+          <button class="nav-item" data-module="server">服务端处理</button>
           <button class="nav-item" data-module="mount">挂载</button>
           <button class="nav-item" data-module="transcode">转码</button>
           <button class="nav-item" data-module="toolbox">工具箱</button>
@@ -541,6 +542,59 @@
                 </section>
               </div>
             </div>
+          </section>
+
+          <!-- ============ 服务端处理（M5b-8）：上传 → 提交 → 跟踪 → 下载 ============ -->
+          <section id="module-server" class="module hidden">
+            <div id="server-context" class="drama-context empty">尚未选择剧目——请先到「剧目库」扫描并点选一部剧。</div>
+
+            <section class="panel">
+              <section class="panel-header">
+                <h3>1. 上传素材</h3>
+                <span id="server-upload-badge" class="badge">未开始</span>
+              </section>
+              <p class="hint">
+                视频要传到服务端处理。按块上传，网络断了可以从断点继续，不用从头再传。
+                上传前会先算整个文件的校验值，服务端拼好后会核对，对不上不会当成可用素材。
+              </p>
+              <div id="server-upload-panel" class="result hidden" aria-live="polite"></div>
+              <div class="option-row">
+                <button id="server-upload-start" class="primary" type="button">开始上传</button>
+                <button id="server-upload-abort" class="ghost" type="button" disabled>放弃上传</button>
+              </div>
+              <p id="server-upload-error" class="field-error hidden" role="alert"></p>
+            </section>
+
+            <section class="panel">
+              <section class="panel-header">
+                <h3>2. 提交处理</h3>
+              </section>
+              <p class="hint">
+                服务端整部剧跑完后，产物在服务端，可以下载回来。提交时会先扣这一单的积分；
+                任务失败或被取消，预扣的积分会退回来。积分不够会被拦下，请先到「积分与充值」充值。
+              </p>
+              <label>处理方式
+                <select id="server-recipe">
+                  <option value="drama.no_edit.generic">通用处理（不改内容）</option>
+                  <option value="drama.logo.erase">角标擦除</option>
+                </select>
+              </label>
+              <div class="option-row">
+                <button id="server-submit" class="primary" type="button" disabled>提交到服务端处理</button>
+              </div>
+              <p id="server-submit-error" class="field-error hidden" role="alert"></p>
+            </section>
+
+            <section class="panel">
+              <section class="panel-header">
+                <h3>3. 任务与产物</h3>
+                <div class="actions">
+                  <button id="server-refresh" class="ghost" type="button">刷新</button>
+                </div>
+              </section>
+              <div id="server-task" class="result hidden" aria-live="polite"></div>
+              <div id="server-artifacts" class="result hidden"></div>
+            </section>
           </section>
 
           <!-- ============ 任务（M4b-1）：处理版本的队列 ============ -->

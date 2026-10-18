@@ -211,13 +211,19 @@ pub struct RecipeResponse {
 
 // ---------- 传输层 ----------
 
-/// 一次请求：方法、路径（不含 `/api/v1`）、可选的访问令牌和 JSON 请求体。
+/// 一次请求：方法、路径（不含 `/api/v1`）、可选的访问令牌和请求体。
+///
+/// 请求体有两种：JSON（绝大多数接口）与**原始字节**（M5b 的分片上传）。
+/// 两者互斥；都用同一个字段，是为了不让 `Transport` trait 长出一个平行的方法，
+/// 那样每个测试里的假实现都得跟着改。
 #[derive(Debug, Clone)]
 pub struct Request {
     pub method: Method,
     pub path: String,
     pub bearer: Option<String>,
     pub body: Option<Value>,
+    /// 原始字节体（分片上传）。为 `Some` 时忽略 `body`。
+    pub raw: Option<Vec<u8>>,
 }
 
 impl Request {
@@ -227,11 +233,18 @@ impl Request {
             path: path.into(),
             bearer: None,
             body: None,
+            raw: None,
         }
     }
 
     pub fn json(mut self, body: Value) -> Self {
         self.body = Some(body);
+        self
+    }
+
+    /// 原始字节体。用于分片上传：分片是视频的一部分，不能当 JSON 传。
+    pub fn bytes(mut self, payload: Vec<u8>) -> Self {
+        self.raw = Some(payload);
         self
     }
 
@@ -317,7 +330,13 @@ impl Transport for HttpTransport {
         if let Some(token) = &request.bearer {
             builder = builder.bearer_auth(token);
         }
-        if let Some(body) = &request.body {
+        if let Some(raw) = &request.raw {
+            // 分片上传：整个分片一次放进内存。8 MiB 的分片对内存没压力，
+            // 而流式上传需要额外的读文件句柄生命周期管理，这里不值得（YAGNI）。
+            builder = builder
+                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                .body(raw.clone());
+        } else if let Some(body) = &request.body {
             builder = builder.json(body);
         }
         // without_url：错误信息里不带地址，免得以后地址里出现敏感参数被打进日志。

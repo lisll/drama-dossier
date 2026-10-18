@@ -812,6 +812,7 @@ function switchModule(name) {
   if (name === "mount") refreshMountContext();
   if (name === "home") loadHome();
   if (name === "version") enterVersionModule();
+  if (name === "server") enterServerModule();
   if (name === "jobs") loadJobs();
 }
 
@@ -827,6 +828,7 @@ function refreshModuleLock() {
 const CONTEXT_SELECTORS = [
   "#generate-context",
   "#version-context",
+  "#server-context",
   "#toolbox-context",
   "#transcode-context",
   "#mount-context",
@@ -2890,6 +2892,315 @@ async function loadInvites() {
   }
 }
 
+// ---- 服务端处理（M5b-8） ----
+//
+// 这条链路是：传素材 → 提交任务 → 轮询状态 → 下载产物。
+// 视频不经过本地 ffmpeg，全部在服务端跑；本机只负责传上去和取回来。
+//
+// 与本机处理的区别：本机处理视频不出这台电脑、断网也能跑；
+// 服务端处理要联网、要花积分，但不用等本机 CPU。
+
+/** 上传进度事件：Rust 侧每传完一块发一次。 */
+function handleServerUploadProgress(progress) {
+  if (!serverState.upload || serverState.upload.uploadId !== progress.uploadId) return;
+  serverState.upload.progress = progress;
+  renderServerUpload();
+}
+
+const serverState = {
+  // 当前这副素材的上传会话（upload_id + 块大小 + 已确认的素材 id）
+  upload: null,
+  // 正在跟踪的任务
+  task: null,
+  // 轮询定时器
+  timer: null,
+  busy: false,
+};
+
+/** 切进「服务端处理」时调用：复位界面到当前剧目对应的状态。 */
+function enterServerModule() {
+  renderServerContext();
+  renderServerUpload();
+  renderServerTask();
+}
+
+function renderServerContext() {
+  const selected = state.selected == null ? null : state.dramas[state.selected];
+  const node = $("#server-context");
+  if (!selected) {
+    node.textContent = "尚未选择剧目——请先到「剧目库」扫描并点选一部剧。";
+    node.classList.add("empty");
+    $("#server-upload-start").disabled = true;
+    $("#server-submit").disabled = true;
+    return;
+  }
+  const episodes = selected.episodes || [];
+  node.classList.remove("empty");
+  node.textContent =
+    `${selected.name || "未命名"} · ${episodes.length} 集 · 合计 ${formatBytes(
+      episodes.reduce((sum, item) => sum + (Number(item.sizeBytes) || 0), 0),
+    )}`;
+  // 传好了才能提交；上传中不能重复点。
+  $("#server-upload-start").disabled = serverState.busy || Boolean(serverState.upload?.assetId);
+  $("#server-submit").disabled = !serverState.upload?.assetId || serverState.busy;
+}
+
+function renderServerUpload() {
+  const badge = $("#server-upload-badge");
+  const panel = $("#server-upload-panel");
+  const upload = serverState.upload;
+  if (!upload) {
+    badge.textContent = "未开始";
+    badge.className = "badge";
+    panel.classList.add("hidden");
+    $("#server-upload-abort").disabled = true;
+    return;
+  }
+  panel.classList.remove("hidden");
+  if (upload.assetId) {
+    badge.textContent = "已上传";
+    badge.className = "badge success";
+    panel.innerHTML = `<strong>素材已就绪</strong><br /><span class="hint">素材编号：<code>${esc(
+      upload.assetId,
+    )}</code></span>`;
+    $("#server-upload-abort").disabled = true;
+    return;
+  }
+  badge.textContent = "上传中";
+  badge.className = "badge";
+  const progress = upload.progress || { totalChunks: 0, sentChunks: 0, skippedChunks: 0 };
+  panel.innerHTML = `
+    <strong>${esc(L.uploadText(progress))}</strong>
+    <progress max="100" value="${L.uploadPercent(progress)}"></progress>
+    <span class="hint">${L.uploadPercent(progress)}%</span>
+  `;
+  $("#server-upload-abort").disabled = false;
+}
+
+function renderServerTask() {
+  const node = $("#server-task");
+  const artifacts = $("#server-artifacts");
+  const task = serverState.task;
+  if (!task) {
+    node.classList.add("hidden");
+    artifacts.classList.add("hidden");
+    return;
+  }
+  const state = L.serverStateLabel(task.state);
+  node.classList.remove("hidden");
+  node.innerHTML = `
+    <strong class="badge ${esc(state.tone)}">${esc(state.label)}</strong>
+    <span class="hint">任务 <code>${esc(task.id || "")}</code></span>
+    ${
+      task.error?.message
+        ? `<br /><span class="field-error">${esc(task.error.message)}</span>`
+        : ""
+    }
+    <div class="option-row">
+      <button id="server-task-cancel" class="ghost" type="button">${
+        L.serverTaskActions(task).cancel ? "取消任务" : "已结束"
+      }</button>
+    </div>
+    <span class="hint">${
+      L.serverTaskFinished(task)
+        ? "任务已结束，不再刷新。"
+        : "正在跟踪进度，结束后会自动停止刷新。"
+    }</span>
+  `;
+  const cancel = $("#server-task-cancel");
+  if (cancel) {
+    cancel.disabled = !L.serverTaskActions(task).cancel;
+    cancel.addEventListener("click", cancelServerTask);
+  }
+
+  const outputs = (task.artifacts || []).filter((item) => item.kind === "output");
+  if (L.serverTaskActions(task).download && outputs.length) {
+    artifacts.classList.remove("hidden");
+    artifacts.innerHTML = `
+      <strong>产物 ${outputs.length} 个</strong>
+      <div class="option-row">
+        ${outputs
+          .map(
+            (item, index) =>
+              `<button class="success" type="button" data-artifact="${esc(item.id)}">下载第 ${
+                index + 1
+              } 个（${formatBytes(item.size_bytes)}）</button>`,
+          )
+          .join("")}
+      </div>
+      <span class="hint">下载链接是短时的，过期后点「刷新」重新获取。</span>
+    `;
+    artifacts.querySelectorAll("[data-artifact]").forEach((button) => {
+      button.addEventListener("click", () => downloadServerArtifact(button.dataset.artifact));
+    });
+  } else {
+    artifacts.classList.add("hidden");
+  }
+}
+
+async function startServerUpload() {
+  const selected = state.selected == null ? null : state.dramas[state.selected];
+  if (!selected) return;
+  const episodes = selected.episodes || [];
+  if (!episodes.length) {
+    showFormError("#server-upload-error", "这部剧还没有分集");
+    return;
+  }
+  // 这一版一次只处理一集：服务端按集计价，多集上传要排队，
+  // 先把「传一集 → 处理一集 → 下载」走通，多集等后面再扩。
+  const first = episodes[0];
+  if (!first.path) {
+    showFormError("#server-upload-error", "这一集没有本机路径，无法上传");
+    return;
+  }
+  showFormError("#server-upload-error", null);
+  serverState.busy = true;
+  $("#server-upload-start").disabled = true;
+  try {
+    // 断点续传：已经有**同一集**未完成的上传会话时直接续传，不重新开会话。
+    // 判据抽在 logic.js 的 uploadResumePlan 里（可单测）：误判成「新开」会让用户
+    // 从头再传几个 GB，「断点续传」就成了空话。
+    const plan = L.uploadResumePlan(serverState.upload, first.path);
+    let session = plan.resume
+      ? { upload_id: plan.uploadId, chunk_size: plan.chunkSize, total_chunks: plan.totalChunks }
+      : null;
+    if (!session) {
+      session = await call("server_upload_start", {
+        path: first.path,
+        name: first.fileName || first.name || "第 1 集",
+        filename: first.fileName || first.name || "ep01.mp4",
+      });
+      serverState.upload = {
+        uploadId: session.upload_id,
+        chunkSize: session.chunk_size,
+        totalChunks: session.total_chunks,
+        progress: { totalChunks: session.total_chunks, sentChunks: 0, skippedChunks: 0 },
+        assetId: null,
+        // 记住这一集：换了一集就要重开会话，不能接着传别的文件。
+        sourcePath: first.path,
+      };
+      renderServerUpload();
+    }
+
+    await call("server_upload_chunks", {
+      uploadId: session.upload_id,
+      path: first.path,
+      chunkSize: session.chunk_size,
+    });
+    const done = await call("server_upload_complete", { uploadId: session.upload_id });
+    serverState.upload.assetId = done.asset_id;
+    toast("素材已上传到服务端");
+  } catch (error) {
+    showFormError("#server-upload-error", L.errorText(error));
+  } finally {
+    serverState.busy = false;
+    renderServerContext();
+    renderServerUpload();
+  }
+}
+
+async function abortServerUpload() {
+  const upload = serverState.upload;
+  if (!upload?.uploadId) return;
+  try {
+    await call("server_upload_abort", { uploadId: upload.uploadId });
+    serverState.upload = null;
+    toast("已放弃这次上传，服务端的分片已删除");
+  } catch (error) {
+    showFormError("#server-upload-error", L.errorText(error));
+  } finally {
+    renderServerContext();
+    renderServerUpload();
+  }
+}
+
+async function submitServerTask() {
+  const upload = serverState.upload;
+  if (!upload?.assetId) return;
+  showFormError("#server-submit-error", null);
+  serverState.busy = true;
+  $("#server-submit").disabled = true;
+  try {
+    const task = await call("server_submit_task", {
+      assetIds: [upload.assetId],
+      recipeId: $("#server-recipe").value,
+    });
+    serverState.task = task;
+    renderServerTask();
+    startServerPolling();
+    toast("已提交到服务端处理");
+  } catch (error) {
+    // 积分不足是这里最常见的错误：把服务端给的数字原样显示出来。
+    showFormError("#server-submit-error", L.errorText(error));
+  } finally {
+    serverState.busy = false;
+    renderServerContext();
+  }
+}
+
+function startServerPolling() {
+  stopServerPolling();
+  serverState.timer = setInterval(refreshServerTask, 3000);
+}
+
+function stopServerPolling() {
+  if (serverState.timer) {
+    clearInterval(serverState.timer);
+    serverState.timer = null;
+  }
+}
+
+async function refreshServerTask() {
+  const task = serverState.task;
+  if (!task?.id) return stopServerPolling();
+  try {
+    const fresh = await call("server_task", { taskId: task.id });
+    serverState.task = fresh;
+    renderServerTask();
+    // 结束了就不用再问：省请求，也让界面稳定下来。
+    if (L.serverTaskFinished(fresh)) stopServerPolling();
+  } catch (error) {
+    stopServerPolling();
+    showFormError("#server-submit-error", L.errorText(error));
+  }
+}
+
+async function cancelServerTask() {
+  const task = serverState.task;
+  if (!task?.id) return;
+  try {
+    await call("server_cancel_task", { taskId: task.id });
+    toast("已请求取消；预扣的积分会退回来");
+    await refreshServerTask();
+  } catch (error) {
+    showFormError("#server-submit-error", L.errorText(error));
+  }
+}
+
+async function downloadServerArtifact(artifactId) {
+  try {
+    const info = await call("server_artifact", { artifactId });
+    // 服务端给的是短时链接。这里不自己写下载器（要处理断点、磁盘、进度），
+    // 而是把链接显示出来交给用户点开——和「模拟收银台」同一个做法，
+    // 也让「短时有效」这件事看得见。
+    const node = $("#server-artifacts");
+    node.classList.remove("hidden");
+    // 只把 http/https 渲染成链接：地址由服务端按环境拼，一律按不可信处理。
+    const url = String(info.download_url ?? "");
+    const linkable = /^https?:\/\//i.test(url);
+    node.insertAdjacentHTML(
+      "beforeend",
+      `<div class="result">${
+        linkable
+          ? `<a href="${esc(url)}" target="_blank" rel="noreferrer noopener">点这里下载</a>`
+          : ""
+      }<br /><span class="hint">下载链接（15 分钟内有效）：<code>${esc(url)}</code></span></div>`,
+    );
+  } catch (error) {
+    showFormError("#server-submit-error", L.errorText(error));
+  }
+}
+
 // ---- 卡密兑换 ----
 
 function openRedeemDialog() {
@@ -4593,6 +4904,11 @@ $("#template-reload").addEventListener("click", () => {
 $("#version-plan").addEventListener("click", planVersion);
 $("#version-start").addEventListener("click", startVersion);
 $("#jobs-refresh").addEventListener("click", loadJobs);
+// 服务端处理（M5b-8）
+$("#server-upload-start").addEventListener("click", startServerUpload);
+$("#server-upload-abort").addEventListener("click", abortServerUpload);
+$("#server-submit").addEventListener("click", submitServerTask);
+$("#server-refresh").addEventListener("click", refreshServerTask);
 // 模板表单任一改动：刷新「未保存」、清字段错误、同步联动开关。
 $$("#module-version input, #module-version select").forEach((node) => {
   const onChange = () => {
@@ -4700,6 +5016,7 @@ if (tauriEvent?.listen) {
   tauriEvent.listen("task-progress", (event) => handleTaskProgress(event.payload));
   tauriEvent.listen("erase-progress", (event) => handleEraseProgress(event.payload));
   tauriEvent.listen("job-progress", (event) => handleJobProgress(event.payload));
+  tauriEvent.listen("server-upload-progress", (event) => handleServerUploadProgress(event.payload));
 }
 
 // 启动：先等恢复登录，再决定显示登录页、锁定页还是主界面（浏览器预览无 IPC 时直接进主界面便于布局验证）。

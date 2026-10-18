@@ -32,6 +32,9 @@ tokio = { version = "=1.53.2", features = ["sync", "time", "macros"] }
 chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
 # 解码服务端发回的报审包文件（标准 base64）。
 base64 = "=0.22.1"
+# 服务端处理上传前要算整文件 SHA-256（服务端用它校验拼接结果）。
+# 版本与 dossier-core / dossier-license 保持一致，避免同一依赖出现两个副本。
+sha2 = "0.10"
 
 # 系统钥匙串：Windows 凭据管理器 / macOS 钥匙串。
 # 这两个 feature 漏开的话 keyring 会退回到只存在内存里的假实现且不报错，启动自检会发现它（account/store.rs）。

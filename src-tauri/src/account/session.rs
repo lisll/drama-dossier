@@ -942,6 +942,112 @@ impl<T: Transport, S: CredentialStore> Session<T, S> {
         Ok(())
     }
 
+    // ---------- 服务端处理（M5b-8） ----------
+    //
+    // 这一组方法只负责「跟媒体控制面说话」，不判断业务该不该做：
+    // 什么时候能传、能不能建任务、余额够不够，都由界面与服务端决定。
+    // 之所以放在 session 里，是因为它需要那个已经带好令牌的 `authed`，
+    // 而那套令牌刷新逻辑不该被复制到第二个地方。
+
+    /// 开一个分片上传会话。
+    pub async fn server_upload_start(
+        &self,
+        name: &str,
+        filename: &str,
+        size_bytes: u64,
+        sha256: &str,
+    ) -> Result<Value, ApiError> {
+        self.authed(Request::new(Method::POST, "/assets/uploads").json(json!({
+            "name": name,
+            "role": "video",
+            "filename": filename,
+            "size_bytes": size_bytes,
+            "sha256": sha256,
+        })))
+        .await
+    }
+
+    /// 查一个上传会话已收到哪些分片（断点续传用）。
+    pub async fn server_upload_status(&self, upload_id: &str) -> Result<Value, ApiError> {
+        self.authed(Request::new(
+            Method::GET,
+            format!("/assets/uploads/{upload_id}"),
+        ))
+        .await
+    }
+
+    /// 传一块。
+    pub async fn server_upload_chunk(
+        &self,
+        upload_id: &str,
+        index: u32,
+        payload: Vec<u8>,
+    ) -> Result<Value, ApiError> {
+        self.authed(
+            Request::new(
+                Method::PUT,
+                format!("/assets/uploads/{upload_id}/chunks/{index}"),
+            )
+            .bytes(payload),
+        )
+        .await
+    }
+
+    /// 完成上传（服务端拼接并校验整文件哈希）。
+    pub async fn server_upload_complete(&self, upload_id: &str) -> Result<Value, ApiError> {
+        self.authed(
+            Request::new(
+                Method::POST,
+                format!("/assets/uploads/{upload_id}/complete"),
+            )
+            .json(json!({})),
+        )
+        .await
+    }
+
+    /// 放弃上传（删掉已传的分片）。
+    pub async fn server_upload_abort(&self, upload_id: &str) -> Result<Value, ApiError> {
+        self.authed(Request::new(
+            Method::DELETE,
+            format!("/assets/uploads/{upload_id}"),
+        ))
+        .await
+    }
+
+    /// 建服务端处理任务。扣费在服务端完成（会先预扣积分）。
+    pub async fn server_submit_task(
+        &self,
+        asset_ids: &[String],
+        recipe_id: &str,
+    ) -> Result<Value, ApiError> {
+        self.authed(Request::new(Method::POST, "/tasks").json(json!({
+            "asset_ids": asset_ids,
+            "recipe_id": recipe_id,
+        })))
+        .await
+    }
+
+    /// 查任务状态。
+    pub async fn server_task(&self, task_id: &str) -> Result<Value, ApiError> {
+        self.authed(Request::new(Method::GET, format!("/tasks/{task_id}")))
+            .await
+    }
+
+    /// 取消任务。
+    pub async fn server_cancel_task(&self, task_id: &str) -> Result<Value, ApiError> {
+        self.authed(Request::new(Method::POST, format!("/tasks/{task_id}/cancel")).json(json!({})))
+            .await
+    }
+
+    /// 取产物信息（含短时下载链接）。
+    pub async fn server_artifact(&self, artifact_id: &str) -> Result<Value, ApiError> {
+        self.authed(Request::new(
+            Method::GET,
+            format!("/artifacts/{artifact_id}"),
+        ))
+        .await
+    }
+
     // ---------- 后台刷新 ----------
 
     /// 距离下一次该做事还有多少秒（后台循环用）。最长 5 分钟醒一次，让宽限期到点时界面及时变化。

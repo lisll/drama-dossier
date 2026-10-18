@@ -69,7 +69,16 @@ pub(crate) fn local_error(code: &str, message: impl Into<String>) -> CommandErro
     }
 }
 
-type Reply<T> = Result<T, CommandError>;
+impl CommandError {
+    /// 错误码。**只给测试用**：前端拿的是序列化后的 `error` 字段，
+    /// 生产代码里没有第二个消费者，加 `cfg(test)` 免得变成死代码告警。
+    #[cfg(test)]
+    pub(crate) fn code(&self) -> &str {
+        &self.error
+    }
+}
+
+pub(crate) type Reply<T> = Result<T, CommandError>;
 
 #[tauri::command]
 pub async fn account_status(account: State<'_, AccountState>) -> Reply<StatusPayload> {

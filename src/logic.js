@@ -233,7 +233,9 @@
 
   // 没有使用权时锁住的模块；首页和设置一直能进。
   // 「任务」不锁：授权到期了也得能看到并停下正在跑的编码（后端闸门同样放行 job_list / job_pause / job_terminate）。
-  const LICENSED_MODULES = ["library", "generate", "version", "mount", "transcode", "toolbox"];
+  //: 需要「使用权」的模块。服务端处理要花积分、占服务端算力，
+  //: 和本机处理的付费功能一样，没有使用权就不该进去。
+  const LICENSED_MODULES = ["library", "generate", "version", "server", "mount", "transcode", "toolbox"];
 
   /**
    * 该显示哪一屏：
@@ -625,6 +627,82 @@
     }
   }
 
+  // ---------- 服务端处理（M5b-8） ----------
+
+  /** 服务端任务的九个状态 → 人话。状态值来自服务端 tasks.state（大写）。 */
+  const SERVER_STATES = {
+    PENDING: { label: "已提交", tone: "" },
+    QUEUED: { label: "排队中", tone: "" },
+    RUNNING: { label: "正在处理", tone: "" },
+    VERIFYING: { label: "校验中", tone: "" },
+    SUCCEEDED: { label: "已完成", tone: "success" },
+    RETRY_WAITING: { label: "等待重试", tone: "warn" },
+    CANCEL_REQUESTED: { label: "正在取消", tone: "warn" },
+    CANCELLED: { label: "已取消", tone: "" },
+    FAILED: { label: "失败", tone: "error" },
+  };
+
+  /** 结束状态：不再变化，界面就不用再轮询了。 */
+  const SERVER_TERMINAL = new Set(["SUCCEEDED", "CANCELLED", "FAILED"]);
+
+  function serverStateLabel(state) {
+    return SERVER_STATES[state] ?? { label: String(state ?? "未知"), tone: "" };
+  }
+
+  function serverTaskFinished(task) {
+    return SERVER_TERMINAL.has(task?.state);
+  }
+
+  /** 服务端任务能做的动作。取消只在还没结束时给——结束后取消没意义。 */
+  function serverTaskActions(task) {
+    const state = task?.state;
+    const finished = SERVER_TERMINAL.has(state);
+    return {
+      cancel: Boolean(state) && !finished,
+      // 产物下载只在成功之后有意义。
+      download: state === "SUCCEEDED",
+    };
+  }
+
+  /**
+   * 上传进度百分比（0–100 的整数）。
+   * 分母用服务端给的总块数，不用本地估的：本地算错会显示「传完了其实没传完」。
+   */
+  function uploadPercent(progress) {
+    const total = Number(progress?.totalChunks) || 0;
+    if (total <= 0) return 0;
+    const sent = Math.min(Math.max(Number(progress?.sentChunks) || 0, 0), total);
+    return Math.round((sent / total) * 100);
+  }
+
+  /** 上传进度一句话：「3/8 块（跳过 3 块已传的）」。 */
+  function uploadText(progress) {
+    const total = Number(progress?.totalChunks) || 0;
+    const sent = Number(progress?.sentChunks) || 0;
+    const skipped = Number(progress?.skippedChunks) || 0;
+    const base = `${sent}/${total} 块`;
+    return skipped > 0 ? `${base}（跳过 ${skipped} 块已传的）` : base;
+  }
+
+  /**
+   * 这次点「开始上传」该续传还是新开一个会话？
+   *
+   * 规则很短，但错了代价很大：误判成「新开会话」会让用户从头再传一遍几个 GB，
+   * 而「断点续传」就成了空话。所以判据只有一条：**同一个文件**且有未完成的会话。
+   * 换了文件（另一集）必须新开——接着往旧会话里传别的文件会拼出一个坏文件。
+   */
+  function uploadResumePlan(state, sourcePath) {
+    if (!state?.uploadId) return { resume: false };
+    if (state.assetId) return { resume: false }; // 上一次已经传完了
+    if (!sourcePath || state.sourcePath !== sourcePath) return { resume: false };
+    return {
+      resume: true,
+      uploadId: state.uploadId,
+      chunkSize: state.chunkSize,
+      totalChunks: state.totalChunks,
+    };
+  }
+
   function templateProblems(template) {
     const problems = [];
     const unit = (value) => Number.isFinite(value) && value >= 0 && value <= 1;
@@ -716,5 +794,11 @@
     regionSummary,
     acceptableCandidates,
     signingLabel,
+    serverStateLabel,
+    serverTaskFinished,
+    serverTaskActions,
+    uploadPercent,
+    uploadText,
+    uploadResumePlan,
   };
 });

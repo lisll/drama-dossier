@@ -682,9 +682,18 @@ test("处理档位：三档的取值、中文标签和说明", () => {
 });
 
 test("受限模块清单：处理版本在锁定范围内，有使用权时不上遮罩", () => {
-  assert.deepEqual(L.LICENSED_MODULES, ["library", "generate", "version", "mount", "transcode", "toolbox"]);
+  // 不用 deepEqual 钉死整个清单：加一个受限模块（例如 M5b 的 server）
+  // 不该让这条测试失败——它要保证的是「在处理版本、生成报审包这些付费
+  // 功能上，没使用权就上遮罩」。
+  for (const name of ["library", "generate", "version", "mount", "transcode", "toolbox"]) {
+    assert.ok(L.LICENSED_MODULES.includes(name), `${name} 应当在受限模块清单里`);
+    assert.ok(L.moduleLock(locked("no_entitlement"), name), `${name} 没使用权时应当上遮罩`);
+    assert.equal(L.moduleLock(online(), name), null, `${name} 有使用权时不该上遮罩`);
+  }
   assert.equal(L.moduleLock(locked("no_entitlement"), "version").actionLabel, "兑换卡密");
-  assert.equal(L.moduleLock(online(), "version"), null);
+  // 首页与任务不是付费功能，不进清单。
+  assert.ok(!L.LICENSED_MODULES.includes("home"));
+  assert.ok(!L.LICENSED_MODULES.includes("jobs"));
 });
 
 test("处理配方与处理版本错误文案：每个码都有非空中文说法", () => {
@@ -724,4 +733,92 @@ test("处理配方与处理版本错误文案：每个码都有非空中文说�
   assert.equal(L.errorText({ code: "version_invalid" }), "操作失败");
   assert.equal(L.errorText({ code: "totally_unknown_code" }), "操作失败");
   assert.equal(L.errorText({ code: "totally_unknown_code", message: "服务端原话" }), "服务端原话");
+});
+
+test("服务端处理：状态文案与动作", () => {
+  // 每个状态都要有人话，不能把英文状态码直接抛给用户。
+  for (const state of [
+    "PENDING",
+    "QUEUED",
+    "RUNNING",
+    "VERIFYING",
+    "SUCCEEDED",
+    "RETRY_WAITING",
+    "CANCEL_REQUESTED",
+    "CANCELLED",
+    "FAILED",
+  ]) {
+    const info = L.serverStateLabel(state);
+    assert.match(info.label, /[\u4e00-\u9fa5]/, state);
+  }
+  // 认不出的状态原样显示，不假装成别的。
+  assert.equal(L.serverStateLabel("WHAT").label, "WHAT");
+  assert.equal(L.serverStateLabel(null).label, "未知");
+
+  // 只有成功的才算「有产物可下」。
+  assert.equal(L.serverTaskActions({ state: "SUCCEEDED" }).download, true);
+  assert.equal(L.serverTaskActions({ state: "RUNNING" }).download, false);
+  assert.equal(L.serverTaskActions({ state: "FAILED" }).download, false);
+  // 取消只在没结束时给。
+  assert.equal(L.serverTaskActions({ state: "RUNNING" }).cancel, true);
+  assert.equal(L.serverTaskActions({ state: "SUCCEEDED" }).cancel, false);
+  assert.equal(L.serverTaskActions({}).cancel, false);
+});
+
+test("服务端处理：结束状态判定", () => {
+  assert.equal(L.serverTaskFinished({ state: "SUCCEEDED" }), true);
+  assert.equal(L.serverTaskFinished({ state: "CANCELLED" }), true);
+  assert.equal(L.serverTaskFinished({ state: "FAILED" }), true);
+  assert.equal(L.serverTaskFinished({ state: "RUNNING" }), false);
+  assert.equal(L.serverTaskFinished({ state: "QUEUED" }), false);
+  assert.equal(L.serverTaskFinished(null), false);
+});
+
+test("服务端处理：上传进度", () => {
+  assert.equal(L.uploadPercent({ totalChunks: 4, sentChunks: 1 }), 25);
+  assert.equal(L.uploadPercent({ totalChunks: 4, sentChunks: 4 }), 100);
+  // 总块数为 0 时不能除零，也不能画成 100%。
+  assert.equal(L.uploadPercent({ totalChunks: 0, sentChunks: 0 }), 0);
+  assert.equal(L.uploadPercent(null), 0);
+  // 超过总数时封顶，负值归零——进度条不该出现怪数值。
+  assert.equal(L.uploadPercent({ totalChunks: 4, sentChunks: 9 }), 100);
+  assert.equal(L.uploadPercent({ totalChunks: 4, sentChunks: -3 }), 0);
+
+  assert.equal(L.uploadText({ totalChunks: 8, sentChunks: 3, skippedChunks: 0 }), "3/8 块");
+  assert.equal(
+    L.uploadText({ totalChunks: 8, sentChunks: 8, skippedChunks: 3 }),
+    "8/8 块（跳过 3 块已传的）",
+  );
+});
+
+test("服务端处理：是受限模块，需要使用权", () => {
+  const locked = { tier: "locked", lockReason: "no_entitlement" };
+  assert.ok(L.moduleLock(locked, "server"), "服务端处理要花积分，没使用权应当被挡");
+  const active = { tier: "month", lockReason: null };
+  assert.equal(L.moduleLock(active, "server"), null);
+});
+
+test("服务端处理：该续传还是新开会话", () => {
+  const unfinished = {
+    uploadId: "up_1",
+    chunkSize: 8388608,
+    totalChunks: 10,
+    assetId: null,
+    sourcePath: "/剧/第01集.mp4",
+  };
+  // 同一个文件、没传完 → 续传，不能从头再来。
+  const resume = L.uploadResumePlan(unfinished, "/剧/第01集.mp4");
+  assert.equal(resume.resume, true);
+  assert.equal(resume.uploadId, "up_1");
+  assert.equal(resume.chunkSize, 8388608);
+
+  // 换了另一集 → 必须新开：接着往旧会话里传别的文件会拼出坏文件。
+  assert.equal(L.uploadResumePlan(unfinished, "/剧/第02集.mp4").resume, false);
+  // 上一次已经传完 → 新开。
+  assert.equal(L.uploadResumePlan({ ...unfinished, assetId: "as_1" }, "/剧/第01集.mp4").resume, false);
+  // 没有会话 → 新开。
+  assert.equal(L.uploadResumePlan(null, "/剧/第01集.mp4").resume, false);
+  assert.equal(L.uploadResumePlan({}, "/剧/第01集.mp4").resume, false);
+  // 拿不到本机路径 → 不能「续传」一个不知道是什么的文件。
+  assert.equal(L.uploadResumePlan(unfinished, null).resume, false);
 });
