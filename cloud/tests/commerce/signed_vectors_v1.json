@@ -2,7 +2,8 @@
   "contexts": {
     "license": "drama-dossier/license/v1\n",
     "package-manifest": "drama-dossier/package-manifest/v1\n",
-    "recipe": "drama-dossier/recipe/v1\n"
+    "recipe": "drama-dossier/recipe/v1\n",
+    "release": "drama-dossier/release/v1\n"
   },
   "format": "drama-dossier package manifest & recipe v1 test vectors",
   "manifest_cases": [

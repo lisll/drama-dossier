@@ -129,6 +129,8 @@
 
       <!-- 账号横幅：离线、快到期、钥匙串写入失败（可以同时有几条） -->
       <div id="account-banners" aria-live="polite"></div>
+      <!-- 版本过旧 / 有新版本的提示（M7-3）。低于最低支持版本时这条会拦住后续操作。 -->
+      <div id="update-banner" class="env-banner hidden" role="status"></div>
 
       <!-- 运行环境横幅：全局首屏，未就绪时显示（含一键配置入口），就绪后隐藏 -->
       <div id="env-banner" class="env-banner hidden"></div>
@@ -392,6 +394,10 @@
           <!-- ============ 处理版本（M4b-1）：权属 → 档位 → 模板 → 预览计划 → 开始生成 ============ -->
           <section id="module-version" class="module hidden">
             <div id="version-context" class="drama-context empty">尚未选择剧目——请先到「剧目库」扫描并点选一部剧。</div>
+            <!-- 功能开关（M7-3）：管理员关掉本机处理版本时显示这条。 -->
+            <div id="module-version-off" class="env-banner warn hidden" role="status">
+              本机处理版本暂时关闭了。服务端处理仍然可用；积分与充值不受影响。
+            </div>
 
             <div id="version-gate" class="gate hidden">
               <p>生成处理版本需要本地运行环境（ffmpeg / ffprobe），当前未就绪。</p>
@@ -547,6 +553,10 @@
           <!-- ============ 服务端处理（M5b-8）：上传 → 提交 → 跟踪 → 下载 ============ -->
           <section id="module-server" class="module hidden">
             <div id="server-context" class="drama-context empty">尚未选择剧目——请先到「剧目库」扫描并点选一部剧。</div>
+            <!-- 功能开关（M7-3）：管理员关掉服务端处理时显示这条，同时服务端也会拒绝。 -->
+            <div id="module-server-off" class="env-banner warn hidden" role="status">
+              服务端处理暂时关闭了。本机处理版本仍然可用；积分与充值不受影响。
+            </div>
 
             <section class="panel">
               <section class="panel-header">
@@ -1181,6 +1191,14 @@
               <p class="settings-note">
                 默认有可用的显卡编码就用（更快）；某一集显卡编码失败时自动改用软件编码重做，任务列表和版本说明里会写明。
                 改动保存后，对之后开始或继续的任务生效。
+              </p>
+              <div class="option-row">
+                <label><input id="settings-report-errors" type="checkbox" /> 出错时上报诊断信息（默认关闭）</label>
+              </div>
+              <p class="settings-note">
+                只上报错误码、应用版本、操作系统和出错的位置（哪个模块），
+                <strong>不上报</strong>邮箱、文件路径、剧名或视频内容。
+                默认关闭；不勾选就完全不上报。开与不开都不影响任何功能。
               </p>
               <div class="option-row">
                 <button id="save-settings-env" class="primary" type="button">保存设置</button>

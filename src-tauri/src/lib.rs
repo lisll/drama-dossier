@@ -21,6 +21,7 @@ mod mount;
 mod package;
 mod paths;
 mod toolbox;
+mod updater;
 mod version;
 
 #[derive(Debug, Serialize)]
@@ -106,6 +107,90 @@ fn save_app_settings(app: AppHandle, settings: AppSettings) -> Result<String, St
     save_settings(&path, &settings)
         .map_err(|error| format!("保存设置失败（{}）：{error}", path.display()))?;
     Ok(path.display().to_string())
+}
+
+/// 准备一个升级包：下载 → 校验大小与 SHA-256 → 校验 Ed25519 签名（M7-4）。
+///
+/// **安装不在这里做**：校验通过后把路径交给前端，由用户点「安装」启动系统安装器
+/// （正在运行的可执行文件不能被自己替换）。所以这个命令只负责「把包弄到手并确认是真的」。
+#[tauri::command]
+async fn prepare_update(
+    app: AppHandle,
+    url: String,
+    sha256: String,
+    signature: String,
+    file_name: String,
+    version: String,
+    size_bytes: Option<u64>,
+) -> Result<updater::VerifiedUpdate, String> {
+    // 元信息不全就别开始下载：省一次几十 MB 的流量，也让错误更早暴露。
+    updater::check_metadata(&url, &sha256, &signature).map_err(|error| error.message())?;
+    let home = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("无法定位应用配置目录：{error}"))?;
+    let path = updater::download(&url, &home, &file_name)
+        .await
+        .map_err(|error| error.message())?;
+    let key_id = match updater::verify_downloaded(&path, &sha256, &signature, size_bytes) {
+        Ok(kid) => kid,
+        Err(error) => {
+            // 校验不过就删掉：留着会让人以为这个包可用。
+            let _ = std::fs::remove_file(&path);
+            return Err(error.message());
+        }
+    };
+    Ok(updater::VerifiedUpdate {
+        path,
+        version,
+        key_id,
+    })
+}
+
+/// 把已校验的安装包交给系统安装（M7-4）。
+///
+/// 只做「启动安装器」这一件事：Windows 打开安装程序，macOS 用 `open` 打开 dmg/pkg。
+/// 重启由安装器负责——程序不自替换正在运行的二进制。
+#[tauri::command]
+fn launch_update_installer(path: String) -> Result<(), String> {
+    let target = std::path::PathBuf::from(&path);
+    if !target.is_file() {
+        return Err(format!("安装包不存在：{path}"));
+    }
+    // 只允许从更新目录启动：防止被诱导去执行任意路径。
+    let name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let allowed = [".exe", ".msi", ".dmg", ".pkg"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix));
+    if !allowed {
+        return Err("这个文件不是可安装的升级包".to_owned());
+    }
+    // 各平台分别返回结果，不在末尾再补一个 Ok(())——
+    // 那样在 Linux 上会因为上面的 return 产生不可达代码。
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new(&target)
+            .spawn()
+            .map_err(|error| format!("启动安装程序失败：{error}"))?;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&target)
+            .spawn()
+            .map_err(|error| format!("打开安装包失败：{error}"))?;
+        return Ok(());
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // Linux 只是开发环境，这里不假装支持自动安装。
+        Err("当前系统不支持自动安装，请手动安装下载的文件".to_owned())
+    }
 }
 
 /// 探测并检查的实现体。
@@ -207,6 +292,9 @@ pub fn run() {
             scan_library,
             load_app_settings,
             save_app_settings,
+            // 自动更新（M7-4）：下载并校验升级包，再把安装交给系统
+            prepare_update,
+            launch_update_installer,
             analyze_drama,
             package::generate_package,
             package::pick_scan_file,
@@ -219,6 +307,10 @@ pub fn run() {
             account::commands::recharge_order_status,
             account::commands::reconcile_recharge,
             account::commands::invite_status,
+            // 客户端配置（M7-3）：公告 / 开关 / 版本策略，公开接口，失败有安全默认值
+            account::commands::client_config,
+            // 客户端错误上报（M7-6）：只在用户打开开关时由前端调用
+            account::commands::report_client_error,
             // 服务端处理（M5b-8）：分片上传、建任务、查状态、取消、取产物
             account::server_jobs::server_upload_start,
             account::server_jobs::server_upload_status,

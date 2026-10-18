@@ -43,6 +43,9 @@ const state = {
   ledger: [],
   // 本次运行里剪映探测是否找到了草稿目录（引导第 5 步）。
   jianyingFound: false,
+  // 服务端的客户端配置（M7-3）：公告、功能开关、版本策略。
+  // 拉不到时保持默认值（见 L.DEFAULT_CLIENT_CONFIG），三条都朝「不把人挡在门外」降级。
+  client: null,
   mountStep: 1,
   mountPlan: null,
   publishRows: [],
@@ -126,6 +129,9 @@ function reportError(error) {
     return;
   }
   const message = error instanceof CommandError ? L.errorText(error) : String(error);
+  // 只上报错误码，不上报 message（message 可能带路径与剧名）。
+  const code = error instanceof CommandError ? error.code : "ui_error";
+  reportDiagnostic(code, state.module);
   if (/ffmpeg|ffprobe|运行环境/i.test(message)) {
     toast(message, true, { label: "重新检测", run: gotoRuntimeSettings });
     return;
@@ -135,6 +141,25 @@ function reportError(error) {
     return;
   }
   toast(message, true);
+}
+
+/**
+ * 上报一条错误（M7-6）。
+ *
+ * **只在用户主动打开开关时才发**（设置 → 本机环境 → 出错时上报诊断信息，默认关闭）。
+ *
+ * 只发四个字段：错误码、应用版本、平台、出错位置（模块名）。
+ * 错误消息本身**不发**——它可能带文件路径或剧名，发了就等于把「不上报路径」
+ * 这条承诺作废。要看细节请让用户截图。
+ */
+function reportDiagnostic(code, location) {
+  if (!state.settings?.reportErrors) return;
+  if (!invoke) return;
+  // 火后不管：上报失败绝不该影响用户正在做的事，也不该弹提示。
+  call("report_client_error", {
+    code: String(code || "unknown").slice(0, 64),
+    location: String(location || "").slice(0, 64),
+  }).catch(() => {});
 }
 
 // ============ 字段级校验 ============
@@ -574,6 +599,8 @@ async function loadSettings() {
     if (settings.aiTemplate) $("#ai-template").value = settings.aiTemplate;
     $("#settings-font").value = settings.fontPath ?? "";
     $("#settings-software-encode").checked = Boolean(settings.softwareEncodeOnly);
+    // 错误上报默认关闭：没有这个字段（旧配置文件）就是 false。
+    $("#settings-report-errors").checked = Boolean(settings.reportErrors);
     if (state.root) $("#env-workdir").value = state.root;
     renderDefaultHints();
     renderEmptyGuide();
@@ -607,6 +634,8 @@ async function saveSettings() {
       // 处理版本（M4b-1）：中文字体、只用软件编码。
       fontPath: $("#settings-font").value.trim() || null,
       softwareEncodeOnly: $("#settings-software-encode").checked,
+      // 错误上报（M7-6）：默认关闭，用户主动勾选才上报。
+      reportErrors: $("#settings-report-errors").checked,
     };
     const path = await call("save_app_settings", { settings });
     state.settings = settings;
@@ -637,6 +666,7 @@ async function rememberRoot(root) {
     jianyingDraftDir: state.settings?.jianyingDraftDir ?? null,
     fontPath: state.settings?.fontPath ?? null,
     softwareEncodeOnly: Boolean(state.settings?.softwareEncodeOnly),
+    reportErrors: Boolean(state.settings?.reportErrors),
     libraryRoot: root,
   };
   state.settings = settings;
@@ -796,7 +826,14 @@ function switchModule(name) {
     node.classList.toggle("active", node.dataset.module === name);
   });
   // 没有使用权时，受限模块换成遮罩（真正的拦截在 Rust 端的闸门，这里只是让用户一眼看明白）。
-  const lock = L.moduleLock(state.account, name);
+  // **版本已停止支持时也换成遮罩**：只显示横幅是不够的——用户点掉提示就继续干活了，
+  // 那「强制更新」等于没做（总方案要求「强制更新能拦住旧版」）。
+  const versionBlock = L.blockedByVersion(
+    state.account?.appVersion || "",
+    clientConfig().version,
+    name,
+  );
+  const lock = L.moduleLock(state.account, name) || versionBlock;
   const visible = lock ? "module-locked" : `module-${name}`;
   document.querySelectorAll(".module").forEach((node) => {
     node.classList.toggle("hidden", node.id !== visible);
@@ -804,7 +841,9 @@ function switchModule(name) {
   if (lock) {
     $("#locked-title").textContent = lock.title;
     $("#locked-message").textContent = lock.message;
-    $("#locked-action").textContent = lock.actionLabel;
+    // 版本拦截没有「兑换卡密」这个动作；把按钮隐藏掉，别给一个点了没用的入口。
+    $("#locked-action").textContent = lock.actionLabel || "";
+    $("#locked-action").classList.toggle("hidden", !lock.actionLabel);
     return;
   }
   // 转码模块需要运行环境；切进去时按当前状态刷新阻断层。
@@ -2333,6 +2372,153 @@ function setScreen(screen) {
 }
 
 /** 收到新的账号状态：决定显示哪一屏，刷新所有和账号有关的地方。 */
+// ---- 客户端配置：公告 / 开关 / 版本策略（M7-3） ----
+
+/** 当前的客户端配置；还没拉到过就用安全默认值。 */
+function clientConfig() {
+  return state.client || L.DEFAULT_CLIENT_CONFIG;
+}
+
+/**
+ * 拉一次配置。**失败不报错**：这是每次启动都会调的公开接口，
+ * 网络不通或服务端还没升级都不该打扰用户——默认值已经能让人正常用。
+ */
+async function loadClientConfig() {
+  try {
+    const raw = await call("client_config");
+    // Rust 侧在失败时返回 {unavailable: true, reason}，不要把那个当成配置。
+    state.client = raw && raw.unavailable ? L.DEFAULT_CLIENT_CONFIG : L.normalizeClientConfig(raw);
+  } catch (error) {
+    state.client = L.DEFAULT_CLIENT_CONFIG;
+  }
+  applyFeatureFlags();
+  renderAnnouncement();
+  renderUpdateBanner();
+}
+
+/**
+ * 按开关收起界面入口。
+ *
+ * **开关只管界面**：服务端仍然会校验（M7-3 计划里写明的双保险）。
+ * 界面藏起来不等于后端口子开了——两处都要挡。
+ */
+function applyFeatureFlags() {
+  const flags = clientConfig().flags;
+  // 注册：关掉后登录页切到注册会显示一句「暂停注册」。
+  const registerTab = document.querySelector('[data-auth-view="register"]');
+  if (registerTab) registerTab.classList.toggle("hidden", !flags.signup);
+  // 充值：关掉后隐藏积分弹窗里的档位与充值按钮。
+  const tiers = $("#credits-tiers");
+  if (tiers) tiers.classList.toggle("hidden", !flags.recharge);
+  const checkout = $("#credits-checkout");
+  if (checkout && !flags.recharge) checkout.classList.add("hidden");
+  // 服务端处理 / 本机处理版本：关掉后在模块里显示「暂不可用」。
+  for (const [module, enabled] of [
+    ["server", flags.server_processing],
+    ["version", flags.version_task],
+  ]) {
+    const notice = $(`#module-${module}-off`);
+    if (notice) notice.classList.toggle("hidden", enabled);
+  }
+}
+
+/** 版本过旧时的横幅：低于最低支持版本就拦住，其它情况只提示。 */
+function renderUpdateBanner() {
+  const node = $("#update-banner");
+  if (!node) return;
+  const version = clientConfig().version;
+  const current = state.account?.appVersion || "";
+  if (!current) {
+    node.classList.add("hidden");
+    return;
+  }
+  const verdict = L.updateState(current, version);
+  if (!verdict.force && !verdict.available) {
+    node.classList.add("hidden");
+    return;
+  }
+  // 有下载地址才给「下载并校验」按钮；没有就让用户联系客服。
+  const action = version.downloadUrl
+    ? `<button type="button" class="primary" data-update-action="prepare">下载并校验升级包</button>`
+    : `<span class="hint">管理员还没有提供下载地址，请联系客服。</span>`;
+  node.classList.remove("hidden");
+  node.innerHTML = verdict.force
+    ? `<strong>这个版本已停止支持</strong>（当前 ${esc(current)}，最低要求 ${esc(
+        version.minSupported,
+      )}）。请更新后继续使用。${action}`
+    : `<strong>有新版本可用</strong>（当前 ${esc(current)}，最新 ${esc(version.latest)}）。${action}`;
+  node.classList.toggle("warn", !verdict.force);
+  node.classList.toggle("error", verdict.force);
+  const button = node.querySelector("[data-update-action]");
+  if (button) button.addEventListener("click", prepareUpdate);
+}
+
+/**
+ * 下载并校验升级包（M7-4）。
+ *
+ * 校验（大小 + SHA-256 + Ed25519 签名）由 Rust 侧完成；这里只负责
+ * 「按按钮 → 等结果 → 校验过了再问用户要不要安装」。
+ * **不在校验前就让用户安装**：那等于把安全步骤变成可选。
+ */
+async function prepareUpdate() {
+  const version = clientConfig().version;
+  const button = $("#update-banner [data-update-action]");
+  if (button) button.disabled = true;
+  try {
+    const info = await call("prepare_update", {
+      url: version.downloadUrl,
+      sha256: version.downloadSha256,
+      signature: version.downloadSig,
+      fileName: updateFileName(version.downloadUrl),
+      version: version.latest,
+      sizeBytes: null,
+    });
+    toast(`升级包已下载并通过校验（签名密钥 ${info.keyId}）`);
+    askInstallUpdate(info.path, info.version);
+  } catch (error) {
+    // 校验失败的说明已经写明「已删除，请重新下载 / 请不要安装」，直接展示。
+    // 不用 showFormError：它会整块覆盖横幅内容，把按钮也一起冲掉。
+    renderUpdateBanner();
+    $("#update-banner").insertAdjacentHTML(
+      "beforeend",
+      `<div class="field-error" role="alert">${esc(
+        error instanceof CommandError ? L.errorText(error) : String(error),
+      )}</div>`,
+    );
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+/** 从下载地址里取文件名；取不到就给一个中性名字。 */
+function updateFileName(url) {
+  try {
+    const path = String(url).split("?")[0];
+    const name = path.split("/").filter(Boolean).pop();
+    return name || "update.bin";
+  } catch {
+    return "update.bin";
+  }
+}
+
+/** 校验通过后才问「现在安装吗」。安装交给系统，重启由安装器完成。 */
+function askInstallUpdate(path, version) {
+  const node = $("#update-banner");
+  node.innerHTML = `
+    <strong>升级包已就绪</strong>（${esc(version || "新版本")}），校验通过。
+    安装会启动系统安装程序；安装完成后由安装程序重启应用。
+    <button type="button" class="primary" data-update-action="install">现在安装</button>
+  `;
+  node.querySelector("[data-update-action]").addEventListener("click", async () => {
+    try {
+      await call("launch_update_installer", { path });
+      toast("已启动安装程序，请按提示完成安装");
+    } catch (error) {
+      toast(L.errorText(error), true);
+    }
+  });
+}
+
 function applyAccount(status) {
   if (!status) return;
   const previous = state.account;
@@ -3724,7 +3910,20 @@ const carousel = {
 };
 
 function renderAnnouncement() {
-  const items = L.ANNOUNCEMENTS;
+  // 公告来自服务端（M7-3）。拉不到时 clientConfig 是全默认值，公告为空数组——
+  // 那就显示一句「暂无公告」，而不是显示过期或来路不明的通知。
+  const items = clientConfig.announcements;
+  if (!items.length) {
+    $("#announce-body").innerHTML = '<p class="hint">暂无公告。</p>';
+    $("#announce-index").textContent = "";
+    $("#announce-prev").disabled = true;
+    $("#announce-next").disabled = true;
+    $("#announce-toggle").disabled = true;
+    return;
+  }
+  $("#announce-prev").disabled = false;
+  $("#announce-next").disabled = false;
+  $("#announce-toggle").disabled = false;
   const item = items[carousel.index % items.length];
   $("#announce-body").innerHTML = `<h4>${esc(item.title)}</h4><p>${esc(item.body)}</p>`;
   $("#announce-index").textContent = `${(carousel.index % items.length) + 1} / ${items.length}`;
@@ -3735,7 +3934,8 @@ function renderAnnouncement() {
 }
 
 function stepAnnouncement(delta, { manual = false } = {}) {
-  const count = L.ANNOUNCEMENTS.length;
+  const count = clientConfig.announcements.length;
+  if (!count) return;
   carousel.index = (carousel.index + delta + count) % count;
   // 手动翻页时读屏要读出新内容；自动轮播时不打扰。
   $("#announce-body").setAttribute("aria-live", manual ? "polite" : "off");
@@ -5022,6 +5222,9 @@ if (tauriEvent?.listen) {
 // 启动：先等恢复登录，再决定显示登录页、锁定页还是主界面（浏览器预览无 IPC 时直接进主界面便于布局验证）。
 boot();
 if (invoke) {
+  // 客户端配置（公告 / 开关 / 版本策略）：公开接口，不需要登录。
+  // 失败也有安全默认值，所以不必等它完成就能继续启动。
+  loadClientConfig();
   // 设置、本机环境、平台规则都是本机信息，不需要登录（闸门里是「不设闸门」）。
   loadSettings().then(() => {
     checkRuntime();

@@ -139,6 +139,65 @@ pub async fn invite_status(account: State<'_, AccountState>) -> Reply<Value> {
     Ok(account.invites().await?)
 }
 
+/// 客户端配置（公告 / 开关 / 版本策略，M7-3）。
+///
+/// **失败不抛错**：这个接口是公开的、每次启动都会拉。网络不通、服务端还没升级
+/// 到有该接口的版本，都不该让界面报错或卡住——前端有安全默认值
+/// （空公告、开关全开、不强制更新）。所以这里把错误吞成 `{unavailable: true}`，
+/// 只带一句原因供界面显示在设置页里，不影响任何功能。
+#[tauri::command]
+pub async fn client_config(account: State<'_, AccountState>) -> Reply<Value> {
+    match account.client_config().await {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            // 只记错误类型，不记地址与响应内容。
+            eprintln!("拉取客户端配置失败：{}", error.message());
+            Ok(serde_json::json!({ "unavailable": true, "reason": error.message() }))
+        }
+    }
+}
+
+/// 上报一条客户端错误（M7-6）。
+///
+/// **由前端决定要不要报**：前端读设置里的开关（默认关），关着就不发这个命令。
+/// 这里只做「字段白名单」的最后一道把关——即使前端传了多余的东西，也不会发出去。
+///
+/// 只发四个字段：错误码、应用版本、平台、出错位置。**不发**错误消息：
+/// 消息里可能带文件路径或剧名。
+#[tauri::command]
+pub async fn report_client_error(
+    account: State<'_, AccountState>,
+    code: String,
+    location: String,
+) -> Reply<Value> {
+    // 错误码与位置只做长度与字符集约束，不做内容解释。
+    let code = sanitize_short(&code, 64);
+    let location = sanitize_short(&location, 64);
+    if code.is_empty() {
+        return Ok(serde_json::json!({ "accepted": false }));
+    }
+    match account.report_client_error(&code, &location).await {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            // 上报失败不打扰用户：它本来就是个后台动作。
+            eprintln!("错误上报失败：{}", error.message());
+            Ok(serde_json::json!({ "accepted": false }))
+        }
+    }
+}
+
+/// 只保留字母数字、下划线与短横线，并截断到 `max`。
+///
+/// 这样即使调用方传了带路径或空格的字符串，也发不出去——
+/// 上报白名单不只在服务端做，客户端也做一层。
+fn sanitize_short(value: &str, max: usize) -> String {
+    value
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .take(max)
+        .collect()
+}
+
 /// 「重试」：钥匙串不可用时重新自检；已登录时重新联网刷新（名额满了解绑后也走这里重新绑定）。
 #[tauri::command]
 pub async fn account_retry(

@@ -26,15 +26,19 @@ pub enum Purpose {
     License,
     PackageManifest,
     Recipe,
+    /// 升级包（M7-4）。加这一项时必须同步改服务端的
+    /// `license_token.PURPOSE_CONTEXTS["release"]`——两边上下文串不一致就验不过。
+    Release,
 }
 
 impl Purpose {
     pub const fn context(self) -> &'static [u8] {
         match self {
             Purpose::License => b"drama-dossier/license/v1\n",
-            // 下面两个前缀和服务端 license_token.PURPOSE_CONTEXTS 一致。
+            // 下面三个前缀和服务端 license_token.PURPOSE_CONTEXTS 一致。
             Purpose::PackageManifest => b"drama-dossier/package-manifest/v1\n",
             Purpose::Recipe => b"drama-dossier/recipe/v1\n",
+            Purpose::Release => b"drama-dossier/release/v1\n",
         }
     }
 }

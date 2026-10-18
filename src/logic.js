@@ -627,6 +627,127 @@
     }
   }
 
+  // ---------- 客户端配置：公告 / 开关 / 版本策略（M7-3） ----------
+
+  /**
+   * 拉不到配置时的安全默认值。
+   *
+   * 三条都朝「不把人挡在门外」的方向降级，理由各不相同：
+   * - 公告空：不显示过期或来路不明的通知；
+   * - 开关全开：功能默认可用，服务端挂了不该让所有人变砖；
+   * - **不强制更新**：拉不到就把人锁在门外是最糟的降级——用户什么都没做错。
+   */
+  const DEFAULT_CLIENT_CONFIG = {
+    announcements: [],
+    flags: {
+      signup: true,
+      recharge: true,
+      server_processing: true,
+      version_task: true,
+    },
+    version: {
+      minSupported: "0.0.0",
+      latest: "0.0.0",
+      downloadUrl: "",
+      downloadSha256: "",
+      downloadSig: "",
+      notes: "",
+    },
+  };
+
+  /** 把服务端返回的配置补齐成本地可用的形状；缺失的字段一律用安全默认值。 */
+  function normalizeClientConfig(raw) {
+    const config = raw && typeof raw === "object" ? raw : {};
+    const flags = config.flags && typeof config.flags === "object" ? config.flags : {};
+    const version = config.version && typeof config.version === "object" ? config.version : {};
+    const announcements = Array.isArray(config.announcements) ? config.announcements : [];
+    return {
+      announcements: announcements
+        .filter((item) => item && typeof item.title === "string" && typeof item.body === "string")
+        .map((item) => ({
+          id: String(item.id ?? ""),
+          title: item.title,
+          body: item.body,
+          level: item.level === "warn" ? "warn" : "info",
+        })),
+      flags: {
+        // 逐个取值而不是整体替换：服务端将来少发一个键时，那个键仍然默认「开」。
+        signup: flags.signup !== false,
+        recharge: flags.recharge !== false,
+        server_processing: flags.server_processing !== false,
+        version_task: flags.version_task !== false,
+      },
+      version: {
+        minSupported: String(version.minSupported ?? "0.0.0"),
+        latest: String(version.latest ?? "0.0.0"),
+        downloadUrl: String(version.downloadUrl ?? ""),
+        downloadSha256: String(version.downloadSha256 ?? ""),
+        downloadSig: String(version.downloadSig ?? ""),
+        notes: String(version.notes ?? ""),
+      },
+    };
+  }
+
+  /** 比较两个「1.2.3」形式的版本号：a<b 返回负数，相等 0，a>b 正数。 */
+  function compareVersions(a, b) {
+    const parse = (value) =>
+      String(value ?? "0")
+        .split(".")
+        .map((part) => {
+          const number = Number.parseInt(part, 10);
+          return Number.isFinite(number) && number >= 0 ? number : 0;
+        });
+    const left = parse(a);
+    const right = parse(b);
+    const length = Math.max(left.length, right.length);
+    for (let index = 0; index < length; index += 1) {
+      const diff = (left[index] || 0) - (right[index] || 0);
+      if (diff !== 0) return diff;
+    }
+    return 0;
+  }
+
+  /**
+   * 当前版本要不要更新。
+   *
+   * `force` 是「必须更新才能继续用」：低于 minSupported 就是这种情况。
+   * 注意 minSupported 为 "0.0.0" 时任何版本都不低于它——这是刻意的，
+   * 默认不拦人。
+   */
+  function updateState(currentVersion, version) {
+    const current = String(currentVersion ?? "0.0.0");
+    const min = String(version?.minSupported ?? "0.0.0");
+    const latest = String(version?.latest ?? "0.0.0");
+    if (compareVersions(current, min) < 0) {
+      return { force: true, available: true, latest };
+    }
+    return { force: false, available: compareVersions(current, latest) < 0, latest };
+  }
+
+  /**
+   * 「这个版本已停止支持」时，某个模块还让不让进。
+   *
+   * 为什么要有这个函数而不是只靠横幅：横幅只是提示，用户点掉就继续干活了——
+   * 那「强制更新」就等于没做。总方案要求「强制更新能拦住旧版」，
+   * 所以这里给出**明确的拦截判据**，由界面据此挡在模块外。
+   *
+   * 放行的只有：首页、设置、账号/授权相关（要有地方看提示、兑换卡密、
+   * 下载并安装更新）。其余功能模块一律挡住。
+   */
+  const FORCE_UPDATE_ALLOWED_MODULES = ["home", "settings"];
+
+  function blockedByVersion(currentVersion, version, moduleName) {
+    const verdict = updateState(currentVersion, version);
+    if (!verdict.force) return null;
+    if (FORCE_UPDATE_ALLOWED_MODULES.includes(moduleName)) return null;
+    return {
+      title: "这个版本已停止支持",
+      message: `当前 ${currentVersion}，最低要求 ${version?.minSupported ?? "0.0.0"}。` +
+        "请在这一页下载并安装新版后再继续使用其它功能。",
+      latest: verdict.latest,
+    };
+  }
+
   // ---------- 服务端处理（M5b-8） ----------
 
   /** 服务端任务的九个状态 → 人话。状态值来自服务端 tasks.state（大写）。 */
@@ -735,20 +856,16 @@
     return problems;
   }
 
-  // ---------- 公告（内置在本地，M7 换成远程来源） ----------
-
-  const ANNOUNCEMENTS = [
-    { title: "账号与授权上线", body: "兑换卡密开通功能；一个账号同时绑定 1 台电脑，在「设备管理」里可以查看和解绑。" },
-    { title: "断网也能用", body: "联网登录过一次之后，断网 72 小时内照常使用本地功能；生成报审包需要联网。" },
-    { title: "换电脑怎么办", body: "先在旧电脑或新电脑的「设备管理」里解绑旧电脑，再在新电脑上登录。每 30 天最多解绑 3 次。" },
-  ];
+  // ---------- 公告 ----------
+  //
+  // 公告不再硬编码在本地：改由服务端的 `/api/v1/client/config` 提供（M7-3）。
+  // 拉不到时显示空公告（见 DEFAULT_CLIENT_CONFIG）——不显示过期或来路不明的通知。
 
   return {
     CARD_ALPHABET,
     CARD_LENGTH,
     LICENSED_MODULES,
     THEME_KEY,
-    ANNOUNCEMENTS,
     cardCore,
     validateCard,
     formatCardInput,
@@ -800,5 +917,11 @@
     uploadPercent,
     uploadText,
     uploadResumePlan,
+    DEFAULT_CLIENT_CONFIG,
+    normalizeClientConfig,
+    compareVersions,
+    updateState,
+    blockedByVersion,
+    FORCE_UPDATE_ALLOWED_MODULES,
   };
 });

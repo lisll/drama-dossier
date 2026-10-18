@@ -37,6 +37,10 @@ PURPOSE_CONTEXTS = {
     "license": SIGNING_CONTEXT,
     "package-manifest": b"drama-dossier/package-manifest/v1\n",
     "recipe": b"drama-dossier/recipe/v1\n",
+    # 升级包签名（M7-4）。加这一项时必须同步改 Rust 侧的
+    # `dossier_license::envelope::Purpose::Release`——两边的上下文串
+    # 少一个字符客户端就验不过，`test_signing_purposes.py` 有对拍。
+    "release": b"drama-dossier/release/v1\n",
 }
 PAYLOAD_VERSION = 1
 ENTITLEMENT_KINDS = ("none", "timed", "lifetime")
@@ -90,22 +94,65 @@ def canonical_payload(payload: dict) -> bytes:
 
 
 class Signer:
-    """服务端签名器。私钥从文件加载，不进仓库，也不进日志。"""
+    """服务端签名器。私钥从文件加载，不进仓库，也不进日志。
 
-    def __init__(self, private_key: Ed25519PrivateKey):
+    **支持「主私钥 + 次私钥」两把**（M7-5 密钥轮换）：正常情况下用主私钥签；
+    过渡期内可以显式指定用次私钥签，好让旧版本客户端（只认旧公钥）
+    与新版本客户端（认新公钥）都能验证。详见 `docs/KEY_ROTATION.md`。
+    """
+
+    def __init__(
+        self,
+        private_key: Ed25519PrivateKey,
+        secondary_key: Optional[Ed25519PrivateKey] = None,
+    ):
         self._private_key = private_key
+        self._secondary_key = secondary_key
         self.public_key = private_key.public_key().public_bytes(
             serialization.Encoding.Raw, serialization.PublicFormat.Raw
         )
         self.kid = key_id(self.public_key)
+        self.secondary_public_key = (
+            secondary_key.public_key().public_bytes(
+                serialization.Encoding.Raw, serialization.PublicFormat.Raw
+            )
+            if secondary_key is not None
+            else None
+        )
+        self.secondary_kid = (
+            key_id(self.secondary_public_key) if self.secondary_public_key else None
+        )
 
     @classmethod
     def from_seed(cls, seed: bytes) -> "Signer":
         return cls(Ed25519PrivateKey.from_private_bytes(seed))
 
     @classmethod
-    def from_pem_file(cls, path) -> "Signer":
-        path = Path(path)
+    def from_pem_file(cls, path, secondary_path=None) -> "Signer":
+        primary = cls._load_private_key(Path(path))
+        secondary = (
+            cls._load_private_key(Path(secondary_path)) if secondary_path else None
+        )
+        if secondary is not None:
+            log.warning(
+                "已启用次签名私钥（密钥轮换过渡期）：主私钥 kid=%s，次私钥 kid=%s。"
+                "过渡期结束后记得移除 DRAMA_COMMERCE_LICENSE_KEY_FILE_SECONDARY。",
+                key_id(
+                    primary.public_key().public_bytes(
+                        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+                    )
+                ),
+                key_id(
+                    secondary.public_key().public_bytes(
+                        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+                    )
+                ),
+            )
+        return cls(primary, secondary)
+
+    @staticmethod
+    def _load_private_key(path: Path) -> Ed25519PrivateKey:
+        """读一把 PEM 私钥。权限过宽要告警，加载失败要报清楚是哪一步。"""
         try:
             data = path.read_bytes()
             mode = path.stat().st_mode
@@ -121,7 +168,7 @@ class Signer:
             raise ConfigError(f"{path} 不是可用的 PEM 私钥（私钥不能加密）") from error
         if not isinstance(key, Ed25519PrivateKey):
             raise ConfigError(f"{path} 不是 Ed25519 私钥")
-        return cls(key)
+        return key
 
     def sign_bytes(self, payload: bytes) -> str:
         signature = self._private_key.sign(SIGNING_CONTEXT + payload)
@@ -130,15 +177,24 @@ class Signer:
     def sign(self, payload: dict) -> str:
         return self.sign_bytes(canonical_payload(payload))
 
-    def sign_detached(self, purpose: str, payload: bytes) -> str:
-        """按用途给一段字节签名，返回 base64url 签名（不含载荷）。报审包清单用这个。"""
-        signature = self._private_key.sign(PURPOSE_CONTEXTS[purpose] + payload)
+    def sign_detached(self, purpose: str, payload: bytes, *, with_secondary: bool = False) -> str:
+        """按用途给一段字节签名，返回 base64url 签名（不含载荷）。
+
+        `with_secondary=True` 时用次私钥签（密钥轮换的过渡期用：
+        老客户端只认旧公钥，新客户端两把都认）。
+        """
+        key = self._secondary_key if with_secondary else self._private_key
+        if key is None:
+            raise ConfigError("没有配置次私钥（DRAMA_COMMERCE_LICENSE_KEY_FILE_SECONDARY）")
+        signature = key.sign(PURPOSE_CONTEXTS[purpose] + payload)
         return b64url_encode(signature)
 
-    def sign_envelope(self, purpose: str, payload: dict) -> str:
+    def sign_envelope(self, purpose: str, payload: dict, *, with_secondary: bool = False) -> str:
         """按用途签内嵌写法 `载荷.签名`。处理配方用这个。"""
         raw = canonical_payload(payload)
-        return b64url_encode(raw) + "." + self.sign_detached(purpose, raw)
+        return b64url_encode(raw) + "." + self.sign_detached(
+            purpose, raw, with_secondary=with_secondary
+        )
 
     def __repr__(self) -> str:
         return f"Signer(kid={self.kid!r})"

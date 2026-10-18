@@ -822,3 +822,87 @@ test("服务端处理：该续传还是新开会话", () => {
   // 拿不到本机路径 → 不能「续传」一个不知道是什么的文件。
   assert.equal(L.uploadResumePlan(unfinished, null).resume, false);
 });
+
+test("客户端配置：拉不到时的安全默认值", () => {
+  const defaults = L.DEFAULT_CLIENT_CONFIG;
+  // 公告空：不显示过期或来路不明的通知。
+  assert.deepEqual(defaults.announcements, []);
+  // 开关全开：功能默认可用，服务端挂了不该让所有人变砖。
+  assert.equal(defaults.flags.signup, true);
+  assert.equal(defaults.flags.recharge, true);
+  assert.equal(defaults.flags.server_processing, true);
+  assert.equal(defaults.flags.version_task, true);
+  // 不强制更新：拉不到就把人锁在门外是最糟的降级。
+  assert.equal(defaults.version.minSupported, "0.0.0");
+  assert.equal(L.updateState("0.1.0", defaults.version).force, false);
+});
+
+test("客户端配置：归一化补齐缺失字段", () => {
+  // 服务端少发一个开关时，那个开关仍然默认「开」。
+  const partial = L.normalizeClientConfig({ flags: { recharge: false } });
+  assert.equal(partial.flags.recharge, false);
+  assert.equal(partial.flags.signup, true);
+  assert.equal(partial.flags.server_processing, true);
+
+  // 空输入、乱输入都不该抛错，一律回到安全默认值。
+  for (const bad of [null, undefined, {}, { flags: null }, { announcements: "x" }]) {
+    const config = L.normalizeClientConfig(bad);
+    assert.deepEqual(config.announcements, []);
+    assert.equal(config.version.minSupported, "0.0.0");
+  }
+
+  // 缺字段的公告条目被丢掉，不会让轮播画出一个空标题。
+  const mixed = L.normalizeClientConfig({
+    announcements: [{ title: "有正文", body: "内容" }, { title: "缺正文" }, null],
+  });
+  assert.equal(mixed.announcements.length, 1);
+  assert.equal(mixed.announcements[0].title, "有正文");
+});
+
+test("客户端配置：版本比较与是否强制更新", () => {
+  assert.ok(L.compareVersions("1.0.0", "1.0.1") < 0);
+  assert.ok(L.compareVersions("1.2.0", "1.1.9") > 0);
+  assert.equal(L.compareVersions("1.2.3", "1.2.3"), 0);
+  // 位数不同也要能比：1.0 与 1.0.0 相等。
+  assert.equal(L.compareVersions("1.0", "1.0.0"), 0);
+  assert.ok(L.compareVersions("1.0.1", "1.0") > 0);
+
+  // 低于最低支持版本 → 强制更新。
+  const forced = L.updateState("1.0.0", { minSupported: "1.1.0", latest: "1.2.0" });
+  assert.equal(forced.force, true);
+  // 没低于最低支持但落后于最新 → 只提示。
+  const optional = L.updateState("1.1.0", { minSupported: "1.1.0", latest: "1.2.0" });
+  assert.equal(optional.force, false);
+  assert.equal(optional.available, true);
+  // 已是最新 → 什么都不提示。
+  const none = L.updateState("1.2.0", { minSupported: "1.1.0", latest: "1.2.0" });
+  assert.equal(none.force, false);
+  assert.equal(none.available, false);
+});
+
+test("客户端配置：强制更新真的拦住旧版", () => {
+  const policy = { minSupported: "1.1.0", latest: "1.2.0" };
+
+  // 旧版进任何功能模块都被挡住——只弹横幅不算「强制」，
+  // 用户点掉提示就继续干活了。
+  for (const module of ["library", "generate", "version", "server", "mount", "transcode", "toolbox", "jobs"]) {
+    const block = L.blockedByVersion("1.0.0", policy, module);
+    assert.ok(block, `${module} 应当被版本拦截挡住`);
+    assert.match(block.title, /停止支持/);
+    // 要说清当前版本与最低要求，用户才知道发生了什么。
+    assert.match(block.message, /1\.0\.0/);
+    assert.match(block.message, /1\.1\.0/);
+  }
+
+  // 首页与设置必须放行：要有地方看提示、下载安装、兑换卡密。
+  assert.equal(L.blockedByVersion("1.0.0", policy, "home"), null);
+  assert.equal(L.blockedByVersion("1.0.0", policy, "settings"), null);
+  assert.deepEqual(L.FORCE_UPDATE_ALLOWED_MODULES, ["home", "settings"]);
+
+  // 版本够新时一律不挡。
+  assert.equal(L.blockedByVersion("1.1.0", policy, "library"), null);
+  assert.equal(L.blockedByVersion("1.2.0", policy, "library"), null);
+
+  // 默认策略（0.0.0）不挡任何人——服务端没配就不该把用户锁在门外。
+  assert.equal(L.blockedByVersion("0.1.0", L.DEFAULT_CLIENT_CONFIG.version, "library"), null);
+});

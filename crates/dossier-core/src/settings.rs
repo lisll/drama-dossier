@@ -37,6 +37,12 @@ pub struct AppSettings {
     pub font_path: Option<PathBuf>,
     /// 编码器：`false` 自动（有可用的硬件编码就用），`true` 只用软件编码。
     pub software_encode_only: bool,
+    /// 是否上报客户端错误（M7-6）。**默认关闭**：隐私优先，用户主动打开才上报。
+    ///
+    /// 上报内容只有错误码、应用版本、平台与出错位置（模块名），
+    /// 不含邮箱、文件路径、剧名、视频内容。服务端也是按白名单收的。
+    #[serde(default)]
+    pub report_errors: bool,
 }
 
 impl AppSettings {
@@ -326,11 +332,14 @@ mod tests {
             jianying_draft_dir: None,
             font_path: Some(PathBuf::from("/字体/苹方.ttc")),
             software_encode_only: true,
+            // 错误上报默认关闭（M7-6）；这一条顺便钉住「存进去再读回来还是开」。
+            report_errors: true,
         };
         save_settings(&path, &settings).unwrap();
         let reloaded = load_settings(&path).settings;
         assert_eq!(reloaded.font_path, Some(PathBuf::from("/字体/苹方.ttc")));
         assert!(reloaded.software_encode_only);
+        assert!(reloaded.report_errors);
 
         let loaded = load_settings(&path);
         assert!(loaded.warning.is_none());

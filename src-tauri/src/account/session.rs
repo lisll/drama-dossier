@@ -942,6 +942,18 @@ impl<T: Transport, S: CredentialStore> Session<T, S> {
         Ok(())
     }
 
+    // ---------- 客户端配置（M7-3） ----------
+
+    /// 拉公告 / 功能开关 / 版本策略。
+    ///
+    /// **不需要登录**：桌面端启动时就要知道「要不要强制更新」，那时可能还没登录。
+    /// 所以这里直接 `api.send`，不走 `authed`——也不该因为没登录就跳过检查更新。
+    pub async fn client_config(&self) -> Result<Value, ApiError> {
+        self.api
+            .send(Request::new(Method::GET, "/client/config"))
+            .await
+    }
+
     // ---------- 服务端处理（M5b-8） ----------
     //
     // 这一组方法只负责「跟媒体控制面说话」，不判断业务该不该做：
@@ -1046,6 +1058,30 @@ impl<T: Transport, S: CredentialStore> Session<T, S> {
             format!("/artifacts/{artifact_id}"),
         ))
         .await
+    }
+
+    // ---------- 客户端错误上报（M7-6） ----------
+
+    /// 上报一条错误。**不需要登录**：出错时用户可能还没登录，
+    /// 而「启动就崩」这类问题恰恰最需要上报。
+    pub async fn report_client_error(&self, code: &str, location: &str) -> Result<Value, ApiError> {
+        // 平台取本机身份里的那个值；取不到就报 unknown，不猜。
+        let platform = self
+            .setup()
+            .map(|setup| setup.identity.platform.as_str())
+            .unwrap_or("unknown");
+        let app_version = self
+            .setup()
+            .map(|setup| setup.app_version.clone())
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned());
+        self.api
+            .send(Request::new(Method::POST, "/client/errors").json(json!({
+                "code": code,
+                "app_version": app_version,
+                "platform": platform,
+                "location": location,
+            })))
+            .await
     }
 
     // ---------- 后台刷新 ----------
