@@ -162,12 +162,25 @@ fn runtime_status_inner(
     let ffprobe = resolve_ffprobe(app, ffprobe_path)?;
     let runner = SystemRunner::new();
     // Windows 的解释器名是 python（py 是启动器兜底），macOS/Linux 是 python3。
-    let python_program = if cfg!(windows) { "python" } else { "python3" };
+    // `python` 若只是微软商店占位符，probe_tool 会按 9009 判为未找到，此时再试 py。
+    let python_report = {
+        let name = "python";
+        let primary = if cfg!(windows) {
+            probe_tool(&runner, name, Path::new("python"), &["--version"])
+        } else {
+            probe_tool(&runner, name, Path::new("python3"), &["--version"])
+        };
+        if primary.ok || !cfg!(windows) {
+            primary
+        } else {
+            probe_tool(&runner, name, Path::new("py"), &["-3", "--version"])
+        }
+    };
     Ok(RuntimeStatus {
         // 只探解释器版本（秒级）；torch/onnxruntime 导入太慢，留给擦除页自查。
         ffmpeg: probe_tool(&runner, "ffmpeg", &ffmpeg, &["-hide_banner", "-version"]),
         ffprobe: probe_tool(&runner, "ffprobe", &ffprobe, &["-hide_banner", "-version"]),
-        python: probe_tool(&runner, "python", Path::new(python_program), &["--version"]),
+        python: python_report,
         install_supported: cfg!(any(target_os = "macos", target_os = "windows")),
         platform: std::env::consts::OS.to_string(),
     })

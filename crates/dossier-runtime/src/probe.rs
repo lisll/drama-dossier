@@ -74,18 +74,32 @@ pub fn probe_tool(
                 version,
             }
         }
-        Ok(output) => ToolReport {
-            name: name.to_string(),
-            program: program.display().to_string(),
-            found: true,
-            version: None,
-            ok: false,
-            detail: format!(
-                "退出码 {}：{}",
-                output.code_label(),
-                first_line(&output.combined()).unwrap_or_default()
-            ),
-        },
+        Ok(output) => {
+            // Windows 上 cmd 找不到命令以 9009 退出；微软商店的 python 占位符
+            // （WindowsApps 里的 stub）同样能被拉起但静默返回 9009。
+            // 这两种情况都是「不可用」，不能算「已找到」。
+            if cfg!(windows) && output.code == Some(9009) {
+                ToolReport::missing(
+                    name,
+                    &program.display().to_string(),
+                    "命令不存在或不可用（Windows 退出码 9009，常见于微软商店占位符；请安装真实版本并加入 PATH）"
+                        .to_string(),
+                )
+            } else {
+                ToolReport {
+                    name: name.to_string(),
+                    program: program.display().to_string(),
+                    found: true,
+                    version: None,
+                    ok: false,
+                    detail: format!(
+                        "退出码 {}：{}",
+                        output.code_label(),
+                        first_line(&output.combined()).unwrap_or_default()
+                    ),
+                }
+            }
+        }
         Err(error) => ToolReport::missing(name, &program.display().to_string(), error.to_string()),
     }
 }
@@ -697,6 +711,18 @@ S..... srt                  SubRip subtitle\n";
         assert!(!caps.usable());
         assert!(caps.list_error.is_some());
         assert!(caps.encoders.video.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn probe_tool_treats_windows_9009_as_missing() {
+        // 微软商店占位符 python.exe 能被拉起但静默退出 9009；
+        // CI 的 windows 分身验证它被判定为「未找到」而不是「已找到但失败」。
+        let runner = FakeRunner::new().on("python", CommandOutput::new(9009, "", ""));
+        let report = probe_tool(&runner, "python", Path::new("python"), &["--version"]);
+        assert!(!report.found);
+        assert!(!report.ok);
+        assert!(report.detail.contains("9009"));
     }
 
     #[test]
