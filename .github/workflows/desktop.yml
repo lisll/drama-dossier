@@ -85,13 +85,95 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+
+      # ---------- 签名（M7-8）----------
+      #
+      # 总方案要求「macOS 签名与公证、Windows 代码签名的流程写进 CI，证书用占位；
+      # 没配证书时跳过签名，并明确提示」。
+      #
+      # 这里刻意**不**用 `continue-on-error`：签名失败必须让构建红掉，
+      # 否则会出现「以为签了，其实没签」的包被发布出去。只有「没配证书」
+      # 这一种情况才是跳过——那是部署方还没买证书，不是签名出错。
+      - name: Detect signing secrets
+        id: signing
+        shell: bash
+        env:
+          MAC_CERT: ${{ secrets.MACOS_CERTIFICATE }}
+          WIN_CERT: ${{ secrets.WINDOWS_CERTIFICATE }}
+        run: |
+          if [[ "$RUNNER_OS" == "macOS" && -n "$MAC_CERT" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "macOS 签名已启用（使用 secrets.MACOS_CERTIFICATE）"
+          elif [[ "$RUNNER_OS" == "Windows" && -n "$WIN_CERT" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "Windows 代码签名已启用（使用 secrets.WINDOWS_CERTIFICATE）"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=构建产物未签名::"
+            echo "没有配置签名证书（secrets.MACOS_CERTIFICATE / WINDOWS_CERTIFICATE）。"
+            echo "本次产出的安装包**未签名**：Windows 会弹 SmartScreen 警告，"
+            echo "macOS 需要右键「打开」才能启动。正式分发前请配置证书。"
+          fi
+
+      - name: Import macOS signing certificate
+        if: runner.os == 'macOS' && steps.signing.outputs.enabled == 'true'
+        shell: bash
+        env:
+          CERT_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          # 证书与密码只出现在这一步的环境变量里；写入临时钥匙串后立即清理。
+          KEYCHAIN="$RUNNER_TEMP/app-signing.keychain-db"
+          echo -n "$CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 900 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Import Windows signing certificate
+        if: runner.os == 'Windows' && steps.signing.outputs.enabled == 'true'
+        id: win_cert
+        shell: pwsh
+        env:
+          CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE }}
+        run: |
+          # 证书写成临时 PFX 文件；路径通过 step 输出传给构建步骤。
+          $path = Join-Path $env:RUNNER_TEMP "cert.pfx"
+          [IO.File]::WriteAllBytes($path, [Convert]::FromBase64String($env:CERT_PFX_BASE64))
+          echo "cert_path=$path" >> $env:GITHUB_OUTPUT
+
       - name: Build desktop bundles
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # macOS：证书已在前一步导入钥匙串，这里只告诉 tauri 用哪个签名身份。
+          APPLE_SIGNING_IDENTITY: ${{ steps.signing.outputs.enabled == 'true' && secrets.MACOS_SIGNING_IDENTITY || '' }}
+          # 公证凭据（可选）：没有就不公证，安装包仍可用但要右键打开。
+          APPLE_ID: ${{ secrets.MACOS_APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.MACOS_APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+          # Windows：证书路径由前一步的输出传来（没配证书时为空字符串）。
+          TAURI_WINDOWS_CERTIFICATE_PATH: ${{ steps.win_cert.outputs.cert_path }}
+          TAURI_WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         with:
           projectPath: .
           args: ${{ matrix.args }}
+
+      - name: Clean up signing material
+        if: always() && steps.signing.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          # 无论构建成没成功都清掉临时证书文件：runner 虽然是临时的，
+          # 但没有理由让私钥在上面多留一刻。
+          rm -f "${RUNNER_TEMP}/cert.p12" "${RUNNER_TEMP}/cert.pfx" 2>/dev/null || true
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" 2>/dev/null || true
+          fi
       - name: Upload Windows bundle
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4

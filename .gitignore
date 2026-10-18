@@ -22,6 +22,17 @@ Thumbs.db
 # 本地环境
 .env
 .env.*
+# 但配置模板要入库：它里面没有真实密码，只是字段说明与占位值。
+!.env.example
+
+# 部署用的签名私钥与 TLS 证书（cloud/.env.example 里的 KEYS_DIR / TLS_DIR 默认值）。
+# 私钥泄露等于任何人都能伪造授权凭证与升级包，所以宁可多忽略几个目录。
+cloud/keys/
+cloud/tls/
+*.pem
+*.key
+*.p12
+*.pfx
 
 # NarraFork 本地工作目录（计划、附件缓存）
 .narrafork/

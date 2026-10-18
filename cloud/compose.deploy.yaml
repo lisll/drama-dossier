@@ -1,0 +1,150 @@
+# 整套服务的部署编排（M7-7）。
+#
+# 与 compose.dev.yaml 分开：那份是**开发用**（PG + Mailpit，只绑 127.0.0.1，
+# 密码是固定开发值）。这份是**部署用**，目标不同：
+#   - 对外只经 Caddy 的 HTTPS，其余服务不直接暴露端口；
+#   - 密码与密钥从 .env 读（仓库里只有 .env.example）；
+#   - 数据落在磁盘卷上，备份脚本能直接打包。
+#
+# 快速开始（详见 cloud/docs/DEPLOYMENT.md）：
+#   cp .env.example .env && 编辑 .env          # 填密码、私钥路径、对外域名
+#   openssl req -x509 -newkey rsa:2048 -nodes \
+#     -keyout tls/key.pem -out tls/cert.pem -days 365 -subj "/CN=<对外域名>"
+#   docker compose -f compose.deploy.yaml up -d --wait    # 会自动先跑一次迁移
+#   docker compose -f compose.deploy.yaml exec commerce drama-commerce admin create --email you@example.com
+#
+# 为什么这是一个「够用的最小部署」而不是生产级方案：
+# 总方案要求「用 docker compose 在本机或局域网部署整套服务，HTTPS 用自签证书」。
+# 多机、对象存储、日志聚合都不在本期范围内。
+
+name: drama-dossier
+
+services:
+  postgres:
+    image: postgres:18.6-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?请在 .env 里设置 POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env 里设置 POSTGRES_PASSWORD}
+      # 两个服务的表结构互不兼容（commerce 的 users.id 是 uuid、媒体侧是 text），
+      # 必须各一个库。这里先建一个库，两个服务各自在自己的库里跑迁移。
+      POSTGRES_DB: ${COMMERCE_DB:-drama_commerce}
+    volumes:
+      - pgdata:/var/lib/postgresql
+      # 初始化时多建一个媒体库。用 /docker-entrypoint-initdb.d 是官方推荐做法；
+      # 只在**数据卷为空**时执行一次。
+      - ./scripts/initdb.sql:/docker-entrypoint-initdb.d/10-media.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${COMMERCE_DB:-drama_commerce}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    # 不映射端口：只有同网络的 commerce / media 能连。
+
+  # 一次性迁移容器：两个服务在「数据库还没迁移到最新」时会拒绝启动
+  # （commerce/api.py 与 drama-cloud 的 init_db 都会检查），所以部署时必须先跑迁移。
+  # 用 `service_completed_successfully` 让两个服务等它成功退出再起。
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    environment:
+      DRAMA_COMMERCE_DSN: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${COMMERCE_DB:-drama_commerce}
+      DRAMA_CLOUD_DSN: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${MEDIA_DB:-drama_media}
+    # 先迁 commerce 再迁 media：两条命令用 `;` 串联会让失败被掩盖，
+    # 所以用 `&&`；任何一条失败，整个容器以非零退出，服务就不会起来。
+    command:
+      - sh
+      - -c
+      - |
+        drama-commerce migrate && drama-cloud initdb
+
+  commerce:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DRAMA_COMMERCE_DSN: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${COMMERCE_DB:-drama_commerce}
+      DRAMA_COMMERCE_CODE_SECRET: ${CODE_SECRET:?请在 .env 里设置 CODE_SECRET（至少 32 字符）}
+      DRAMA_COMMERCE_INTERNAL_SECRET: ${INTERNAL_SECRET:?请在 .env 里设置 INTERNAL_SECRET}
+      DRAMA_COMMERCE_SMTP_HOST: ${SMTP_HOST:?请在 .env 里设置 SMTP_HOST}
+      DRAMA_COMMERCE_SMTP_PORT: ${SMTP_PORT:-587}
+      DRAMA_COMMERCE_SMTP_SECURITY: ${SMTP_SECURITY:-starttls}
+      DRAMA_COMMERCE_SMTP_USERNAME: ${SMTP_USERNAME:-}
+      DRAMA_COMMERCE_SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      DRAMA_COMMERCE_SMTP_FROM: ${SMTP_FROM:-}
+      DRAMA_COMMERCE_PRODUCT_NAME: ${PRODUCT_NAME:-剧备 DramaDossier}
+      DRAMA_COMMERCE_LICENSE_KEY_FILE: /keys/license.pem
+      DRAMA_COMMERCE_LICENSE_KEY_FILE_SECONDARY: ${LICENSE_KEY_SECONDARY:-}
+      DRAMA_COMMERCE_PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?请在 .env 里设置对外地址，例如 https://drama.local}
+      DRAMA_COMMERCE_MOCK_PAY_SECRET: ${MOCK_PAY_SECRET:-}
+      # 注意：commerce 没有 REQUIRE_TLS 这个配置项（只有媒体控制面有）。
+      # TLS 在这里由 Caddy 终结，容器间是明文 HTTP——这是同一台机器上的容器网络，
+      # 出机器的那一段由 Caddy 加密。
+    volumes:
+      # 私钥挂只读：容器被攻破也改不了它。
+      - ${KEYS_DIR:?请在 .env 里设置 KEYS_DIR（放 license.pem 的目录）}:/keys:ro
+      # 报审包的 PDF 字体与 dossier-artifacts 工具。
+      - ${FONTS_DIR:-./fonts}:/fonts:ro
+    command: ["drama-commerce", "serve", "--host", "0.0.0.0", "--port", "8100"]
+    # 不映射端口：只经 Caddy 访问。
+
+  media:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      commerce:
+        condition: service_started
+    environment:
+      DRAMA_CLOUD_DSN: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${MEDIA_DB:-drama_media}
+      DRAMA_CLOUD_HOME: /data
+      DRAMA_CLOUD_COMMERCE_URL: http://commerce:8100
+      DRAMA_CLOUD_INTERNAL_SECRET: ${INTERNAL_SECRET:?必须在 commerce 与 media 用同一个值}
+      DRAMA_CLOUD_COMMERCE_URL_PUBLIC: ${PUBLIC_BASE_URL}
+      DRAMA_CLOUD_PDF_FONT: ${PDF_FONT:-}
+      DRAMA_CLOUD_ASSET_RETENTION_DAYS: ${ASSET_RETENTION_DAYS:-30}
+      DRAMA_CLOUD_UPLOAD_RETENTION_DAYS: ${UPLOAD_RETENTION_DAYS:-7}
+      DRAMA_CLOUD_ARTIFACT_RETENTION_DAYS: ${ARTIFACT_RETENTION_DAYS:-30}
+      DRAMA_CLOUD_REQUIRE_TLS: "0"   # TLS 由 Caddy 终结
+    volumes:
+      # 素材、产物、分片上传都在这一个目录下——备份脚本只打包它。
+      - mediadata:/data
+    command: ["drama-cloud", "serve", "--host", "0.0.0.0", "--port", "8000"]
+
+  caddy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    depends_on:
+      - commerce
+      - media
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # 自签证书挂只读；生成方法见 docs/DEPLOYMENT.md。
+      - ${TLS_DIR:?请在 .env 里设置 TLS_DIR（放 cert.pem/key.pem 的目录）}:/certs:ro
+      - caddydata:/data
+      - caddyconfig:/config
+
+volumes:
+  pgdata:
+  mediadata:
+  caddydata:
+  caddyconfig:

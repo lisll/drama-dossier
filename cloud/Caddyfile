@@ -1,0 +1,78 @@
+# 反向代理（M7-7）：对外只经这里访问，两个服务不直接暴露端口。
+#
+# 自签证书：交给 Caddy 用 tls 指令加载本机文件（不用 ACME —— 局域网没有公网域名，
+# 申请不到真证书；自签是总方案明确的方案）。
+#
+# 域名用 {env.DEPLOY_HOST}：部署时在 .env 里设成局域网 IP 或内网域名。
+# 用 IP 访问时浏览器会提示证书不受信任——这是自签的必然结果，
+# 文档里写明「点继续访问」的做法。
+
+{
+	# 关掉 admin API：这套部署不需要运行时改配置，少一个入口少一分风险。
+	admin off
+	# 容器上前端不可达时不要回连本地。
+	auto_https off
+}
+
+{$DEPLOY_HOST:localhost}:{$HTTPS_PORT:443} {
+	tls /certs/cert.pem /certs/key.pem
+
+	# 管理后台与账号接口走 commerce。
+	handle /api/v1/admin/* {
+		reverse_proxy commerce:8100
+	}
+	handle /api/v1/auth/* {
+		reverse_proxy commerce:8100
+	}
+	handle /api/v1/credits* {
+		reverse_proxy commerce:8100
+	}
+	handle /api/v1/payments* {
+		reverse_proxy commerce:8100
+	}
+	handle /api/v1/invites {
+		reverse_proxy commerce:8100
+	}
+	handle /api/v1/cards/* {
+		reverse_proxy commerce:8100
+	}
+	handle /api/v1/license/* {
+		reverse_proxy commerce:8100
+	}
+	handle /api/v1/devices* {
+		reverse_proxy commerce:8100
+	}
+	handle /api/v1/me* {
+		reverse_proxy commerce:8100
+	}
+	handle /api/v1/client/* {
+		reverse_proxy commerce:8100
+	}
+	# 模拟收银台页面（本地开发用；部署时可删掉这一段）。
+	handle /pay/* {
+		reverse_proxy commerce:8100
+	}
+	handle /admin {
+		reverse_proxy commerce:8100
+	}
+	handle /internal/* {
+		# 内部接口**不要**暴露到外面：只允许同容器网络。
+		# 这里显式拒绝，避免有人误以为走 Caddy 就能调。
+		respond 404
+	}
+
+	# 其余都归媒体控制面（含它自己的 Web 客户端）。
+	handle {
+		reverse_proxy media:8000
+	}
+
+	# 大文件上传：分片是 8 MiB，留够余量。
+	request_body {
+		max_size 64MB
+	}
+}
+
+# 明文端口只做一件事：跳转到 HTTPS。
+{$DEPLOY_HOST:localhost}:{$HTTP_PORT:80} {
+	redir https://{host}{uri} permanent
+}
