@@ -36,6 +36,20 @@ pub fn log_file() -> Option<String> {
     LOG_PATH.get().map(|path| path.display().to_string())
 }
 
+/// 读日志尾部 N 行（供界面「运行日志」面板展示与一键复制；对应 Grove 的
+/// 可复制日志面板）。文件不存在或未初始化时返回空。
+pub fn read_recent_logs(limit: usize) -> Vec<String> {
+    let Some(path) = LOG_PATH.get() else {
+        return Vec::new();
+    };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.len().saturating_sub(limit);
+    lines[start..].iter().map(|line| line.to_string()).collect()
+}
+
 /// 记一条关键日志：`[时间] [操作] 说明`。文件写失败静默（测试辅助，不该影响业务）。
 pub fn log_event(op: &str, message: impl AsRef<str>) {
     let line = format!("[{}] [{}] {}", now_timestamp(), op, message.as_ref());

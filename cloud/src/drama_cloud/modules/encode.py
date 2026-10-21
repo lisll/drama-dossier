@@ -326,7 +326,29 @@ def implement_encode(ctx: MediaContext, params: EncodeParams) -> dict:
         chapters_input_index = len(ctx.inputs) + (1 if subtitle_input_index is not None else 0)
         args += ["-f", "ffmetadata", "-i", str(metadata_file)]
 
-    args += ["-filter_complex", ";".join(filters), "-map", video_label]
+    # V5 式 overlay（AI 角标/剧名水印）：PNG 作为额外输入，串在视频链末端。
+    # 输入序号排在字幕/章节额外输入之后；overlay 的 x/y 是表达式（含位置漂移），
+    # 表达式里的逗号按 ffmpeg 规则转义。
+    overlays = ctx.plan.get("overlays") or []
+    mapped_label = video_label
+    if overlays:
+        overlay_base = len(ctx.inputs) + (1 if subtitle_input_index is not None else 0) + (
+            1 if chapters_input_index is not None else 0
+        )
+        current = video_label.strip("[]")
+        for offset, item in enumerate(overlays):
+            nxt = f"vov{offset}"
+            x_expr = str(item.get("x", "0")).replace(",", r"\,")
+            y_expr = str(item.get("y", "0")).replace(",", r"\,")
+            filters.append(
+                f"[{current}][{overlay_base + offset}:v]overlay=x='{x_expr}':y='{y_expr}'[{nxt}]"
+            )
+            current = nxt
+        for item in overlays:
+            args += ["-i", str(item["path"])]
+        mapped_label = f"[{current}]"
+
+    args += ["-filter_complex", ";".join(filters), "-map", mapped_label]
     if params.audio_codec != "none" and ctx.probe.get("has_audio"):
         args += ["-map", audio_label]
 

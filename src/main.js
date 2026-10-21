@@ -2578,6 +2578,30 @@ $("#runtime-install").addEventListener("click", runtimeInstall);
 $("#open-log").addEventListener("click", () =>
   invoke("open_log_dir").catch((error) => toast(error, true)),
 );
+// 运行日志面板（对照 Grove 的可复制日志面板）：加载最近 200 条 + 一键复制。
+async function refreshLogPanel() {
+  const panel = $("#log-panel");
+  try {
+    const lines = await invoke("read_recent_logs", { limit: 200 });
+    panel.textContent = lines.length ? lines.join("\n") : "日志为空。";
+    panel.scrollTop = panel.scrollHeight;
+  } catch (error) {
+    panel.textContent = `加载失败：${error}`;
+  }
+}
+$("#log-refresh").addEventListener("click", refreshLogPanel);
+// 初次进入页面即加载一次（读取很轻，避免面板一直是「尚未加载」）。
+refreshLogPanel();
+$("#log-copy").addEventListener("click", async () => {
+  const text = $("#log-panel").textContent || "";
+  if (!text || text === "尚未加载。") return;
+  try {
+    await navigator.clipboard.writeText(text);
+    toast("日志已复制到剪贴板");
+  } catch (error) {
+    toast(`复制失败：${error}`, true);
+  }
+});
 // 横幅里的安装按钮随 innerHTML 重建，用事件委托绑定。
 $("#env-banner").addEventListener("click", (event) => {
   if (event.target instanceof Element && event.target.id === "env-install") {

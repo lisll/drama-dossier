@@ -352,6 +352,12 @@ fn open_log_dir() -> Result<(), String> {
     paths::open_in_file_manager(&dir)
 }
 
+/// 读日志尾部 N 行，供设置页「运行日志」面板展示与一键复制。
+#[tauri::command]
+fn read_recent_logs(limit: Option<usize>) -> Vec<String> {
+    logging::read_recent_logs(limit.unwrap_or(200))
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -372,6 +378,7 @@ pub fn run() {
             generate_package,
             open_path,
             open_log_dir,
+            read_recent_logs,
             account::account_register,
             account::account_login,
             account::account_logout,
