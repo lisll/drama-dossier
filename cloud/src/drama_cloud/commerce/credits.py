@@ -28,11 +28,18 @@ from .errors import CommerceError
 #: 预扣的悬挂时限：超过这么久还没结算，视为放弃并自动退还。
 #:
 #: 只用于「报审包」这类**服务端自己执行**的任务。处理版本的预扣与结算在同一个事务里
-#: 完成，不存在悬挂状态。
+#: 完成，不存在悬挂状态。**服务端处理**（`server_task:` 前缀）在 `release_stale_holds`
+#: 里被明确排除：它排队 + 最多 3 次重试、每次 ffmpeg 上限 30 分钟，超过 2 小时是常态，
+#: 预扣的结算与退还由媒体服务在任务终态主动完成，任何一条路径都会调
+#: `settle_task_billing`（runner.py / service.py）——中途被自动退回会让任务完成后
+#: 结算得到 409，变成「白送积分」。
 HOLD_TTL_SECONDS = 2 * 3600
 
 #: 目前支持的计价对象。
 SUBJECTS = ("version", "package", "server_version")
+
+#: 媒体控制面持有的预扣引用前缀。`release_stale_holds` 不回收这类预扣（见上）。
+SERVER_TASK_REF_PREFIX = "server_task:"
 
 
 def _idempotency_key(kind: str, ref: str) -> str:
@@ -266,6 +273,10 @@ def release_stale_holds(conn, user_id: Optional[str] = None) -> int:
     返回回收的笔数。`user_id` 给了就只扫这个人（查余额时用，开销小）；
     不给就扫全部（管理端清理用）。
 
+    **服务端处理的预扣（`ref` 以 `server_task:` 开头）不回收**：任务的结算与退还
+    由媒体服务在终态主动完成，回收时限盖不住排队 + 重试的正常时长，见
+    [`HOLD_TTL_SECONDS`][drama_cloud.commerce.credits.HOLD_TTL_SECONDS] 的注释。
+
     **整个扫描与改写都在一个事务里**：`FOR UPDATE SKIP LOCKED` 必须在事务内才有意义，
     否则锁立刻释放，两个并发调用会挑中同一批行。
     """
@@ -273,8 +284,9 @@ def release_stale_holds(conn, user_id: Optional[str] = None) -> int:
     sql = (
         "SELECT idempotency_key, user_id, delta, ref FROM credit_ledger"
         " WHERE kind = 'hold' AND settled_state = 'reserved' AND created_at < %s"
+        " AND (ref IS NULL OR ref NOT LIKE %s)"
     )
-    params: List = [cutoff]
+    params: List = [cutoff, SERVER_TASK_REF_PREFIX + "%"]
     if user_id is not None:
         sql += " AND user_id = %s::uuid"
         params.append(user_id)

@@ -1,6 +1,6 @@
 # 管理后台操作手册
 
-> 面向**运维与运营**：怎么开管理员账号、登录后在七个视图里看什么、能改什么，
+> 面向**运维与运营**：怎么开管理员账号、登录后在八个视图里看什么、能改什么，
 > 以及最常见的两类客诉（「充了钱没到账」「积分不对」）怎么一步步查。
 >
 > 接口与安全设计见 [`COMMERCE.md`](COMMERCE.md#310-管理后台)；整套服务的部署见
@@ -105,13 +105,29 @@ drama-commerce admin enable  --email ops@example.com
 计数存在 PostgreSQL 的 `rate_limits` 表里，多个实例共享同一份计数；**被拒绝的请求也算一次**
 （`ratelimit.py` 模块注释）。
 
-## 3. 七个视图
+## 3. 八个视图
 
-左侧导航七项：用户、卡密批次、订单、积分流水、设备、公告、开关与版本。
-**前五个是只读**，只有公告、开关、版本策略能改（`admin_views.py` 的模块注释）。
+左侧导航八项：用户、卡密批次、订单、积分流水、设备、公告、开关与版本、价目与档位。
+**前五个是只读**，只有公告、开关与版本策略、价目与档位能改。
 
 只读的五个视图有明确理由：它们是「已经发生的事实」，管理员需要看，但不该在后台随手改。
 改用户余额要走 `credits` CLI（有审计与幂等键），改订单状态更不该允许。
+
+### 3.0 价目与档位（`GET /api/v1/admin/prices`、`PUT /api/v1/admin/prices/{subject}`）
+
+总方案要求「价格做成后台可配置」，所以改价不需要重新部署。
+
+- 三个计价对象：`version`（本机处理版本）、`package`（报审包）、`server_version`（服务端处理），
+  各自可以改「每集多少积分」与「起扣集数」。不认识的 subject 直接 404——客户端只认这几个。
+- **改价只影响之后签发的配方与新下的订单**：配方在签发时把价格写进 `recipes.credits`、
+  订单在创建时把金额写进 `payment_orders`，两者都不重算。所以改价不会让用户已买的东西变价。
+- 充值档位用 `PUT /api/v1/admin/recharge-tiers/{id}` 做 upsert：既能改已有档位，也能加新档。
+  **下架的档位仍会列出来**（`active=false`），否则没法重新上架。
+- 档位 id 一旦被历史订单引用就不要再改：改 id 等于把历史订单和档位断开。
+- **邀请奖励**用 `GET` / `PUT /api/v1/admin/invite-settings`：邀请人得多少积分、被邀请人得多少、
+  每个邀请人最多拿几次。**改配置只影响之后发放的奖励**：已发的在发放那一刻就把数量写进了
+  `invite_rewards.credits`，不会跟着变。审计（`admin.invite_settings.set`）同时记改前值与改后值。
+- 所有改动都写审计（`admin.price.set` / `admin.tier.upsert` / `admin.invite_settings.set`）。
 
 ### 3.1 用户（`GET /api/v1/admin/users`）
 
@@ -129,8 +145,9 @@ drama-commerce admin enable  --email ops@example.com
 
 ### 3.2 卡密批次（`GET /api/v1/admin/card-batches`）
 
-每批：`name`、`kind`（`timed` / `lifetime`）、`days`、`createdBy`、`createdAt`、`revoked`、
-`total`（总数）、`redeemed`（已兑换）、`remaining`（未兑换）。
+每批：`name`、`kind`（`timed` / `lifetime`）、`days`、`priceFen`（售价，分；`null` 表示生成时没标价，
+**不是免费**——0 才是赠品卡）、`createdBy`、`createdAt`、`revoked`、`total`（总数）、`redeemed`（已兑换）、
+`remaining`（未兑换）。售价在 `cards generate --price-yuan` 时记录，**只用于对账盘点，不参与兑换**。
 
 **不返回卡密明文**（`cloud/src/drama_cloud/commerce/admin_views.py:100`）：数据库里只有摘要，明文只在 `cards generate` 导出 CSV
 那一刻存在。CSV 丢了找不回来，泄露了用 `cards revoke` 作废整批。
@@ -345,7 +362,9 @@ drama-commerce admin enable  --email ops@example.com
      账本没有更新与删除的接口，正常情况下不可能发生。
 4. 数得差不多但用户说「少了几十点」：看有没有 `kind = hold` 且 `settledState = reserved` 的行。
    **预扣期间余额已经减掉了**，而用户往往只记得「我充了多少」。悬挂超过 2 小时的预扣会自动退还
-   （原行标 `released`，另加一条正的退还流水），让用户点一次「刷新」即可触发清理。
+   （原行标 `released`，另加一条正的退还流水），让用户点一次「刷新」即可触发清理；
+   **例外**：`ref` 以 `server_task:` 开头（服务端处理）的预扣**不参与自动回收**——任务排队加
+   重试很容易超过 2 小时，它的结算与退还由媒体服务在任务终态主动完成（见下一段）。
 
 ### 常见误解，可以这样回答用户
 
@@ -353,7 +372,7 @@ drama-commerce admin enable  --email ops@example.com
 | --- | --- |
 | 「我充了 550，怎么只多了 550 又少了 5」 | 充值加 550，之后生成报审包/服务端处理按集预扣了 5。预扣在流水里是负的 `hold` 行 |
 | 「处理版本失败了，积分怎么不退」 | 处理版本在本机执行、视频不上传，服务端判断不了成败，所以**不退**。报审包与服务端处理的失败会自动退还预扣 |
-| 「有一条预扣一直不动」 | 超过 2 小时未结算的预扣会被自动回收；查一次余额就触发清理，那行会变成 `released` 并多一条正的退还流水 |
+| 「有一条预扣一直不动」 | 报审包类的预扣超过 2 小时会自动回收（查一次余额触发）。`server_task:` 开头的是服务端处理任务，**不自动回收**，任务到终态（成功/失败/取消）时由媒体服务结算或退还——真卡住的处置见下一节 |
 | 「余额怎么比我算的少 1」 | 让用户按流水逐笔对。价目是服务端的种子数据，后台改不了价（`price_rules` 表） |
 
 ### 管理员在这里能做什么、不能做什么
@@ -362,6 +381,25 @@ drama-commerce admin enable  --email ops@example.com
 - **不能**：在后台改余额或改价目。后台没有这些接口，是刻意的设计。
   补积分要用命令行 `drama-commerce credits grant --email a@example.com --amount 500 --memo 补偿 --by 你的名字`，
   它走账本、有审计、有幂等键（`admin:<操作人>:<用户>:<金额>:<备注>`，重复执行不会重复加）。
+
+### 服务端处理的预扣卡住了怎么办
+
+服务端处理（`ref` 形如 `server_task:tsk_...`）的预扣**不参与自动回收**（`credits.py` 的
+`release_stale_holds` 明确排除这个前缀）。媒体控制面丢了任务（进程崩溃、任务记录没了）时，
+那笔 `hold` 会一直停在 `reserved`，用户的余额里就少着这笔钱。定位与处置：
+
+1. 后台 → **积分流水**，按用户筛出 `kind = hold`、`settledState = reserved`、`ref` 以
+   `server_task:` 开头的行，记下 `ref` 和 `delta`。
+2. 到媒体控制面查这个任务：网页控制台的任务页，或 `GET /api/v1/tasks/<task_id>`
+   （`task_id` 就是 `ref` 里冒号后面那串）。
+3. **任务还在**（排队中 / 运行中 / 刚到终态）：等它到终态，媒体服务会自动结算或退还，
+   **不要动账本**。排队加上失败重试超过 2 小时是正常现象，先确认再动手。
+4. **任务真没了**（404，且没有任务记录）：用 `drama-commerce credits grant` 把被扣的数额
+   补给用户，**memo 里写清 ref**（例如「补偿：server_task:tsk_... 任务丢失」），事后对账才对得上。
+   那行 `hold` 保持 `reserved` 原样——账本只增不改，没有、也不该有手工改行状态的命令。
+   局限要如实知道：万一媒体侧后来又恢复并按同一 `ref` 退了一次，流水里会多出一条正的
+   `release`（等于用户拿了两次），此时以流水为准向用户说明；没有「扣回」命令，多补的部分
+   无法从账本里直接撤回，处理时务必先确认任务确实 404 再补偿。
 
 ## 6. 安全边界
 

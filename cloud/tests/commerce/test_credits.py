@@ -180,6 +180,35 @@ def test_stale_holds_are_released_after_the_ttl(pg):
     assert releases == 1
 
 
+def test_stale_server_task_holds_survive_the_ttl_and_can_still_settle(pg):
+    """服务端处理的预扣不参与自动回收。
+
+    任务要排队、失败还会重试，预扣超过 2 小时是常态；自动回收会让任务完成后
+    结算得到 409，等于白送积分。它的结算与退还由媒体服务在任务终态主动完成。
+    """
+    user = _user(pg)
+    credits.grant(pg, user, 100, idempotency_key="seed")
+    with pg.transaction():
+        key = credits.hold(pg, user, 25, ref="server_task:tsk_1")
+    # 推到 TTL 之前：模拟「任务还在排队，还没到终态」。
+    pg.execute(
+        "UPDATE credit_ledger SET created_at = now() - make_interval(secs => %s)"
+        " WHERE idempotency_key = %s",
+        (credits.HOLD_TTL_SECONDS + 60, key),
+    )
+    # 查余额（顺带触发回收）后，这笔预扣仍然在扣着。
+    assert credits.balance(pg, user) == 75, "服务端处理的预扣不该被 TTL 回收"
+    # 媒体服务按自己的 ref 找回幂等键（它不知道我们内部的键格式）。
+    assert credits.hold_key_for(pg, "server_task:tsk_1") == key
+    # 任务完成，正常结算——钱是花掉的，不是退回的。
+    credits.settle(pg, key)
+    assert credits.balance(pg, user) == 75, "结算后这笔钱就是花掉了"
+    # 预扣已进终态，退款路径拒绝（模拟「媒体侧想退」的迟到调用不会双花）。
+    with pytest.raises(CommerceError) as caught:
+        credits.release(pg, key)
+    assert caught.value.code == "hold_closed"
+
+
 def test_concurrent_holds_cannot_both_spend_the_same_money(pg, database_dsn):
     """两个人（或两个线程）同时预扣同一笔余额：只能有一个成功。
 

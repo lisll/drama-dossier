@@ -13,11 +13,10 @@ use dossier_core::{
     build_mount_copy_rows, builtin_profiles, diff_packages as diff_packages_core,
     export_capcut_draft, find_profile, import_capcut_draft, load_mount_copy_csv,
     make_publish_batch, plan_normalization, preview_publish_batch, probe_episode, review_drama,
-    scan_drama_dir, transition_publish_row, validate_drama_dir, validate_drama_name,
-    validate_library_root, validate_publish_update, write_mount_copy_csv, CapcutDraft,
-    DraftExportOptions, DraftExportResult, Drama, FfprobeConfig, MountCopyRow,
-    MountCopyWriteResult, NormalizationPlan, PackageDiff, PlatformProfile, ProbedEpisode,
-    ProfileReview, PublishPreview, TranscodeTarget,
+    scan_drama_dir, validate_drama_dir, validate_drama_name, validate_library_root,
+    validate_publish_update, write_mount_copy_csv, CapcutDraft, DraftExportOptions,
+    DraftExportResult, Drama, FfprobeConfig, MountCopyRow, MountCopyWriteResult, NormalizationPlan,
+    PackageDiff, PlatformProfile, ProbedEpisode, ProfileReview, PublishPreview, TranscodeTarget,
 };
 use serde::Serialize;
 
@@ -188,17 +187,4 @@ pub fn preview_mount_copy_publish(
     let batch = make_publish_batch(&batch_id, &drama_name, &PathBuf::from(path))
         .map_err(|error| error.to_string())?;
     Ok(preview_publish_batch(&batch_id, &batch))
-}
-
-/// 按本地发布状态机更新一条记录。这里只记账，不会向平台提交内容。
-#[tauri::command]
-pub fn transition_mount_copy_row(
-    row: MountCopyRow,
-    next_status: String,
-    result_note: String,
-) -> Result<MountCopyRow, String> {
-    let mut row = row;
-    transition_publish_row(&mut row, &next_status, result_note)
-        .map_err(|error| error.to_string())?;
-    Ok(row)
 }

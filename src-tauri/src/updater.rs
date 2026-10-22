@@ -149,16 +149,21 @@ pub fn update_dir(home: &Path) -> PathBuf {
 /// **一次性读完再写盘**：安装包几十 MB，分块流式下载需要额外的进度与断点
 /// 状态管理；这一版先保证「下完、验完、能装」这条链路是对的（YAGNI）。
 /// 下载失败时删除半截文件——留着会让人以为下载过了。
+///
+/// 下载跟随重定向（见 [`redirect_policy`]）：GitHub Releases 这类发布源一律先 302
+/// 跳到存储域名，不跟就下不了。安全性不靠跳转规则，靠后面的哈希 + 签名。
 pub async fn download(url: &str, home: &Path, file_name: &str) -> Result<PathBuf, UpdateError> {
     let directory = update_dir(home);
     std::fs::create_dir_all(&directory)
         .map_err(|error| UpdateError::Download(format!("创建更新目录失败：{error}")))?;
     let target = directory.join(sanitize_file_name(file_name));
 
+    // 建客户端前先装 rustls 后端（正常启动时账号模块已经装过，重复调用无副作用）。
+    crate::account::api::install_crypto_provider();
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(15))
         .timeout(std::time::Duration::from_secs(600))
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(redirect_policy())
         .build()
         .map_err(|error| UpdateError::Download(format!("初始化网络模块失败：{error}")))?;
 
@@ -187,6 +192,39 @@ pub async fn download(url: &str, home: &Path, file_name: &str) -> Result<PathBuf
     Ok(target)
 }
 
+/// 跟随重定向的上限。5 次对发布源足够（GitHub Releases 是 1 跳），
+/// 又能挡住无限互相踢皮球的环。
+const MAX_REDIRECTS: usize = 5;
+
+/// 决定一次跳转跟不跟：目标必须是 https，且已跳次数没到上限。
+///
+/// 抽成纯函数是为了**不联网就能测这两条规则**；真发 302 的接线测试另有一条。
+/// 初始地址的协议不在这里管——[`check_metadata`] 已要求 https。
+fn follows_redirect(hops_done: usize, target_scheme: &str) -> bool {
+    hops_done < MAX_REDIRECTS && target_scheme == "https"
+}
+
+/// 重定向策略：只跟 https 跳转、最多 [`MAX_REDIRECTS`] 次，其余按错误报出。
+///
+/// 哈希 + 签名在跳转**之后**仍然全量校验，所以跟重定向不降低安全性；
+/// 拒绝 https 以外的目标是让「302 跳明文地址」这种把包降级成可替换的行为走不通。
+fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let target = attempt.url().clone();
+        if follows_redirect(attempt.previous().len(), target.scheme()) {
+            attempt.follow()
+        } else if target.scheme() != "https" {
+            let reason: Box<dyn std::error::Error + Send + Sync> =
+                format!("下载地址跳转到 {}，不是 https，已拒绝", target.scheme()).into();
+            attempt.error(reason)
+        } else {
+            let reason: Box<dyn std::error::Error + Send + Sync> =
+                format!("下载地址重定向超过 {MAX_REDIRECTS} 次，已拒绝").into();
+            attempt.error(reason)
+        }
+    })
+}
+
 /// 只取文件名部分，并挡掉可能穿越目录的写法。
 fn sanitize_file_name(name: &str) -> String {
     let base = name
@@ -205,6 +243,47 @@ fn sanitize_file_name(name: &str) -> String {
     } else {
         cleaned
     }
+}
+
+/// 不碰文件系统的路径规范化：展开 `.` 与 `..`，**不解析符号链接**。
+///
+/// `/..` 再往上走，POSIX 规定等于 `/`，这里照此处理——规范化结果一定还是绝对路径，
+/// 挡住 `updates/../../evil.exe` 这类写法靠的是后面的前缀比较，不靠这里报错。
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                result.push(component.as_os_str());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                result.pop();
+            }
+            std::path::Component::Normal(name) => result.push(name),
+        }
+    }
+    result
+}
+
+/// 「启动安装器」的放行检查：候选文件必须真的落在 `update_dir` 里。
+///
+/// 两层检查，缺一不可：
+/// 1. **字面路径**展开 `..` 后仍在目录内——挡住直接传 `../evil.exe`；
+/// 2. **真实路径**（canonicalize，会解析符号链接）也在目录内——挡住把目录里
+///    的一个名字做成指向目录外文件的链接（字面合规、实际执行的是别的东西）。
+///
+/// `update_dir` 自身也按真实路径比较，目录被整体做成链接时不会误放行。
+/// 抽成独立函数是为了能直接测这几条规则；真目录、真符号链接的测试见下。
+pub fn is_inside_dir(update_dir: &Path, candidate: &Path) -> bool {
+    if !lexical_normalize(candidate).starts_with(lexical_normalize(update_dir)) {
+        return false;
+    }
+    // 目录都不存在（还没下载过任何包）就没有可放行的文件。
+    let Ok(real_base) = std::fs::canonicalize(update_dir) else {
+        return false;
+    };
+    std::fs::canonicalize(candidate).is_ok_and(|real| real.starts_with(real_base))
 }
 
 #[cfg(test)]
@@ -300,5 +379,107 @@ mod tests {
             verify_downloaded(&dir.join("nope.bin"), &"0".repeat(64), "sig", None).unwrap_err();
         assert!(matches!(error, UpdateError::Download(_)));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---------- 重定向策略 ----------
+
+    #[test]
+    fn redirects_stay_on_https_within_the_cap() {
+        assert!(follows_redirect(0, "https"));
+        assert!(
+            follows_redirect(MAX_REDIRECTS - 1, "https"),
+            "第 5 跳本身仍允许"
+        );
+        assert!(
+            !follows_redirect(MAX_REDIRECTS, "https"),
+            "再跳一跳超过上限，拒绝"
+        );
+        assert!(
+            !follows_redirect(0, "http"),
+            "跳到明文 http 拒绝——发布源 302 降级成可替换的传输"
+        );
+        assert!(!follows_redirect(0, "ftp"));
+    }
+
+    /// 应答 302 的迷你服务器：验证策略真的接进了下载（不只是规则对）。
+    /// tokio 没开 net 特性，用标准库现写。
+    fn redirecting_server(location: String) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).unwrap() == 0 {
+                    break;
+                }
+                head.push(byte[0]);
+            }
+            let reply = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(reply.as_bytes()).unwrap();
+        });
+        (base, handle)
+    }
+
+    /// 302 跳到明文地址：下载必须失败，且不落半截文件。
+    #[tokio::test]
+    async fn a_redirect_to_plain_http_is_refused() {
+        let (start, server) = redirecting_server("http://127.0.0.1:9/pkg.bin".into());
+        let home = tempdir();
+        let error = download(&format!("{start}/pkg.bin"), &home, "pkg.bin")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, UpdateError::Download(_)), "{error:?}");
+        assert!(
+            !update_dir(&home).join("pkg.bin").exists(),
+            "拒绝后不能留下半截文件"
+        );
+        server.join().unwrap();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ---------- 启动安装器的放行检查 ----------
+
+    #[test]
+    fn only_files_inside_the_update_dir_are_allowed() {
+        let home = tempdir();
+        let dir = update_dir(&home);
+        std::fs::create_dir_all(&dir).unwrap();
+        let inside = dir.join("pkg.exe");
+        std::fs::write(&inside, b"pkg").unwrap();
+
+        // 目录内的正常文件放行（字面与真实路径都在目录里）。
+        assert!(is_inside_dir(&dir, &inside));
+        // 字面在目录外：拒绝（第二层都不用看）。
+        assert!(!is_inside_dir(&dir, &home.join("elsewhere.exe")));
+        // `..` 穿越展开后跑出目录。
+        let escape = dir.join("..").join("escaped.exe");
+        assert!(!is_inside_dir(&dir, &escape));
+        // 目录不存在（还没下载过任何包）：一律拒绝。
+        assert!(!is_inside_dir(&home.join("missing"), &inside));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// 字面在目录里、实际指向目录外的符号链接：不放行。
+    /// （Windows 建符号链接要特权，这条只在 unix 上测。）
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_inside_the_dir_pointing_out_is_refused() {
+        let home = tempdir();
+        let dir = update_dir(&home);
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = home.join("real.exe");
+        std::fs::write(&outside, b"evil").unwrap();
+        let link = dir.join("link.exe");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(
+            !is_inside_dir(&dir, &link),
+            "目录里的名字指向目录外的文件，等于执行任意路径"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }

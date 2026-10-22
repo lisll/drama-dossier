@@ -149,31 +149,6 @@ pub fn mount_csv_save(
     })
 }
 
-/// 只校验当前剧目目录下的「挂载文案.csv」（文案可能被外部编辑过）。
-#[tauri::command]
-pub fn mount_csv_check(root: String, drama_name: String) -> Result<MountCsvCheckPayload, String> {
-    let drama = load_drama(&root, &drama_name)?;
-    let csv_path = PathBuf::from(&drama.dir).join(MOUNT_CSV_NAME);
-    if !csv_path.exists() {
-        return Err(format!(
-            "{} 尚未生成，请先点击「生成模板」。",
-            csv_path.display()
-        ));
-    }
-    let content =
-        std::fs::read_to_string(&csv_path).map_err(|error| format!("读取挂载文案失败：{error}"))?;
-    let numbers: Vec<u32> = drama
-        .episodes
-        .iter()
-        .filter_map(|e| e.episode_number)
-        .collect();
-    Ok(MountCsvCheckPayload {
-        check: validate_mount_csv(&content, &numbers),
-        csv_path: csv_path.display().to_string(),
-        content,
-    })
-}
-
 /// 生成流水文件位置（供账单页读取；与 generate_package 写入共用）。
 pub(crate) fn ledger_path(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()

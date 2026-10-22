@@ -84,6 +84,9 @@ docker compose -f compose.deploy.yaml run --rm --no-deps \
   否则客户端验不过任何凭证（见 [`KEY_ROTATION.md`](../../docs/KEY_ROTATION.md) 3.1）。
 - 私钥文件权限 600，目录以**只读**方式挂进容器（`compose.deploy.yaml:69` 的 `:ro`）：
   容器被攻破也改不了它。
+- **必须用上面的容器内命令生成**：容器进程是以 `appuser`（uid 10001）跑的，宿主 root 生成的
+  600 私钥它读不到，服务会在启动自检时报 `读不到授权签名私钥（PermissionError）` 后退出。
+  已经这样生成了的话：`chown 10001:10001 <私钥>` 再重启。
 - 私钥**丢了**要换新钥并发布内置新公钥的桌面端；**泄露了**任何人都能给自己签永久授权（见第 8 节）。
 
 ### 3.3 生成自签证书
@@ -392,9 +395,11 @@ cd cloud
 
 - `min_supported` 决定「红色横幅 vs 黄色横幅」：低于它的客户端会一直显示「这个版本已停止支持」，
   否则只在落后于 `latest` 时给一条黄色提示。
-- **但它是提示、不是拦截。** 桌面的功能闸门（`src-tauri/src/account/gate.rs`）只按授权档位
-  （`Open` / `Local` / `Paid`）放行，不看版本号；所以抬高 `min_supported` 不会让旧版停止工作。
-  要真正挡住旧版，得再加一道基于版本的闸门——当前实现没有。
+- **低于 `min_supported` 的客户端还会被功能遮罩拦住**：除首页与设置外的模块全部换成
+  「请下载新版」的遮罩页（`src-tauri` 的闸门 + `src/logic.js` 的 `blockedByVersion`），
+  只在设置页里下载、安装新版。
+- **遮罩只对带这段代码的版本有效**（M7 之后构建的安装包）。更早的客户端没有拦截逻辑，
+  抬高 `min_supported` 拦不住它们，只能靠红横幅提示——如实告知，不要以为改了策略就万事大吉。
 - 只是想提示「有新版本」就只改 `latest`。
 - 回退版本策略时把 `latest` / `min_supported` 改回原值即可，用户下次启动拉到新策略后横幅就恢复正常
   （客户端每次启动都拉一次配置）。
@@ -411,8 +416,6 @@ cd cloud
 - **无日志聚合**：日志在各自容器的 stdout，靠 `docker compose logs <服务>` 看，没有集中检索、没有轮转配置、
   没有告警。排查历史问题只能靠当时的 `docker compose logs` 输出或数据库里的 `audit_log` 表。
 - **数据库没有备份自动化**：`scripts/backup.sh` 要自己挂 cron 或 systemd timer，仓库里没有定时任务。
-- **没有数据库迁移的自动执行**：`commerce` 的 `command` 只有 `serve`，
-  **升级到带新迁移的版本后必须先手工跑 `drama-commerce migrate`**，否则服务起不来（见 3.4）。
 - **只有 postgres 写了健康检查**：编排里 `commerce` 与 `media` 都没有 `healthcheck`
   （`compose.deploy.yaml:36-40` 只有 postgres 那一段），所以 `up -d --wait` 只保证容器起来了，
   不保证服务真的能干活。验收要自己 `curl /api/v1/health`。两个服务其实都有这个端点

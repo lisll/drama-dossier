@@ -11,7 +11,6 @@ use tauri::{AppHandle, Emitter, Manager};
 mod account;
 mod dossier;
 mod encode;
-mod erase;
 mod erase_batch;
 mod jianying;
 mod jobs;
@@ -152,12 +151,20 @@ async fn prepare_update(
 /// 只做「启动安装器」这一件事：Windows 打开安装程序，macOS 用 `open` 打开 dmg/pkg。
 /// 重启由安装器负责——程序不自替换正在运行的二进制。
 #[tauri::command]
-fn launch_update_installer(path: String) -> Result<(), String> {
+fn launch_update_installer(app: tauri::AppHandle, path: String) -> Result<(), String> {
     let target = std::path::PathBuf::from(&path);
     if !target.is_file() {
         return Err(format!("安装包不存在：{path}"));
     }
-    // 只允许从更新目录启动：防止被诱导去执行任意路径。
+    // 只允许启动**本次更新下载目录里**的文件：前端传来的路径是不可信输入，
+    // 只查扩展名挡不住拿任意 `.exe/.dmg` 诱导执行。真实路径判断见 `is_inside_dir`。
+    let home = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("无法定位应用配置目录：{error}"))?;
+    if !updater::is_inside_dir(&updater::update_dir(&home), &target) {
+        return Err("只能启动自动更新下载的安装包".to_owned());
+    }
     let name = target
         .file_name()
         .and_then(|value| value.to_str())
@@ -340,12 +347,7 @@ pub fn run() {
             mount::mount_plan_load,
             mount::mount_csv_template,
             mount::mount_csv_save,
-            mount::mount_csv_check,
             mount::ledger_list,
-            erase::pick_video,
-            erase::erase_status,
-            erase::plan_erase,
-            erase::run_erase,
             dossier::transcode_advice,
             dossier::diff_report_packages,
             dossier::platform_profiles,
@@ -362,7 +364,6 @@ pub fn run() {
             dossier::generate_mount_copy_csv,
             dossier::load_mount_copy,
             dossier::save_mount_copy,
-            dossier::transition_mount_copy_row,
             dossier::preview_mount_copy_publish,
             version::rights_status,
             version::rights_declare,

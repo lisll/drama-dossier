@@ -909,11 +909,13 @@ mod installer {
     /// 写错会让所有用户装不上，只能由真正下载过的人核对。
     /// 未填时一键安装会明确报「哈希未配置」并给出手动步骤，**绝不会跳过校验直接装**。
     #[cfg(target_os = "macos")]
-    const EVERMEET_FFMPEG_SHA256: &str = "unverified";
+    const EVERMEET_FFMPEG_SHA256: &str =
+        "4acc0be580f9b2788029eb7bd4d645ff87968911b0a62aeeb3940d42d54558d5";
 
     /// `ffprobe-9.0.2.zip` 的 SHA-256。占位值，填法见上一条注释。
     #[cfg(target_os = "macos")]
-    const EVERMEET_FFPROBE_SHA256: &str = "unverified";
+    const EVERMEET_FFPROBE_SHA256: &str =
+        "24a9c968cd4da72d99c7245e914b921815835eb6dff01d99868031aebaf1d439";
 
     /// Windows 来源 1：gyan.dev 的**按版本归档**地址。浮动地址 `ffmpeg-release-*`
     /// 会随新版本滚动，钉不了哈希，所以不用它。

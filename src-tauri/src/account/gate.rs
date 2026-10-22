@@ -157,7 +157,7 @@ mod tests {
         for local in [
             "scan_library",
             "analyze_drama",
-            "run_erase",
+            "erase_batch_start",
             "transcode_execute",
             "jianying_detect",
             "import_draft",
