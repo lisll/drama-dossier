@@ -848,7 +848,11 @@ function switchModule(name) {
   }
   // 转码模块需要运行环境；切进去时按当前状态刷新阻断层。
   if (name === "transcode") renderTranscodeGate();
-  if (name === "mount") refreshMountContext();
+  if (name === "mount") {
+    refreshMountContext();
+    // 计划只在切进这个模块时读一次（理由见 loadMountPlan 的注释）。
+    loadMountPlan();
+  }
   if (name === "home") loadHome();
   if (name === "version") enterVersionModule();
   if (name === "server") enterServerModule();
@@ -4138,6 +4142,22 @@ function refreshMountContext() {
   }
   node.textContent = `当前剧目：${selected.name}（${selected.episodes.length} 集）`;
   node.classList.remove("empty");
+}
+
+/** 读回已保存的挂载计划。只在切进「挂载」模块时读一次：
+ *  它要访问磁盘，放在 renderContexts 里会变成每点一次剧目就读一次文件，
+ *  计划文件损坏时也会在别的模块反复弹错误。读不到就当作还没绑定；
+ *  文件损坏时会提示一次（不至于挡住页面，但要让「计划怎么没了」有线索可查）。
+ */
+async function loadMountPlan() {
+  try {
+    const plan = await call("mount_plan_load");
+    state.mountPlan = plan ?? null;
+  } catch (error) {
+    state.mountPlan = null;
+    toast(L.errorText(error), true);
+  }
+  renderMountPlanSummary();
 }
 
 function requireMountDrama() {

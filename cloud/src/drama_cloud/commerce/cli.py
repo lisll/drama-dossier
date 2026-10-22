@@ -18,6 +18,7 @@ import secrets
 import sys
 import uuid
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import List, Optional
 
@@ -98,6 +99,15 @@ def cmd_cards_generate(args) -> int:
     days = None if args.lifetime else args.days
     if days is not None and not 1 <= days <= 3650:
         raise UsageError("--days 要在 1 到 3650 之间")
+    price_fen: Optional[int] = None
+    if args.price_yuan is not None:
+        if not 0 <= args.price_yuan <= 1_000_000:
+            raise UsageError("--price-yuan 要在 0 到 1000000 之间")
+        # 界面层按元输入，存储按分（整数）：先用 Decimal 限制两位小数再取整，
+        # 避免 19.99 * 100 的浮点误差把 1999 分写成 1998 分。
+        price_fen = int(Decimal(str(args.price_yuan)) * 100)
+        if Decimal(price_fen) / 100 != Decimal(str(args.price_yuan)):
+            raise UsageError("--price-yuan 最多两位小数（分是最小单位）")
     kind = "lifetime" if days is None else "timed"
     label = "永久" if days is None else f"{days}天"
     name = (args.name if args.name is not None else f"{label}-{datetime.now():%Y%m%d-%H%M%S}").strip()
@@ -118,13 +128,19 @@ def cmd_cards_generate(args) -> int:
     try:
         with os.fdopen(fd, "w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.writer(handle)
-            writer.writerow(["code", "kind", "days", "batch_name"])
+            writer.writerow(["code", "kind", "days", "price_fen", "batch_name"])
             for code in codes:
-                writer.writerow([cards.display(code), kind, "" if days is None else days, name])
+                writer.writerow([
+                    cards.display(code), kind, "" if days is None else days,
+                    "" if price_fen is None else price_fen, name,
+                ])
             handle.flush()
             os.fsync(handle.fileno())
         with connect(load_dsn()) as conn:
-            batch_id = cards.create_batch(conn, name=name, days=days, codes=codes, operator=_operator(args))
+            batch_id = cards.create_batch(
+                conn, name=name, days=days, codes=codes, operator=_operator(args),
+                price_fen=price_fen,
+            )
     except BaseException:
         temp.unlink(missing_ok=True)
         raise
@@ -135,8 +151,8 @@ def cmd_cards_generate(args) -> int:
               f"明文在 {temp}，请手动改名并妥善保管", file=sys.stderr)
         return 1
     temp.unlink()
-    summary = {"batch_id": batch_id, "name": name, "kind": kind, "days": days, "count": len(codes),
-               "file": str(out)}
+    summary = {"batch_id": batch_id, "name": name, "kind": kind, "days": days,
+               "price_fen": price_fen, "count": len(codes), "file": str(out)}
     print(json.dumps(summary, ensure_ascii=False))
     print("CSV 是卡密明文的唯一副本（数据库里只有摘要）：丢了找不回来；泄露了请用 cards revoke 作废整批。",
           file=sys.stderr)
@@ -155,6 +171,7 @@ def cmd_cards_list(args) -> int:
     for row in batches:
         print(json.dumps({
             "batch_id": str(row["id"]), "name": row["name"], "kind": row["kind"], "days": row["days"],
+            "price_fen": row["price_fen"],
             "total": row["total"], "redeemed": row["redeemed"], "revoked_at": _when(row["revoked_at"]),
             "created_by": row["created_by"], "created_at": _when(row["created_at"]),
         }, ensure_ascii=False))
@@ -403,6 +420,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--count", type=int, required=True)
     p.add_argument("--out", required=True, help="导出的 CSV 路径，文件不能已存在")
     p.add_argument("--name", help="批次名称，默认按类型和时间生成")
+    p.add_argument(
+        "--price-yuan", type=float,
+        help="这批卡的售价（元）。只记录在批次上供对账，不参与兑换；"
+             "不填表示这批不标价。0 表示赠品卡",
+    )
     p.add_argument("--by", help="操作人，记进审计日志（默认是当前系统用户）")
     p.set_defaults(func=cmd_cards_generate)
 

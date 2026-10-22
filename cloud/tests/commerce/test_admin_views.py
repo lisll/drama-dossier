@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 from drama_cloud.commerce.admins import AdminService
 from drama_cloud.commerce.api import create_app
 
-from .conftest import FAST_HASHER, auth
+from .conftest import FAST_HASHER, activate, auth, new_cards
 
 ADMIN_PASSWORD = "admin-password-1234"
 
@@ -44,7 +44,7 @@ def admin_auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
-READ_VIEWS = ["/users", "/card-batches", "/orders", "/ledger", "/devices", "/announcements", "/flags", "/version-policy"]
+READ_VIEWS = ["/users", "/card-batches", "/orders", "/ledger", "/devices", "/announcements", "/flags", "/version-policy", "/prices", "/recharge-tiers", "/invite-settings"]
 
 
 @pytest.mark.parametrize("path", READ_VIEWS)
@@ -280,3 +280,302 @@ def test_the_admin_page_is_served(client):
     response = client.get("/admin")
     assert response.status_code == 200, response.text
     assert "管理后台" in response.text
+
+
+# ---------- 价目与充值档位（可写） ----------
+
+def test_prices_can_be_read_and_changed(client, admin_token):
+    """总方案要求「价格做成后台可配置」。之前只能改种子 SQL 再重新部署。"""
+    listing = client.get("/api/v1/admin/prices", headers=admin_auth(admin_token)).json()
+    subjects = {row["subject"] for row in listing["items"]}
+    assert {"version", "package", "server_version"} <= subjects
+
+    response = client.put(
+        "/api/v1/admin/prices/version",
+        headers=admin_auth(admin_token),
+        json={"credits_per_unit": 8, "min_units": 1},
+    )
+    assert response.status_code == 200, response.text
+    after = client.get("/api/v1/admin/prices", headers=admin_auth(admin_token)).json()
+    row = next(item for item in after["items"] if item["subject"] == "version")
+    assert row["creditsPerUnit"] == 8
+
+
+def test_a_price_change_does_not_affect_already_issued_recipes(client, admin_token, register, pg):
+    """签发配方 → 走**后台接口**改价 → 消费，扣的是签发时定死的价。
+
+    与 `test_recipe_billing.test_price_is_fixed_at_issue_time…` 的分工：那边直接改库
+    （`price_rules`），这条走的是管理后台的改价接口——后台改价与直接改库必须同样守承诺。
+    """
+    from drama_cloud.commerce import credits
+    from .test_recipes import PASSWORD, PC, TASK
+
+    body = register("priced@example.com", PASSWORD)
+    token = body["tokens"]["access_token"]
+    assert activate(client, token, PC).status_code == 200
+    [code] = new_cards(pg, days=30)
+    assert client.post("/api/v1/cards/redeem", json={"code": code}, headers=auth(token)).status_code == 200
+    credits.grant(pg, body["user"]["id"], 100, idempotency_key="seed:price")
+
+    issued = client.post(
+        "/api/v1/version-recipes",
+        headers=auth(token),
+        json={"device_id": PC, "task": TASK, "platform": "universal",
+              "strength": "medium", "episode_count": 3},
+    )
+    assert issued.status_code == 200, issued.text
+    assert issued.json()["credits"] == 15, "签发时每集 5 积分，3 集定死 15"
+
+    # 后台把单价改成 50：已签发的配方不重算。
+    client.put(
+        "/api/v1/admin/prices/version",
+        headers=admin_auth(admin_token),
+        json={"credits_per_unit": 50, "min_units": 1},
+    )
+
+    consumed = client.post(
+        f"/api/v1/version-recipes/{issued.json()['recipe_id']}/consume",
+        headers=auth(token),
+        json={"device_id": PC},
+    )
+    assert consumed.status_code == 200, consumed.text
+    assert consumed.json()["credits"] == 15, "消费仍按签发时定死的 15 扣"
+    assert credits.balance(pg, body["user"]["id"]) == 85, "100 - 15，改价没让已买的变价"
+
+
+def test_a_tier_change_does_not_affect_already_placed_orders(client, admin_token, register, pg):
+    """下单 → 后台改档位 → 模拟支付回调入账，到账的是**下单时**的积分数。
+
+    订单在创建时把积分数写进了 `payment_orders.credits`，回调入账读的是它，
+    不再回头看档位表——改档位不能让用户已下的单变多或变少。
+    """
+    from drama_cloud.commerce import credits
+    from drama_cloud.commerce.payments import mock as mock_provider
+    from .conftest import MOCK_PAY_SECRET
+
+    body = register("tiered@example.com", "correct-horse-1")
+    token = body["tokens"]["access_token"]
+    order = client.post(
+        "/api/v1/payments/orders",
+        headers=auth(token),
+        json={"tier_id": "tier-100", "channel": "mock"},
+    ).json()
+    assert order["credits"] == 100, "下单时 tier-100 是 100 积分"
+
+    # 后台把这档改成 999 积分、金额不动。
+    changed = client.put(
+        "/api/v1/admin/recharge-tiers/tier-100",
+        headers=admin_auth(admin_token),
+        json={"amount_fen": 1000, "credits": 999, "sort_order": 10, "active": True},
+    )
+    assert changed.status_code == 200, changed.text
+
+    # 按订单金额回调（金额必须一致，验签用真报文）。
+    provider = mock_provider.MockProvider(MOCK_PAY_SECRET, None)
+    payload = {
+        "out_trade_no": order["outTradeNo"], "channel_trade_no": "mock-tier-1",
+        "amount_fen": 1000, "status": "paid", "paid_at": "2026-10-17T12:00:00+00:00",
+    }
+    signed, signature = provider.sign(payload)
+    notify = client.post(
+        "/api/v1/payments/mock/notify",
+        content=signed,
+        headers={"content-type": "application/json", mock_provider.SIGNATURE_HEADER: signature},
+    )
+    assert notify.status_code == 200, notify.text
+    assert credits.balance(pg, body["user"]["id"]) == 100, "到账的是下单时的 100，不是改后的 999"
+
+
+def test_an_unknown_subject_is_refused(client, admin_token):
+    response = client.put(
+        "/api/v1/admin/prices/not-a-subject",
+        headers=admin_auth(admin_token),
+        json={"credits_per_unit": 1, "min_units": 1},
+    )
+    assert response.status_code == 404, response.text
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_a_non_positive_price_is_refused(client, admin_token, value):
+    response = client.put(
+        "/api/v1/admin/prices/version",
+        headers=admin_auth(admin_token),
+        json={"credits_per_unit": value, "min_units": 1},
+    )
+    assert response.status_code == 422, response.text
+
+
+def test_tiers_can_be_listed_including_inactive(client, admin_token):
+    listing = client.get(
+        "/api/v1/admin/recharge-tiers", headers=admin_auth(admin_token)
+    ).json()
+    ids = [row["id"] for row in listing["items"]]
+    assert "tier-100" in ids
+
+
+def test_a_tier_can_be_added_and_updated(client, admin_token):
+    created = client.put(
+        "/api/v1/admin/recharge-tiers/tier-999",
+        headers=admin_auth(admin_token),
+        json={"amount_fen": 9900, "credits": 1000, "sort_order": 40, "active": True},
+    )
+    assert created.status_code == 200, created.text
+
+    updated = client.put(
+        "/api/v1/admin/recharge-tiers/tier-999",
+        headers=admin_auth(admin_token),
+        json={"amount_fen": 9900, "credits": 1200, "sort_order": 40, "active": False},
+    )
+    assert updated.status_code == 200, updated.text
+
+    listing = client.get(
+        "/api/v1/admin/recharge-tiers", headers=admin_auth(admin_token)
+    ).json()
+    row = next(item for item in listing["items"] if item["id"] == "tier-999")
+    assert row["credits"] == 1200
+    assert row["active"] is False, "下架的档位仍要能看到，否则没法重新上架"
+
+
+def test_a_tier_change_shows_up_in_the_public_tier_list(client, admin_token):
+    """改档位后，用户端看到的就是新价格。"""
+    client.put(
+        "/api/v1/admin/recharge-tiers/tier-100",
+        headers=admin_auth(admin_token),
+        json={"amount_fen": 1000, "credits": 150, "sort_order": 10, "active": True},
+    )
+    from drama_cloud.commerce.payments import service as pay_service
+
+    # 用户端接口用的是同一个表；这里直接查 service 避免依赖登录。
+    with client.app.state.pool.connection() as conn:
+        tiers = pay_service.list_tiers(conn)
+    row = next(item for item in tiers if item["id"] == "tier-100")
+    assert row["credits"] == 150
+
+
+def test_price_changes_are_audited_with_before_and_after(client, admin_token, pg):
+    client.put(
+        "/api/v1/admin/prices/package",
+        headers=admin_auth(admin_token),
+        json={"credits_per_unit": 6, "min_units": 1},
+    )
+    rows = pg.execute(
+        "SELECT detail FROM audit_log WHERE action = 'admin.price.set'"
+    ).fetchall()
+    assert len(rows) == 1
+    detail = rows[0]["detail"]
+    # 种子价目是 5/集：改前值要记下来，否则事后查不出「从多少改成多少」。
+    assert detail["before"] == {"credits_per_unit": 5, "min_units": 1}
+    assert detail["after"] == {"credits_per_unit": 6, "min_units": 1}
+
+
+def test_tier_upserts_are_audited_with_before_and_after(client, admin_token, pg):
+    headers = admin_auth(admin_token)
+    # 新增：改前是 null（这一档还不存在）。
+    client.put(
+        "/api/v1/admin/recharge-tiers/tier-new",
+        headers=headers,
+        json={"amount_fen": 500, "credits": 60, "sort_order": 40, "active": True},
+    )
+    # 修改：改前是上一步写入的值（conftest 种子之外新造的，不受别的测试干扰）。
+    client.put(
+        "/api/v1/admin/recharge-tiers/tier-new",
+        headers=headers,
+        json={"amount_fen": 500, "credits": 66, "sort_order": 41, "active": False},
+    )
+    rows = pg.execute(
+        "SELECT detail FROM audit_log WHERE action = 'admin.tier.upsert' ORDER BY id"
+    ).fetchall()
+    assert [row["detail"] for row in rows] == [
+        {
+            "before": None,
+            "after": {"amount_fen": 500, "credits": 60, "sort_order": 40, "active": True},
+        },
+        {
+            "before": {"amount_fen": 500, "credits": 60, "sort_order": 40, "active": True},
+            "after": {"amount_fen": 500, "credits": 66, "sort_order": 41, "active": False},
+        },
+]
+
+
+# ---------- 邀请奖励（审查批次 C） ----------
+
+
+def test_invite_settings_can_be_read_and_changed(client, admin_token, pg):
+    """读写走同一个后台接口；改完之后发奖路径读到的就是新值。"""
+    from drama_cloud.commerce import invites
+
+    headers = admin_auth(admin_token)
+    before = client.get("/api/v1/admin/invite-settings", headers=headers).json()
+    # 迁移 0009 的种子数据：改之前先确认起点，改坏了立刻看得出来。
+    assert before == {"inviterCredits": 50, "inviteeCredits": 20, "maxRewards": 20}
+
+    changed = client.put(
+        "/api/v1/admin/invite-settings",
+        headers=headers,
+        json={"inviter_credits": 30, "invitee_credits": 10, "max_rewards": 5},
+    )
+    assert changed.status_code == 200, changed.text
+    assert changed.json() == {"inviterCredits": 30, "inviteeCredits": 10, "maxRewards": 5}
+    # 发奖时读的就是 invites.settings（invites.py），不能出现「后台改了、发奖还用旧值」。
+    assert invites.settings(pg) == {
+        "inviterCredits": 30,
+        "inviteeCredits": 10,
+        "maxRewards": 5,
+    }
+
+
+def test_invite_settings_changes_are_audited_with_before_and_after(client, admin_token, pg):
+    """审计要同时记改前与改后值：事后才查得出「从多少改成多少」。"""
+    client.put(
+        "/api/v1/admin/invite-settings",
+        headers=admin_auth(admin_token),
+        json={"inviter_credits": 40, "invitee_credits": 15, "max_rewards": 8},
+    )
+    rows = pg.execute(
+        "SELECT detail FROM audit_log WHERE action = 'admin.invite_settings.set'"
+    ).fetchall()
+    assert len(rows) == 1, "改邀请奖励必须写审计"
+    detail = rows[0]["detail"]
+    # 改前值是迁移种子（50/20/20）。
+    assert detail["before"] == {"inviter_credits": 50, "invitee_credits": 20, "max_rewards": 20}
+    assert detail["after"] == {"inviter_credits": 40, "invitee_credits": 15, "max_rewards": 8}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"inviter_credits": -1, "invitee_credits": 10, "max_rewards": 5},
+        {"inviter_credits": 10, "invitee_credits": -1, "max_rewards": 5},
+        {"inviter_credits": 10, "invitee_credits": 10, "max_rewards": 0},
+        {"inviter_credits": 10, "invitee_credits": 10, "max_rewards": 5, "extra": 1},
+    ],
+)
+def test_invalid_invite_settings_are_refused(client, admin_token, payload):
+    response = client.put(
+        "/api/v1/admin/invite-settings",
+        headers=admin_auth(admin_token),
+        json=payload,
+    )
+    assert response.status_code == 422, response.text
+
+
+# ---------- 卡密售价（审查批次 C） ----------
+
+
+def test_card_batches_view_shows_the_price(client, admin_token, pg):
+    """批次带售价时后台要显示；没标价的批次显示 NULL（不是 0——0 是赠品卡）。"""
+    from drama_cloud.commerce import cards
+
+    cards.create_batch(
+        pg, name="标价批次", days=30, codes=[cards.generate_code()], operator="t",
+        price_fen=1999,
+    )
+    cards.create_batch(
+        pg, name="没标价", days=30, codes=[cards.generate_code()], operator="t",
+    )
+    items = client.get(
+        "/api/v1/admin/card-batches", headers=admin_auth(admin_token)
+    ).json()["items"]
+    by_name = {row["name"]: row for row in items}
+    assert by_name["标价批次"]["priceFen"] == 1999
+    assert by_name["没标价"]["priceFen"] is None

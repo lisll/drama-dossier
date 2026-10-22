@@ -88,6 +88,7 @@
     <button data-view="devices">设备</button>
     <button data-view="announcements">公告</button>
     <button data-view="flags">开关与版本</button>
+    <button data-view="prices">价目与档位</button>
     <button id="logout" style="margin-top:16px;color:var(--muted)">退出登录</button>
   </aside>
   <main>
@@ -169,6 +170,51 @@
         </label>
         <button id="ver-save" class="primary">保存</button>
         <p id="ver-error" class="err hidden" role="alert"></p>
+      </div>
+    </section>
+
+    <!-- 价目与充值档位 -->
+    <section id="price-view" class="hidden">
+      <div class="card">
+        <strong>积分单价</strong>
+        <p class="muted">按集计价。改价只影响之后签发的配方与新下的订单——
+          已签发的配方在签发时就把价格写死了，不会因为改价变贵或变便宜。</p>
+        <table>
+          <thead><tr><th>计价对象</th><th>每集积分</th><th>起扣集数</th><th>操作</th></tr></thead>
+          <tbody id="price-list"></tbody>
+        </table>
+      </div>
+      <p id="price-error" class="err hidden" role="alert"></p>
+
+      <div class="card" style="margin-top:12px">
+        <strong>充值档位</strong>
+        <p class="muted">下架的档位仍列在这里，方便重新上架；历史订单不受影响。
+          档位 id 一旦被订单引用就不要再改。</p>
+        <table>
+          <thead><tr><th>id</th><th>售价（元）</th><th>积分</th><th>排序</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody id="tier-list"></tbody>
+        </table>
+        <div class="form-row" style="margin-top:12px">
+          <label>id<input id="tier-id" maxlength="32" placeholder="tier-1000" /></label>
+          <label>售价（元）<input id="tier-yuan" type="number" step="0.01" min="0.01" /></label>
+          <label>积分<input id="tier-credits" type="number" min="1" /></label>
+          <label>排序<input id="tier-order" type="number" value="100" min="0" /></label>
+        </div>
+        <button id="tier-save" class="primary">新增或修改这一档</button>
+        <p id="tier-error" class="err hidden" role="alert"></p>
+      </div>
+
+      <div class="card" style="margin-top:12px">
+        <strong>邀请奖励</strong>
+        <p class="muted">只影响之后发放的奖励；已发的在发放那一刻就写死了数量。
+          「每人最多」是同一个邀请人最多能拿到几次奖励（防刷的一道闸）。</p>
+        <div class="form-row">
+          <label>邀请人得（积分）<input id="invite-inviter" type="number" min="0" max="100000" /></label>
+          <label>被邀请人得（积分）<input id="invite-invitee" type="number" min="0" max="100000" /></label>
+          <label>每人最多（次）<input id="invite-max" type="number" min="1" max="10000" /></label>
+        </div>
+        <button id="invite-save" class="primary">保存邀请奖励</button>
+        <p id="invite-error" class="err hidden" role="alert"></p>
       </div>
     </section>
   </main>
@@ -303,6 +349,7 @@ const VIEWS = {
   devices: { title: "设备", hint: "只显示机器码前 12 位，够辨认、不泄露完整标识。" },
   announcements: { title: "公告", hint: "桌面端首页轮播读这里。" },
   flags: { title: "开关与版本", hint: "" },
+  prices: { title: "价目与档位", hint: "改价只影响之后签发的配方与新下的订单。" },
 };
 
 function switchView(name) {
@@ -317,9 +364,11 @@ function switchView(name) {
   $("#table-view").classList.toggle("hidden", !isTable);
   $("#announcement-view").classList.toggle("hidden", name !== "announcements");
   $("#flag-view").classList.toggle("hidden", name !== "flags");
+  $("#price-view").classList.toggle("hidden", name !== "prices");
   if (isTable) return loadTable();
   if (name === "announcements") return loadAnnouncements();
   if (name === "flags") return loadFlags();
+  if (name === "prices") return loadPrices();
 }
 
 document.querySelectorAll("aside button[data-view]").forEach((button) => {
@@ -591,6 +640,168 @@ $("#ver-save").addEventListener("click", async () => {
       }),
     });
     toast("版本策略已保存");
+  } catch (exception) {
+    error.textContent = exception.message;
+    error.classList.remove("hidden");
+  }
+});
+
+// ---------- 价目与档位 ----------
+
+const SUBJECT_LABELS = {
+  version: "本机处理版本",
+  package: "报审包",
+  server_version: "服务端处理",
+};
+
+async function loadPrices() {
+  try {
+    const [prices, tiers, invite] = await Promise.all([
+      api("/prices"),
+      api("/recharge-tiers"),
+      api("/invite-settings"),
+    ]);
+    $("#price-list").innerHTML = prices.items
+      .map(
+        (row) => `<tr>
+          <td>${esc(SUBJECT_LABELS[row.subject] || row.subject)}</td>
+          <td><input data-price-credits="${esc(row.subject)}" type="number" min="1"
+                     value="${row.creditsPerUnit}" style="width:100px" /></td>
+          <td><input data-price-min="${esc(row.subject)}" type="number" min="1"
+                     value="${row.minUnits}" style="width:90px" /></td>
+          <td><button class="ghost" data-save-price="${esc(row.subject)}">保存</button></td>
+        </tr>`,
+      )
+      .join("");
+    document.querySelectorAll("[data-save-price]").forEach((button) => {
+      button.addEventListener("click", () => savePrice(button.dataset.savePrice));
+    });
+
+    $("#tier-list").innerHTML = tiers.items
+      .map(
+        (row) => `<tr>
+          <td>${esc(row.id)}</td>
+          <td>${(row.amountFen / 100).toFixed(2)}</td>
+          <td>${row.credits}</td>
+          <td>${row.sortOrder}</td>
+          <td>${row.active ? "在售" : "已下架"}</td>
+          <td>
+            <button class="ghost" data-toggle-tier="${esc(row.id)}"
+                    data-tier-active="${row.active}"
+                    data-tier-fen="${row.amountFen}"
+                    data-tier-credits="${row.credits}"
+                    data-tier-order="${row.sortOrder}">
+              ${row.active ? "下架" : "上架"}
+            </button>
+          </td>
+        </tr>`,
+      )
+      .join("");
+    document.querySelectorAll("[data-toggle-tier]").forEach((button) => {
+      button.addEventListener("click", () =>
+        toggleTier(
+          button.dataset.toggleTier,
+          button.dataset.tierActive === "true",
+          Number(button.dataset.tierFen),
+          Number(button.dataset.tierCredits),
+          Number(button.dataset.tierOrder),
+        ),
+      );
+    });
+
+    $("#invite-inviter").value = invite.inviterCredits;
+    $("#invite-invitee").value = invite.inviteeCredits;
+    $("#invite-max").value = invite.maxRewards;
+  } catch (error) {
+    if (error.message !== "未登录") toast(error.message, true);
+  }
+}
+
+async function savePrice(subject) {
+  const error = $("#price-error");
+  error.classList.add("hidden");
+  const credits = Number(document.querySelector(`[data-price-credits="${subject}"]`).value);
+  const minUnits = Number(document.querySelector(`[data-price-min="${subject}"]`).value);
+  try {
+    await api(`/prices/${subject}`, {
+      method: "PUT",
+      body: JSON.stringify({ credits_per_unit: credits, min_units: minUnits }),
+    });
+    toast("价目已保存（只影响之后签发的配方与新订单）");
+    await loadPrices();
+  } catch (exception) {
+    error.textContent = exception.message;
+    error.classList.remove("hidden");
+  }
+}
+
+async function toggleTier(id, active, fen, credits, order) {
+  try {
+    await api(`/recharge-tiers/${id}`, {
+      method: "PUT",
+      body: JSON.stringify({
+        amount_fen: fen,
+        credits,
+        sort_order: order,
+        // 取反：在售的改成下架，下架的重新上架。
+        active: !active,
+      }),
+    });
+    toast(active ? "已下架（历史订单不受影响）" : "已重新上架");
+    await loadPrices();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+$("#tier-save").addEventListener("click", async () => {
+  const error = $("#tier-error");
+  error.classList.add("hidden");
+  const tierId = $("#tier-id").value.trim();
+  if (!tierId) {
+    error.textContent = "请填档位 id（例如 tier-100）";
+    error.classList.remove("hidden");
+    return;
+  }
+  const yuan = Number($("#tier-yuan").value);
+  try {
+    if (!Number.isFinite(yuan) || yuan <= 0) throw new Error("售价要大于 0");
+    // id 会拼进地址，必须编码：留着 / ? # 这类字符会拼出别的接口或截断。
+    await api(`/recharge-tiers/${encodeURIComponent(tierId)}`, {
+      method: "PUT",
+      body: JSON.stringify({
+        // 界面按「元」输入，接口按「分」收：钱只用整数存。
+        amount_fen: Math.round(yuan * 100),
+        credits: Number($("#tier-credits").value),
+        sort_order: Number($("#tier-order").value) || 100,
+        active: true,
+      }),
+    });
+    toast("档位已保存");
+    $("#tier-id").value = "";
+    await loadPrices();
+  } catch (exception) {
+    error.textContent = exception.message;
+    error.classList.remove("hidden");
+  }
+});
+
+$("#invite-save").addEventListener("click", async () => {
+  const error = $("#invite-error");
+  error.classList.add("hidden");
+  const inviter = Number($("#invite-inviter").value);
+  const invitee = Number($("#invite-invitee").value);
+  const maxRewards = Number($("#invite-max").value);
+  try {
+    await api("/invite-settings", {
+      method: "PUT",
+      body: JSON.stringify({
+        inviter_credits: inviter,
+        invitee_credits: invitee,
+        max_rewards: maxRewards,
+      }),
+    });
+    toast("邀请奖励已保存（只影响之后发放的奖励）");
   } catch (exception) {
     error.textContent = exception.message;
     error.classList.remove("hidden");

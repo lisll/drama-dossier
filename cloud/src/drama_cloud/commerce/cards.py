@@ -49,19 +49,32 @@ def digest(code: str) -> bytes:
     return hashlib.sha256(b"drama-dossier/card/v1\n" + code.encode("ascii")).digest()
 
 
-def create_batch(conn, *, name: str, days: Optional[int], codes: List[str], operator: str) -> str:
-    """一个事务写入一批卡密（只写摘要）。days 为 None 表示永久卡。返回批次 ID。"""
+def create_batch(
+    conn,
+    *,
+    name: str,
+    days: Optional[int],
+    codes: List[str],
+    operator: str,
+    price_fen: Optional[int] = None,
+) -> str:
+    """一个事务写入一批卡密（只写摘要）。days 为 None 表示永久卡。返回批次 ID。
+
+    `price_fen` 是这批卡的售价（单位：分，可空）——只记录在批次上，
+    不参与兑换逻辑；见迁移 0013。
+    """
     kind = "lifetime" if days is None else "timed"
     with conn.transaction():
         batch_id = conn.execute(
-            "INSERT INTO card_batches (name, kind, days, created_by) VALUES (%s, %s, %s, %s) RETURNING id",
-            (name, kind, days, operator),
+            "INSERT INTO card_batches (name, kind, days, created_by, price_fen)"
+            " VALUES (%s, %s, %s, %s, %s) RETURNING id",
+            (name, kind, days, operator, price_fen),
         ).fetchone()["id"]
         with conn.cursor() as cursor, cursor.copy("COPY cards (code_digest, batch_id) FROM STDIN") as copy:
             for code in codes:
                 copy.write_row((digest(code), batch_id))
         audit(conn, operator, "cards.batch_create", str(batch_id),
-              {"count": len(codes), "kind": kind, "days": days})
+              {"count": len(codes), "kind": kind, "days": days, "price_fen": price_fen})
     return str(batch_id)
 
 
@@ -86,7 +99,7 @@ def revoke_batch(conn, batch_id: str, operator: str) -> Optional[dict]:
 def list_batches(conn, limit: int = 50) -> list:
     return conn.execute(
         """
-        SELECT b.id, b.name, b.kind, b.days, b.created_by, b.created_at, b.revoked_at,
+        SELECT b.id, b.name, b.kind, b.days, b.price_fen, b.created_by, b.created_at, b.revoked_at,
                count(c.code_digest) AS total, count(c.redeemed_by) AS redeemed
         FROM card_batches b LEFT JOIN cards c ON c.batch_id = b.id
         GROUP BY b.id ORDER BY b.created_at DESC LIMIT %s

@@ -70,7 +70,8 @@ def test_generate_exports_plaintext_and_stores_digests(cli_env, tmp_path, capsys
     batch = pg.execute("SELECT id, kind, days, created_by FROM card_batches").fetchone()
     assert str(batch["id"]) == summary["batch_id"] and batch["created_by"] == "ops-alice"
     audit = pg.execute("SELECT actor, detail FROM audit_log WHERE action = 'cards.batch_create'").fetchone()
-    assert audit["actor"] == "ops-alice" and audit["detail"] == {"count": 25, "kind": "timed", "days": 30}
+    assert audit["actor"] == "ops-alice"
+    assert audit["detail"] == {"count": 25, "kind": "timed", "days": 30, "price_fen": None}
     dumped = str(pg.execute("SELECT * FROM audit_log").fetchall()) + str(pg.execute("SELECT * FROM card_batches").fetchall())
     assert not any(code in dumped for code in codes)
 
@@ -99,6 +100,41 @@ def test_generate_cleans_up_when_database_is_down(monkeypatch, tmp_path, capsys)
     code, _, err = run(capsys, "cards", "generate", "--lifetime", "--count", "3", "--out", str(tmp_path / "c.csv"))
     assert code == 2 and "无法连接数据库" in err
     assert list(tmp_path.iterdir()) == []  # 没写进数据库，明文也不能留在磁盘上
+
+
+def test_generate_records_the_price_in_fen(cli_env, tmp_path, capsys):
+    """--price-yuan 按分记录在批次上；不填是 NULL（没标价），不是 0（0 是赠品卡）。"""
+    pg = cli_env
+    priced = tmp_path / "priced.csv"
+    code, out, err = run(capsys, "cards", "generate", "--lifetime", "--count", "2",
+                         "--out", str(priced), "--price-yuan", "19.99", "--by", "ops-bob")
+    assert code == 0, err
+    # 19.99 元 → 1999 分（Decimal 换算，避开 19.99*100 的浮点误差）。
+    assert json.loads(out)["price_fen"] == 1999
+    rows = read_csv(priced)
+    assert all(row["price_fen"] == "1999" for row in rows), "CSV 里要有售价列"
+    assert (pg.execute("SELECT price_fen FROM card_batches").fetchone()["price_fen"]) == 1999
+
+    plain = tmp_path / "plain.csv"
+    code, _, err = run(capsys, "cards", "generate", "--lifetime", "--count", "1", "--out", str(plain))
+    assert code == 0, err
+    counted = pg.execute(
+        "SELECT"
+        " count(*) FILTER (WHERE price_fen = 1999) AS priced,"
+        " count(*) FILTER (WHERE price_fen IS NULL) AS unpriced"
+        " FROM card_batches"
+    ).fetchone()
+    assert (counted["priced"], counted["unpriced"]) == (1, 1)
+
+    # 负数与超过两位小数都拒绝；拒绝时不能落库、也不能留 CSV。
+    for bad in ("-1", "19.999"):
+        target = tmp_path / f"bad-{bad}.csv"
+        code, _, err = run(capsys, "cards", "generate", "--lifetime", "--count", "1",
+                           "--out", str(target), "--price-yuan", bad)
+        assert code == 2, bad
+        assert not target.exists(), bad
+    capsys.readouterr()
+    assert pg.execute("SELECT count(*) AS n FROM card_batches").fetchone()["n"] == 2
 
 
 def test_list_status_and_revoke(cli_env, client, register, tmp_path, capsys):

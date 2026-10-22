@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, Query
 from pydantic import Field
 
 from ..base import StrictModel
-from . import errors
+from . import errors, invites
 from .admins import AdminContext
 from .admin_routes import require_admin
 from .db import audit
@@ -101,7 +101,7 @@ def list_card_batches(
     """
     rows = conn.execute(
         """
-        SELECT b.id, b.name, b.kind, b.days, b.created_by, b.created_at, b.revoked_at,
+        SELECT b.id, b.name, b.kind, b.days, b.price_fen, b.created_by, b.created_at, b.revoked_at,
                count(c.code_digest) AS total,
                count(c.redeemed_at) AS redeemed
         FROM card_batches b LEFT JOIN cards c ON c.batch_id = b.id
@@ -116,6 +116,7 @@ def list_card_batches(
                 "name": row["name"],
                 "kind": row["kind"],
                 "days": row["days"],
+                "priceFen": row["price_fen"],
                 "createdBy": row["created_by"],
                 "createdAt": row["created_at"].isoformat(),
                 "revoked": row["revoked_at"] is not None,
@@ -494,3 +495,219 @@ def _check_version(value: str) -> None:
         raise errors.CommerceError(
             422, "invalid_request", f"版本号要形如 1.2.3：{value!r}"
         )
+
+
+# ---------- 8. 价目与充值档位（可写） ----------
+#
+# 总方案 §6 第 2 条要求「价格做成后台可配置」。这一节补的就是它：
+# 之前只能改种子 SQL 再重新部署，运营改个价要发版。
+#
+# **改价只影响之后的新单**：配方在签发时把价格写进 recipes.credits、
+# 订单在创建时把金额写进 payment_orders，两者都不重算。
+# 所以改价不会让已签发的配方或已下的单变价——这正是「价格定死」的设计。
+
+
+@router.get("/prices")
+def list_prices(
+    ctx: AdminContext = Depends(require_admin),
+    conn=Depends(get_conn),
+):
+    """当前价目表（每种计价对象一集多少积分）。"""
+    rows = conn.execute(
+        "SELECT subject, credits_per_unit, min_units, updated_at"
+        " FROM price_rules ORDER BY subject"
+    ).fetchall()
+    return {
+        "items": [
+            {
+                "subject": row["subject"],
+                "creditsPerUnit": int(row["credits_per_unit"]),
+                "minUnits": int(row["min_units"]),
+                "updatedAt": row["updated_at"].isoformat(),
+            }
+            for row in rows
+        ]
+    }
+
+
+class PriceIn(StrictModel):
+    credits_per_unit: int = Field(gt=0, le=100_000)
+    min_units: int = Field(default=1, gt=0, le=10_000)
+
+
+@router.put("/prices/{subject}")
+def set_price(
+    subject: str,
+    payload: PriceIn,
+    ctx: AdminContext = Depends(require_admin),
+    conn=Depends(get_conn),
+):
+    """改某个计价对象的单价。只影响之后签发的配方 / 创建的任务。"""
+    from .credits import SUBJECTS
+
+    if subject not in SUBJECTS:
+        # 不认识的计价对象直接拒：客户端只认这几个，
+        # 后台造一个新的只会让两边不一致。
+        raise errors.CommerceError(
+            404, "price_not_found", f"不认识的计价对象：{subject}"
+        )
+    with conn.transaction():
+        # 先锁行读改前值：审计要同时记改前与改后，事后才查得出「从多少改成多少」。
+        before = conn.execute(
+            "SELECT credits_per_unit, min_units FROM price_rules WHERE subject = %s FOR UPDATE",
+            (subject,),
+        ).fetchone()
+        if before is None:
+            raise errors.CommerceError(404, "price_not_found", f"价目里没有：{subject}")
+        row = conn.execute(
+            "UPDATE price_rules SET credits_per_unit = %s, min_units = %s, updated_at = now()"
+            " WHERE subject = %s RETURNING subject",
+            (int(payload.credits_per_unit), int(payload.min_units), subject),
+        ).fetchone()
+        if row is None:
+            raise errors.CommerceError(404, "price_not_found", f"价目里没有：{subject}")
+        audit(conn, ctx.admin_id, "admin.price.set", subject, {
+            "before": {
+                "credits_per_unit": int(before["credits_per_unit"]),
+                "min_units": int(before["min_units"]),
+            },
+            "after": {
+                "credits_per_unit": int(payload.credits_per_unit),
+                "min_units": int(payload.min_units),
+            },
+        })
+    return {"subject": subject, "creditsPerUnit": int(payload.credits_per_unit)}
+
+
+@router.get("/recharge-tiers")
+def list_tiers_admin(
+    ctx: AdminContext = Depends(require_admin),
+    conn=Depends(get_conn),
+):
+    """全部充值档位，**含已下架的**（下架的也要能看到并重新上架）。"""
+    rows = conn.execute(
+        "SELECT id, amount_fen, credits, sort_order, active FROM recharge_tiers"
+        " ORDER BY sort_order, amount_fen"
+    ).fetchall()
+    return {
+        "items": [
+            {
+                "id": row["id"],
+                "amountFen": int(row["amount_fen"]),
+                "credits": int(row["credits"]),
+                "sortOrder": int(row["sort_order"]),
+                "active": bool(row["active"]),
+            }
+            for row in rows
+        ]
+    }
+
+
+class TierIn(StrictModel):
+    amount_fen: int = Field(gt=0, le=100_000_000)
+    credits: int = Field(gt=0, le=100_000_000)
+    sort_order: int = Field(default=100, ge=0, le=10_000)
+    active: bool = True
+
+
+@router.put("/recharge-tiers/{tier_id}")
+def upsert_tier(
+    tier_id: str,
+    payload: TierIn,
+    ctx: AdminContext = Depends(require_admin),
+    conn=Depends(get_conn),
+):
+    """新增或修改一个充值档位。
+
+    用 upsert 而不是「只能改已有档位」：运营加一档新的价格包是常规操作。
+    **档位 id 一旦被历史订单引用就不要再改**——改 id 等于把历史订单和档位断开。
+    所以这里只允许改金额、积分、顺序、是否上架。
+    """
+    if not tier_id or len(tier_id) > 32:
+        raise errors.CommerceError(422, "invalid_request", "档位 id 长度要在 1–32 之间")
+    with conn.transaction():
+        # upsert 前先读旧值：审计记改前与改后（新增时改前是 null）。
+        before = conn.execute(
+            "SELECT amount_fen, credits, sort_order, active"
+            " FROM recharge_tiers WHERE id = %s FOR UPDATE",
+            (tier_id,),
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO recharge_tiers (id, amount_fen, credits, sort_order, active)"
+            " VALUES (%s,%s,%s,%s,%s)"
+            " ON CONFLICT (id) DO UPDATE SET amount_fen = excluded.amount_fen,"
+            " credits = excluded.credits, sort_order = excluded.sort_order,"
+            " active = excluded.active",
+            (tier_id, int(payload.amount_fen), int(payload.credits),
+             int(payload.sort_order), payload.active),
+        )
+        audit(conn, ctx.admin_id, "admin.tier.upsert", tier_id, {
+            "before": None if before is None else {
+                "amount_fen": int(before["amount_fen"]), "credits": int(before["credits"]),
+                "sort_order": int(before["sort_order"]), "active": bool(before["active"]),
+            },
+            "after": {
+                "amount_fen": int(payload.amount_fen), "credits": int(payload.credits),
+                "sort_order": int(payload.sort_order), "active": payload.active,
+            },
+        })
+    return {"id": tier_id}
+
+# ---------- 9. 邀请奖励（可写） ----------
+#
+# 总方案 §6 第 7 项「邀请奖励后台可配」。之前 `invite_settings` 只有迁移里的种子数据，
+# 运营想调整奖励数量只能改库。**已发的奖励不受影响**：`invite_rewards.credits`
+# 在发放那一刻就写定了（见 invites.py），所以这里只影响之后发放的。
+
+
+@router.get("/invite-settings")
+def get_invite_settings(
+    ctx: AdminContext = Depends(require_admin),
+    conn=Depends(get_conn),
+):
+    """当前邀请奖励配置（复用 invites.settings 的读法与 503 语义）。"""
+    return invites.settings(conn)
+
+
+class InviteSettingsIn(StrictModel):
+    inviter_credits: int = Field(ge=0, le=100_000)
+    invitee_credits: int = Field(ge=0, le=100_000)
+    max_rewards: int = Field(ge=1, le=10_000)
+
+
+@router.put("/invite-settings")
+def put_invite_settings(
+    payload: InviteSettingsIn,
+    ctx: AdminContext = Depends(require_admin),
+    conn=Depends(get_conn),
+):
+    """改邀请奖励配置。审计同时记改前与改后值：事后才查得出「从多少改成多少」。"""
+    with conn.transaction():
+        before = conn.execute(
+            "SELECT inviter_credits, invitee_credits, max_rewards FROM invite_settings FOR UPDATE"
+        ).fetchone()
+        if before is None:
+            # 配置行是迁移里的种子数据，丢了就不能发奖：宁可拒绝，也不要按 0 发。
+            raise errors.CommerceError(503, "invite_not_configured", "邀请奖励还没配置")
+        conn.execute(
+            "UPDATE invite_settings SET inviter_credits = %s, invitee_credits = %s,"
+            " max_rewards = %s, updated_at = now()",
+            (payload.inviter_credits, payload.invitee_credits, payload.max_rewards),
+        )
+        audit(conn, ctx.admin_id, "admin.invite_settings.set", "invite", {
+            "before": {
+                "inviter_credits": int(before["inviter_credits"]),
+                "invitee_credits": int(before["invitee_credits"]),
+                "max_rewards": int(before["max_rewards"]),
+            },
+            "after": {
+                "inviter_credits": payload.inviter_credits,
+                "invitee_credits": payload.invitee_credits,
+                "max_rewards": payload.max_rewards,
+            },
+        })
+    return {
+        "inviterCredits": payload.inviter_credits,
+        "inviteeCredits": payload.invitee_credits,
+        "maxRewards": payload.max_rewards,
+    }
