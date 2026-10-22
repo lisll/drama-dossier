@@ -18,6 +18,11 @@ RECIPE_CONSUME_PER_USER = Rule("recipe_consume:user", 120, 3600)
 
 router = APIRouter(prefix="/api/v1")
 
+# 处理配方的路径用 `version-recipes`，不用 `recipes`：
+# 媒体控制面早就有一套 `/api/v1/recipes`（处理流程的配方目录，含网页控制台），
+# 两个服务在部署时共用一个入口地址（Caddy），同一路径只能归一个服务。
+# 这套是「处理版本」的一次性签名配方，名字也更贴切。
+
 
 @router.post("/packages")
 def create_package(
@@ -30,7 +35,7 @@ def create_package(
     return request.app.state.packages.create(conn, ctx, payload)
 
 
-@router.post("/recipes")
+@router.post("/version-recipes")
 def issue_recipe(
     payload: RecipeRequest,
     request: Request,
@@ -41,7 +46,7 @@ def issue_recipe(
     return request.app.state.recipes.issue(conn, ctx, payload)
 
 
-@router.post("/recipes/{recipe_id}/consume")
+@router.post("/version-recipes/{recipe_id}/consume")
 def consume_recipe(
     recipe_id: uuid.UUID,
     payload: RecipeConsumeRequest,

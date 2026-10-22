@@ -47,10 +47,6 @@
 | `save_app_settings` | `settings` | 校验检查规则并写入本机设置文件 |
 | `analyze_drama` | `root`, `name`, `ffprobePath`, `rules` | 探测规格并返回检查报告 |
 | `generate_package` | 剧目与包选项，含 `rules` | 重新探测、逐集算哈希后调服务端生成文档，再验签组装报审包（需要联网与有效使用权） |
-| `pick_video` | 无 | 选择待擦除的视频文件 |
-| `erase_status` | `toolPath` | 查询擦除工具是否可用 |
-| `plan_erase` | `request`, `toolPath` | 只拼装命令供预览，不执行 |
-| `run_erase` | `request`, `toolPath`, `timeoutSeconds` | 执行擦除并回传确认流结论 |
 | `video_frame` | `path`, `seconds`, `maxWidth` | 取某一秒的画面，等比缩到 `maxWidth`（默认 720、宽高取偶数）后返回 JPEG 的 data URL |
 | `detect_still_regions` | `path`, `samples`, `toolPath` | 调 `dossier-inpaint --detect-only` 找「位置固定、内容不变」的候选区域（`samples` 夹到 2–600），只做检测、不产视频 |
 | `erase_preview` | `input`, `seconds`, `startSec`, `durationSec`, `regions`, `toolPath` | 只擦一小段（默认 `seconds - 2` 起、4 秒）并取同一时刻的帧，返回擦除后的 JPEG data URL 供左右对比 |
@@ -117,8 +113,8 @@ Rust 命令使用 snake_case，Tauri 会把 JavaScript 的 camelCase 参数映�
 剧目目录（含分集）
   → 门槛：权属材料已声明且文件没变；这部剧还没有处理版本目录
   → 算任务哈希（分集文件 + 模板 + 权属材料 + 档位）
-  → POST /recipes 申请配方 → 本机验签（签名 / 机器码 / 任务 / 有效期）
-  → POST /recipes/{id}/consume 消费（服务端记账，只能一次），配方原文存进任务目录 recipe.token
+  → POST /version-recipes 申请配方 → 本机验签（签名 / 机器码 / 任务 / 有效期）
+  → POST /version-recipes/{id}/consume 消费（服务端记账，只能一次），配方原文存进任务目录 recipe.token
   → 任务队列逐集处理：一次 ffmpeg 调用完成两层处理、编码、画质检测
   → 全部完成后写 版本说明.json、封面.jpg 和台账 processing.jsonl
 ```
@@ -233,7 +229,8 @@ cd tools/model_worker && python3 -m unittest discover -s tests -v
 
 | 变量 | 作用 |
 | --- | --- |
-| `DOSSIER_API_BASE` | 服务端地址，编译进程序。不设时是 `http://127.0.0.1:8100`。不是本机地址的必须用 `https://`。调试版运行时也能用同名环境变量覆盖，正式版不能 |
+| `DOSSIER_API_BASE` | 账号服务（登录、授权、积分、配方）地址，编译进程序。不设时是 `http://127.0.0.1:8100`。不是本机地址的必须用 `https://`。调试版运行时也能用同名环境变量覆盖，正式版不能。CI 打包从仓库变量（Variables，不是 Secrets）`DOSSIER_API_BASE` 注入 |
+| `DOSSIER_MEDIA_BASE` | 媒体控制面（分片上传、服务端任务、产物下载）地址，规则与 `DOSSIER_API_BASE` 一致。**不设时与它相同**：部署后两个服务经 Caddy 共用一个 https 入口，什么都不用配；本地开发两个服务各占一个端口（8100 / 8000）时设上它，桌面端的服务端处理模式才连得通。调试版运行时同样可用环境变量覆盖 |
 | `DOSSIER_LICENSE_PUBKEYS` | 受信的授权签名公钥（base64url，逗号分隔），追加在内置列表后面。现在内置列表是空的，**不设就验不过任何凭证**，登录后会停在「授权凭证无效」 |
 
 ```bash

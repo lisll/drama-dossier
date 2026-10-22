@@ -31,7 +31,7 @@ def _account(pg, register, client, email: str = EMAIL, seed: int = 0) -> dict:
 
 def _issue(client, token: str, episode_count: int):
     return client.post(
-        "/api/v1/recipes",
+        "/api/v1/version-recipes",
         headers=auth(token),
         json={"device_id": PC, "task": TASK, "platform": "universal",
               "strength": "medium", "episode_count": episode_count},
@@ -39,7 +39,7 @@ def _issue(client, token: str, episode_count: int):
 
 
 def _consume(client, token: str, recipe_id: str):
-    return client.post(f"/api/v1/recipes/{recipe_id}/consume", headers=auth(token),
+    return client.post(f"/api/v1/version-recipes/{recipe_id}/consume", headers=auth(token),
                        json={"device_id": PC})
 
 

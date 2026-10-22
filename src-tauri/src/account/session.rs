@@ -902,7 +902,7 @@ impl<T: Transport, S: CredentialStore> Session<T, S> {
             "episode_count": episode_count,
         });
         let response: RecipeResponse = decode(
-            self.authed(Request::new(Method::POST, "/recipes").json(body))
+            self.authed(Request::new(Method::POST, "/version-recipes").json(body))
                 .await?,
         )?;
         let recipe = recipe::verify(&response.token, &keys, &device_id, task, (self.now)())
@@ -934,7 +934,7 @@ impl<T: Transport, S: CredentialStore> Session<T, S> {
         self.authed(
             Request::new(
                 Method::POST,
-                format!("/recipes/{}/consume", recipe.recipe_id),
+                format!("/version-recipes/{}/consume", recipe.recipe_id),
             )
             .json(json!({ "device_id": device_id })),
         )
@@ -960,6 +960,9 @@ impl<T: Transport, S: CredentialStore> Session<T, S> {
     // 什么时候能传、能不能建任务、余额够不够，都由界面与服务端决定。
     // 之所以放在 session 里，是因为它需要那个已经带好令牌的 `authed`，
     // 而那套令牌刷新逻辑不该被复制到第二个地方。
+    //
+    // 每个请求都要 `.media()`：不标就发给账号服务。部署时两者同一个入口、碰巧能通，
+    // 本地开发两个服务分开端口时才会 404——`session_tests` 里有测试逐个钉住。
 
     /// 开一个分片上传会话。
     pub async fn server_upload_start(
@@ -969,23 +972,24 @@ impl<T: Transport, S: CredentialStore> Session<T, S> {
         size_bytes: u64,
         sha256: &str,
     ) -> Result<Value, ApiError> {
-        self.authed(Request::new(Method::POST, "/assets/uploads").json(json!({
-            "name": name,
-            "role": "video",
-            "filename": filename,
-            "size_bytes": size_bytes,
-            "sha256": sha256,
-        })))
+        self.authed(
+            Request::new(Method::POST, "/assets/uploads")
+                .media()
+                .json(json!({
+                    "name": name,
+                    "role": "video",
+                    "filename": filename,
+                    "size_bytes": size_bytes,
+                    "sha256": sha256,
+                })),
+        )
         .await
     }
 
     /// 查一个上传会话已收到哪些分片（断点续传用）。
     pub async fn server_upload_status(&self, upload_id: &str) -> Result<Value, ApiError> {
-        self.authed(Request::new(
-            Method::GET,
-            format!("/assets/uploads/{upload_id}"),
-        ))
-        .await
+        self.authed(Request::new(Method::GET, format!("/assets/uploads/{upload_id}")).media())
+            .await
     }
 
     /// 传一块。
@@ -1000,7 +1004,8 @@ impl<T: Transport, S: CredentialStore> Session<T, S> {
                 Method::PUT,
                 format!("/assets/uploads/{upload_id}/chunks/{index}"),
             )
-            .bytes(payload),
+            .bytes(payload)
+            .media(),
         )
         .await
     }
@@ -1012,18 +1017,16 @@ impl<T: Transport, S: CredentialStore> Session<T, S> {
                 Method::POST,
                 format!("/assets/uploads/{upload_id}/complete"),
             )
-            .json(json!({})),
+            .json(json!({}))
+            .media(),
         )
         .await
     }
 
     /// 放弃上传（删掉已传的分片）。
     pub async fn server_upload_abort(&self, upload_id: &str) -> Result<Value, ApiError> {
-        self.authed(Request::new(
-            Method::DELETE,
-            format!("/assets/uploads/{upload_id}"),
-        ))
-        .await
+        self.authed(Request::new(Method::DELETE, format!("/assets/uploads/{upload_id}")).media())
+            .await
     }
 
     /// 建服务端处理任务。扣费在服务端完成（会先预扣积分）。
@@ -1032,7 +1035,7 @@ impl<T: Transport, S: CredentialStore> Session<T, S> {
         asset_ids: &[String],
         recipe_id: &str,
     ) -> Result<Value, ApiError> {
-        self.authed(Request::new(Method::POST, "/tasks").json(json!({
+        self.authed(Request::new(Method::POST, "/tasks").media().json(json!({
             "asset_ids": asset_ids,
             "recipe_id": recipe_id,
         })))
@@ -1041,23 +1044,24 @@ impl<T: Transport, S: CredentialStore> Session<T, S> {
 
     /// 查任务状态。
     pub async fn server_task(&self, task_id: &str) -> Result<Value, ApiError> {
-        self.authed(Request::new(Method::GET, format!("/tasks/{task_id}")))
+        self.authed(Request::new(Method::GET, format!("/tasks/{task_id}")).media())
             .await
     }
 
     /// 取消任务。
     pub async fn server_cancel_task(&self, task_id: &str) -> Result<Value, ApiError> {
-        self.authed(Request::new(Method::POST, format!("/tasks/{task_id}/cancel")).json(json!({})))
-            .await
+        self.authed(
+            Request::new(Method::POST, format!("/tasks/{task_id}/cancel"))
+                .media()
+                .json(json!({})),
+        )
+        .await
     }
 
     /// 取产物信息（含短时下载链接）。
     pub async fn server_artifact(&self, artifact_id: &str) -> Result<Value, ApiError> {
-        self.authed(Request::new(
-            Method::GET,
-            format!("/artifacts/{artifact_id}"),
-        ))
-        .await
+        self.authed(Request::new(Method::GET, format!("/artifacts/{artifact_id}")).media())
+            .await
     }
 
     // ---------- 客户端错误上报（M7-6） ----------

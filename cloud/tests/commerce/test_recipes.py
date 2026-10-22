@@ -48,13 +48,13 @@ def issue(client, token: str, device: str = PC, task: str = TASK, platform: str 
           strength: str = "medium", episode_count: int = 2):
     # `episode_count` 是按集计价的输入（M5a）。默认给 2 集，
     # 个别用例要测价格时再显式传。
-    return client.post("/api/v1/recipes", headers=auth(token),
+    return client.post("/api/v1/version-recipes", headers=auth(token),
                        json={"device_id": device, "task": task, "platform": platform,
                              "strength": strength, "episode_count": episode_count})
 
 
 def consume(client, token: str, recipe_id: str, device: str = PC):
-    return client.post(f"/api/v1/recipes/{recipe_id}/consume", headers=auth(token), json={"device_id": device})
+    return client.post(f"/api/v1/version-recipes/{recipe_id}/consume", headers=auth(token), json={"device_id": device})
 
 
 def _payload(token: str) -> dict:

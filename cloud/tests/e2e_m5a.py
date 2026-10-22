@@ -344,7 +344,7 @@ def run_scenarios(api: Api, card_a: str, card_b: str) -> None:
     print("\n[G] 处理配方：按集扣费（5 积分/集）")
     device = DEVICE_A
     task = hashlib.sha256(b"e2e-task").hexdigest()
-    status, recipe, _ = api.call("POST", "/api/v1/recipes", {
+    status, recipe, _ = api.call("POST", "/api/v1/version-recipes", {
         "device_id": device, "task": task, "platform": "universal",
         "strength": "medium", "episode_count": 3,
     })
@@ -352,7 +352,7 @@ def run_scenarios(api: Api, card_a: str, card_b: str) -> None:
     check(recipe.get("credits") == 15, f"3 集应扣 15 积分（实际 {recipe.get('credits')}）")
     check(balance(api) == 100, "签发配方时还没扣费")
 
-    status, consumed, _ = api.call("POST", f"/api/v1/recipes/{recipe['recipe_id']}/consume", {
+    status, consumed, _ = api.call("POST", f"/api/v1/version-recipes/{recipe['recipe_id']}/consume", {
         "device_id": device,
     })
     check(status == 200, f"消费配方（HTTP {status}）")
@@ -362,24 +362,24 @@ def run_scenarios(api: Api, card_a: str, card_b: str) -> None:
     print("\n[H] 积分不足：402")
     # 把余额花到不够一集（5 积分）。
     short_task = hashlib.sha256(b"e2e-short").hexdigest()
-    status, big, _ = api.call("POST", "/api/v1/recipes", {
+    status, big, _ = api.call("POST", "/api/v1/version-recipes", {
         "device_id": device, "task": short_task, "platform": "universal",
         "strength": "medium", "episode_count": 17,  # 17 * 5 = 85，正好花完
     })
     check(status == 200, f"再签发 17 集配方（HTTP {status}）")
-    status, _, _ = api.call("POST", f"/api/v1/recipes/{big['recipe_id']}/consume", {
+    status, _, _ = api.call("POST", f"/api/v1/version-recipes/{big['recipe_id']}/consume", {
         "device_id": device,
     })
     check(status == 200, f"消费 17 集（HTTP {status}）")
     check(balance(api) == 0, f"余额花光到 0（实际 {balance(api)}）")
 
     third_task = hashlib.sha256(b"e2e-third").hexdigest()
-    status, third, _ = api.call("POST", "/api/v1/recipes", {
+    status, third, _ = api.call("POST", "/api/v1/version-recipes", {
         "device_id": device, "task": third_task, "platform": "universal",
         "strength": "medium", "episode_count": 1,
     })
     check(status == 200, f"余额 0 时仍能签发（签发不扣费，HTTP {status}）")
-    status, body, _ = api.call("POST", f"/api/v1/recipes/{third['recipe_id']}/consume", {
+    status, body, _ = api.call("POST", f"/api/v1/version-recipes/{third['recipe_id']}/consume", {
         "device_id": device,
     })
     check(status == 402, f"扣费时余额不足返回 402（HTTP {status}）")

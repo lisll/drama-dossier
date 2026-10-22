@@ -287,13 +287,30 @@ pub async fn server_cancel_task(
 }
 
 /// 取产物的短时下载链接。
+///
+/// 媒体控制面回的 `download_url` 是站内路径（`/api/v1/artifacts/…/download?token=…`），
+/// 界面只把 http/https 完整地址做成链接，所以这里补上媒体控制面的地址。
 #[tauri::command]
 pub async fn server_artifact(
     account: State<'_, AccountState>,
     artifact_id: String,
 ) -> Reply<serde_json::Value> {
     safe_segment(&artifact_id, "产物编号")?;
-    Ok(account.server_artifact(&artifact_id).await?)
+    let mut artifact = account.server_artifact(&artifact_id).await?;
+    let base =
+        super::api::resolve_media_base().map_err(|problem| local_error("config", problem))?;
+    absolutize_download_url(&mut artifact, &base);
+    Ok(artifact)
+}
+
+/// 把产物信息里的 `download_url` 补成完整地址；没有这个字段（或不是字符串）就不动。
+fn absolutize_download_url(artifact: &mut serde_json::Value, base: &reqwest::Url) {
+    if let Some(url) = artifact
+        .get_mut("download_url")
+        .and_then(|value| value.as_str().map(str::to_owned))
+    {
+        artifact["download_url"] = super::api::absolute_media_url(base, &url).into();
+    }
 }
 
 #[cfg(test)]
@@ -360,6 +377,32 @@ mod tests {
         for bad in ["", "a/b", "../etc", "a?x=1", "a b", "a#b", "中文"] {
             assert!(safe_segment(bad, "编号").is_err(), "{bad} 应当被拒");
         }
+    }
+
+    /// 媒体控制面回的是站内路径；补成完整地址后界面才能做成链接。其余字段原样保留。
+    #[test]
+    fn artifact_download_url_is_made_absolute() {
+        let base = reqwest::Url::parse("http://127.0.0.1:8000").unwrap();
+        let mut artifact = serde_json::json!({
+            "id": "af_1",
+            "download_url": "/api/v1/artifacts/af_1/download?token=t",
+        });
+        absolutize_download_url(&mut artifact, &base);
+        assert_eq!(
+            artifact,
+            serde_json::json!({
+                "id": "af_1",
+                "download_url": "http://127.0.0.1:8000/api/v1/artifacts/af_1/download?token=t",
+            })
+        );
+
+        // 没有下载链接（例如产物还没生成）：不凭空加字段。
+        let mut pending = serde_json::json!({ "id": "af_2", "download_url": null });
+        absolutize_download_url(&mut pending, &base);
+        assert_eq!(
+            pending,
+            serde_json::json!({ "id": "af_2", "download_url": null })
+        );
     }
 
     /// 测试用的临时目录：不引第三方 crate，用系统临时目录 + 唯一名。

@@ -76,13 +76,13 @@ def issue(client, token: str, device: str = PC, task: str = TASK, platform: str 
           strength: str = "medium", episode_count: int = 2):
     # `episode_count` 是按集计价的输入（M5a）；这些样板用例只关心限流与请求体上限，
     # 给一个固定集数就够了。
-    return client.post("/api/v1/recipes", headers=auth(token),
+    return client.post("/api/v1/version-recipes", headers=auth(token),
                        json={"device_id": device, "task": task, "platform": platform,
                              "strength": strength, "episode_count": episode_count})
 
 
 def consume(client, token: str, recipe_id: str, device: str = PC):
-    return client.post(f"/api/v1/recipes/{recipe_id}/consume", headers=auth(token), json={"device_id": device})
+    return client.post(f"/api/v1/version-recipes/{recipe_id}/consume", headers=auth(token), json={"device_id": device})
 
 
 @pytest.fixture()
@@ -151,9 +151,9 @@ def test_requires_login(client, pg):
     """三个接口都不接受匿名请求，也不会留下任何记录。"""
     responses = [
         client.post("/api/v1/packages", json=package_body()),
-        client.post("/api/v1/recipes", json={"device_id": PC, "task": TASK, "platform": "universal",
+        client.post("/api/v1/version-recipes", json={"device_id": PC, "task": TASK, "platform": "universal",
                                              "strength": "medium"}),
-        client.post(f"/api/v1/recipes/{uuid.uuid4()}/consume", json={"device_id": PC}),
+        client.post(f"/api/v1/version-recipes/{uuid.uuid4()}/consume", json={"device_id": PC}),
     ]
     for response in responses:
         assert response.status_code == 401, response.text
@@ -205,7 +205,7 @@ def test_body_over_default_limit_is_413(client, pg, account):
     """普通接口（配方）超过 1 MiB 在读请求体时就挡掉，不等到解析 JSON。"""
     body = json.dumps({"pad": "x" * DEFAULT_LIMIT}).encode("utf-8")
     assert len(body) > DEFAULT_LIMIT
-    response = client.post("/api/v1/recipes", content=body, headers=_json_headers(account["token"]))
+    response = client.post("/api/v1/version-recipes", content=body, headers=_json_headers(account["token"]))
     assert response.status_code == 413, response.text
     assert response.json()["error"] == "payload_too_large"
     assert _recipe_count(pg) == 0
@@ -235,7 +235,7 @@ def test_chunked_body_over_limit_is_413(client, pg, account):
     """
     body = b'{"pad":"' + b"x" * DEFAULT_LIMIT + b'"}'
     assert len(body) > DEFAULT_LIMIT
-    response = client.post("/api/v1/recipes", content=_chunks(body),
+    response = client.post("/api/v1/version-recipes", content=_chunks(body),
                            headers=_json_headers(account["token"]))
     assert response.status_code == 413, response.text[:200]
     assert response.json()["error"] == "payload_too_large"
@@ -245,7 +245,7 @@ def test_chunked_body_over_limit_is_413(client, pg, account):
 def test_chunked_body_within_limit_reaches_the_app(client, pg, account):
     """分块发送、但没超限：中间件收齐后原样交给应用，应用照常解析（这里是参数不合法的 422）。"""
     body = json.dumps({"platform": "bilibili"}).encode("utf-8")
-    response = client.post("/api/v1/recipes", content=_chunks(body, size=4),
+    response = client.post("/api/v1/version-recipes", content=_chunks(body, size=4),
                            headers=_json_headers(account["token"]))
     assert response.status_code == 422, response.text
     assert response.json()["error"] == "invalid_request"

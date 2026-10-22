@@ -2,6 +2,9 @@
 //!
 //! - 服务端地址编译时用 `DOSSIER_API_BASE` 写进程序；调试版运行时也能用同名环境变量覆盖，正式版不能
 //!   （让用户随便改地址，等于允许别人把登录引到钓鱼服务器）。不是本机地址的，必须用 HTTPS。
+//! - 服务端处理（上传、建任务、取产物）发给**媒体控制面**，地址是 `DOSSIER_MEDIA_BASE`，规则同上；
+//!   不设时与 `DOSSIER_API_BASE` 相同——部署时两个服务经 Caddy 共用一个入口，什么都不用配。
+//!   只有本地开发两个服务各占一个端口时才需要设它。
 //! - 证书校验走系统信任库；不自动跟随重定向（令牌在请求头里，不能被带到别的地址）。
 //! - 日志和错误里不出现令牌、密码、卡密、授权凭证和响应体。
 
@@ -18,12 +21,51 @@ const DEFAULT_BASE: &str = "http://127.0.0.1:8100";
 const API_PREFIX: &str = "/api/v1";
 
 /// 决定服务端地址。返回的错误是中文，界面直接展示。
+///
+/// CI 从仓库变量注入，未配置时是**空字符串**——当作没配、退回默认值，
+/// 而不是把空串当地址报「格式不正确」让程序一启动就锁死。
 pub fn resolve_base() -> Result<Url, String> {
     #[cfg(debug_assertions)]
     if let Ok(text) = std::env::var("DOSSIER_API_BASE") {
         return parse_base(&text);
     }
-    parse_base(option_env!("DOSSIER_API_BASE").unwrap_or(DEFAULT_BASE))
+    parse_base(
+        option_env!("DOSSIER_API_BASE")
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or(DEFAULT_BASE),
+    )
+}
+
+/// 决定媒体控制面的地址。没单独配就用账号服务那个地址。
+pub fn resolve_media_base() -> Result<Url, String> {
+    #[cfg(debug_assertions)]
+    let runtime = std::env::var("DOSSIER_MEDIA_BASE").ok();
+    #[cfg(not(debug_assertions))]
+    let runtime: Option<String> = None;
+    match pick_media_base(runtime.as_deref(), option_env!("DOSSIER_MEDIA_BASE")) {
+        Some(text) => parse_base(text),
+        None => resolve_base(),
+    }
+}
+
+/// 媒体地址的取值顺序：调试版的运行时环境变量 → 编译时写入的值 → 都没有就返回 `None`
+/// （调用方退回账号服务地址）。空字符串当作没配：CI 里变量没设时展开出来就是空串。
+fn pick_media_base<'a>(runtime: Option<&'a str>, compiled: Option<&'a str>) -> Option<&'a str> {
+    [runtime, compiled]
+        .into_iter()
+        .flatten()
+        .find(|text| !text.trim().is_empty())
+}
+
+/// 把媒体控制面返回的站内路径（如产物下载链接 `/api/v1/artifacts/…/download?token=…`）
+/// 补成完整地址，界面才能把它做成可点的链接。已经是 http/https 完整地址的原样返回；
+/// 其余形状（不以 `/` 开头）也原样返回，由界面按「不可信地址」处理。
+pub fn absolute_media_url(base: &Url, url: &str) -> String {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") || !url.starts_with('/') {
+        return url.to_owned();
+    }
+    format!("{}{url}", base.as_str().trim_end_matches('/'))
 }
 
 /// 校验服务端地址：只认 http / https；http 只允许本机地址；不能带查询参数和片段。
@@ -196,7 +238,7 @@ pub struct PackageResponse {
     pub files: Vec<PackageFileView>,
 }
 
-/// `POST /recipes` 的结果。`params` 只是方便查看；处理时以验过签的 `token` 里的为准。
+/// `POST /version-recipes` 的结果。`params` 只是方便查看；处理时以验过签的 `token` 里的为准。
 #[derive(Debug, Clone, Deserialize)]
 pub struct RecipeResponse {
     pub recipe_id: String,
@@ -211,6 +253,16 @@ pub struct RecipeResponse {
 
 // ---------- 传输层 ----------
 
+/// 请求发给哪个服务。两个服务是不同的进程，地址可能不同（见文件开头）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Service {
+    /// 账号与授权服务（drama-commerce）：登录、授权、积分、报审包、版本配方。
+    #[default]
+    Commerce,
+    /// 媒体控制面（drama-cloud）：分片上传、服务端任务、产物。
+    Media,
+}
+
 /// 一次请求：方法、路径（不含 `/api/v1`）、可选的访问令牌和请求体。
 ///
 /// 请求体有两种：JSON（绝大多数接口）与**原始字节**（M5b 的分片上传）。
@@ -224,6 +276,8 @@ pub struct Request {
     pub body: Option<Value>,
     /// 原始字节体（分片上传）。为 `Some` 时忽略 `body`。
     pub raw: Option<Vec<u8>>,
+    /// 发给哪个服务。默认账号服务；媒体控制面的请求用 [`Request::media`] 标出来。
+    pub service: Service,
 }
 
 impl Request {
@@ -234,6 +288,7 @@ impl Request {
             bearer: None,
             body: None,
             raw: None,
+            service: Service::Commerce,
         }
     }
 
@@ -250,6 +305,12 @@ impl Request {
 
     pub fn bearer(mut self, token: &str) -> Self {
         self.bearer = Some(token.to_owned());
+        self
+    }
+
+    /// 这个请求发给媒体控制面。
+    pub fn media(mut self) -> Self {
+        self.service = Service::Media;
         self
     }
 }
@@ -269,12 +330,29 @@ pub fn decode<T: DeserializeOwned>(value: Value) -> Result<T, ApiError> {
 /// 地址不合规、网络模块初始化失败时照样能构造出来，[`HttpTransport::problem`] 给出原因：
 /// 界面锁定为「安装包配置有误」，而不是让程序启动就崩溃。
 pub struct HttpTransport {
-    inner: Result<(reqwest::Client, Url), String>,
+    inner: Result<Connection, String>,
+}
+
+/// 一个共用的 HTTP 客户端 + 两个服务各自的地址。
+struct Connection {
+    client: reqwest::Client,
+    commerce: Url,
+    media: Url,
+}
+
+impl Connection {
+    fn base(&self, service: Service) -> &Url {
+        match service {
+            Service::Commerce => &self.commerce,
+            Service::Media => &self.media,
+        }
+    }
 }
 
 impl HttpTransport {
     pub fn new() -> Self {
-        let inner = resolve_base().and_then(|base| {
+        let inner = resolve_base().and_then(|commerce| {
+            let media = resolve_media_base()?;
             install_crypto_provider();
             let client = reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
@@ -287,22 +365,38 @@ impl HttpTransport {
                 ))
                 .build()
                 .map_err(|error| format!("初始化网络模块失败：{error}"))?;
-            Ok((client, base))
+            Ok(Connection {
+                client,
+                commerce,
+                media,
+            })
         });
         Self { inner }
     }
 
     /// 指定服务端地址（端到端测试用：模拟「服务端停了」时指向一个没人监听的端口，不用改环境变量）。
+    /// 两个服务用同一个地址：端到端测试只碰账号服务。
     #[cfg(test)]
     pub fn with_base(base: &str) -> Self {
+        Self::with_bases(base, base)
+    }
+
+    /// 两个服务各给一个地址（测试「请求发对了服务」用）。
+    #[cfg(test)]
+    pub fn with_bases(commerce: &str, media: &str) -> Self {
         install_crypto_provider();
-        let inner = parse_base(base).and_then(|base| {
+        let inner = parse_base(commerce).and_then(|commerce| {
+            let media = parse_base(media)?;
             reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))
                 .timeout(Duration::from_secs(15))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
-                .map(|client| (client, base))
+                .map(|client| Connection {
+                    client,
+                    commerce,
+                    media,
+                })
                 .map_err(|error| format!("初始化网络模块失败：{error}"))
         });
         Self { inner }
@@ -314,19 +408,23 @@ impl HttpTransport {
     }
 }
 
+/// 接口完整地址：服务地址 + `/api/v1` + 路径。
+fn endpoint(base: &Url, path: &str) -> Result<Url, ApiError> {
+    Url::parse(&format!(
+        "{}{API_PREFIX}{path}",
+        base.as_str().trim_end_matches('/')
+    ))
+    .map_err(|error| ApiError::Protocol(format!("接口地址拼接失败：{error}")))
+}
+
 impl Transport for HttpTransport {
     async fn send(&self, request: Request) -> Result<Value, ApiError> {
-        let (client, base) = self
+        let connection = self
             .inner
             .as_ref()
             .map_err(|problem| ApiError::Protocol(problem.clone()))?;
-        let url = Url::parse(&format!(
-            "{}{API_PREFIX}{}",
-            base.as_str().trim_end_matches('/'),
-            request.path
-        ))
-        .map_err(|error| ApiError::Protocol(format!("接口地址拼接失败：{error}")))?;
-        let mut builder = client.request(request.method, url);
+        let url = endpoint(connection.base(request.service), &request.path)?;
+        let mut builder = connection.client.request(request.method, url);
         if let Some(token) = &request.bearer {
             builder = builder.bearer_auth(token);
         }
@@ -362,9 +460,9 @@ impl Transport for HttpTransport {
 /// 装上 rustls 的加密后端。
 ///
 /// 用 `ring` 而不是默认的 `aws-lc-rs`：后者在 Windows 上要装 NASM，GitHub 的 Windows runner 没有预装。
-/// `reqwest` 的 `rustls-no-provider` 要求建 Client 之前必须装好，否则会 panic。
-/// 装一次就够，重复调用返回 Err（已经装过），忽略即可。
-fn install_crypto_provider() {
+/// `reqwest` 的 `rustls-no-provider` 要求建 Client 之前必须装好，否则会 panic。装一次就够，
+/// 重复调用返回 Err（已经装过），忽略即可。updater.rs 建下载客户端前也会调用。
+pub(crate) fn install_crypto_provider() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -409,5 +507,127 @@ fn server_error(status: StatusCode, retry_after: Option<u64>, body: Option<Value
             extra: Value::Null,
         },
         None => ApiError::Protocol(format!("服务端返回 {status}，但没有错误码")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    #[test]
+    fn media_base_prefers_runtime_then_compiled_then_falls_back() {
+        assert_eq!(
+            pick_media_base(Some("http://127.0.0.1:8000"), Some("https://m.example")),
+            Some("http://127.0.0.1:8000")
+        );
+        assert_eq!(
+            pick_media_base(None, Some("https://m.example")),
+            Some("https://m.example")
+        );
+        // CI 里变量没设时展开成空串：当作没配，退回账号服务地址，而不是把空串当地址报错。
+        assert_eq!(pick_media_base(Some(""), Some("  ")), None);
+        assert_eq!(pick_media_base(None, None), None);
+    }
+
+    #[test]
+    fn relative_artifact_links_become_absolute_on_the_media_base() {
+        let base = Url::parse("http://127.0.0.1:8000").unwrap();
+        assert_eq!(
+            absolute_media_url(&base, "/api/v1/artifacts/af_1/download?token=t"),
+            "http://127.0.0.1:8000/api/v1/artifacts/af_1/download?token=t"
+        );
+        // 以 `//` 开头也只会落在媒体服务自己的主机上，不会被当成「换一台主机」。
+        assert_eq!(
+            absolute_media_url(&base, "//evil.example/x"),
+            "http://127.0.0.1:8000//evil.example/x"
+        );
+        // 地址带路径前缀和末尾斜杠：不丢前缀、不多斜杠。
+        let prefixed = Url::parse("https://example.com/dossier/").unwrap();
+        assert_eq!(
+            absolute_media_url(&prefixed, "/api/v1/artifacts/a/download"),
+            "https://example.com/dossier/api/v1/artifacts/a/download"
+        );
+        // 已是完整地址的原样返回；其余形状不猜，原样交给界面按不可信地址处理。
+        for kept in [
+            "https://cdn.example/x",
+            "HTTP://127.0.0.1/x",
+            "javascript:alert(1)",
+            "relative/x",
+            "",
+        ] {
+            assert_eq!(absolute_media_url(&base, kept), kept);
+        }
+    }
+
+    /// 起一个只应答一次的本机 HTTP 服务，回 `{"service": 名字, "path": 请求路径}`。
+    /// 用标准库现写：tokio 没开 net 特性，不为一条测试加依赖。
+    fn one_shot_server(name: &'static str) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).unwrap() == 0 {
+                    break;
+                }
+                head.push(byte[0]);
+            }
+            let text = String::from_utf8_lossy(&head);
+            let path = text
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_owned();
+            let body = json!({ "service": name, "path": path }).to_string();
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(reply.as_bytes()).unwrap();
+        });
+        (base, handle)
+    }
+
+    /// 两个服务地址不同时，请求必须发到自己标记的那个服务（曾经全部发给账号服务）。
+    /// 用 GET：假服务只读请求头，带请求体时提前关连接可能让客户端收到 RST。
+    #[tokio::test]
+    async fn each_request_goes_to_the_service_it_is_marked_for() {
+        let (commerce, commerce_server) = one_shot_server("commerce");
+        let (media, media_server) = one_shot_server("media");
+        let transport = HttpTransport::with_bases(&commerce, &media);
+        assert_eq!(transport.problem(), None);
+
+        let reply = transport
+            .send(Request::new(Method::GET, "/me"))
+            .await
+            .unwrap();
+        assert_eq!(
+            reply,
+            json!({ "service": "commerce", "path": "/api/v1/me" })
+        );
+
+        let reply = transport
+            .send(Request::new(Method::GET, "/tasks/tsk_1").media())
+            .await
+            .unwrap();
+        assert_eq!(
+            reply,
+            json!({ "service": "media", "path": "/api/v1/tasks/tsk_1" })
+        );
+
+        commerce_server.join().unwrap();
+        media_server.join().unwrap();
+    }
+
+    #[test]
+    fn an_invalid_media_base_is_reported_not_ignored() {
+        let transport = HttpTransport::with_bases("http://127.0.0.1:8100", "http://media.example");
+        let problem = transport.problem().expect("非本机 http 地址必须报出来");
+        assert!(problem.contains("HTTPS"), "{problem}");
     }
 }

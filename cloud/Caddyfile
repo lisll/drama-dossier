@@ -48,6 +48,22 @@
 	handle /api/v1/client/* {
 		reverse_proxy commerce:8100
 	}
+	# 报审包与处理配方（M4a）。之前漏配，这两类请求会落到媒体控制面：
+	# 报审包 404；`POST /api/v1/recipes` 更糟，会撞上媒体控制面同名的配方目录接口。
+	# 所以 commerce 的处理配方改名为 version-recipes，路由一致性测试见
+	# cloud/tests/commerce/test_deploy_routes.py。
+	handle /api/v1/packages {
+		reverse_proxy commerce:8100
+	}
+	handle /api/v1/version-recipes* {
+		reverse_proxy commerce:8100
+	}
+	# 媒体控制面网页控制台的「当前身份」。它在 /api/v1/auth/ 下，
+	# 不单列就会被上面的 /api/v1/auth/* 转给 commerce（404）。
+	# Caddy 按路径长度排序 handle，精确路径比通配更具体，所以这条优先。
+	handle /api/v1/auth/whoami {
+		reverse_proxy media:8000
+	}
 	# 模拟收银台页面（本地开发用；部署时可删掉这一段）。
 	handle /pay/* {
 		reverse_proxy commerce:8100

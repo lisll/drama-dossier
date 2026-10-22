@@ -7,7 +7,7 @@
 - M1（已完成）：邮件验证码、注册、登录、刷新与吊销令牌、重设密码、修改密码、集中限流、审计日志。
 - M2：卡密批量生成与兑换、使用权、电脑绑定与解绑、授权凭证的签发与刷新、管理命令。
 - 桌面端接入（钥匙串、本机机器码、本地验签、离线提示）在 M3。
-- M4a：报审包（`POST /packages`）与处理配方（`POST /recipes`、`/recipes/{id}/consume`），
+- M4a：报审包（`POST /packages`）与处理配方（`POST /version-recipes`、`/version-recipes/{id}/consume`），
   三种签名用途前缀隔离；处理配方接桌面界面在 M4b。
 - M5a：积分账本与按集计价（3.7）、充值订单与支付渠道抽象（3.8）、邀请码与防刷（3.7）。
   报审包与处理配方在这一期开始扣积分；真实收款渠道仍只有占位实现。
@@ -372,8 +372,8 @@ PNG / JPEG 铺满一页 A4；页数必须与原文档一致，否则 422 `scan_i
 | 接口 | 规则 |
 | --- | --- |
 | `POST /packages` | 每账号每小时 **30** 次 |
-| `POST /recipes` | 每账号每小时 **60** 次 |
-| `POST /recipes/{id}/consume` | 每账号每小时 **120** 次 |
+| `POST /version-recipes` | 每账号每小时 **60** 次 |
+| `POST /version-recipes/{id}/consume` | 每账号每小时 **120** 次 |
 
 ### 3.6 处理配方
 
@@ -381,8 +381,8 @@ PNG / JPEG 铺满一页 A4；页数必须与原文档一致，否则 422 `scan_i
 
 | 方法 | 路径 | 请求体 | 成功 |
 | --- | --- | --- | --- |
-| POST | `/recipes` | `device_id`、`task`、`platform`、`strength`、`episode_count` | 200 `{"recipe_id", "token", "expires_at", "params", "credits", "episode_count"}` |
-| POST | `/recipes/{recipe_id}/consume` | `device_id` | 200 `{"recipe_id", "consumed": true, "credits"}` |
+| POST | `/version-recipes` | `device_id`、`task`、`platform`、`strength`、`episode_count` | 200 `{"recipe_id", "token", "expires_at", "params", "credits", "episode_count"}` |
+| POST | `/version-recipes/{recipe_id}/consume` | `device_id` | 200 `{"recipe_id", "consumed": true, "credits"}` |
 
 - 两个接口都要求登录、这台电脑绑定在当前账号上、使用权有效（与 3.5 同样的三个前提）。
 - 请求字段：`device_id` 是 64 位小写十六进制机器码；`task` 是**任务描述的哈希**，64 位小写十六进制；
@@ -527,19 +527,19 @@ PNG / JPEG 铺满一页 A4；页数必须与原文档一致，否则 422 `scan_i
 - 服务端处理：`cost_for("server_version", 集数)`，由媒体控制面通过 `/internal/credits/cost` 问价，
   **客户端不能传价格**。媒体控制面按 `max(1, 素材数)` 算 `units`——服务端处理就是逐集跑。
 
-**价格在签发时定死**：`POST /recipes` 算出 `required` 后，把它和集数一起写进 `recipes.credits` / `episode_count`；
+**价格在签发时定死**：`POST /version-recipes` 算出 `required` 后，把它和集数一起写进 `recipes.credits` / `episode_count`；
 消费时直接读这个值扣款，**不重算**。否则中途改过价目表，就会出现「签发时说 25、扣钱时扣 30」。
 0007 之前签发的旧配方这两列是 NULL（那时还没有计费），按 0 处理，只参与审计。
 
 `credits.quote()` 是「只算价、不扣钱」的辅助函数（返回 `required` / `balance` / `enough`），
 `price_per_unit()` 只查单个计价对象的单价；目前没有把它们暴露成接口。界面上的预估价是桌面端按「每集 5 积分」
-自己乘出来的，确认框里同时写明「准确数额以服务端签发时为准」——以 `POST /recipes` 返回的 `credits` 为准。
+自己乘出来的，确认框里同时写明「准确数额以服务端签发时为准」——以 `POST /version-recipes` 返回的 `credits` 为准。
 
 #### 扣费时机
 
 三个付费功能的定案时点不同，这是刻意的：
 
-**处理版本：消费即定案。** 扣费发生在 `POST /recipes/{id}/consume` 里，和「标记配方已消费」在**同一个事务**：
+**处理版本：消费即定案。** 扣费发生在 `POST /version-recipes/{id}/consume` 里，和「标记配方已消费」在**同一个事务**：
 先 `hold` 再立刻 `settle`，要么配方被消费且钱被扣，要么两件都没发生。余额不足时 `hold` 抛 402，
 整个事务回滚，配方**仍然可以充值后再消费**。
 
@@ -1160,19 +1160,23 @@ M7 起服务端也能同时持有两把私钥（`Signer` 的 `secondary_key`，�
 
 `drama-commerce migrate` 必须在 `serve` **之前**跑：`serve` 启动时检查迁移，缺了就直接拒绝启动
 （「数据库还没有迁移到最新，缺少 …」）。M7 新增的两个迁移是 `0011_admins.sql`（管理员与会话）
-与 `0012_ops_content.sql`（公告、功能开关、版本策略、客户端错误）。
+与 `0012_ops_content.sql`（公告、功能开关、版本策略、客户端错误）；`0013_card_price.sql`
+给 `card_batches` 补售价列（可空，只做记录，见 5.2）。
 
 ### 5.2 卡密
 
 ```bash
 drama-commerce cards generate --days 30 --count 500 --out 月卡-第一批.csv --name 月卡-第一批 --by 张三
 drama-commerce cards generate --lifetime --count 20 --out 永久卡.csv
+drama-commerce cards generate --days 30 --count 100 --out 促销卡.csv --price-yuan 19.99   # 记录这批售价
 drama-commerce cards list [--limit 50]                    # 最近的批次：总数、已兑换数、是否作废
 drama-commerce cards status DD-XXXX-XXXX-XXXX-XXXX        # unused / redeemed / revoked / not_found
 drama-commerce cards revoke --batch <批次 ID> --yes        # 作废这一批里还没兑换的卡密，不能撤销
 ```
 
 - 只需要 `DRAMA_COMMERCE_DSN`。结果是 JSON，打印到标准输出（`list` 每行一个批次）；提示打印到标准错误。
+- `--price-yuan`（可选）：把这批卡的售价记录在批次上（`price_fen`，单位分，最多两位小数；
+  `0` 表示赠品卡，不填表示不标价）。**只用于对账盘点，不参与兑换**；导出的 CSV 相应多一列 `price_fen`。
 - 退出码：0 成功；1 `status` 查不到这张卡，或者卡密已入库但 CSV 没能改成正式文件名（报错里给出临时文件路径）；
   2 参数、配置或数据库错误。
 - `generate`：一批 1..10000 张，`--days` 1..3650；`--name` 默认按类型和时间生成，`--by` 默认当前系统用户。

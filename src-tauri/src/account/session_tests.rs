@@ -15,6 +15,7 @@ use dossier_license::{derive_device_id, MachineIdentity, Platform};
 use ed25519_dalek::{Signer, SigningKey};
 
 use super::*;
+use crate::account::api::Service;
 use crate::account::store::StoreError;
 
 // ---------- 可控时钟 ----------
@@ -120,6 +121,8 @@ struct Server {
     unbind_remaining: u32,
     entitlement: (&'static str, Option<u64>),
     calls: HashMap<String, u32>,
+    /// 每个请求标记的目标服务，按到达顺序：`(路由, 服务)`。
+    services: Vec<(String, Service)>,
     /// 配方：签发时写进载荷的机器码（`None` = 请求里的机器码；设成别的模拟服务端发错了）。
     recipe_device: Option<String>,
     /// 已消费的配方编号（服务端记账，第二次消费 409）。
@@ -141,6 +144,7 @@ impl Default for Server {
             unbind_remaining: 3,
             entitlement: ("lifetime", None),
             calls: HashMap::new(),
+            services: Vec::new(),
             recipe_device: None,
             consumed: HashSet::new(),
         }
@@ -157,6 +161,10 @@ impl FakeApi {
 
     fn calls(&self, path: &str) -> u32 {
         self.0.lock().unwrap().calls.get(path).copied().unwrap_or(0)
+    }
+
+    fn services(&self) -> Vec<(String, Service)> {
+        self.0.lock().unwrap().services.clone()
     }
 }
 
@@ -294,6 +302,7 @@ impl Transport for FakeApi {
         {
             let mut server = self.0.lock().unwrap();
             *server.calls.entry(route.clone()).or_default() += 1;
+            server.services.push((route.clone(), request.service));
             if server.offline {
                 return Err(ApiError::Network("无法连接：假服务端已停".into()));
             }
@@ -387,16 +396,16 @@ impl Transport for FakeApi {
                     json!({ "package_id": "pkg-1", "manifest": "{}", "signature": "{}", "files": [] }),
                 )
             }
-            "POST /recipes" => {
+            "POST /version-recipes" => {
                 server.check_bearer(bearer)?;
                 server.require_bound(&body)?;
                 Ok(server.recipe_response(&body))
             }
-            other if other.starts_with("POST /recipes/") && other.ends_with("/consume") => {
+            other if other.starts_with("POST /version-recipes/") && other.ends_with("/consume") => {
                 server.check_bearer(bearer)?;
                 server.require_bound(&body)?;
                 let id = other
-                    .trim_start_matches("POST /recipes/")
+                    .trim_start_matches("POST /version-recipes/")
                     .trim_end_matches("/consume")
                     .to_owned();
                 if !server.consumed.insert(id.clone()) {
@@ -428,6 +437,17 @@ impl Transport for FakeApi {
                     server.revoked = true;
                 }
                 Ok(Value::Null)
+            }
+            // 媒体控制面（上传、任务、产物）：会话层只负责带令牌、标对服务，内容随便回。
+            other
+                if ["/assets/", "/tasks", "/artifacts/"].iter().any(|prefix| {
+                    other
+                        .split_once(' ')
+                        .is_some_and(|(_, path)| path.starts_with(prefix))
+                }) =>
+            {
+                server.check_bearer(bearer)?;
+                Ok(json!({ "route": other }))
             }
             other => Err(error(404, "not_found", json!({ "route": other }))),
         }
@@ -617,7 +637,7 @@ async fn recipe_is_verified_locally_then_consumed_once() {
     session.consume_recipe(&recipe).await.expect("第一次消费");
     let error = session.consume_recipe(&recipe).await.unwrap_err();
     assert_eq!(error.code(), "recipe_consumed");
-    assert_eq!(api.calls("POST /recipes"), 1);
+    assert_eq!(api.calls("POST /version-recipes"), 1);
 }
 
 #[tokio::test]
@@ -631,6 +651,67 @@ async fn recipe_for_another_computer_is_rejected_locally() {
         .unwrap_err();
     assert_eq!(error.code(), "recipe_wrong_device");
     assert!(session.is_logged_in());
+}
+
+// ---------- 服务端处理：请求发给媒体控制面 ----------
+
+/// 九个服务端处理请求都必须标成媒体控制面；登录、授权、刷新令牌仍发给账号服务。
+/// 曾经全部发给账号服务：本地开发两个服务分开端口时，上传、任务、产物一律 404。
+#[tokio::test]
+async fn server_processing_requests_go_to_the_media_service() {
+    let (session, api, _store) = logged_in().await;
+    // 第一个媒体请求时访问令牌在服务端提前失效：`authed` 刷新后克隆原请求重发，标记不能丢。
+    api.with(|server| server.reject_next_access = true);
+    session
+        .server_upload_start("第01集", "第01集.mp4", 10, "ab")
+        .await
+        .unwrap();
+    session.server_upload_status("up_1").await.unwrap();
+    session
+        .server_upload_chunk("up_1", 0, b"0123".to_vec())
+        .await
+        .unwrap();
+    session.server_upload_complete("up_1").await.unwrap();
+    session.server_upload_abort("up_1").await.unwrap();
+    session
+        .server_submit_task(&["as_1".to_owned()], "rcp_1")
+        .await
+        .unwrap();
+    session.server_task("tsk_1").await.unwrap();
+    session.server_cancel_task("tsk_1").await.unwrap();
+    session.server_artifact("af_1").await.unwrap();
+
+    let services = api.services();
+    let routes_for = |wanted: Service| -> Vec<&str> {
+        services
+            .iter()
+            .filter(|(_, service)| *service == wanted)
+            .map(|(route, _)| route.as_str())
+            .collect()
+    };
+    assert_eq!(
+        routes_for(Service::Media),
+        [
+            "POST /assets/uploads",
+            "POST /assets/uploads", // 刷新令牌后重发
+            "GET /assets/uploads/up_1",
+            "PUT /assets/uploads/up_1/chunks/0",
+            "POST /assets/uploads/up_1/complete",
+            "DELETE /assets/uploads/up_1",
+            "POST /tasks",
+            "GET /tasks/tsk_1",
+            "POST /tasks/tsk_1/cancel",
+            "GET /artifacts/af_1",
+        ]
+    );
+    assert_eq!(
+        routes_for(Service::Commerce),
+        [
+            "POST /auth/login",
+            "POST /license/activate",
+            "POST /auth/refresh"
+        ]
+    );
 }
 
 // ---------- 断网、时钟 ----------

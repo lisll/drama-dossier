@@ -75,6 +75,21 @@ jobs:
     permissions:
       contents: write
     runs-on: ${{ matrix.os }}
+    env:
+      # 授权公钥提到 job 级：构建步骤要用它编译注入，后面的「未注入」告警也要读同一个值。
+      # **不注入的话装出来的客户端登录不了**——`BUILTIN_KEYS` 是空列表，
+      # 而 `option_env!("DOSSIER_LICENSE_PUBKEYS")` 在没注入时是 None，
+      # 于是信任公钥集合为空，服务端签发的授权凭证一律验不过。
+      # 值来自 `drama-commerce keyinfo <私钥文件>` 打印的 `public_key`
+      # （base64url；多把用英文逗号分隔，供密钥轮换期并存）。
+      DOSSIER_LICENSE_PUBKEYS: ${{ secrets.DOSSIER_LICENSE_PUBKEYS }}
+      # 服务端地址（编译时写进程序，api.rs 的 `resolve_base`）。地址不是机密，
+      # 放仓库 Variables，不放 Secrets。变量没配置时是空字符串——
+      # 程序里已把空串当「没配」、退回默认 http://127.0.0.1:8100（只连得到本机）。
+      # 部署后两个服务经 Caddy 共用一个 https 入口，所以通常只需要 DOSSIER_API_BASE；
+      # 媒体控制面另走一个入口时才需要 DOSSIER_MEDIA_BASE。
+      DOSSIER_API_BASE: ${{ vars.DOSSIER_API_BASE }}
+      DOSSIER_MEDIA_BASE: ${{ vars.DOSSIER_MEDIA_BASE }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust target
@@ -151,6 +166,7 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 授权公钥在 job 级 env 里（见上），这里不用重复。
           # macOS：证书已在前一步导入钥匙串，这里只告诉 tauri 用哪个签名身份。
           APPLE_SIGNING_IDENTITY: ${{ steps.signing.outputs.enabled == 'true' && secrets.MACOS_SIGNING_IDENTITY || '' }}
           # 公证凭据（可选）：没有就不公证，安装包仍可用但要右键打开。
@@ -163,6 +179,32 @@ jobs:
         with:
           projectPath: .
           args: ${{ matrix.args }}
+
+      - name: Warn when no license key was injected
+        if: env.DOSSIER_LICENSE_PUBKEYS == ''
+        shell: bash
+        run: |
+          # 明确指出后果，避免「装完发现登录不了」却不知道原因。
+          echo "::warning title=未注入授权公钥::"
+          echo "没有配置 secrets.DOSSIER_LICENSE_PUBKEYS。"
+          echo "本安装包的信任公钥列表为空，**无法通过任何授权验证**："
+          echo "登录后会一直停在锁定页。仅可用于界面走查，不能做真实登录测试。"
+          echo "修法：在仓库 Secrets 里加 DOSSIER_LICENSE_PUBKEYS，"
+          echo "值取 drama-commerce keyinfo 打印的 public_key。"
+
+      - name: Warn when no server address was injected
+        if: vars.DOSSIER_API_BASE == ''
+        shell: bash
+        run: |
+          # 地址默认是本机开发服务，装到用户电脑上什么都连不上——必须说清楚。
+          echo "::warning title=未注入服务端地址::"
+          echo "没有配置仓库变量 DOSSIER_API_BASE。"
+          echo "本安装包只连编译进程序的默认值 http://127.0.0.1:8100，"
+          echo "装到别的电脑上登录、授权、充值等服务端功能都用不了。"
+          echo "修法：Settings → Secrets and variables → Actions → Variables"
+          echo "里加 DOSSIER_API_BASE（部署后的 https 入口）。"
+          echo "服务端处理（上传、任务）另走一个入口时，再配 DOSSIER_MEDIA_BASE；"
+          echo "共用一个入口则不用配。"
 
       - name: Clean up signing material
         if: always() && steps.signing.outputs.enabled == 'true'
