@@ -1173,11 +1173,19 @@ fn dedup_demo_blocking(
         "--ffprobe".into(),
         ffprobe.display().to_string(),
     ];
-    if let Some(text) = badge.as_deref().map(str::trim).filter(|text| !text.is_empty()) {
+    if let Some(text) = badge
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
         args.push("--badge".into());
         args.push(text.to_string());
     }
-    if let Some(text) = watermark.as_deref().map(str::trim).filter(|text| !text.is_empty()) {
+    if let Some(text) = watermark
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
         args.push("--watermark".into());
         args.push(text.to_string());
     }
@@ -1198,11 +1206,7 @@ fn dedup_demo_blocking(
         .collect();
     if !output.success() {
         let stderr_tail: Vec<&str> = output.stderr.lines().rev().take(6).collect();
-        let stderr_tail = stderr_tail
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("\n");
+        let stderr_tail = stderr_tail.into_iter().rev().collect::<Vec<_>>().join("\n");
         return Err(format!(
             "V5 去重验证失败（退出码 {}）：\n{}",
             output.code_label(),
@@ -1211,7 +1215,10 @@ fn dedup_demo_blocking(
     }
     let final_video = Path::new(output_dir).join("final-encode.mp4");
     if !final_video.is_file() {
-        return Err(format!("进程已成功但未找到成片产物：{}", final_video.display()));
+        return Err(format!(
+            "进程已成功但未找到成片产物：{}",
+            final_video.display()
+        ));
     }
     let manifest_path = Path::new(output_dir).join("final-manifest.json");
     let manifest: serde_json::Value = serde_json::from_str(
@@ -1266,7 +1273,14 @@ pub async fn dedup_demo_execute(
     );
     let result = tauri::async_runtime::spawn_blocking(move || {
         dedup_demo_blocking(
-            &app, &input, &output_dir, seed, &series, badge, watermark, &time_stretch,
+            &app,
+            &input,
+            &output_dir,
+            seed,
+            &series,
+            badge,
+            watermark,
+            &time_stretch,
         )
     })
     .await
