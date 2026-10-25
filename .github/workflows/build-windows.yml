@@ -27,9 +27,21 @@ jobs:
         with:
           workspaces: .
 
-      - name: 安装 tauri-cli
-        shell: bash
-        run: cargo install tauri-cli --locked
+      # 用官方预编译 CLI（解压即用的 cargo-tauri.exe）替代 cargo install 从源码
+      # 编译：后者在 Windows 云机上要 10~20 分钟且缓存不覆盖，每次构建都白等。
+      # 升级 CLI 版本只需改下面 URL 里的 tag 号（资产名规则见 tauri releases 页）。
+      - name: 安装 tauri-cli（预编译）
+        shell: pwsh
+        run: |
+          $url = "https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v2.12.4/cargo-tauri-x86_64-pc-windows-msvc.zip"
+          $zip = "$env:RUNNER_TEMP\cargo-tauri.zip"
+          curl.exe -sSL --retry 5 --max-time 300 -o $zip $url
+          if (-not (Test-Path $zip)) { throw "tauri-cli 预编译包下载失败" }
+          $dir = "$env:RUNNER_TEMP\cargo-tauri"
+          Expand-Archive -Force $zip $dir
+          # cargo 对 `cargo tauri` 子命令会按 PATH 查找 cargo-tauri(.exe)，进 PATH 即生效
+          echo $dir >> $env:GITHUB_PATH
+          Get-ChildItem $dir | ForEach-Object { $_.Name }
 
       # 把 ffmpeg/ffprobe 直接打进 NSIS 安装包：用户端一键配置时零下载，
       # 不再依赖 gyan.dev 等第三方下载源的可用性（曾出现 404）。
