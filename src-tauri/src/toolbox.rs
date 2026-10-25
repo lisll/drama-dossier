@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dossier_core::{
     bitrate_report, load_settings, nudge_frames, output_dir_hits_sources, plan_recut_segments,
@@ -1073,6 +1073,207 @@ pub async fn transcode_execute(
         crate::logging::result_text(&result, |report| {
             format!("完成：{} 项（{}）", report.items.len(), report.output_dir)
         }),
+    );
+    result
+}
+
+// ---------------------------------------------------------------------------
+// V5 去重端到端验证（技术验证，依赖仓库内 cloud 虚拟环境）
+// ---------------------------------------------------------------------------
+
+/// V5 去重验证结果。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DedupDemoReport {
+    pub output_dir: String,
+    pub final_video: String,
+    /// 子进程 stdout 逐行（已带时间戳的 per-episode 日志流）。
+    pub log_lines: Vec<String>,
+    /// final-manifest.json 原文（全链 sha256 汇总）。
+    pub manifest: serde_json::Value,
+}
+
+/// 定位开发仓库里的 cloud 虚拟环境 Python（技术验证口径）。
+///
+/// 从当前工作目录与可执行文件位置逐级向上找 `cloud/.venv/bin/python`
+/// （Windows 为 `cloud/.venv/Scripts/python.exe`）。桌面端打包分发不含仓库
+/// 环境，找不到时给出中文指引——这是有意为之：该功能只用于技术验证。
+fn locate_cloud_python() -> Result<PathBuf, String> {
+    const REL: &str = if cfg!(target_os = "windows") {
+        "cloud/.venv/Scripts/python.exe"
+    } else {
+        "cloud/.venv/bin/python"
+    };
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            roots.push(dir.to_path_buf());
+        }
+    }
+    for root in roots {
+        let mut dir = Some(root);
+        while let Some(current) = dir {
+            let candidate = current.join(REL);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+            dir = current.parent().map(Path::to_path_buf);
+        }
+    }
+    Err(
+        "未找到 cloud/.venv 虚拟环境 Python。V5 去重验证是技术验证功能，依赖开发仓库目录布局：\
+         请先在仓库根目录创建 cloud 虚拟环境。"
+            .into(),
+    )
+}
+
+/// V5 去重验证主流程：拼 CLI 参数 → 跑 demo_dedup.py → 收日志 + 读 manifest。
+#[allow(clippy::too_many_arguments)]
+fn dedup_demo_blocking(
+    app: &AppHandle,
+    input: &str,
+    output_dir: &str,
+    seed: i64,
+    series: &str,
+    badge: Option<String>,
+    watermark: Option<String>,
+    time_stretch: &str,
+) -> Result<DedupDemoReport, String> {
+    let python = locate_cloud_python()?;
+    // cloud 源码目录：python 位于 <仓库>/cloud/.venv/bin/python，上溯三级即 cloud。
+    let cloud_dir = python
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .ok_or_else(|| format!("无法从 Python 路径推断 cloud 目录：{}", python.display()))?
+        .to_path_buf();
+    // ffmpeg/ffprobe 与其他工具箱功能同一套解析（设置 → 一键安装目录 → PATH），
+    // 并显式作为参数传给子进程——macOS GUI 进程的 PATH 不可靠。
+    let ffmpeg = resolve_ffmpeg(app)?;
+    let ffprobe = resolve_ffprobe(app, None)?;
+
+    let mut args: Vec<String> = vec![
+        "-m".into(),
+        "drama_cloud.demo_dedup".into(),
+        "--input".into(),
+        input.to_string(),
+        "--output-dir".into(),
+        output_dir.to_string(),
+        "--seed".into(),
+        seed.to_string(),
+        "--series".into(),
+        series.to_string(),
+        "--time-stretch".into(),
+        time_stretch.to_string(),
+        "--ffmpeg".into(),
+        ffmpeg.display().to_string(),
+        "--ffprobe".into(),
+        ffprobe.display().to_string(),
+    ];
+    if let Some(text) = badge.as_deref().map(str::trim).filter(|text| !text.is_empty()) {
+        args.push("--badge".into());
+        args.push(text.to_string());
+    }
+    if let Some(text) = watermark.as_deref().map(str::trim).filter(|text| !text.is_empty()) {
+        args.push("--watermark".into());
+        args.push(text.to_string());
+    }
+
+    let spec = CommandSpec::new(python.display().to_string())
+        .args(args)
+        .env("PYTHONPATH", cloud_dir.join("src").display().to_string())
+        // 两轮编码耗时与片长成正比；30 分钟封顶防挂死。
+        .timeout(Duration::from_secs(1800));
+    let output = SystemRunner::new()
+        .run(&spec)
+        .map_err(|error| format!("V5 去重验证进程启动失败：{error}"))?;
+    let log_lines: Vec<String> = output
+        .stdout
+        .lines()
+        .map(str::to_string)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if !output.success() {
+        let stderr_tail: Vec<&str> = output.stderr.lines().rev().take(6).collect();
+        let stderr_tail = stderr_tail
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(format!(
+            "V5 去重验证失败（退出码 {}）：\n{}",
+            output.code_label(),
+            stderr_tail
+        ));
+    }
+    let final_video = Path::new(output_dir).join("final-encode.mp4");
+    if !final_video.is_file() {
+        return Err(format!("进程已成功但未找到成片产物：{}", final_video.display()));
+    }
+    let manifest_path = Path::new(output_dir).join("final-manifest.json");
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&manifest_path)
+            .map_err(|error| format!("读取 final-manifest.json 失败：{error}"))?,
+    )
+    .map_err(|error| format!("解析 final-manifest.json 失败：{error}"))?;
+    Ok(DedupDemoReport {
+        output_dir: output_dir.to_string(),
+        final_video: final_video.display().to_string(),
+        log_lines,
+        manifest,
+    })
+}
+
+/// 跑仓库内 cloud 虚拟环境的 V5 两轮去重端到端验证（对照 Grove 逆向文档 §6/§12）。
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn dedup_demo_execute(
+    app: AppHandle,
+    input: String,
+    output_dir: String,
+    seed: i64,
+    series: Option<String>,
+    badge: Option<String>,
+    watermark: Option<String>,
+    time_stretch: Option<String>,
+) -> Result<DedupDemoReport, String> {
+    let input = input.trim().to_string();
+    if input.is_empty() {
+        return Err("请先填写输入视频路径。".into());
+    }
+    if !Path::new(&input).is_file() {
+        return Err(format!("输入视频不存在：{input}"));
+    }
+    let output_dir = output_dir.trim().to_string();
+    if output_dir.is_empty() {
+        return Err("请先填写输出目录。".into());
+    }
+    let series = series
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "示例剧".into());
+    // 非法取值一律回落 auto（前端下拉只发这三个值，这里是兜底）。
+    let time_stretch = match time_stretch.as_deref() {
+        Some("atempo") | Some("rubberband") | Some("auto") => time_stretch.unwrap().to_string(),
+        _ => "auto".to_string(),
+    };
+    crate::logging::log_event(
+        "V5去重",
+        format!("开始：{input} seed={seed} → {output_dir}（变调 {time_stretch}）"),
+    );
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        dedup_demo_blocking(
+            &app, &input, &output_dir, seed, &series, badge, watermark, &time_stretch,
+        )
+    })
+    .await
+    .map_err(|error| format!("V5 去重验证任务失败：{error}"))?;
+    crate::logging::log_event(
+        "V5去重",
+        crate::logging::result_text(&result, |report| format!("完成：{}", report.final_video)),
     );
     result
 }

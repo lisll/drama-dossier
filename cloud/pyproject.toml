@@ -14,6 +14,8 @@ dependencies = [
     "jsonschema>=4.20",
     "python-multipart>=0.0.9",
     "pillow>=10.0",
+    "pyJianYingDraft>=0.3.1",
+    "pymediainfo>=7.0.1",
 ]
 
 [project.optional-dependencies]

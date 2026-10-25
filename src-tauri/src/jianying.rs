@@ -48,10 +48,13 @@ fn skip_tag(text: &str) -> Option<&str> {
     Some(&text[close..])
 }
 
-/// 探测剪映：设置里手动指定的目录优先，其次默认安装位置。
+/// 探测剪映：界面本次传入的目录优先，其次设置里手动指定的，最后默认安装位置。
+///
+/// `dir` 是输入框的当前值——「自动检测」必须即时响应用户刚填的路径，
+/// 而不是逼用户先点「保存到设置」再检测。
 #[tauri::command]
-pub fn jianying_detect(app: AppHandle) -> Result<JianyingDetect, String> {
-    let result = jianying_detect_inner(&app);
+pub fn jianying_detect(app: AppHandle, dir: Option<String>) -> Result<JianyingDetect, String> {
+    let result = jianying_detect_inner(&app, dir);
     // 测试期关键日志：剪映检测影响「设置-剪映」与挂载流程提示。
     crate::logging::log_event(
         "剪映",
@@ -69,16 +72,23 @@ pub fn jianying_detect(app: AppHandle) -> Result<JianyingDetect, String> {
     result
 }
 
-fn jianying_detect_inner(app: &AppHandle) -> Result<JianyingDetect, String> {
+fn jianying_detect_inner(app: &AppHandle, dir: Option<String>) -> Result<JianyingDetect, String> {
     let settings = read_settings(app)?;
-    let configured = settings
-        .jianying_dir
+    // 优先级：界面本次传入 > 设置保存 > 默认路径。
+    let configured = dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or(settings.jianying_dir)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_APP));
-    let install_dir = if configured.exists() {
+    let configured = if configured.exists() {
         configured
     } else {
         PathBuf::from(DEFAULT_APP)
     };
+    // 用户可能填到 `X.app/Contents`（甚至更深）这一层；归一回 .app 根才能读到 Info.plist。
+    let install_dir = normalize_app_dir(&configured);
 
     let plist = install_dir.join("Contents").join("Info.plist");
     let installed = plist.is_file();
@@ -101,6 +111,24 @@ fn jianying_detect_inner(app: &AppHandle) -> Result<JianyingDetect, String> {
     })
 }
 
+/// 把用户填的路径归一到 `.app` 包根目录。
+///
+/// 从深到浅找第一个「以 .app 结尾且含 Contents/Info.plist」的祖先——
+/// 填了 `X.app/Contents` 或 `X.app/Contents/MacOS` 都能归到 `X.app`；
+/// 路径里没有任何 .app 层时原样返回，保持原判定与报错语义。
+fn normalize_app_dir(path: &Path) -> PathBuf {
+    let mut current = Some(path);
+    while let Some(dir) = current {
+        if dir.extension().and_then(|ext| ext.to_str()) == Some("app")
+            && dir.join("Contents").join("Info.plist").is_file()
+        {
+            return dir.to_path_buf();
+        }
+        current = dir.parent();
+    }
+    path.to_path_buf()
+}
+
 /// 默认草稿目录：`~/Movies/JianyingPro/...`。
 fn default_draft_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
@@ -109,7 +137,8 @@ fn default_draft_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::version_from_plist;
+    use super::{normalize_app_dir, version_from_plist};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn extracts_short_version_from_plist_text() {
@@ -128,5 +157,25 @@ mod tests {
 "#;
         assert_eq!(version_from_plist(plist).as_deref(), Some("5.9.0"));
         assert_eq!(version_from_plist("no version here"), None);
+    }
+
+    /// 用真实存在的目录结构验证归一化：本机的 VideoFusion（com.lemon.lvpro）
+    /// 或任何 /Applications 下的 .app 都行；没有可用样本时跳过。
+    #[test]
+    fn normalizes_contents_level_path_to_app_root() {
+        let sample = Path::new("/Applications/VideoFusion-macOS.app");
+        if !sample.join("Contents").join("Info.plist").is_file() {
+            return; // 环境无样本（如 Windows CI），跳过
+        }
+        // 填到 Contents 层 → 归到 .app 根
+        let deep = sample.join("Contents");
+        assert_eq!(normalize_app_dir(&deep), sample.to_path_buf());
+        // 填到可执行文件所在层 → 一样归到 .app 根
+        let deeper = sample.join("Contents").join("MacOS");
+        assert_eq!(normalize_app_dir(&deeper), sample.to_path_buf());
+        // 已是 .app 根 → 原样
+        assert_eq!(normalize_app_dir(sample), sample.to_path_buf());
+        // 与 .app 无关的路径 → 原样返回（保持报错语义）
+        assert_eq!(normalize_app_dir(Path::new("/tmp")), PathBuf::from("/tmp"));
     }
 }

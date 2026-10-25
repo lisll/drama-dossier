@@ -23,7 +23,7 @@ const state = {
   dramas: [],
   selected: null,
   analysis: null,
-  module: "library",
+  module: "home",
   runtime: null,
   // 已保存的设置：探测与生成都读这里，设置页里没保存的改动不生效。
   settings: {},
@@ -225,25 +225,30 @@ async function copyPath(key) {
 
 // ============ 长任务：全局进度与按钮禁用 ============
 
-/** 进度文案始终带上「已用 n 秒」：拿不到总量时，这至少能说明它还在跑。 */
+/** 进度卡：标题只放任务说明；「已用 n 秒」单独放右侧 meta 位，长文件名不会把计时挤没。 */
 function renderProgressLabel() {
   const seconds = state.taskStartedAt
     ? Math.round((Date.now() - state.taskStartedAt) / 1000)
     : 0;
-  const suffix = state.task && seconds >= 1 ? `（已用 ${seconds} 秒）` : "";
-  $("#progress-label").textContent = `${state.taskLabel ?? ""}${suffix}`;
+  $("#progress-label").textContent = state.taskLabel ?? "";
+  $("#progress-meta").textContent =
+    state.task && seconds >= 1 ? `已用 ${seconds} 秒` : "";
 }
 
 function setProgress({ label, done = null, total = null }) {
   state.taskLabel = label ?? state.taskLabel;
   const node = $("#progress");
   node.classList.remove("hidden");
+  const percent = $("#progress-percent");
   if (done != null && total) {
     node.classList.remove("indeterminate");
-    $("#progress-fill").style.width = `${Math.round((done / total) * 100)}%`;
+    const value = Math.min(Math.round((done / total) * 100), 100);
+    $("#progress-fill").style.width = `${value}%`;
+    percent.textContent = `${value}%`;
   } else {
     node.classList.add("indeterminate");
     $("#progress-fill").style.width = "";
+    percent.textContent = "—";
   }
   renderProgressLabel();
 }
@@ -253,6 +258,8 @@ function hideProgress() {
   node.classList.add("hidden");
   node.classList.remove("indeterminate");
   $("#progress-fill").style.width = "0";
+  $("#progress-percent").textContent = "—";
+  $("#progress-meta").textContent = "";
   state.taskLabel = null;
 }
 
@@ -669,6 +676,102 @@ function renderEmptyGuide() {
       </li>`;
     })
     .join("");
+  // 首页「使用教程」与本页三步引导共用同一进度口径，一并刷新。
+  renderTutorial();
+}
+
+/**
+ * 首页「使用教程」六步手风琴：状态按本机实际进度刷新
+ * （前两步与剧目库三步引导同口径，后面几步是固定的引导文案）。
+ */
+function renderTutorial() {
+  const host = $("#tutorial-list");
+  if (!host) return;
+  const hasRoot = Boolean($("#library-root").value.trim());
+  const hasDramas = state.dramas.length > 0;
+  const steps = [
+    {
+      title: "选择素材目录",
+      detail:
+        "一部剧一个子目录，分集视频放子目录里（推荐命名「第01集.mp4」）；封面可叫「封面.jpg」，简介可叫「简介.txt」。",
+      done: hasRoot,
+      status: hasRoot ? "已完成" : "待准备",
+      body: "素材目录是所有功能的起点：扫描剧目、生成报审包与挂载文案都基于它。",
+      actions: [{ label: "去选择目录", guideAction: "browse" }],
+    },
+    {
+      title: "扫描并检查剧目",
+      detail: "扫描后列出每个剧目与集数，点选剧目再「探测并检查」确认材料可用。",
+      done: hasDramas,
+      status: hasDramas ? "已完成" : hasRoot ? "待扫描" : "待准备",
+      body: "探测每集的时长、分辨率与码率，检查结果会逐项列出是否通过。",
+      actions: [{ label: "去剧目库", goto: "library" }],
+    },
+    {
+      title: "生成报审包",
+      detail: "填写出品信息后一键生成内容权属声明、简介、成本图等报审材料。",
+      done: false,
+      status: "待选择",
+      body: "报审包只生成在本地目录；「转码」页第一张卡就是生成入口。",
+      actions: [{ label: "去转码", goto: "transcode" }],
+    },
+    {
+      title: "转码处理",
+      detail: "智能微帧 / 分集重组两种模式，输出到新目录，绝不改动原素材。",
+      done: false,
+      status: "可选",
+      body: "需要去重或调整分集结构时使用；全剧重编码耗时较长，可随时停止。",
+      actions: [{ label: "去转码", goto: "transcode" }],
+    },
+    {
+      title: "分轨与字幕擦除",
+      detail: "擦除硬字幕与角标，为草稿准备干净视频；只处理自有素材。",
+      done: false,
+      status: "可选",
+      body: "「分轨」页提供字幕擦除、V5 去重验证等后期工具。",
+      actions: [{ label: "去分轨", goto: "track" }],
+    },
+    {
+      title: "制作剪映草稿",
+      detail: "导出分集顺序与时长到剪映草稿目录，在剪映里继续精修。",
+      done: false,
+      status: "待准备",
+      body: "先在「设置 → 剪映」确认草稿目录，再到「分轨」页导出草稿。",
+      actions: [
+        { label: "去分轨", goto: "track" },
+        { label: "去剪映设置", gotoSub: "jianying" },
+      ],
+    },
+  ];
+  const doneCount = steps.filter((step) => step.done).length;
+  const countNode = $("#tutorial-count");
+  if (countNode) {
+    countNode.textContent = doneCount ? `已完成 ${doneCount}/6` : "待开始";
+  }
+  host.innerHTML = steps
+    .map((step, index) => {
+      const actions = step.actions
+        .map((action) =>
+          action.guideAction
+            ? `<button class="ghost" data-guide-action="${action.guideAction}">${esc(action.label)}</button>`
+            : action.gotoSub
+              ? `<button class="ghost" data-goto-sub="${action.gotoSub}">${esc(action.label)}</button>`
+              : `<button class="ghost" data-goto="${action.goto}">${esc(action.label)}</button>`,
+        )
+        .join("");
+      return `<details class="tut-row ${step.done ? "done" : ""}">
+        <summary>
+          <span class="tut-mark" aria-hidden="true">${step.done ? "✓" : index + 1}</span>
+          <span class="tut-title">${esc(step.title)}</span>
+          <span class="tut-status">${esc(step.status)}</span>
+        </summary>
+        <div class="tut-body">
+          <p>${esc(step.body)}</p>
+          <div class="option-row">${actions}</div>
+        </div>
+      </details>`;
+    })
+    .join("");
 }
 
 /// 剧目或目录一变，工具箱里的旧计划一律作废（别让人拿着上一部剧的计划点执行）。
@@ -722,6 +825,15 @@ function selectDrama(index) {
 
 // ============ 模块导航 ============
 
+// 内容区页头标题：与侧边栏导航一一对应。
+const MODULE_TITLES = {
+  home: "首页",
+  library: "剧目库",
+  transcode: "转码",
+  track: "分轨",
+  toolbox: "工具箱",
+};
+
 function switchModule(name) {
   // 设置是独立视图：替换整个工作区，对照竞品「← 返回应用」布局。
   if (name === "settings") {
@@ -730,6 +842,7 @@ function switchModule(name) {
   }
   closeSettingsView();
   state.module = name;
+  $("#page-title").textContent = MODULE_TITLES[name] ?? name;
   document.querySelectorAll(".nav-item").forEach((node) => {
     node.classList.toggle("active", node.dataset.module === name);
   });
@@ -738,7 +851,6 @@ function switchModule(name) {
   });
   // 转码模块需要运行环境；切进去时按当前状态刷新阻断层。
   if (name === "transcode") renderTranscodeGate();
-  if (name === "mount") refreshMountContext();
 }
 
 function renderContexts() {
@@ -748,7 +860,7 @@ function renderContexts() {
     chip.classList.add("hidden");
     const emptyText =
       "尚未选择剧目——请先到「剧目库」扫描并点选一部剧。";
-    for (const id of ["#generate-context", "#toolbox-context", "#transcode-context", "#mount-context"]) {
+    for (const id of ["#toolbox-context", "#transcode-context", "#track-context"]) {
       const node = $(id);
       node.textContent = emptyText;
       node.classList.add("empty");
@@ -758,7 +870,7 @@ function renderContexts() {
   }
   chip.textContent = `当前剧目：${selected.name}`;
   chip.classList.remove("hidden");
-  for (const id of ["#generate-context", "#toolbox-context", "#transcode-context", "#mount-context"]) {
+  for (const id of ["#toolbox-context", "#transcode-context", "#track-context"]) {
     const node = $(id);
     node.textContent = `当前剧目：${selected.name}（${selected.episodes.length} 集）`;
     node.classList.remove("empty");
@@ -1172,6 +1284,52 @@ async function importDraft() {
   }
 }
 
+/**
+ * V5 去重端到端验证（技术验证）：调用仓库内 cloud 虚拟环境跑两轮编码 CLI。
+ * 完成后展示成片位置、manifest 关键摘要与运行日志尾部；输出目录里另有
+ * episode-1.log（per-episode 日志）、checkpoint.json（断点续跑进度）可回溯。
+ */
+async function runDedupDemo() {
+  const input = $("#dedup-demo-input").value.trim();
+  const outputDir = $("#dedup-demo-output").value.trim();
+  setFieldError("#dedup-demo-input", input ? null : "请填写输入视频路径。");
+  setFieldError("#dedup-demo-output", outputDir ? null : "请填写输出目录。");
+  if (!input || !outputDir) {
+    toast("请先填写输入视频与输出目录", true);
+    return;
+  }
+  if (!beginTask("正在执行 V5 去重验证（两轮编码）")) return;
+  try {
+    const result = await call("dedup_demo_execute", {
+      input,
+      outputDir,
+      seed: Number($("#dedup-demo-seed").value) || 0,
+      series: $("#dedup-demo-series").value.trim() || null,
+      badge: $("#dedup-demo-badge").value.trim() || null,
+      watermark: $("#dedup-demo-watermark").value.trim() || null,
+      timeStretch: $("#dedup-demo-stretch").value,
+    });
+    const manifest = result.manifest ?? {};
+    const tags = manifest.metadataTags ?? {};
+    const logTail = (result.logLines ?? []).slice(-10).join("\n");
+    renderResult("#dedup-demo-result", {
+      tone: "ok",
+      html: `
+      <strong>V5 验证完成</strong><br />
+      成片：${esc(result.finalVideo)}<br />
+      referenceSha256：<code>${esc(String(manifest.referenceSha256 ?? "?"))}</code><br />
+      伪装机型：${esc(String(tags.make ?? "?"))} · encoder：${esc(String(tags.encoder ?? "?"))}<br />
+      输出目录内含 episode-1.log / checkpoint.json / final-manifest.json<br />
+      <details><summary>运行日志（尾部 10 行）</summary><pre>${esc(logTail)}</pre></details>`,
+      paths: [["dedupDemoOutput", result.outputDir]],
+    });
+  } catch (error) {
+    reportError(error);
+  } finally {
+    endTask();
+  }
+}
+
 async function generatePublishCopy() {
   try {
     const path = $("#publish-copy-path").value.trim();
@@ -1426,10 +1584,11 @@ async function runErase() {
   }
 }
 
-async function browse(targetId) {
+/** 通用路径选择：mode="folder" 选目录（默认），mode="file" 选视频文件（pick_video 带 mp4 等扩展名过滤）。 */
+async function browse(targetId, mode = "folder") {
   try {
-    const folder = await call("pick_folder");
-    if (folder) $(targetId).value = folder;
+    const picked = await call(mode === "file" ? "pick_video" : "pick_folder");
+    if (picked) $(targetId).value = picked;
   } catch (error) {
     reportError(error);
   }
@@ -2229,7 +2388,10 @@ async function changePassword(event) {
 
 async function jianyingDetect() {
   try {
-    const result = await call("jianying_detect");
+    // 把输入框当前值一起传给后端：检测要响应"刚填还没保存"的路径。
+    const result = await call("jianying_detect", {
+      dir: $("#jianying-dir").value.trim() || null,
+    });
     const badge = $("#jianying-status");
     badge.textContent = result.installed ? "已安装" : "未安装";
     badge.className = `badge ${result.installed ? "status-ready" : "status-fail"}`;
@@ -2451,6 +2613,9 @@ async function loadVersion() {
   try {
     const version = await window.__TAURI__?.app?.getVersion?.();
     $("#about-version").textContent = version ?? "未知";
+    // 侧边栏品牌处的版本号（Grove 样式：品牌名下挂小字版本）。
+    const side = $("#side-version");
+    if (side) side.textContent = version ?? "…";
   } catch {
     $("#about-version").textContent = "未知";
   }
@@ -2476,7 +2641,8 @@ $("#auth-login-form").addEventListener("submit", loginAccount);
 $("#auth-register-form").addEventListener("submit", registerAccount);
 // ============ 设置独立视图 ============
 $("#settings-back").addEventListener("click", () => {
-  switchModule("library");
+  // 返回进入设置前的页面；异常兜底回首页。
+  switchModule(state.module ?? "home");
 });
 document.querySelectorAll(".settings-nav").forEach((node) => {
   node.addEventListener("click", () => switchToSubAnd(node.dataset.sub));
@@ -2494,19 +2660,21 @@ $("#logout").addEventListener("click", logoutAccount);
 $("#ledger-refresh").addEventListener("click", () => loadLedger());
 $("#jianying-detect").addEventListener("click", jianyingDetect);
 $("#jianying-save").addEventListener("click", jianyingSave);
+$("#jianying-dir-pick").addEventListener("click", () => browse("#jianying-dir"));
 $("#ai-save").addEventListener("click", aiSave);
 $("#env-workdir-pick").addEventListener("click", envWorkdirPick);
 $("#env-workdir").addEventListener("keydown", (event) => {
   if (event.key === "Enter") envWorkdirApply();
 });
 // ============ 挂载 ============
-document.querySelectorAll("#mount-steps .step").forEach((node) => {
-  node.addEventListener("click", () => switchMountStep(Number(node.dataset.step)));
-});
-$("#mount-bind").addEventListener("click", mountBind);
-$("#mount-csv-generate").addEventListener("click", mountCsvGenerate);
-$("#mount-csv-save").addEventListener("click", mountCsvSave);
-$("#mount-plan-save").addEventListener("click", mountPlanSave);
+// 挂载与发布卡暂时下架（HTML 已整块注释）：功能函数保留，仅注释事件绑定，恢复时一并取消注释。
+// document.querySelectorAll("#mount-steps .step").forEach((node) => {
+//   node.addEventListener("click", () => switchMountStep(Number(node.dataset.step)));
+// });
+// $("#mount-bind").addEventListener("click", mountBind);
+// $("#mount-csv-generate").addEventListener("click", mountCsvGenerate);
+// $("#mount-csv-save").addEventListener("click", mountCsvSave);
+// $("#mount-plan-save").addEventListener("click", mountPlanSave);
 // ============ 转码 ============
 $("#mode-nudge").addEventListener("click", () => selectTranscodeMode("nudge"));
 $("#mode-recut").addEventListener("click", () => selectTranscodeMode("recut"));
@@ -2627,6 +2795,8 @@ $("#platform-run").addEventListener("click", platformReview);
 $("#draft-pick").addEventListener("click", () => browse("#draft-dir"));
 $("#draft-export").addEventListener("click", exportDraft);
 $("#draft-import").addEventListener("click", importDraft);
+$("#dedup-demo-pick").addEventListener("click", () => browse("#dedup-demo-input", "file"));
+$("#dedup-demo-run").addEventListener("click", runDedupDemo);
 $("#publish-copy-generate").addEventListener("click", generatePublishCopy);
 $("#publish-copy-load").addEventListener("click", loadPublishCopy);
 $("#publish-copy-preview").addEventListener("click", previewPublishCopy);
@@ -2659,7 +2829,8 @@ $("#library-root").addEventListener("input", renderEmptyGuide);
 // 用户改了「本次覆盖」的路径就清掉旧的字段错误提示。
 ["#exec-output", "#exec-target", "#erase-input", "#erase-output", "#erase-regions",
   "#total-investment", "#actor-ratio", "#bitrate-min", "#diff-left", "#diff-right",
-  "#draft-dir", "#rule-min-episodes", "#rule-min-duration", "#rule-max-duration",
+  "#draft-dir", "#dedup-demo-input", "#dedup-demo-output",
+  "#rule-min-episodes", "#rule-min-duration", "#rule-max-duration",
   "#rule-max-bitrate",
 ].forEach((selector) => {
   $(selector).addEventListener("input", () => setFieldError(selector, null));
@@ -2671,6 +2842,18 @@ document.addEventListener("click", (event) => {
   if (guideButton) {
     if (guideButton.dataset.guideAction === "browse") browse("#library-root");
     else if (guideButton.dataset.guideAction === "scan") scan();
+    return;
+  }
+  // 页内跳转（首页教程 / 横幅 CTA）：data-goto 切模块，data-goto-sub 直达设置子页。
+  const gotoNode = event.target.closest("[data-goto]");
+  if (gotoNode) {
+    switchModule(gotoNode.dataset.goto);
+    return;
+  }
+  const gotoSubNode = event.target.closest("[data-goto-sub]");
+  if (gotoSubNode) {
+    switchModule("settings");
+    switchToSubAnd(gotoSubNode.dataset.gotoSub);
     return;
   }
   const openButton = event.target.closest("[data-open-key]");

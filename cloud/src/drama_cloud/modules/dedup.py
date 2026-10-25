@@ -122,26 +122,42 @@ def compile_dedup_finish(variant) -> List[str]:
     ]
 
 
-def compile_dedup_audio(audio, variant) -> List[str]:
+def compile_dedup_audio(audio, variant, backend: str = "atempo") -> List[str]:
     """音频去重链（Grove compile_reference 的 audioFilters 段，v5-video-clock/1 时序）。
 
     语义：asetrate 把采样率微移（音调变化），再 atempo 补偿回原时长
     （correction = rate/shifted），最后按 speed 整体变速。总变速恰为 speed。
+
+    ``backend``（对照 Grove 逆向文档 §12.3「rubberband 优先、atempo 链兜底」）：
+    - ``atempo``（默认）：asetrate+atempo 补偿链，任何 ffmpeg 都能跑；
+    - ``rubberband``：``rubberband=tempo=speed:pitch=ratio`` 单滤镜完成音调微扰
+      与总变速（librubberband 时域拉伸音质更好）。两个后端净语义严格一致
+      （音调 ×ratio、时长 ×1/speed），rubberband 的 tempo 已折入总变速 speed，
+      因此链尾不再追加 atempo=speed。调用方负责探测 ffmpeg 是否带该滤镜
+      （auto 回落逻辑在 CLI 层，本函数保持纯函数）。
     """
     audio = _as_dict(audio)
     variant = _as_dict(variant)
     rate = int(audio["sampleRateHz"])
-    shifted_rate = math.floor(rate * float(f"{variant['asetrateRatio']:.12f}") + 0.5)
-    compensation = float(variant["audioTempoCompensation"])
-    correction = 1 / ((shifted_rate / rate) * compensation)
-    effective = compensation * correction
+    ratio = float(f"{variant['asetrateRatio']:.12f}")
+    if backend not in ("atempo", "rubberband"):
+        raise bad_param(f"未知变调后端：{backend}（可选 atempo / rubberband）")
     chain = [
         f"aresample={rate}",
         "aformat=sample_fmts=fltp:channel_layouts=stereo",
-        f"asetrate={shifted_rate}",
-        f"aresample={rate}",
-        f"atempo={effective:.12f}",
     ]
+    if backend == "rubberband":
+        chain.append(f"rubberband=tempo={float(variant['speed']):.12f}:pitch={ratio:.12f}")
+    else:
+        shifted_rate = math.floor(rate * ratio + 0.5)
+        compensation = float(variant["audioTempoCompensation"])
+        correction = 1 / ((shifted_rate / rate) * compensation)
+        effective = compensation * correction
+        chain += [
+            f"asetrate={shifted_rate}",
+            f"aresample={rate}",
+            f"atempo={effective:.12f}",
+        ]
     chain.extend(
         f"equalizer=f={float(eq['frequencyHz']):.12f}:t=q:w={float(eq['widthQ']):.12f}"
         f":g={float(eq['gainDb']):.12f}"
@@ -153,7 +169,8 @@ def compile_dedup_audio(audio, variant) -> List[str]:
         f":attack={float(comp['attackMs']):.12f}:release={float(comp['releaseMs']):.12f}"
         f":makeup={float(comp['makeup']):.12f}"
     )
-    chain.append(f"atempo={float(variant['speed']):.12f}")
+    if backend == "atempo":
+        chain.append(f"atempo={float(variant['speed']):.12f}")
     return chain
 
 

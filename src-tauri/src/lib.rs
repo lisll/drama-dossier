@@ -408,6 +408,7 @@ pub fn run() {
             toolbox::fix_bitrate,
             toolbox::transcode_execute,
             toolbox::transcode_stop,
+            toolbox::dedup_demo_execute,
             toolbox::install_runtime,
             dossier::generate_mount_copy_csv,
             dossier::load_mount_copy,

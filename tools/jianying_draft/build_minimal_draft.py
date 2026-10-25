@@ -17,14 +17,18 @@
 - 不做转场/滤镜/特效/贴纸/参考文本等装饰轨，只保留三轨核心结构。
 - 无 SRT 时放一条 3 秒剧名占位标题，验证文本轨可编辑。
 
+双平台说明（macOS / Windows）：
+- pymediainfo 的 macOS 与 Windows wheel 自带 MediaInfo 动态库（官方 PyPI 口径，
+  Windows 实测待确认），`pip install pymediainfo` 即可用；Linux 需系统装 libmediainfo。
+- 剪映草稿根目录随平台不同，用 `--output-root` 显式指定：
+  - macOS：~/Movies/JianyingPro/User Data/Projects/com.lveditor.draft
+  - Windows：%LOCALAPPDATA%/JianyingPro/User Data/Projects/com.lveditor.draft
+
 运行方式（复用 cloud venv，pyJianYingDraft 已装入）：
     cloud/.venv/bin/python tools/jianying_draft/build_minimal_draft.py \
         --video /path/to/final-encode.mp4 [--audio /path/to/audio.m4a] \
         [--srt /path/to/subs.srt] [--output-root /path/to/jianying_drafts]
-
-已知待确认项（后续适配 Windows 时验证）：
-- pymediainfo 依赖 MediaInfo 动态库；macOS 的 wheel 自带，Windows 需要随包
-  分发 MediaInfo.dll（待确认发行方式）。
+    （Windows 用 cloud\\.venv\\Scripts\\python.exe）
 """
 
 from __future__ import annotations

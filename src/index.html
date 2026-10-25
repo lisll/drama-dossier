@@ -52,44 +52,24 @@
       </div>
     </div>
 
+    <!-- ============ 主应用：左侧边栏 + 右侧内容（对照 Grove 布局） ============ -->
     <div class="app hidden">
-      <header class="app-header">
+      <!-- 侧边栏：品牌 + 导航 + 底部账号 -->
+      <aside class="sidebar">
         <div class="brand">
-          <img src="./icon.svg" alt="" width="36" height="36" />
-          <div>
-            <h1>剧备 <span>DramaDossier</span></h1>
-            <p>从素材目录到结构化报审材料包</p>
+          <img src="./icon.svg" alt="" width="34" height="34" />
+          <div class="brand-text">
+            <h1>剧备 <span>v<span id="side-version">…</span></span></h1>
+            <p>从素材到报审材料</p>
           </div>
         </div>
-        <div class="header-status">
-          <button
-            id="env-chip"
-            class="env-chip"
-            type="button"
-            title="查看本机环境检测结果"
-            aria-describedby="env-chip-detail"
-          >
-            正在检测本机环境…
-          </button>
-          <span id="env-chip-detail" class="sr-only"></span>
-          <span id="current-drama" class="drama-chip hidden"></span>
-        </div>
-      </header>
 
-      <!-- 运行环境横幅：全局首屏，未就绪时显示（含一键配置入口），就绪后隐藏 -->
-      <div id="env-banner" class="env-banner hidden"></div>
-
-      <div id="progress" class="progress hidden" role="status" aria-live="polite">
-        <div class="progress-track"><span id="progress-fill"></span></div>
-        <p id="progress-label" class="progress-label">正在处理…</p>
-      </div>
-
-      <main class="workspace">
         <nav class="sidenav" id="sidenav">
-          <button class="nav-item active" data-module="library">剧目库</button>
-          <button class="nav-item" data-module="generate">生成报审包</button>
-          <button class="nav-item" data-module="mount">挂载</button>
+          <div class="nav-group">工作台</div>
+          <button class="nav-item active" data-module="home">首页</button>
+          <button class="nav-item" data-module="library">剧目库</button>
           <button class="nav-item" data-module="transcode">转码</button>
+          <button class="nav-item" data-module="track">分轨</button>
           <button class="nav-item" data-module="toolbox">工具箱</button>
           <button class="nav-item" data-module="settings">设置</button>
           <div class="sidenav-foot">
@@ -99,10 +79,77 @@
             </div>
           </div>
         </nav>
+      </aside>
 
-        <div class="modules">
-          <!-- ============ 模块一：剧目库 ============ -->
-          <section id="module-library" class="module module-library">
+      <!-- 内容区：页头（页面标题 + 环境状态） + 横幅/进度 + 模块 -->
+      <div class="content">
+        <header class="content-topbar">
+          <h1 id="page-title">首页</h1>
+          <div class="header-status">
+            <button
+              id="env-chip"
+              class="env-chip"
+              type="button"
+              title="查看本机环境检测结果"
+              aria-describedby="env-chip-detail"
+            >
+              正在检测本机环境…
+            </button>
+            <span id="env-chip-detail" class="sr-only"></span>
+            <span id="current-drama" class="drama-chip hidden"></span>
+          </div>
+        </header>
+
+        <!-- 运行环境横幅：未就绪时显示（含一键配置入口），就绪后隐藏 -->
+        <div id="env-banner" class="env-banner hidden"></div>
+
+        <!-- 全局长任务状态卡：任何页面触发的长任务都显示在这里（标题 + 进度条 + 已用时 + 百分比） -->
+        <div id="progress" class="task-card hidden" role="status" aria-live="polite">
+          <span class="task-spin" aria-hidden="true"></span>
+          <div class="task-main">
+            <div class="task-top">
+              <strong id="progress-label">正在处理…</strong>
+              <span id="progress-meta" class="task-meta"></span>
+            </div>
+            <div class="task-bar-row">
+              <div class="task-track"><span id="progress-fill"></span></div>
+              <span id="progress-percent" class="task-percent">—</span>
+            </div>
+          </div>
+        </div>
+
+        <main class="modules">
+          <!-- ============ 模块：首页（欢迎横幅 + 公告 + 使用教程） ============ -->
+          <section id="module-home" class="module module-home">
+            <div class="home-hero-grid">
+              <div class="home-hero">
+                <p class="hero-hello">欢迎回来 · 剧备</p>
+                <h2>让好故事，<br />更快准备就绪。</h2>
+                <p class="hero-sub">准备素材、生成报审材料，从这里开始今天的工作。</p>
+                <button type="button" class="hero-cta" data-goto="library">立即使用 →</button>
+              </div>
+              <div class="home-notice">
+                <div class="notice-head">
+                  <span>产品公告</span>
+                  <span class="notice-date">本地演示版</span>
+                </div>
+                <h3>报审包生成完全在本地</h3>
+                <p>扫描剧目、检查材料、生成报审包、剪映草稿与字幕擦除都只在本机完成，不上传素材。</p>
+                <button type="button" class="notice-link" data-goto-sub="about">阅读公告 →</button>
+              </div>
+            </div>
+
+            <!-- 使用教程：六步手风琴，状态由 renderTutorial() 按本机进度刷新 -->
+            <section class="panel home-tutorial">
+              <section class="panel-header">
+                <h3>使用教程 <span id="tutorial-count" class="badge">待开始</span></h3>
+              </section>
+              <div id="tutorial-list" class="tut-list"></div>
+            </section>
+          </section>
+
+          <!-- ============ 模块：剧目库 ============ -->
+          <section id="module-library" class="module module-library hidden">
             <section class="panel library-panel">
               <section class="panel-header">
                 <h2>剧目</h2>
@@ -173,117 +220,53 @@
             </section>
           </section>
 
-          <!-- ============ 模块二：生成报审包 ============ -->
-          <section id="module-generate" class="module hidden">
-            <div id="generate-context" class="drama-context empty">尚未选择剧目——请先到「剧目库」扫描并点选一部剧。</div>
-
-            <section class="panel package-panel">
-              <section class="panel-header">
-                <h3>生成报审包</h3>
-              </section>
-              <p class="hint">
-                「本次运行覆盖」只在这一次生效；留空时写到「剧目目录/报审包」。
-              </p>
-              <div class="form-grid">
-                <label>输出目录（本次覆盖）<input id="output-dir" type="text" placeholder="留空时生成到剧目目录/报审包" /></label>
-                <label>出品 / 公司<input id="company-name" type="text" placeholder="使用者填写的真实信息" /></label>
-                <label>投资总额（万元）<input id="total-investment" type="number" min="0" step="0.01" /></label>
-                <label>演员成本占比（%）<input id="actor-ratio" type="number" min="0" max="100" step="0.01" /></label>
-                <label>联系方式<input id="contact" type="text" placeholder="仅写入本地报审包" /></label>
-              </div>
-              <div class="option-row">
-                <label><input id="copy-episodes" type="checkbox" /> 复制分集视频进报审包</label>
-                <label><input id="ai-generated" type="checkbox" /> 剧名/简介/封面使用了 AI 辅助生成</label>
-                <button id="browse-output" class="ghost">选择输出目录</button>
-                <button id="generate" data-long-task class="success">生成材料包</button>
-              </div>
-              <div id="generate-result" class="result hidden"></div>
-              <p class="legal">
-                合规说明：剧备只整理使用者提供的真实材料，不伪造签名、印章或时间戳；报审包固定包含内容权属声明模板。
-              </p>
-            </section>
-          </section>
-
-          <!-- ============ 模块三：挂载（四步步骤条） ============ -->
-          <section id="module-mount" class="module hidden">
-            <div id="mount-context" class="drama-context empty">尚未选择剧目——请先到「剧目库」扫描并点选一部剧。</div>
-
-            <nav class="steps" id="mount-steps">
-              <button class="step active" data-step="1"><i>1</i>素材</button>
-              <button class="step" data-step="2"><i>2</i>文案</button>
-              <button class="step" data-step="3"><i>3</i>账号</button>
-              <button class="step" data-step="4"><i>4</i>执行</button>
-            </nav>
-
-            <!-- 步骤 1：素材（绑定当前剧目） -->
-            <section id="mount-step-1" class="panel mount-step">
-              <section class="panel-header">
-                <h3>选择素材剧目</h3>
-              </section>
-              <p class="hint">挂载以「一部剧」为单位：绑定后会在剧目目录创建（或复用）<code>挂载文案.csv</code>。</p>
-              <div id="mount-drama" class="drama-context empty">尚未选择剧目。</div>
-              <div class="option-row">
-                <button id="mount-bind" class="primary">绑定当前剧目</button>
-              </div>
-              <div id="mount-bind-result" class="result hidden"></div>
-            </section>
-
-            <!-- 步骤 2：文案（生成 / 编辑 / 校验挂载文案.csv） -->
-            <section id="mount-step-2" class="panel mount-step hidden">
-              <section class="panel-header">
-                <h3>挂载文案</h3>
-              </section>
-              <p class="hint">文案按「集号,文案」逐集填写；保存时自动校验必填列、集号与分集匹配。</p>
-              <div class="option-row">
-                <button id="mount-csv-generate" class="primary">生成 / 打开模板</button>
-                <button id="mount-csv-save" class="success" disabled>保存并校验</button>
-                <button id="mount-csv-ai" class="ghost" disabled title="云端版开放后可用">AI 生成文案</button>
-              </div>
-              <label class="csv-label">挂载文案.csv（<span id="mount-csv-path">尚未生成</span>）
-                <textarea id="mount-csv-content" rows="12" spellcheck="false" placeholder="集号,文案&#10;1,…&#10;2,…"></textarea>
-              </label>
-              <div id="mount-csv-result" class="result hidden"></div>
-            </section>
-
-            <!-- 步骤 3：账号（占位） -->
-            <section id="mount-step-3" class="panel mount-step hidden">
-              <section class="panel-header">
-                <h3>上传账号</h3>
-              </section>
-              <div class="placeholder-card">
-                <h4>视频号登录待接入</h4>
-                <p class="hint">上传需要登录视频号账号；此能力随云端版开放，届时在此完成扫码 / 授权。</p>
-              </div>
-            </section>
-
-            <!-- 步骤 4：执行（保存计划；上传待云端） -->
-            <section id="mount-step-4" class="panel mount-step hidden">
-              <section class="panel-header">
-                <h3>执行挂载</h3>
-              </section>
-              <div id="mount-plan-summary" class="result hidden"></div>
-              <div class="option-row">
-                <button id="mount-plan-save" class="primary">保存挂载计划</button>
-                <button id="mount-upload" class="success" disabled title="云端版开放后可用">开始上传</button>
-              </div>
-              <p class="legal">挂载计划保存在本机（应用数据目录 mount-plan.json）；文案保存在剧目目录，随素材一起管理。</p>
-            </section>
-          </section>
-
-          <!-- ============ 模块四：转码（模式卡片） ============ -->
+          <!-- ============ 模块：转码（报审包 + 转码处理 + 挂载发布） ============ -->
           <section id="module-transcode" class="module hidden">
             <div id="transcode-context" class="drama-context empty">尚未选择剧目——请先到「剧目库」扫描并点选一部剧。</div>
 
-            <!-- 运行环境未就绪时整页阻断 -->
+            <!-- 运行环境未就绪时整页阻断（Grove 同款横幅样式） -->
             <div id="transcode-gate" class="gate hidden">
-              <p>转码需要本地运行环境（ffmpeg / ffprobe），当前未就绪。</p>
-              <button id="gate-install" class="primary">下载运行环境</button>
+              <span class="gate-icon" aria-hidden="true">⬇</span>
+              <div class="gate-text">
+                <strong>准备运行环境</strong>
+                <p>转码需要本地运行环境（ffmpeg / ffprobe），当前未就绪。</p>
+              </div>
+              <button id="gate-install" class="primary">下载并安装</button>
             </div>
 
             <div id="transcode-body">
+              <!-- 卡 1：生成报审包（Grove「生成配置」卡样式） -->
               <section class="panel">
                 <section class="panel-header">
-                  <h3>转码模式</h3>
+                  <h3>生成报审包</h3>
+                  <span class="badge">本地生成</span>
+                </section>
+                <p class="hint">
+                  「本次运行覆盖」只在这一次生效；留空时写到「剧目目录/报审包」。
+                </p>
+                <div class="form-grid">
+                  <label>出品 / 公司<input id="company-name" type="text" placeholder="使用者填写的真实信息" /></label>
+                  <label>投资总额（万元）<input id="total-investment" type="number" min="0" step="0.01" /></label>
+                  <label>演员成本占比（%）<input id="actor-ratio" type="number" min="0" max="100" step="0.01" /></label>
+                  <label>联系方式<input id="contact" type="text" placeholder="仅写入本地报审包" /></label>
+                  <label>输出目录（本次覆盖）<input id="output-dir" type="text" placeholder="留空时生成到剧目目录/报审包" /></label>
+                </div>
+                <div class="option-row">
+                  <label><input id="copy-episodes" type="checkbox" /> 复制分集视频进报审包</label>
+                  <label><input id="ai-generated" type="checkbox" /> 剧名/简介/封面使用了 AI 辅助生成</label>
+                  <button id="browse-output" class="ghost">选择输出目录</button>
+                  <button id="generate" data-long-task class="success">生成材料包</button>
+                </div>
+                <div id="generate-result" class="result hidden"></div>
+                <p class="legal">
+                  合规说明：剧备只整理使用者提供的真实材料，不伪造签名、印章或时间戳；报审包固定包含内容权属声明模板。
+                </p>
+              </section>
+
+              <!-- 卡 2：转码处理（Grove「处理档位」双卡样式） -->
+              <section class="panel">
+                <section class="panel-header">
+                  <h3>转码处理</h3>
                 </section>
                 <div class="mode-cards">
                   <button class="mode-card active" id="mode-nudge" data-mode="nudge">
@@ -302,41 +285,198 @@
                   <label>输出目录<input id="exec-output" type="text" placeholder="留空时写到剧目目录/微调输出 或 /重组输出" /></label>
                 </div>
                 <div class="option-row">
-                  <button id="exec-run" class="success">执行转码</button>
+                  <button id="exec-run" data-long-task class="success">执行转码</button>
                   <!-- 转码进行中才显示；不带 data-long-task，任务期间必须保持可点 -->
                   <button id="exec-stop" class="danger hidden">停止转码</button>
                 </div>
                 <p class="hint">两种模式都输出到新目录，绝不改动原素材；全剧重编码，耗时较长。点「停止转码」会立刻终止并删除本次输出目录。</p>
                 <div id="exec-result" class="result hidden"></div>
+
+                <details class="tool-block" id="tool-transcode-advice">
+                  <summary>转码建议与批量规范化</summary>
+                  <p class="hint">对照目标规格逐集给出「是否需要转码 + 原因 + ffmpeg 命令」。只产出建议，不会自动转码。</p>
+                  <div class="form-grid">
+                    <label>目标容器<input id="transcode-container" type="text" value="mp4" /></label>
+                    <label>码率上限（Mbps）<input id="transcode-bitrate" type="number" min="0.1" step="0.1" value="8" /></label>
+                    <label>最大宽（0 表示不限）<input id="transcode-width" type="number" min="0" step="2" value="1080" /></label>
+                    <label>最大高（0 表示不限）<input id="transcode-height" type="number" min="0" step="2" value="1920" /></label>
+                  </div>
+                  <div class="option-row">
+                    <button id="transcode-plan" class="primary">生成转码建议</button>
+                  </div>
+                  <div id="transcode-result" class="result hidden"></div>
+                </details>
               </section>
 
-              <details class="panel tool-card" id="tool-transcode-advice">
-                <summary>转码建议与批量规范化</summary>
-                <p class="hint">对照目标规格逐集给出「是否需要转码 + 原因 + ffmpeg 命令」。只产出建议，不会自动转码。</p>
-                <div class="form-grid">
-                  <label>目标容器<input id="transcode-container" type="text" value="mp4" /></label>
-                  <label>码率上限（Mbps）<input id="transcode-bitrate" type="number" min="0.1" step="0.1" value="8" /></label>
-                  <label>最大宽（0 表示不限）<input id="transcode-width" type="number" min="0" step="2" value="1080" /></label>
-                  <label>最大高（0 表示不限）<input id="transcode-height" type="number" min="0" step="2" value="1920" /></label>
-                </div>
-                <div class="option-row">
-                  <button id="transcode-plan" class="primary">生成转码建议</button>
-                </div>
-                <div id="transcode-result" class="result hidden"></div>
-              </details>
+              <!-- 卡 3：挂载与发布（暂时下架不上展示；整块注释保留，待云端版开放后取消注释即可恢复。
+                   注意：恢复时需同时取消 main.js 中 mount 相关的 4 处事件绑定注释） -->
+              <!--
+              <section class="panel">
+                <section class="panel-header">
+                  <h3>挂载与发布</h3>
+                </section>
+
+                <nav class="steps" id="mount-steps">
+                  <button class="step active" data-step="1"><i>1</i>素材</button>
+                  <button class="step" data-step="2"><i>2</i>文案</button>
+                  <button class="step" data-step="3"><i>3</i>账号</button>
+                  <button class="step" data-step="4"><i>4</i>执行</button>
+                </nav>
+
+                <section id="mount-step-1" class="mount-step">
+                  <p class="hint">挂载以「一部剧」为单位：绑定后会在剧目目录创建（或复用）<code>挂载文案.csv</code>。</p>
+                  <div id="mount-drama" class="drama-context empty">尚未选择剧目。</div>
+                  <div class="option-row">
+                    <button id="mount-bind" class="primary">绑定当前剧目</button>
+                  </div>
+                  <div id="mount-bind-result" class="result hidden"></div>
+                </section>
+
+                <section id="mount-step-2" class="mount-step hidden">
+                  <p class="hint">文案按「集号,文案」逐集填写；保存时自动校验必填列、集号与分集匹配。</p>
+                  <div class="option-row">
+                    <button id="mount-csv-generate" class="primary">生成 / 打开模板</button>
+                    <button id="mount-csv-save" class="success" disabled>保存并校验</button>
+                    <button id="mount-csv-ai" class="ghost" disabled title="云端版开放后可用">AI 生成文案</button>
+                  </div>
+                  <label class="csv-label">挂载文案.csv（<span id="mount-csv-path">尚未生成</span>）
+                    <textarea id="mount-csv-content" rows="12" spellcheck="false" placeholder="集号,文案&#10;1,…&#10;2,…"></textarea>
+                  </label>
+                  <div id="mount-csv-result" class="result hidden"></div>
+                </section>
+
+                <section id="mount-step-3" class="mount-step hidden">
+                  <div class="placeholder-card">
+                    <h4>视频号登录待接入</h4>
+                    <p class="hint">上传需要登录视频号账号；此能力随云端版开放，届时在此完成扫码 / 授权。</p>
+                  </div>
+                </section>
+
+                <section id="mount-step-4" class="mount-step hidden">
+                  <div id="mount-plan-summary" class="result hidden"></div>
+                  <div class="option-row">
+                    <button id="mount-plan-save" class="primary">保存挂载计划</button>
+                    <button id="mount-upload" class="success" disabled title="云端版开放后可用">开始上传</button>
+                  </div>
+                  <p class="legal">挂载计划保存在本机（应用数据目录 mount-plan.json）；文案保存在剧目目录，随素材一起管理。</p>
+                </section>
+              </section>
+              -->
             </div>
           </section>
 
-          <!-- ============ 模块五：工具箱（转码已拆出） ============ -->
+          <!-- ============ 模块：分轨（字幕擦除 + 剪映草稿 + V5 验证） ============ -->
+          <section id="module-track" class="module hidden">
+            <div id="track-context" class="drama-context empty">尚未选择剧目——请先到「剧目库」扫描并点选一部剧。</div>
+
+            <!-- 卡 1：字幕擦除 -->
+            <section class="panel" id="tool-erase">
+              <section class="panel-header">
+                <h3>字幕擦除</h3>
+                <span class="badge">实验功能 · 仅限自有素材</span>
+              </section>
+              <p class="hint">为草稿准备干净视频：擦除硬字幕与角标，结果按确认流自动校验。</p>
+              <div class="form-grid">
+                <label>输入视频<input id="erase-input" type="text" placeholder="仅限自有素材" /></label>
+                <label>输出视频<input id="erase-output" type="text" placeholder="例如 /path/out.mp4" /></label>
+                <label>区域（x,y,w,h）<input id="erase-regions" type="text" placeholder="120,300,400,40；多个用分号分隔" /></label>
+                <label>检测后端<select id="erase-detector">
+                  <option value="fixed">fixed（按上面的区域）</option>
+                  <option value="worker">worker（DBNet 模型检测）</option>
+                </select></label>
+                <label>修复后端<select id="erase-inpainter">
+                  <option value="column">column（本地基线，无需模型）</option>
+                  <option value="worker">worker（时序模型）</option>
+                </select></label>
+              </div>
+              <details class="adv">
+                <summary>高级参数（膨胀 / 羽化 / worker / 截取）</summary>
+                <div class="form-grid">
+                  <label>掩码膨胀（px）<input id="erase-dilate" type="number" min="0" max="64" step="1" value="4" /></label>
+                  <label>羽化（px）<input id="erase-feather" type="number" min="0" max="64" step="1" value="2" /></label>
+                  <label>ROI 外扩比例<input id="erase-context" type="number" min="1" max="8" step="0.1" value="1.6" /></label>
+                  <label>起始秒（可选）<input id="erase-start" type="number" min="0" step="0.1" /></label>
+                  <label>时长秒（可选）<input id="erase-duration" type="number" min="0.1" step="0.1" /></label>
+                  <label>worker 程序<input id="erase-worker-program" type="text" placeholder="如 python3（Windows 填 python）" /></label>
+                  <label>worker 参数<input id="erase-worker-args" type="text" placeholder="逗号分隔，如 tools/model_worker/worker.py,--serve" /></label>
+                  <label>工具路径<input id="erase-tool-path" type="text" placeholder="留空时从 PATH / 仓库 target 查找" /></label>
+                </div>
+                <div class="option-row">
+                  <label><input id="erase-persistent" type="checkbox" /> 常驻 worker（--persistent-worker）</label>
+                </div>
+              </details>
+              <div class="option-row">
+                <button id="browse-erase-input" class="ghost">选择输入视频</button>
+                <button id="erase-status" class="ghost">检测工具状态</button>
+                <button id="erase-plan" class="primary">预览命令</button>
+                <button id="erase-run" data-long-task class="success">执行擦除</button>
+              </div>
+              <div id="erase-result" class="result hidden"></div>
+              <p class="legal">
+                只处理自有素材的硬字幕与角标；擦除结果按确认流自动校验（退出码 0 通过 / 3 需人工抽查 / 2 校验失败）。
+                本功能不提供 DRM 绕过能力，也不处理他人作品的版权标识。
+              </p>
+            </section>
+
+            <!-- 卡 2：剪映草稿 -->
+            <section class="panel" id="tool-draft">
+              <section class="panel-header">
+                <h3>剪映草稿</h3>
+              </section>
+              <p class="hint">导出分集顺序与时长到剪映草稿目录，或把草稿时间线读回来核对。草稿格式随剪映版本变化。</p>
+              <div class="form-grid">
+                <label>草稿目录（读回时选择）<input id="draft-dir" type="text" placeholder="导出时留空写到剧目目录" /></label>
+              </div>
+              <div class="option-row">
+                <button id="draft-pick" class="ghost">选择草稿目录</button>
+                <button id="draft-export" data-long-task class="primary">导出草稿</button>
+                <button id="draft-import" data-long-task class="ghost">读回草稿</button>
+              </div>
+              <div id="draft-result" class="result hidden"></div>
+            </section>
+
+            <!-- 卡 3：V5 去重验证 -->
+            <section class="panel" id="tool-dedup-demo">
+              <section class="panel-header">
+                <h3>V5 去重验证</h3>
+                <span class="badge">技术验证</span>
+              </section>
+              <p class="hint">
+                对照 Grove Max 逆向文档的两轮编码端到端验证：母版去重 → overlay（AI 角标 / 剧名水印）→ 成片（机型伪装元数据）。
+                同一输出目录 + 同参数重跑时，已完成的步骤按 checkpoint 自动跳过（断点续跑）。
+                依赖仓库内 cloud 虚拟环境，仅用于技术验证，不是正式去重功能。
+              </p>
+              <div class="form-grid">
+                <label>输入视频<input id="dedup-demo-input" type="text" placeholder="例如 /path/第01集.mp4" /></label>
+                <label>输出目录<input id="dedup-demo-output" type="text" placeholder="例如 /tmp/v5demo/第01集" /></label>
+                <label>seed（同 seed 配方可复现）<input id="dedup-demo-seed" type="number" step="1" value="42" /></label>
+                <label>剧名<input id="dedup-demo-series" type="text" value="示例剧" /></label>
+                <label>AI 声明角标（留空则不叠加）<input id="dedup-demo-badge" type="text" placeholder="例如 内容由AI生成，纯属虚构" /></label>
+                <label>剧名水印（留空则不叠加）<input id="dedup-demo-watermark" type="text" placeholder="例如 示例剧" /></label>
+                <label>音频变调后端<select id="dedup-demo-stretch">
+                  <option value="auto">auto（rubberband 优先，atempo 兜底）</option>
+                  <option value="atempo">atempo（兼容兜底）</option>
+                  <option value="rubberband">rubberband（音质优先）</option>
+                </select></label>
+              </div>
+              <div class="option-row">
+                <button id="dedup-demo-pick" class="ghost">选择视频</button>
+                <button id="dedup-demo-run" data-long-task class="primary">执行验证</button>
+              </div>
+              <div id="dedup-demo-result" class="result hidden"></div>
+            </section>
+          </section>
+
+          <!-- ============ 模块：工具箱（转码/分轨已拆出） ============ -->
           <section id="module-toolbox" class="module hidden">
             <div id="toolbox-context" class="drama-context empty">尚未选择剧目——请先到「剧目库」扫描并点选一部剧。</div>
 
             <section class="panel guidance">
               <h3>该用哪个工具？</h3>
               <ol>
-                <li><strong>只想先看看要改什么</strong>：用「视频转码 → 转码建议」，它只出建议，不动文件。</li>
+                <li><strong>只想先看看要改什么</strong>：用「转码 → 转码建议」，它只出建议，不动文件。</li>
                 <li><strong>只是码率不达标</strong>：用「码率修复」，会就地重编码不达标的分集（<em>替换原文件</em>）。</li>
-                <li><strong>要改时长、顺序或分集数</strong>：用「视频转码 → 执行转码」，结果写到新目录。</li>
+                <li><strong>要改时长、顺序或分集数</strong>：用「转码 → 执行转码」，结果写到新目录。</li>
                 <li><strong>文件名不统一</strong>：先做「批量改名」，再跑上面的检查（集号解析依赖文件名）。</li>
               </ol>
             </section>
@@ -412,19 +552,6 @@
                 <div id="platform-result" class="result hidden"></div>
               </details>
 
-              <details class="panel tool-card" id="tool-draft">
-                <summary>剪映草稿</summary>
-                <p class="hint">导出分集顺序与时长到剪映草稿目录，或把草稿时间线读回来核对。草稿格式随剪映版本变化。</p>
-                <div class="form-grid">
-                  <label>草稿目录（读回时选择）<input id="draft-dir" type="text" placeholder="导出时留空写到剧目目录" /></label>
-                </div>
-                <div class="option-row">
-                  <button id="draft-pick" class="ghost">选择草稿目录</button>
-                  <button id="draft-export" data-long-task class="primary">导出草稿</button>
-                  <button id="draft-import" data-long-task class="ghost">读回草稿</button>
-                </div>
-                <div id="draft-result" class="result hidden"></div>
-              </details>
               <details class="panel tool-card" id="tool-publish-copy">
                 <summary>发布素材文案（本地 CSV）</summary>
                 <p class="hint">生成并编辑「挂载文案.csv」。此功能只处理本地文案和状态，不连接第三方平台或读取登录会话。</p>
@@ -439,61 +566,16 @@
                 <div id="publish-copy-result" class="result hidden"></div>
                 <p class="hint">dry-run 只校验文案和 ready 状态，不连接平台、不模拟上传；预览中的“可提交”不代表已提交。</p>
               </details>
-
-              <details class="panel tool-card" id="tool-erase">
-                <summary>字幕 / 角标擦除（实验功能，仅限自有素材）</summary>
-                <div class="form-grid">
-                  <label>输入视频<input id="erase-input" type="text" placeholder="仅限自有素材" /></label>
-                  <label>输出视频<input id="erase-output" type="text" placeholder="例如 /path/out.mp4" /></label>
-                  <label>区域（x,y,w,h）<input id="erase-regions" type="text" placeholder="120,300,400,40；多个用分号分隔" /></label>
-                  <label>检测后端<select id="erase-detector">
-                    <option value="fixed">fixed（按上面的区域）</option>
-                    <option value="worker">worker（DBNet 模型检测）</option>
-                  </select></label>
-                  <label>修复后端<select id="erase-inpainter">
-                    <option value="column">column（本地基线，无需模型）</option>
-                    <option value="worker">worker（时序模型）</option>
-                  </select></label>
-                </div>
-                <details class="adv">
-                  <summary>高级参数（膨胀 / 羽化 / worker / 截取）</summary>
-                  <div class="form-grid">
-                    <label>掩码膨胀（px）<input id="erase-dilate" type="number" min="0" max="64" step="1" value="4" /></label>
-                    <label>羽化（px）<input id="erase-feather" type="number" min="0" max="64" step="1" value="2" /></label>
-                    <label>ROI 外扩比例<input id="erase-context" type="number" min="1" max="8" step="0.1" value="1.6" /></label>
-                    <label>起始秒（可选）<input id="erase-start" type="number" min="0" step="0.1" /></label>
-                    <label>时长秒（可选）<input id="erase-duration" type="number" min="0.1" step="0.1" /></label>
-                    <label>worker 程序<input id="erase-worker-program" type="text" placeholder="如 python3（Windows 填 python）" /></label>
-                    <label>worker 参数<input id="erase-worker-args" type="text" placeholder="逗号分隔，如 tools/model_worker/worker.py,--serve" /></label>
-                    <label>工具路径<input id="erase-tool-path" type="text" placeholder="留空时从 PATH / 仓库 target 查找" /></label>
-                  </div>
-                  <div class="option-row">
-                    <label><input id="erase-persistent" type="checkbox" /> 常驻 worker（--persistent-worker）</label>
-                  </div>
-                </details>
-                <div class="option-row">
-                  <button id="browse-erase-input" class="ghost">选择输入视频</button>
-                  <button id="erase-status" class="ghost">检测工具状态</button>
-                  <button id="erase-plan" class="primary">预览命令</button>
-                  <button id="erase-run" data-long-task class="success">执行擦除</button>
-                </div>
-                <div id="erase-result" class="result hidden"></div>
-                <p class="legal">
-                  只处理自有素材的硬字幕与角标；擦除结果按确认流自动校验（退出码 0 通过 / 3 需人工抽查 / 2 校验失败）。
-                  本功能不提供 DRM 绕过能力，也不处理他人作品的版权标识。
-                </p>
-              </details>
             </div>
           </section>
-        </div>
-      </main>
+        </main>
+      </div>
     </div>
 
-    <!-- ============ 设置：独立视图（对照竞品：顶部返回 + 内部侧栏七子页） ============ -->
+    <!-- ============ 设置：独立视图（对照竞品：顶部返回 + 内部侧栏分组） ============ -->
     <div id="settings-view" class="settings-view hidden">
       <header class="settings-header">
         <button id="settings-back" class="ghost">← 返回应用</button>
-        <h2>设置</h2>
       </header>
 
       <div class="settings-body">
@@ -501,18 +583,19 @@
           <div class="settings-group">个人</div>
           <button class="settings-nav active" data-sub="account">账号</button>
           <button class="settings-nav" data-sub="billing">账单</button>
-          <div class="settings-group">配置</div>
+          <div class="settings-group">成片</div>
+          <button class="settings-nav" data-sub="rules">生成设置</button>
+          <button class="settings-nav" data-sub="ai">AI 提示</button>
+          <div class="settings-group">本机</div>
+          <button class="settings-nav" data-sub="env">目录与引擎</button>
           <button class="settings-nav" data-sub="jianying">剪映</button>
-          <button class="settings-nav" data-sub="ai">AI</button>
-          <div class="settings-group">应用</div>
-          <button class="settings-nav" data-sub="env">本机环境</button>
-          <button class="settings-nav" data-sub="rules">检查规则</button>
-          <button class="settings-nav" data-sub="about">关于</button>
+          <button class="settings-nav" data-sub="about">软件</button>
         </nav>
 
         <div class="settings-pages">
           <!-- 子页 1：账号（登录方式卡） -->
           <section id="sub-account" class="settings-page">
+            <h2 class="settings-title">账号</h2>
             <section class="panel">
               <section class="panel-header">
                 <h3>登录方式</h3>
@@ -552,6 +635,7 @@
 
           <!-- 子页 2：账单（本地流水） -->
           <section id="sub-billing" class="settings-page hidden">
+            <h2 class="settings-title">账单</h2>
             <div class="billing-cards">
               <div class="panel billing-card">
                 <div class="account-label">还能生成</div>
@@ -569,15 +653,6 @@
                 <div class="hint">次（自然月）</div>
               </div>
             </div>
-            <section class="panel">
-              <section class="panel-header">
-                <h3>积分说明</h3>
-              </section>
-              <p class="hint">
-                报审包生成完全在本地进行，不消耗积分；后续云端版将在此展示 AI 积分余额、
-                最近 30 天消耗与积分流水。
-              </p>
-            </section>
             <section class="panel">
               <section class="panel-header">
                 <h3>生成流水</h3>
@@ -607,28 +682,50 @@
             </section>
           </section>
 
-          <!-- 子页 3：剪映 -->
-          <section id="sub-jianying" class="settings-page hidden">
+          <!-- 子页 3：生成设置（检查规则与默认路径） -->
+          <section id="sub-rules" class="settings-page hidden">
+            <h2 class="settings-title">生成设置</h2>
             <section class="panel">
               <section class="panel-header">
-                <h3>剪映专业版</h3>
-                <span id="jianying-status" class="badge">未检测</span>
+                <h3>检查规则</h3>
+                <span class="badge">可覆盖默认阈值</span>
+                <span id="settings-dirty" class="badge dirty hidden">有改动未保存</span>
               </section>
+              <p class="hint">
+                这里的值保存后才会生效（探测、生成报审包与工具箱都会读已保存的设置）；
+                「生成报审包」和「执行转码」里的输出目录只是本次运行的临时覆盖。
+                <br />
+                「默认输出目录」是<strong>产物的根目录</strong>：留空时产物写在各自剧目目录内；
+                填了则按「该目录 / 剧名 / 产物名」落盘，这样多部剧各占一个子目录、不会互相顶掉。
+              </p>
               <div class="form-grid">
-                <label>安装目录<input id="jianying-dir" type="text" placeholder="/Applications/JianyingPro.app" /></label>
-                <label>当前版本<input id="jianying-version" type="text" placeholder="自动检测" /></label>
-                <label>草稿目录<input id="jianying-draft-dir" type="text" placeholder="留空使用剪映默认草稿位置" /></label>
+                <label>最少集数<input id="rule-min-episodes" type="number" min="1" step="1" /></label>
+                <label>单集时长下限（秒）<input id="rule-min-duration" type="number" min="1" step="1" /></label>
+                <label>单集时长上限（秒）<input id="rule-max-duration" type="number" min="1" step="1" /></label>
+                <label>码率上限（Mbps）<input id="rule-max-bitrate" type="number" min="0.1" step="0.1" /></label>
+                <label class="checkbox-label">
+                  <input id="rule-prefer-portrait" type="checkbox" /> 横屏分集给出警告
+                </label>
+              </div>
+              <div class="form-grid">
+                <label>默认输出目录（产物根目录）<input id="settings-output" type="text" placeholder="留空时写在剧目目录内；填了会写到 该目录/剧名/报审包" /></label>
               </div>
               <div class="option-row">
-                <button id="jianying-detect" class="primary">自动检测</button>
-                <button id="jianying-save" class="success">保存到设置</button>
+                <button id="save-settings" class="primary">保存设置</button>
+                <button id="reset-settings" class="ghost">恢复默认</button>
               </div>
-              <p class="hint">「自动检测」读取应用包 Info.plist 的版本号；草稿目录默认为 ~/Movies/JianyingPro/... 下的工程目录。</p>
+              <p class="settings-note">
+                保存时一并记录「目录与引擎」里的 ffprobe 路径、「生成报审包」的输出目录与剪映 / AI 配置；
+                设置只写入本机配置文件，不上传；素材根目录会随扫描自动记住。
+                <br />
+                配置文件：<span id="settings-path">—</span>
+              </p>
             </section>
           </section>
 
           <!-- 子页 4：AI（本地模板编辑，留云端入口） -->
           <section id="sub-ai" class="settings-page hidden">
+            <h2 class="settings-title">AI 提示</h2>
             <section class="panel">
               <section class="panel-header">
                 <h3>提示词模板</h3>
@@ -644,8 +741,9 @@
             </section>
           </section>
 
-          <!-- 子页 5：本机环境 -->
+          <!-- 子页 5：目录与引擎 -->
           <section id="sub-env" class="settings-page hidden">
+            <h2 class="settings-title">目录与引擎</h2>
             <section class="panel">
               <section class="panel-header">
                 <h3>工作目录</h3>
@@ -692,48 +790,31 @@
             </section>
           </section>
 
-          <!-- 子页 6：检查规则（原设置面板迁移） -->
-          <section id="sub-rules" class="settings-page hidden">
+          <!-- 子页 6：剪映（对照竞品「剪映」设置页） -->
+          <section id="sub-jianying" class="settings-page hidden">
+            <h2 class="settings-title">剪映</h2>
             <section class="panel">
               <section class="panel-header">
-                <h3>检查规则</h3>
-                <span class="badge">可覆盖默认阈值</span>
-                <span id="settings-dirty" class="badge dirty hidden">有改动未保存</span>
+                <h3>本机剪映</h3>
+                <span id="jianying-status" class="badge">未检测</span>
               </section>
-              <p class="hint">
-                这里的值保存后才会生效（探测、生成报审包与工具箱都会读已保存的设置）；
-                「生成报审包」和「执行转码」里的输出目录只是本次运行的临时覆盖。
-                <br />
-                「默认输出目录」是<strong>产物的根目录</strong>：留空时产物写在各自剧目目录内；
-                填了则按「该目录 / 剧名 / 产物名」落盘，这样多部剧各占一个子目录、不会互相顶掉。
-              </p>
               <div class="form-grid">
-                <label>最少集数<input id="rule-min-episodes" type="number" min="1" step="1" /></label>
-                <label>单集时长下限（秒）<input id="rule-min-duration" type="number" min="1" step="1" /></label>
-                <label>单集时长上限（秒）<input id="rule-max-duration" type="number" min="1" step="1" /></label>
-                <label>码率上限（Mbps）<input id="rule-max-bitrate" type="number" min="0.1" step="0.1" /></label>
-                <label class="checkbox-label">
-                  <input id="rule-prefer-portrait" type="checkbox" /> 横屏分集给出警告
-                </label>
-              </div>
-              <div class="form-grid">
-                <label>默认输出目录（产物根目录）<input id="settings-output" type="text" placeholder="留空时写在剧目目录内；填了会写到 该目录/剧名/报审包" /></label>
+                <label>剪映安装目录<input id="jianying-dir" type="text" placeholder="/Applications/JianyingPro.app" /></label>
+                <label>当前剪映版本<input id="jianying-version" type="text" placeholder="自动检测" /></label>
+                <label>剪映草稿目录<input id="jianying-draft-dir" type="text" placeholder="留空使用剪映默认草稿位置" /></label>
               </div>
               <div class="option-row">
-                <button id="save-settings" class="primary">保存设置</button>
-                <button id="reset-settings" class="ghost">恢复默认</button>
+                <button id="jianying-dir-pick" class="ghost">浏览安装目录</button>
+                <button id="jianying-detect" class="primary">自动检测</button>
+                <button id="jianying-save" class="success">保存到设置</button>
               </div>
-              <p class="settings-note">
-                保存时一并记录「本机环境」里的 ffprobe 路径、「生成报审包」的输出目录与剪映 / AI 配置；
-                设置只写入本机配置文件，不上传；素材根目录会随扫描自动记住。
-                <br />
-                配置文件：<span id="settings-path">—</span>
-              </p>
+              <p class="hint">「自动检测」读取应用包 Info.plist 的版本号；草稿目录应与剪映「全局设置」中的草稿位置保持一致。</p>
             </section>
           </section>
 
-          <!-- 子页 7：关于 -->
+          <!-- 子页 7：软件（关于） -->
           <section id="sub-about" class="settings-page hidden">
+            <h2 class="settings-title">软件</h2>
             <section class="panel">
               <section class="panel-header">
                 <h3>关于</h3>

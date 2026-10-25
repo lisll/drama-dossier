@@ -19,6 +19,14 @@ from drama_cloud.modules.dedup import (
     compile_dedup_video,
     format_wave,
 )
+from drama_cloud.demo_dedup import (
+    _load_checkpoint,
+    _make_logger,
+    _record_stage,
+    _stage_valid,
+    sha256_file,
+)
+from drama_cloud.errors import WorkError
 
 
 def _make_recipe():
@@ -118,3 +126,121 @@ class TestFilterCompilation:
         rotated = _safe_crop_ratio(720, 1280, 1.0, 1.0, [0.5, 0.5, 600.0, 0.0])
         assert rotated < 1.0
         assert _safe_crop_ratio(720, 1280, 1.0, 1.0, [0.0, 0.0, 600.0, 0.0]) == 1.0
+
+
+class TestAudioBackend:
+    """变调后端（Grove 逆向文档 §12.3：rubberband 优先、atempo 链兜底）。"""
+
+    def test_rubberband_backend_replaces_atempo_head(self):
+        recipe = _make_recipe()
+        variant = recipe["variants"][0]
+        chain = compile_dedup_audio(recipe["audio"], variant, backend="rubberband")
+        joined = ",".join(chain)
+        assert f"rubberband=tempo={variant['speed']:.12f}:pitch={variant['asetrateRatio']:.12f}" in joined
+        assert "asetrate=" not in joined
+        assert "atempo=" not in joined  # tempo 已折入 rubberband，链尾不再追加
+        assert sum("equalizer=" in part for part in chain) == 4
+        assert any(part.startswith("acompressor=") for part in chain)
+
+    def test_rubberband_net_speed_matches_atempo_tail(self):
+        """两后端净语义一致：rubberband 的 tempo 折入总变速，等于 atempo 链尾的 speed。"""
+        recipe = _make_recipe()
+        variant = recipe["variants"][0]
+        atempo_chain = compile_dedup_audio(recipe["audio"], variant, backend="atempo")
+        rubber_chain = compile_dedup_audio(recipe["audio"], variant, backend="rubberband")
+        assert atempo_chain[-1] == f"atempo={variant['speed']:.12f}"
+        tempo_part = next(p for p in rubber_chain if p.startswith("rubberband=tempo="))
+        assert tempo_part.split("tempo=")[1].split(":")[0] == f"{variant['speed']:.12f}"
+
+    def test_default_backend_keeps_legacy_chain(self):
+        """默认 atempo 后端必须与历史行为逐字节一致（不破坏已有配方/产物）。"""
+        recipe = _make_recipe()
+        chain = compile_dedup_audio(recipe["audio"], recipe["variants"][0])
+        assert chain[0] == "aresample=48000"
+        assert chain[2].startswith("asetrate=")
+        assert chain[-1].startswith("atempo=")
+
+    def test_unknown_backend_rejected(self):
+        recipe = _make_recipe()
+        with pytest.raises(WorkError):
+            compile_dedup_audio(recipe["audio"], recipe["variants"][0], backend="nope")
+
+
+class TestCheckpointResume:
+    """断点续跑（Grove 逆向文档 §12.2 母版续跑 + checkpoint.json 语义）。"""
+
+    @staticmethod
+    def _config(**overrides):
+        config = {"seed": 42, "episode": 1, "series": "剧", "badge": "",
+                  "watermark": "", "timeStretch": "atempo", "inputSha256": "a" * 64}
+        config.update(overrides)
+        return config
+
+    def test_load_missing_checkpoint_returns_fresh(self, tmp_path):
+        cp = _load_checkpoint(tmp_path, self._config(), lambda line: None)
+        assert cp["stages"] == {}
+        assert cp["config"] == self._config()
+
+    def test_load_valid_checkpoint_keeps_stages(self, tmp_path):
+        (tmp_path / "checkpoint.json").write_text(json.dumps(
+            {"schemaVersion": 1, "config": self._config(),
+             "stages": {"firstEncode": {"status": "done", "outputs": {}}}}),
+            encoding="utf-8")
+        cp = _load_checkpoint(tmp_path, self._config(), lambda line: None)
+        assert "firstEncode" in cp["stages"]
+
+    def test_load_config_mismatch_resets(self, tmp_path):
+        """seed/输入/文案等配置变化 → 全量重跑（Grove：seed 不一致全部重来）。"""
+        (tmp_path / "checkpoint.json").write_text(json.dumps(
+            {"schemaVersion": 1, "config": self._config(seed=7),
+             "stages": {"firstEncode": {"status": "done", "outputs": {}}}}),
+            encoding="utf-8")
+        lines = []
+        cp = _load_checkpoint(tmp_path, self._config(), lines.append)
+        assert cp["stages"] == {}
+        assert any("全量重跑" in line for line in lines)
+
+    def test_load_corrupted_resets(self, tmp_path):
+        (tmp_path / "checkpoint.json").write_text("{not json", encoding="utf-8")
+        lines = []
+        cp = _load_checkpoint(tmp_path, self._config(), lines.append)
+        assert cp["stages"] == {}
+        assert any("全量重跑" in line for line in lines)
+
+    def test_stage_valid_requires_matching_sha256(self, tmp_path):
+        target = tmp_path / "first-encode.mp4"
+        target.write_bytes(b"payload")
+        good = {"status": "done", "outputs": {"first-encode.mp4": sha256_file(target)}}
+        assert _stage_valid(tmp_path, good, ("first-encode.mp4",))
+        # 产物 sha 不匹配 / 产物缺失 / 清单不一致 / 状态非 done 都视为未完成
+        assert not _stage_valid(tmp_path, {"status": "done",
+                                           "outputs": {"first-encode.mp4": "0" * 64}},
+                                ("first-encode.mp4",))
+        assert not _stage_valid(tmp_path, good, ("first-encode.mp4", "overlay/x.png"))
+        assert not _stage_valid(tmp_path, {"status": "pending"}, ("first-encode.mp4",))
+        target.unlink()
+        assert not _stage_valid(tmp_path, good, ("first-encode.mp4",))
+
+    def test_record_stage_drops_downstream(self, tmp_path):
+        """上游重做后下游记录作废（下游产物由上游派生）。"""
+        cp = {"schemaVersion": 1, "config": {}, "stages": {
+            "firstEncode": {"status": "done", "outputs": {}},
+            "overlay": {"status": "done", "outputs": {}},
+            "finalEncode": {"status": "done", "outputs": {}},
+        }}
+        _record_stage(tmp_path, cp, "firstEncode",
+                      {"first-encode.mp4": "x" * 64}, lambda line: None)
+        assert "firstEncode" in cp["stages"]
+        assert "overlay" not in cp["stages"]
+        assert "finalEncode" not in cp["stages"]
+        assert (tmp_path / "checkpoint.json").is_file()
+
+    def test_logger_writes_per_episode_log(self, tmp_path):
+        """per-episode 日志命名（Grove episode-<ep>.log 规范）+ 追加双写。"""
+        log, path = _make_logger(tmp_path, 3)
+        log("hello")
+        log("world again")
+        assert path.name == "episode-3.log"
+        content = path.read_text(encoding="utf-8")
+        assert "hello" in content and "world again" in content
+        assert content.count("\n") == 2

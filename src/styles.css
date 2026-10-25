@@ -1,50 +1,48 @@
 :root {
-  color-scheme: dark;
+  color-scheme: light;
 
-  /* 画布与层级：中性冷灰，配「顶亮底平」的单一点光。
-     旧版用紫、绿两个径向光晕铺满整屏，半透明面板叠上去就变成一片浑汤——
-     语义色（成功/警告/失败）也跟着一起脏。所以这里只保留一层很淡的品牌顶光。 */
-  --canvas: #0c1016;
-  --canvas-top: #101620;
-  --surface: #151b24;
-  --surface-2: #1a222c;
-  --surface-3: #212a35;
-  --line: #232c38;
-  --line-strong: #33404f;
+  /* 画布与层级：浅灰绿画布 + 白卡片（对照 Grove 官方客户端的浅色主题）。
+     侧边栏与内容区同底色，卡片用白面 + 细边 + 极浅投影分层。 */
+  --canvas: #f6f7f6;
+  --canvas-top: #f6f7f6;
+  --surface: #ffffff;
+  --surface-2: #f3f5f3;
+  --surface-3: #eaeeea;
+  --line: #e4e8e4;
+  --line-strong: #d2d9d2;
 
   /* 文字三级：正文 / 次要 / 极弱（极弱只用在装饰性说明，仍需 ≥ 3:1） */
-  --text: #e8edf5;
-  --muted: #9aa7b8;
-  --faint: #6f7d90;
+  --text: #1f241f;
+  --muted: #5c665e;
+  --faint: #879189;
 
-  /* 品牌蓝：全app唯一的强调色，负责「可交互」与「已选中」 */
-  --accent: #5b8cff;
-  --accent-text: #79a2ff;
-  --accent-soft: #16203a;
-  --accent-fill: #3566e0;
-  --accent-fill-hover: #2a58cc;
-  --accent-line: rgba(91, 140, 255, 0.42);
-  --accent-tint: rgba(91, 140, 255, 0.14);
+  /* 品牌深绿：全 app 唯一的强调色，负责「可交互」与「已选中」（Grove 主色系） */
+  --accent: #1d4d2b;
+  --accent-text: #1d4d2b;
+  --accent-soft: #edf3ee;
+  --accent-fill: #1d4d2b;
+  --accent-fill-hover: #163d22;
+  --accent-line: rgba(29, 77, 43, 0.32);
+  --accent-tint: rgba(29, 77, 43, 0.07);
 
-  /* 语义色：亮色只用于文字/描边，深色用于填充——白字压深填充才能过 4.5:1。
-     旧版把白字压在亮绿 #2ed694 / 亮红 #ff6b7a 上，实测只有 1.9、2.8。 */
-  --ok-text: #45d68f;
-  --ok-soft: #0f2a24;
-  --ok-line: rgba(69, 214, 143, 0.34);
-  --ok-fill: #15805c;
-  --ok-fill-hover: #116a4c;
+  /* 语义色：文字用深色调保证白底可读；填充用中深色配白字 */
+  --ok-text: #1a6b40;
+  --ok-soft: #ecf6f0;
+  --ok-line: rgba(26, 107, 64, 0.3);
+  --ok-fill: #1d7a48;
+  --ok-fill-hover: #16603a;
 
-  --warn-text: #f2c46b;
-  --warn-soft: #2e2415;
-  --warn-line: rgba(242, 196, 107, 0.32);
+  --warn-text: #8f6410;
+  --warn-soft: #faf3e1;
+  --warn-line: rgba(143, 100, 16, 0.3);
 
-  --err-text: #ff8f99;
-  --err-soft: #2f1b20;
-  --err-line: rgba(255, 143, 153, 0.36);
+  --err-text: #ab3a4b;
+  --err-soft: #fceef1;
+  --err-line: rgba(171, 58, 75, 0.32);
   --err-fill: #c03a4b;
-  --err-fill-hover: #a83246;
+  --err-fill-hover: #a53245;
 
-  /* 兼容既有写法：这些名字仍被下面大量规则引用 */
+  /* 兼容既有写法：这些名字仍被大量规则引用 */
   --bg: var(--canvas);
   --panel: var(--surface);
   --panel-strong: var(--surface-2);
@@ -54,17 +52,17 @@
   --danger: var(--err-text);
   --warn: var(--warn-text);
 
-  /* 圆角 / 焦点环 / 高度：统一取值，避免 9/10/11/12/14/18 混用 */
+  /* 圆角 / 焦点环 / 阴影：统一取值 */
   --r-sm: 8px;
   --r-md: 10px;
   --r-lg: 14px;
   --r-xl: 18px;
   --r-pill: 999px;
-  --ring: 0 0 0 3px rgba(91, 140, 255, 0.28);
-  --edge: inset 0 1px 0 rgba(255, 255, 255, 0.06);
-  --shadow-1: 0 1px 2px rgba(3, 6, 12, 0.4);
-  --shadow-2: 0 10px 28px rgba(3, 6, 12, 0.42);
-  --shadow-3: 0 26px 64px rgba(3, 6, 12, 0.5);
+  --ring: 0 0 0 3px rgba(29, 77, 43, 0.22);
+  --edge: inset 0 1px 0 rgba(255, 255, 255, 0.7);
+  --shadow-1: 0 1px 2px rgba(24, 44, 30, 0.06);
+  --shadow-2: 0 6px 20px rgba(24, 44, 30, 0.07);
+  --shadow-3: 0 20px 48px rgba(24, 44, 30, 0.14);
 }
 
 * {
@@ -76,11 +74,6 @@ body {
   height: 100%;
   margin: 0;
   background-color: var(--canvas);
-  /* 顶光只铺满首屏高度，往下就是干净的画布——空态不再是一片发绿发紫的雾。 */
-  background-image:
-    radial-gradient(1100px 380px at 50% -14%, rgba(91, 140, 255, 0.12), transparent 72%),
-    linear-gradient(180deg, var(--canvas-top), var(--canvas) 380px);
-  background-repeat: no-repeat;
   color: var(--text);
   /* 拉丁字形走系统 UI 字体，中文再退回中文字体：混排时数字与英文更利落 */
   font-family:
@@ -93,10 +86,10 @@ body {
 }
 
 ::selection {
-  background: rgba(91, 140, 255, 0.32);
+  background: rgba(29, 77, 43, 0.18);
 }
 
-/* 深色界面里系统默认的亮色滚动条很扎眼，统一成细轨 */
+/* 浅色界面用细浅轨滚动条 */
 * {
   scrollbar-width: thin;
   scrollbar-color: var(--line-strong) transparent;
@@ -119,47 +112,45 @@ body {
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #3f4d5e;
+  background: #b9c2b9;
   background-clip: content-box;
 }
 
+/* ============ 主应用骨架：侧边栏 + 内容区 ============ */
+
 .app {
-  min-height: 100%;
+  min-height: 100vh;
   display: flex;
-  flex-direction: column;
+  align-items: stretch;
 }
 
-.app-header {
-  position: sticky;
-  top: 0;
-  z-index: 5;
+/* 侧边栏：与画布同色，导航项激活时用白面胶囊浮起（Grove 样式） */
+.sidebar {
+  flex: none;
+  width: 218px;
   display: flex;
-  gap: 24px;
-  align-items: center;
-  justify-content: space-between;
-  padding: 16px 24px;
-  border-bottom: 1px solid var(--line);
-  /* 有底色，backdrop-filter 才真的糊得住下面的内容 */
-  background: rgba(12, 16, 22, 0.74);
-  backdrop-filter: blur(18px);
+  flex-direction: column;
+  padding: 18px 14px 14px;
 }
 
 .brand {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
+  padding: 2px 8px 14px;
 }
 
 .brand h1 {
   margin: 0;
-  font-size: 17px;
-  font-weight: 600;
+  font-size: 15px;
+  font-weight: 700;
   letter-spacing: 0.01em;
 }
 
 .brand h1 span {
   color: var(--faint);
-  font-weight: 400;
+  font-weight: 500;
+  font-size: 11.5px;
 }
 
 .brand p,
@@ -170,8 +161,86 @@ body {
   font-size: 13px;
 }
 
-/* 旧版给这一行写死 min-width: min(620px, 58vw)，而它所在的剧目面板只有 295px 宽，
-   于是输入框和按钮直接溢出面板、压到右侧「检查结果 / 分集」上（1280 宽必现）。 */
+.brand-text p {
+  margin: 1px 0 0;
+  color: var(--faint);
+  font-size: 11px;
+}
+
+.sidenav {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.nav-group {
+  margin: 10px 10px 5px;
+  color: var(--faint);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+
+.nav-item {
+  text-align: left;
+  padding: 10px 12px;
+  font-size: 14px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.nav-item:hover {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.nav-item.active {
+  background: var(--surface);
+  border-color: var(--line);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: var(--shadow-1);
+}
+
+/* 内容区：白面板浮在画布上，左上角圆角（Grove 内容容器样式） */
+.content {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-right: 0;
+  border-radius: 16px 0 0 0;
+  margin: 10px 0 0 6px;
+  min-height: calc(100vh - 10px);
+}
+
+.content-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 26px 0;
+}
+
+.content-topbar h1 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.modules {
+  flex: 1;
+  min-width: 0;
+  padding: 14px 26px 34px;
+}
+
+/* ============ 表单基础 ============ */
+
 .path-row {
   display: flex;
   flex-wrap: wrap;
@@ -192,10 +261,10 @@ body {
 input,
 button,
 select {
-  min-height: 38px;
+  min-height: 36px;
   border-radius: var(--r-md);
-  border: 1px solid var(--line);
-  background: rgba(9, 13, 19, 0.72);
+  border: 1px solid var(--line-strong);
+  background: var(--surface);
   color: var(--text);
   font-size: 13px;
   font-family: inherit;
@@ -227,9 +296,9 @@ button:disabled {
   transform: none;
 }
 
-/* 键盘焦点：旧版只给 input 做了焦点框，按钮/导航/步骤条键盘走到时没有任何反馈 */
+/* 键盘焦点：按钮/导航/步骤条键盘走到时要有反馈 */
 :focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--accent-fill);
   outline-offset: 2px;
 }
 
@@ -237,11 +306,11 @@ input:focus-visible,
 textarea:focus-visible,
 select:focus-visible {
   outline: none;
-  border-color: var(--accent);
+  border-color: var(--accent-fill);
   box-shadow: var(--ring);
 }
 
-/* 主按钮：白字压深蓝填充（5.1:1）。旧版是 #647eff 亮端，白字只有 3.5:1。 */
+/* 主按钮：白字压深绿填充（Grove 主操作色） */
 .primary {
   border-color: transparent;
   background: var(--accent-fill);
@@ -254,7 +323,7 @@ select:focus-visible {
   background: var(--accent-fill-hover);
 }
 
-/* 成功按钮：旧版白字压 #2ed694 只有 1.9:1，等于看不清 */
+/* 成功按钮：稍亮的绿色，用于「产出结果」类动作 */
 .success {
   border-color: transparent;
   background: var(--ok-fill);
@@ -281,100 +350,107 @@ select:focus-visible {
 }
 
 .ghost {
-  background: var(--surface-2);
-  border-color: var(--line);
+  background: var(--surface);
+  border-color: var(--line-strong);
 }
 
 .ghost:hover:not(:disabled) {
-  background: var(--surface-3);
-  border-color: var(--line-strong);
+  background: var(--surface-2);
+  border-color: var(--faint);
   transform: translateY(-1px);
 }
 
-.workspace {
-  flex: 1;
-  display: grid;
-  grid-template-columns: 176px minmax(0, 1fr);
-  gap: 18px;
-  padding: 18px 24px 24px;
-  align-items: start;
+/* ============ 页头状态与横幅 ============ */
+
+.header-status {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 
-.sidenav {
-  display: grid;
-  gap: 8px;
-  position: sticky;
-  top: 18px;
-}
-
-.nav-item {
-  text-align: left;
-  padding: 12px 14px;
-  font-size: 14px;
+/* 环境状态：圆点 + 文案（Grove 页头「待安装运行环境」样式） */
+.env-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 30px;
+  border: 0;
+  border-radius: var(--r-pill);
+  padding: 0 6px;
+  font-size: 12.5px;
+  font-weight: 500;
   background: transparent;
-  border: 1px solid transparent;
   color: var(--muted);
-  font-weight: 600;
 }
 
-.nav-item:hover {
-  background: var(--surface-2);
-  color: var(--text);
+.env-chip::before {
+  content: "";
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--faint);
 }
 
-.nav-item.active {
-  background: var(--accent-tint);
-  border-color: var(--accent-line);
-  color: var(--text);
-  box-shadow: var(--edge);
+.env-chip.ok {
+  color: var(--ok-text);
 }
 
-.modules {
-  min-width: 0;
+.env-chip.ok::before {
+  background: var(--ok-fill);
 }
 
-.module-library {
-  display: grid;
-  grid-template-columns: 295px minmax(0, 1fr);
-  gap: 18px;
-  align-items: start;
+.env-chip.warn {
+  color: var(--warn-text);
 }
 
-/* 「当前剧目」是上下文、不是状态：用中性面 + 品牌细边，
-   这样页头不会同时出现蓝绿两颗同样抢眼的胶囊。 */
+.env-chip.warn::before {
+  background: #d99a2b;
+}
+
+.env-chip.error {
+  color: var(--err-text);
+}
+
+.env-chip.error::before {
+  background: var(--err-fill);
+}
+
+/* 「当前剧目」是上下文：白面胶囊 + 品牌细边 */
 .drama-chip {
   display: inline-flex;
   align-items: center;
-  min-height: 32px;
-  padding: 0 14px;
+  min-height: 30px;
+  padding: 0 12px;
   border-radius: var(--r-pill);
   border: 1px solid var(--accent-line);
-  background: var(--surface-2);
+  background: var(--accent-soft);
   color: var(--text);
-  font-size: 13px;
-  max-width: 40vw;
+  font-size: 12.5px;
+  max-width: 34vw;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .drama-context {
-  margin-bottom: 16px;
-  padding: 12px 14px;
-  border-radius: 10px;
+  margin-bottom: 14px;
+  padding: 11px 14px;
+  border-radius: var(--r-md);
   font-size: 13px;
-  background: var(--panel);
-  border: 1px solid var(--border);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
 }
 
 .drama-context.empty {
   color: var(--muted);
 }
 
-/* 全局横幅：位于页头与工作台之间，横向留白与 workspace 对齐 */
+/* 全局横幅：位于页头与工作区之间 */
 .env-banner {
-  margin: 14px 24px 0;
-  padding: 12px 14px;
+  margin: 12px 26px 0;
+  padding: 11px 14px;
   border-radius: var(--r-md);
   font-size: 13px;
   line-height: 1.6;
@@ -403,43 +479,113 @@ select:focus-visible {
   color: var(--err-text);
 }
 
-.tool-grid {
+/* ============ 全局长任务状态卡（进度提示） ============ */
+
+/* 位置固定在页头下方：任何页面触发的长任务都能看到，卡片化避免"一行裸字" */
+.task-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 12px 26px 0;
+  padding: 13px 18px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-2);
+}
+
+/* 左侧旋转指示：绿色圆环 */
+.task-spin {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2.5px solid var(--accent-soft);
+  border-top-color: var(--accent-fill);
+  animation: task-rotate 0.9s linear infinite;
+}
+
+@keyframes task-rotate {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.task-main {
+  flex: 1;
+  min-width: 0;
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(430px, 1fr));
-  gap: 16px;
-  align-items: start;
+  gap: 7px;
 }
 
-.adv {
-  margin-top: 10px;
-  border-top: 1px dashed var(--border);
-  padding-top: 8px;
+.task-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
 }
 
-.adv summary {
-  cursor: pointer;
+/* 长文件名/长说明只省略号，不撑破卡片 */
+.task-top strong {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-meta {
+  flex: none;
   color: var(--muted);
   font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
 
-.adv summary:hover {
-  color: var(--text);
+.task-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 
-.adv[open] summary {
-  margin-bottom: 10px;
+.task-track {
+  flex: 1;
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+  overflow: hidden;
 }
 
-.runtime-list table {
-  width: 100%;
+.task-track span {
+  display: block;
+  height: 100%;
+  width: 0%;
+  border-radius: var(--r-pill);
+  background: linear-gradient(90deg, var(--accent-fill), var(--ok-fill));
+  transition: width 0.3s ease;
 }
+
+/* 总量未知时走滑动动画：宁可显示"在动"，不显示假百分比 */
+.task-card.indeterminate .task-track span {
+  width: 36%;
+  animation: install-slide 1.2s ease-in-out infinite alternate;
+}
+
+.task-percent {
+  flex: none;
+  width: 44px;
+  text-align: right;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ============ 卡片与面板 ============ */
 
 .panel {
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: var(--r-lg);
-  padding: 16px;
-  box-shadow: var(--shadow-2), var(--edge);
+  padding: 18px;
+  box-shadow: var(--shadow-1);
 }
 
 .panel-header {
@@ -447,6 +593,7 @@ select:focus-visible {
   align-items: center;
   justify-content: space-between;
   margin-bottom: 14px;
+  gap: 10px;
 }
 
 .panel-header .actions {
@@ -459,7 +606,7 @@ select:focus-visible {
 .panel-header h3,
 .detail-head h2 {
   margin: 0;
-  font-size: 16px;
+  font-size: 15px;
 }
 
 .badge {
@@ -468,15 +615,228 @@ select:focus-visible {
   min-height: 24px;
   padding: 0 9px;
   border-radius: var(--r-pill);
-  background: var(--surface-3);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
   color: var(--muted);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 
+.badge.dirty {
+  color: var(--warn-text);
+  background: var(--warn-soft);
+  border-color: var(--warn-line);
+}
+
+/* ============ 首页（Grove 同款：欢迎横幅 + 公告 + 教程） ============ */
+
+.home-hero-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+  gap: 16px;
+}
+
+.home-hero {
+  border-radius: var(--r-xl);
+  padding: 30px 32px 28px;
+  color: #fff;
+  background:
+    radial-gradient(560px 260px at 86% 18%, rgba(122, 196, 145, 0.28), transparent 68%),
+    linear-gradient(115deg, #0f2718 0%, #1d4d2b 55%, #2f6d40 100%);
+}
+
+.hero-hello {
+  margin: 0;
+  color: rgba(255, 255, 255, 0.78);
+  font-size: 12.5px;
+}
+
+.home-hero h2 {
+  margin: 12px 0 10px;
+  font-size: 27px;
+  line-height: 1.35;
+  font-weight: 700;
+}
+
+.hero-sub {
+  margin: 0 0 20px;
+  color: rgba(255, 255, 255, 0.82);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+/* CTA：浅绿胶囊 + 深绿字（Grove 首页按钮样式） */
+.hero-cta {
+  min-height: 34px;
+  padding: 0 18px;
+  border: 0;
+  border-radius: var(--r-pill);
+  background: #cfe5c8;
+  color: #17401f;
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.hero-cta:hover:not(:disabled) {
+  background: #dfefda;
+  transform: translateY(-1px);
+}
+
+.home-notice {
+  border-radius: var(--r-xl);
+  padding: 22px 24px;
+  color: #fff;
+  background:
+    radial-gradient(420px 220px at 90% 0%, rgba(122, 196, 145, 0.22), transparent 70%),
+    linear-gradient(150deg, #10281a 0%, #1d4d2b 70%, #275c34 100%);
+  display: flex;
+  flex-direction: column;
+}
+
+.notice-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 12px;
+}
+
+.notice-date {
+  font-variant-numeric: tabular-nums;
+}
+
+.home-notice h3 {
+  margin: 10px 0 6px;
+  font-size: 17px;
+  font-weight: 700;
+}
+
+.home-notice p {
+  margin: 0;
+  color: rgba(255, 255, 255, 0.8);
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+.notice-link {
+  margin-top: auto;
+  align-self: flex-start;
+  padding: 4px 0;
+  min-height: 0;
+  border: 0;
+  background: transparent;
+  color: #cfe5c8;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.notice-link:hover:not(:disabled) {
+  color: #fff;
+  text-decoration: underline;
+  transform: none;
+}
+
+/* 使用教程：六步手风琴（Grove 样式：序号圆 + 标题 + 状态 + 展开） */
+.home-tutorial {
+  margin-top: 16px;
+}
+
+.tut-list {
+  display: grid;
+}
+
+.tut-row {
+  border-bottom: 1px solid var(--line);
+}
+
+.tut-row:last-child {
+  border-bottom: 0;
+}
+
+.tut-row summary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 13px 6px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.tut-row summary::-webkit-details-marker {
+  display: none;
+}
+
+.tut-mark {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--surface-3);
+  color: var(--muted);
+  display: grid;
+  place-items: center;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.tut-row.done .tut-mark {
+  background: var(--accent-fill);
+  color: #fff;
+}
+
+.tut-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.tut-status {
+  flex: none;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.tut-row.done .tut-status {
+  color: var(--ok-text);
+}
+
+.tut-row summary::after {
+  content: "▾";
+  flex: none;
+  color: var(--faint);
+  font-size: 11px;
+  transition: transform 0.15s ease;
+}
+
+.tut-row[open] summary::after {
+  transform: rotate(180deg);
+}
+
+.tut-body {
+  padding: 0 6px 14px 42px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.tut-body .option-row {
+  margin-top: 10px;
+}
+
+/* ============ 剧目库 ============ */
+
+.module-library {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
 .drama-list {
-  max-height: calc(100vh - 190px);
+  max-height: calc(100vh - 210px);
   overflow: auto;
   display: grid;
   gap: 8px;
@@ -502,7 +862,7 @@ select:focus-visible {
 }
 
 .drama-item.active {
-  background: var(--accent-tint);
+  background: var(--accent-soft);
   border-color: var(--accent-line);
 }
 
@@ -531,19 +891,16 @@ select:focus-visible {
   margin-bottom: 16px;
 }
 
-/* 「检查结果 / 分集」两栏。旧版死守 0.8fr : 1.2fr，默认 1200 宽窗口下分集面板只有
-   376px，而分集表本身要 520px——文件名被拆成三行、状态列被挤出可视区。
-   改成按容器宽度自动换行：放得下两栏就并排，放不下就各自占满整行。 */
+/* 「检查结果 / 分集」两栏：放得下两栏就并排，放不下就各自占满整行 */
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(540px, 1fr));
-  gap: 18px;
+  gap: 16px;
   align-items: start;
 }
 
 .checklist {
   display: grid;
-  /* 满行时自动分成多列，避免单列把面板拉得很长 */
   grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
   gap: 8px;
   max-height: 360px;
@@ -595,6 +952,7 @@ select:focus-visible {
   overflow: auto;
   max-height: 360px;
   border-radius: var(--r-sm);
+  border: 1px solid var(--line);
 }
 
 table {
@@ -627,16 +985,12 @@ table {
   font-variant-numeric: tabular-nums;
 }
 
-/* 分集表：规格/时长这类短值整块显示（旧版会把 1080×1920 拆成两行），
-   只有文件名在面板过窄时才允许折行兜底。表格本身约需 520px，
-   由下面的 .grid 响应式规则保证默认窗口下也有足够宽度。 */
+/* 分集表：规格/时长这类短值整块显示，只有文件名在面板过窄时才允许折行兜底 */
 #episode-body td:not(:nth-child(2)) {
   white-space: nowrap;
 }
 
-.package-panel {
-  margin-top: 18px;
-}
+/* ============ 表单布局 ============ */
 
 .form-grid {
   display: grid;
@@ -652,6 +1006,10 @@ table {
 }
 
 .form-grid input {
+  width: 100%;
+}
+
+.form-grid select {
   width: 100%;
 }
 
@@ -671,11 +1029,19 @@ table {
   font-size: 13px;
 }
 
-.option-row input[type="checkbox"] {
+.option-row input[type="checkbox"],
+.checkbox-label input[type="checkbox"] {
   width: 16px;
   height: 16px;
   min-height: 0;
-  accent-color: var(--accent);
+  accent-color: var(--accent-fill);
+}
+
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
 }
 
 .result {
@@ -689,9 +1055,54 @@ table {
   line-height: 1.65;
 }
 
+.result.warn {
+  background: var(--warn-soft);
+  border-color: var(--warn-line);
+  color: var(--warn-text);
+}
+
+.result.error {
+  background: var(--err-soft);
+  border-color: var(--err-line);
+  color: var(--err-text);
+}
+
+.result-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.result-actions button {
+  min-height: 30px;
+  font-size: 12px;
+}
+
+.result table {
+  width: 100%;
+  margin-top: 8px;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.result th,
+.result td {
+  padding: 4px 6px;
+  text-align: left;
+  border-bottom: 1px solid var(--line);
+}
+
+.result pre,
+.result code {
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: 12px;
+}
+
 .legal {
   margin: 15px 0 0;
-  color: var(--muted);
+  color: var(--faint);
   font-size: 12px;
   line-height: 1.7;
 }
@@ -741,7 +1152,8 @@ table {
   width: 24px;
   height: 24px;
   border-radius: 50%;
-  border: 1px solid var(--border);
+  border: 1px solid var(--line-strong);
+  background: var(--surface);
   display: grid;
   place-items: center;
   font-size: 12px;
@@ -778,7 +1190,7 @@ table {
   display: none !important;
 }
 
-/* 只给读屏用的文本：原生 title 提示在键盘操作时不会出现，需要一份可朗读的副本。 */
+/* 只给读屏用的文本：原生 title 提示在键盘操作时不会出现，需要一份可朗读的副本 */
 .sr-only {
   position: absolute;
   width: 1px;
@@ -800,8 +1212,8 @@ table {
   padding: 13px 16px;
   border: 1px solid var(--line-strong);
   border-radius: var(--r-lg);
-  background: var(--surface-3);
-  box-shadow: var(--shadow-3), var(--edge);
+  background: var(--surface);
+  box-shadow: var(--shadow-3);
   font-size: 13px;
 }
 
@@ -811,13 +1223,14 @@ table {
   color: var(--err-text);
 }
 
-/* 提示里的「下一步」按钮：右侧对齐，不换行挤掉正文。 */
+/* 提示里的「下一步」按钮：右侧对齐，不换行挤掉正文 */
 .toast-action {
   display: block;
   margin: 10px 0 0 auto;
 }
 
 /* ============ 一键安装运行环境：进度 / 失败弹窗 ============ */
+
 .install-overlay {
   position: fixed;
   inset: 0;
@@ -825,16 +1238,16 @@ table {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(0, 0, 0, 0.55);
+  background: rgba(24, 40, 28, 0.4);
 }
 
 .install-modal {
   width: min(460px, 88vw);
   padding: 20px 22px 18px;
-  border: 1px solid var(--line-strong);
-  border-radius: var(--r-lg);
-  background: var(--surface-2);
-  box-shadow: var(--shadow-3), var(--edge);
+  border: 1px solid var(--line);
+  border-radius: var(--r-xl);
+  background: var(--surface);
+  box-shadow: var(--shadow-3);
 }
 
 .install-modal-head {
@@ -850,13 +1263,13 @@ table {
   height: 40px;
   flex: none;
   border-radius: var(--r-lg);
-  background: var(--accent-tint);
+  background: var(--accent-soft);
   border: 1px solid var(--accent-line);
   color: var(--accent-text);
   font-size: 17px;
 }
 
-/* 失败时换红色系，与竞品的错误态一致。 */
+/* 失败时换红色系，与竞品的错误态一致 */
 .install-modal.failed .install-icon {
   background: var(--err-soft);
   border-color: var(--err-line);
@@ -877,7 +1290,7 @@ table {
 .install-titles p {
   margin: 3px 0 0;
   font-size: 12px;
-  color: var(--text-dim);
+  color: var(--muted);
 }
 
 .install-close {
@@ -899,7 +1312,7 @@ table {
 
 .install-stats dt {
   font-size: 11px;
-  color: var(--text-dim);
+  color: var(--muted);
 }
 
 .install-stats dd {
@@ -913,27 +1326,26 @@ table {
   display: flex;
   justify-content: space-between;
   font-size: 12px;
-  color: var(--text-dim);
+  color: var(--muted);
 }
 
 .install-track {
   margin-top: 7px;
   height: 7px;
-  border-radius: 999px;
+  border-radius: var(--r-pill);
   background: var(--surface-3);
-  border: 1px solid var(--line);
   overflow: hidden;
 }
 
 .install-bar {
   height: 100%;
   width: 0%;
-  border-radius: 999px;
+  border-radius: var(--r-pill);
   background: var(--ok-fill);
   transition: width 0.25s ease;
 }
 
-/* 总大小未知时走不定进度动画。 */
+/* 总大小未知时走不定进度动画 */
 .install-bar.indeterminate {
   width: 36%;
   animation: install-slide 1.2s ease-in-out infinite alternate;
@@ -959,12 +1371,12 @@ table {
 code {
   padding: 2px 5px;
   border-radius: 6px;
-  background: var(--surface-3);
+  background: var(--surface-2);
   border: 1px solid var(--line);
   font-size: 12px;
 }
 
-/* 工具箱卡片：可独立折叠的 details 面板。 */
+/* 工具箱卡片：可独立折叠的 details 面板 */
 .tool-card summary {
   cursor: pointer;
   font-weight: 600;
@@ -983,7 +1395,7 @@ code {
 .tool-card summary::after {
   content: "▾";
   float: right;
-  color: var(--muted);
+  color: var(--faint);
 }
 
 .tool-card[open] summary {
@@ -994,18 +1406,58 @@ code {
   content: "▴";
 }
 
-.checkbox-label {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  font-size: 13px;
+.tool-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(430px, 1fr));
+  gap: 16px;
+  align-items: start;
 }
 
-.checkbox-label input[type="checkbox"] {
-  width: 16px;
-  height: 16px;
-  min-height: 0;
-  accent-color: var(--accent);
+.adv {
+  margin-top: 10px;
+  border-top: 1px dashed var(--line);
+  padding-top: 8px;
+}
+
+.adv summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.adv summary:hover {
+  color: var(--text);
+}
+
+.adv[open] summary {
+  margin-bottom: 10px;
+}
+
+.tool-block {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.tool-block summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.tool-block summary:hover {
+  color: var(--accent-text);
+}
+
+.tool-block[open] summary {
+  margin-bottom: 12px;
+}
+
+.hint {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
 }
 
 .settings-note {
@@ -1016,155 +1468,8 @@ code {
   word-break: break-all;
 }
 
-@media (max-width: 1080px) {
-  .app-header,
-  .detail-head {
-    align-items: stretch;
-    flex-direction: column;
-  }
-
-  .path-row {
-    min-width: 0;
-    width: 100%;
-  }
-
-  .workspace,
-  .module-library,
-  .grid,
-  .form-grid,
-  .tool-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .sidenav {
-    position: static;
-    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-  }
-}
-
-.form-grid select {
+.runtime-list table {
   width: 100%;
-}
-
-.tool-block {
-  margin-top: 18px;
-  padding-top: 14px;
-  border-top: 1px solid var(--border);
-}
-
-.tool-block h4 {
-  margin: 0 0 8px;
-  font-size: 14px;
-}
-
-.hint {
-  margin: 0 0 10px;
-  color: var(--muted);
-  font-size: 12px;
-  line-height: 1.6;
-}
-
-.result table {
-  width: 100%;
-  margin-top: 8px;
-  border-collapse: collapse;
-  font-size: 12px;
-}
-
-.result th,
-.result td {
-  padding: 4px 6px;
-  text-align: left;
-  border-bottom: 1px solid var(--line);
-}
-
-.result pre,
-.result code {
-  white-space: pre-wrap;
-  word-break: break-all;
-  font-size: 12px;
-}
-
-/* ---------------------------------------------------------------------------
-   环境状态、长任务进度与结果语义色
-   （本轮为「C 端可用性」补的组件：状态前置、任务可见、失败不再穿成功色）
-   --------------------------------------------------------------------------- */
-
-.header-status {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
-.env-chip {
-  border-radius: var(--r-pill);
-  padding: 0 14px;
-  font-size: 12px;
-  font-weight: 600;
-  background: var(--surface-2);
-  color: var(--muted);
-}
-
-.env-chip.ok {
-  color: var(--ok-text);
-  border-color: var(--ok-line);
-  background: var(--ok-soft);
-}
-
-.env-chip.warn {
-  color: var(--warn-text);
-  border-color: var(--warn-line);
-  background: var(--warn-soft);
-}
-
-.env-chip.error {
-  color: var(--err-text);
-  border-color: var(--err-line);
-  background: var(--err-soft);
-}
-
-.progress {
-  display: grid;
-  gap: 6px;
-  padding: 12px 24px 0;
-}
-
-.progress-track {
-  height: 6px;
-  border-radius: var(--r-pill);
-  background: var(--surface-3);
-  overflow: hidden;
-}
-
-/* 进度条只走品牌色：旧版是蓝→绿的彩虹渐变，和「成功」色撞语义 */
-.progress-track > span {
-  display: block;
-  width: 0;
-  height: 100%;
-  border-radius: var(--r-pill);
-  background: linear-gradient(90deg, #2c58cc, var(--accent));
-  transition: width 0.25s ease;
-}
-
-.progress.indeterminate .progress-track > span {
-  width: 34%;
-  animation: progress-slide 1.4s ease-in-out infinite;
-}
-
-@keyframes progress-slide {
-  0% {
-    margin-left: -34%;
-  }
-  100% {
-    margin-left: 100%;
-  }
-}
-
-.progress-label {
-  margin: 0;
-  color: var(--muted);
-  font-size: 12px;
 }
 
 .field-error {
@@ -1174,31 +1479,7 @@ code {
 }
 
 input[aria-invalid="true"] {
-  border-color: rgba(255, 143, 153, 0.72);
-}
-
-.result.warn {
-  background: var(--warn-soft);
-  border-color: var(--warn-line);
-  color: var(--warn-text);
-}
-
-.result.error {
-  background: var(--err-soft);
-  border-color: var(--err-line);
-  color: var(--err-text);
-}
-
-.result-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 10px;
-}
-
-.result-actions button {
-  min-height: 30px;
-  font-size: 12px;
+  border-color: var(--err-fill);
 }
 
 .confirm {
@@ -1225,6 +1506,39 @@ input[aria-invalid="true"] {
   font-size: 15px;
 }
 
+.guidance ol {
+  margin: 0;
+  padding-left: 20px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.8;
+}
+
+.guidance strong {
+  color: var(--text);
+}
+
+.guidance em {
+  color: var(--warn-text);
+  font-style: normal;
+}
+
+.csv-label {
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--muted);
+  margin-bottom: 12px;
+}
+
+.issue-list {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  color: var(--err-text);
+  font-size: 12px;
+  line-height: 1.8;
+}
+
 /* ============ 通用：链接按钮 / 全宽 / 等宽 ============ */
 
 .link {
@@ -1233,14 +1547,13 @@ input[aria-invalid="true"] {
   min-height: 0;
   padding: 2px 4px;
   border-radius: var(--r-sm);
-  /* 旧版 #5b73ff 在面板上只有 4.1:1，作为正文链接偏弱 */
   color: var(--accent-text);
   font-size: 13px;
   font-weight: 500;
 }
 
 .link:hover:not(:disabled) {
-  color: var(--accent);
+  color: var(--accent-fill-hover);
   text-decoration: underline;
   transform: none;
 }
@@ -1260,12 +1573,214 @@ textarea {
   min-height: 120px;
   padding: 10px 12px;
   border-radius: var(--r-md);
-  border: 1px solid var(--line);
-  background: rgba(9, 13, 19, 0.72);
+  border: 1px solid var(--line-strong);
+  background: var(--surface);
   color: var(--text);
   font: 13px/1.7 "SF Mono", Menlo, Consolas, monospace;
   outline: none;
   resize: vertical;
+}
+
+/* ============ 侧栏底部账号 chip ============ */
+
+.sidenav-foot {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.account-chip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.account-email {
+  font-size: 12px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ============ 转码：运行环境横幅（Grove 样式）与处理档位卡 ============ */
+
+.gate {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 16px;
+  padding: 18px 20px;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--line);
+  background: linear-gradient(90deg, #eef4ef 0%, #f9fbf9 70%);
+}
+
+.gate-icon {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border-radius: var(--r-md);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  color: var(--accent-text);
+  font-size: 18px;
+}
+
+.gate-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.gate-text strong {
+  display: block;
+  font-size: 14.5px;
+  margin-bottom: 3px;
+}
+
+.gate-text p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.mode-cards {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+/* 处理档位：双渐变卡（Grove 样式），选中时绿描边 + 右下角绿勾 */
+.mode-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 132px;
+  text-align: left;
+  padding: 16px 18px;
+  border: 0;
+  border-radius: var(--r-lg);
+  color: #fff;
+  overflow: hidden;
+}
+
+.mode-card strong {
+  font-size: 15.5px;
+  text-shadow: 0 1px 2px rgba(20, 30, 20, 0.25);
+}
+
+.mode-card span {
+  color: rgba(255, 255, 255, 0.94);
+  font-size: 12.5px;
+  line-height: 1.6;
+  text-shadow: 0 1px 2px rgba(20, 30, 20, 0.25);
+}
+
+#mode-nudge {
+  background: linear-gradient(135deg, #8fa3d6 0%, #b3a5d4 48%, #d8b394 100%);
+}
+
+#mode-recut {
+  background: linear-gradient(135deg, #d29a55 0%, #b4602f 55%, #7e3d1e 100%);
+}
+
+.mode-card:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+
+.mode-card.active {
+  outline: 2px solid var(--accent-fill);
+  outline-offset: 2px;
+}
+
+.mode-card.active::after {
+  content: "✓";
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--accent-fill);
+  color: #fff;
+  display: grid;
+  place-items: center;
+  font-size: 13px;
+  box-shadow: 0 2px 6px rgba(20, 44, 26, 0.35);
+}
+
+/* ============ 挂载：四步步骤条 ============ */
+
+.steps {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.step {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  justify-content: flex-start;
+  padding: 10px 14px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.step i {
+  font-style: normal;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--surface-3);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.step.active {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.step.active i {
+  background: var(--accent-fill);
+  color: #fff;
+}
+
+.mount-step .drama-context {
+  margin: 0 0 12px;
+}
+
+.placeholder-card {
+  padding: 26px 20px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--r-md);
+  text-align: center;
+}
+
+.placeholder-card h4 {
+  margin: 0 0 8px;
+  font-size: 15px;
 }
 
 /* ============ 登录 / 注册视图 ============ */
@@ -1283,8 +1798,8 @@ textarea {
   padding: 30px 28px 22px;
   border-radius: var(--r-xl);
   border: 1px solid var(--line);
-  background: var(--surface-2);
-  box-shadow: var(--shadow-3), var(--edge);
+  background: var(--surface);
+  box-shadow: var(--shadow-3);
 }
 
 .auth-brand {
@@ -1354,7 +1869,7 @@ textarea {
 .auth-note {
   margin: 18px 0 0;
   padding-top: 14px;
-  border-top: 1px dashed var(--border);
+  border-top: 1px dashed var(--line);
   color: var(--muted);
   font-size: 12px;
   text-align: center;
@@ -1366,204 +1881,20 @@ textarea {
   gap: 8px;
 }
 
-/* ============ 侧栏底部账号 chip ============ */
-
-.sidenav-foot {
-  margin-top: 14px;
-  padding-top: 14px;
-  border-top: 1px solid var(--border);
-}
-
-.account-chip {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 10px 12px;
-  border-radius: var(--r-md);
-  border: 1px solid var(--line);
-  background: var(--surface-2);
-}
-
-.account-email {
-  font-size: 12px;
-  color: var(--muted);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* ============ 挂载：四步步骤条 ============ */
-
-.steps {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 10px;
-  margin-bottom: 16px;
-}
-
-.step {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  justify-content: flex-start;
-  padding: 11px 14px;
-  border-radius: var(--r-md);
-  border: 1px solid var(--line);
-  background: var(--surface);
-  color: var(--muted);
-  font-size: 14px;
-  font-weight: 600;
-}
-
-.step i {
-  font-style: normal;
-  width: 22px;
-  height: 22px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 50%;
-  background: var(--surface-3);
-  font-size: 12px;
-  font-variant-numeric: tabular-nums;
-}
-
-.step.active {
-  border-color: var(--accent-line);
-  background: var(--accent-tint);
-  color: var(--text);
-}
-
-.step.active i {
-  background: var(--accent-fill);
-  color: #fff;
-}
-
-.mount-step .drama-context {
-  margin: 0 0 12px;
-}
-
-.placeholder-card {
-  padding: 26px 20px;
-  border: 1px dashed var(--line-strong);
-  border-radius: var(--r-md);
-  text-align: center;
-}
-
-.placeholder-card h4 {
-  margin: 0 0 8px;
-  font-size: 15px;
-}
-
-.guidance ol {
-  margin: 0;
-  padding-left: 20px;
-  color: var(--muted);
-  font-size: 13px;
-  line-height: 1.8;
-}
-
-.guidance strong {
-  color: var(--text);
-}
-
-.guidance em {
-  color: var(--warn-text);
-  font-style: normal;
-}
-
-.badge.dirty {
-  color: var(--warn-text);
-  background: var(--warn-soft);
-}
-
-.csv-label {
-  display: grid;
-  gap: 6px;
-  font-size: 13px;
-  color: var(--muted);
-  margin-bottom: 12px;
-}
-
-.issue-list {
-  margin: 8px 0 0;
-  padding-left: 18px;
-  color: var(--err-text);
-  font-size: 12px;
-  line-height: 1.8;
-}
-
-/* ============ 转码：模式卡片与阻断层 ============ */
-
-.mode-cards {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
-  margin-bottom: 14px;
-}
-
-.mode-card {
-  display: grid;
-  gap: 6px;
-  text-align: left;
-  padding: 15px 16px;
-  border-radius: var(--r-md);
-  border: 1px solid var(--line);
-  background: var(--surface);
-  min-height: 0;
-}
-
-.mode-card:hover {
-  background: var(--surface-2);
-  transform: none;
-}
-
-.mode-card strong {
-  font-size: 15px;
-}
-
-.mode-card span {
-  color: var(--muted);
-  font-size: 12px;
-  line-height: 1.6;
-}
-
-/* 选中 = 品牌色（旧版沿用竞品的绿色描边，与「检查通过」的绿混在同一个语义位上） */
-.mode-card.active {
-  border-color: var(--accent-line);
-  box-shadow: var(--ring);
-}
-
-.gate {
-  margin-bottom: 16px;
-  padding: 22px 20px;
-  border-radius: var(--r-lg);
-  border: 1px solid var(--err-line);
-  background: var(--err-soft);
-  text-align: center;
-}
-
-.gate p {
-  margin: 0 0 12px;
-  color: var(--err-text);
-  font-size: 14px;
-}
-
-/* ============ 设置独立视图 ============ */
+/* ============ 设置：独立视图（返回 + 侧栏分组 + 白色内容容器） ============ */
 
 .settings-view {
   min-height: 100vh;
   display: flex;
   flex-direction: column;
+  background: var(--canvas);
 }
 
 .settings-header {
   display: flex;
   align-items: center;
   gap: 14px;
-  padding: 18px 24px;
-  border-bottom: 1px solid var(--border);
+  padding: 16px 22px;
 }
 
 .settings-header h2 {
@@ -1574,22 +1905,22 @@ textarea {
 .settings-body {
   flex: 1;
   display: grid;
-  grid-template-columns: 176px minmax(0, 1fr);
-  gap: 18px;
-  padding: 18px 24px 28px;
+  grid-template-columns: 190px minmax(0, 1fr);
+  gap: 8px;
+  padding: 0 22px 30px;
   align-items: start;
 }
 
 .settings-sidenav {
   display: grid;
-  gap: 4px;
+  gap: 3px;
   position: sticky;
-  top: 18px;
+  top: 14px;
 }
 
-/* 中文分组标题不需要伪大写，字距也要收回来（0.14em 是给拉丁大写的写法） */
+/* 中文分组标题 */
 .settings-group {
-  margin: 12px 6px 4px;
+  margin: 12px 10px 4px;
   color: var(--faint);
   font-size: 11px;
   letter-spacing: 0.02em;
@@ -1605,30 +1936,44 @@ textarea {
   font-size: 14px;
   background: transparent;
   border: 1px solid transparent;
-  border-radius: 9px;
+  border-radius: var(--r-md);
   color: var(--muted);
-  font-weight: 600;
+  font-weight: 500;
 }
 
 .settings-nav:hover {
-  background: var(--surface-2);
+  background: var(--surface);
   color: var(--text);
 }
 
 .settings-nav.active {
-  background: var(--accent-tint);
-  border-color: var(--accent-line);
+  background: var(--surface);
+  border-color: var(--line);
   color: var(--text);
+  font-weight: 600;
+  box-shadow: var(--shadow-1);
 }
 
+/* 设置内容：白色大圆角容器（Grove 设置页样式） */
 .settings-pages {
-  display: grid;
-  gap: 16px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-xl);
+  padding: 26px 30px 30px;
+  max-width: 1020px;
+  box-shadow: var(--shadow-1);
 }
 
 .settings-page {
   display: grid;
   gap: 16px;
+}
+
+.settings-title {
+  margin: 0 0 6px;
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
 }
 
 /* ---- 设置：账号 / 账单子页 ---- */
@@ -1679,7 +2024,7 @@ textarea {
   gap: 4px;
 }
 
-/* ---- 设置：本机环境错误行（竞品红色错误行样式） ---- */
+/* ---- 设置：引擎错误行 ---- */
 
 .runtime-error {
   margin-top: 12px;
@@ -1699,15 +2044,15 @@ textarea {
   margin-bottom: 12px;
 }
 
-/* 运行日志面板：等宽字体 + 固定高度滚动，配合「复制日志」按钮使用。 */
+/* 运行日志面板：等宽字体 + 固定高度滚动，配合「复制日志」按钮使用 */
 .log-panel {
   max-height: 260px;
   overflow: auto;
   margin: 0 0 8px;
   padding: 10px 12px;
   border-radius: var(--r-md);
-  border: 1px solid var(--line, #ddd);
-  background: var(--bg-soft, #f7f7f8);
+  border: 1px solid var(--line);
+  background: var(--surface-2);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
   line-height: 1.6;
@@ -1715,10 +2060,56 @@ textarea {
   word-break: break-all;
 }
 
+.about-line {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+
+/* ============ 响应式 ============ */
+
 @media (max-width: 1080px) {
-  .steps,
-  .mode-cards,
+  .app {
+    flex-direction: column;
+  }
+
+  .sidebar {
+    width: 100%;
+    padding: 12px 14px 0;
+  }
+
+  .sidenav {
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .nav-group {
+    display: none;
+  }
+
+  .sidenav-foot {
+    margin: 0;
+    padding: 0;
+    border: 0;
+  }
+
+  .content {
+    border-radius: 16px 16px 0 0;
+    margin: 10px 0 0;
+    min-height: 0;
+  }
+
+  .home-hero-grid,
+  .module-library,
+  .grid,
+  .form-grid,
+  .tool-grid,
   .billing-cards {
+    grid-template-columns: 1fr;
+  }
+
+  .steps,
+  .mode-cards {
     grid-template-columns: 1fr;
   }
 
@@ -1733,6 +2124,10 @@ textarea {
 
   .settings-group {
     grid-column: 1 / -1;
+  }
+
+  .settings-pages {
+    padding: 20px;
   }
 }
 
@@ -1753,11 +2148,11 @@ textarea {
   }
 }
 
-/* 深色高对比需求：把最弱的文字提到可读线以上 */
+/* 高对比需求：把最弱的文字提到可读线以上 */
 @media (prefers-contrast: more) {
   :root {
-    --muted: #b9c4d4;
-    --faint: #98a5b8;
-    --line: #37424f;
+    --muted: #4a544c;
+    --faint: #6c766e;
+    --line: #c6cec6;
   }
 }

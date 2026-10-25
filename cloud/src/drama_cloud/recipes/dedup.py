@@ -72,6 +72,9 @@ ENCODE_TAG_MAKE_MAX = 64
 #: 伪装成「手机实拍」的编码器串（Grove 实测指向 Apple 硬件编码器）。
 DISGUISE_ENCODER = "Apple AVFoundation H.264 Encoder"
 
+#: 伪装拍摄时间的确定性派生纪元（2023-11-14T22:13:20Z）；同 seed 配方字节级可复现。
+_CREATION_EPOCH = 1_700_000_000
+
 
 class DedupRecipeError(ValueError):
     """配方参数越界（生成后自检失败）。"""
@@ -250,7 +253,14 @@ def generate_dedup_recipe(
     rng = random.Random(seed)
     bitrate = rng.randint(*ENCODE_BITRATE_RANGE)
     keyframe_interval = 250
-    creation = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(minutes=episode_count)
+    # 伪装拍摄时间从 seed 确定性派生（Grove 的 creationTime 本质是伪装值，不应把
+    # 真实时钟带进配方——否则同 seed 配方无法字节级复现，checkpoint 断点续跑时
+    # 重算配方的 referenceSha256 会与已产物信封的哈希失配）。固定纪元 + seed 偏移。
+    creation = (
+        datetime.fromtimestamp(_CREATION_EPOCH + seed % 86_400, tz=timezone.utc)
+        .replace(microsecond=0)
+        - timedelta(minutes=episode_count)
+    )
 
     variants = [_variant(rng, 48_000) for _ in range(episode_count)]
     episodes_meta = []
