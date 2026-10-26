@@ -331,7 +331,7 @@
                 <div class="mode-cards single">
                   <div class="mode-card active deep-card">
                     <strong>深度处理</strong>
-                    <span>材料先行：先自动准备剧名 / 简介 / 海报 / 过程图并写入 AI 制作证明，再按场景切点重新分集（重组）并逐集微帧。编码按机器能力自动选路：有硬件编码器（显卡 / Apple 芯片）时 3 路并行，否则 CPU 2 路并行。</span>
+                    <span>并行材料线程先提取视频内容并生成剧名 / 简介 / 海报 / 过程图与 AI 制作证明；编码侧同时按场景切点重新分集（重组）并逐集微帧。编码按机器能力自动选路：有硬件编码器（显卡 / Apple 芯片）时 3 路并行，否则 CPU 2 路并行。</span>
                   </div>
                 </div>
 
@@ -344,7 +344,7 @@
                 <p class="hint">
                   输出目录与目标集数统一在
                   <button type="button" class="link" data-goto-sub="rules">设置 → 生成设置 → 转码设置</button>
-                  中配置；未配置输出目录时写到剧目目录/深度处理。全程不改动原素材；剧名等 AI 材料缺失时不阻塞，处理完成后可回设置页补生成。
+                  中配置；未配置输出目录时写到剧目目录/深度处理。全程不改动原素材；剧名等 AI 材料缺失时不阻塞，处理完成后可回设置页补生成。自动材料需要先在「设置 → 目录与引擎 → 内容模型」配置 ASR/OCR。
                 </p>
                 <div class="option-row">
                   <button id="exec-run" data-long-task class="success">开始深度处理</button>
@@ -877,6 +877,41 @@
                     type="text"
                     placeholder="一键配置后自动填写"
                 /></label>
+              </div>
+            </section>
+            <section class="panel">
+              <section class="panel-header">
+                <h3>内容模型</h3>
+                <span class="badge">ASR + OCR</span>
+              </section>
+              <p class="hint">
+                深度处理会在编码开始时并行启动材料线程：先用 ASR 提取对白、OCR 识别画面文字，
+                再自动生成剧名、简介、海报与过程图。应用不自动下载大模型；
+                推荐配置 whisper.cpp（模型文件）与本机 tesseract（需 chi_sim 语言包）。
+              </p>
+              <div id="model-runtime-list" class="runtime-list"><div class="empty">尚未检测。</div></div>
+              <div class="form-grid">
+                <label>ASR 引擎
+                  <select id="asr-engine">
+                    <option value="openai">openai-whisper CLI</option>
+                    <option value="whisper_cpp">whisper.cpp CLI</option>
+                  </select>
+                </label>
+                <label>ASR 可执行文件
+                  <input id="asr-executable" type="text" placeholder="留空查找 whisper / whisper-cli" />
+                </label>
+                <label>ASR 模型（openai 模型名或 whisper.cpp 权重路径）
+                  <input id="asr-model" type="text" placeholder="small 或 /path/to/ggml-large-v3-turbo.bin" />
+                </label>
+                <label>OCR 可执行文件
+                  <input id="ocr-executable" type="text" placeholder="留空查找 tesseract" />
+                </label>
+                <label>剧情抽样集数
+                  <input id="content-sample-count" type="number" min="1" max="16" step="1" placeholder="默认 4" />
+                </label>
+                <label class="checkbox-label">
+                  <input id="material-pipeline-enabled" type="checkbox" checked /> 深度处理时自动生成材料
+                </label>
               </div>
             </section>
             <section class="panel">

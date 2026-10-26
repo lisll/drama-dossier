@@ -239,10 +239,20 @@ pub(crate) fn generate_poster_blocking(
     settings: &AppSettings,
     output_dir: &Path,
 ) -> Result<PathBuf, String> {
-    let (base, key, model) = img_config(settings)?;
     let title = settings.drama_title.clone().unwrap_or_default();
     let synopsis = settings.drama_synopsis.clone().unwrap_or_default();
-    let prompt = build_poster_prompt(&title, &synopsis);
+    poster_blocking(settings, output_dir, &title, &synopsis)
+}
+
+/// 按指定的剧名/简介生成竖版海报并落盘。
+pub(crate) fn poster_blocking(
+    settings: &AppSettings,
+    output_dir: &Path,
+    title: &str,
+    synopsis: &str,
+) -> Result<PathBuf, String> {
+    let (base, key, model) = img_config(settings)?;
+    let prompt = build_poster_prompt(title, synopsis);
     let client = http_client()?;
     let post = |payload: serde_json::Value| -> Result<String, String> {
         let response = client
@@ -330,6 +340,71 @@ fn parse_storyboard_summaries(body: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// 自动材料流水线用的组合文本结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MaterialIdentity {
+    pub title: String,
+    pub synopsis: String,
+    pub summaries: Vec<String>,
+}
+
+/// 根据视频内容证据一次性生成剧名、简介与分镜概要。
+pub(crate) fn material_identity_blocking(
+    settings: &AppSettings,
+    content_evidence: &str,
+) -> Result<MaterialIdentity, String> {
+    let (base, key, model) = llm_config(settings)?;
+    let system = "你是短剧报审材料策划。只输出一个 UTF-8 JSON 对象，不要 Markdown、解释或代码围栏。\
+                  格式：{\"title\":\"8~12字剧名\",\"synopsis\":\"100字内简介\",\"summaries\":[\"4个40字内分镜概要\"]}。\
+                  内容必须只依据用户提供的视频转写与画面文字证据，不得编造证据之外的关键情节。";
+    let user = format!("以下是视频内容证据：\n{content_evidence}\n请生成报审材料。");
+    let body = chat_blocking(&base, &key, &model, system, &user)?;
+    parse_material_identity(&body)
+}
+
+/// 解析自动材料响应；模型偶尔包一层代码围栏，这里统一剥掉。
+pub(crate) fn parse_material_identity(body: &str) -> Result<MaterialIdentity, String> {
+    let cleaned = body
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    // 部分模型会在 JSON 前后加一句说明；只截第一个 `{` 到最后一个 `}`，比要求模型
+    // 严格输出更稳，也不会把围栏外的文字当成字段。
+    let json_text = match (cleaned.find('{'), cleaned.rfind('}')) {
+        (Some(start), Some(end)) if end > start => &cleaned[start..=end],
+        _ => cleaned,
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(json_text).map_err(|error| format!("材料 JSON 解析失败：{error}"))?;
+    let required = |key: &str| -> Result<String, String> {
+        value[key]
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| format!("材料 JSON 缺少 {key}"))
+    };
+    let title = required("title")?;
+    let synopsis = required("synopsis")?;
+    let summaries = value["summaries"]
+        .as_array()
+        .ok_or_else(|| "材料 JSON 缺少 summaries 数组".to_string())?
+        .iter()
+        .filter_map(|item| item.as_str().map(|text| text.trim().to_string()))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>();
+    if summaries.len() < 4 {
+        return Err("材料 JSON 的 summaries 至少需要 4 段".into());
+    }
+    Ok(MaterialIdentity {
+        title,
+        synopsis,
+        summaries,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,15 +490,33 @@ mod tests {
     }
 
     #[test]
-    fn parse_storyboard_summaries_accepts_fenced_json() {
-        let body = "```json\n{\"summaries\":[\"甲\",\"乙\",\"丙\",\"丁\"]}\n```";
-        let parsed = parse_storyboard_summaries(body).unwrap();
-        assert_eq!(parsed, vec!["甲", "乙", "丙", "丁"]);
+    fn parse_material_identity_accepts_fenced_json() {
+        let body = "```json\n{\"title\":\"雪夜进山\",\"synopsis\":\"医生被困山村。\",\
+                    \"summaries\":[\"甲\",\"乙\",\"丙\",\"丁\"]}\n```";
+        let parsed = parse_material_identity(body).unwrap();
+        assert_eq!(parsed.title, "雪夜进山");
+        assert_eq!(parsed.synopsis, "医生被困山村。");
+        assert_eq!(parsed.summaries, vec!["甲", "乙", "丙", "丁"]);
     }
 
     #[test]
-    fn parse_storyboard_summaries_rejects_short_list() {
-        let body = r#"{"summaries":["只有一段"]}"#;
-        assert!(parse_storyboard_summaries(body).is_err());
+    fn parse_material_identity_accepts_json_wrapped_in_prose() {
+        let body = "已根据视频证据生成材料：\n\
+                    {\"title\":\"雪夜进山\",\"synopsis\":\"医生被困山村。\",\
+                    \"summaries\":[\"甲\",\"乙\",\"丙\",\"丁\"]}\n\
+                    以上内容仅供参考。";
+        let parsed = parse_material_identity(body).unwrap();
+        assert_eq!(parsed.title, "雪夜进山");
+        assert_eq!(parsed.synopsis, "医生被困山村。");
+        assert_eq!(parsed.summaries, vec!["甲", "乙", "丙", "丁"]);
+    }
+
+    #[test]
+    fn parse_material_identity_requires_complete_fields() {
+        assert!(parse_material_identity(r#"{"title":"只有标题"}"#).is_err());
+        assert!(parse_material_identity(
+            r#"{"title":"标题","synopsis":"简介","summaries":["甲","乙","丙"]}"#
+        )
+        .is_err());
     }
 }

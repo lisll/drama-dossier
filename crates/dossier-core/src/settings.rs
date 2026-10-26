@@ -66,6 +66,18 @@ pub struct AppSettings {
     pub ai_synopsis_enabled: Option<bool>,
     /// 海报来源开关：`None`/`true` 表示 AI 生成，`false` 表示本地图片。
     pub ai_poster_enabled: Option<bool>,
+    /// ASR 引擎：`openai`（openai-whisper 兼容 CLI）或 `whisper_cpp`。
+    pub asr_engine: Option<String>,
+    /// ASR 可执行文件；空/None 表示从 PATH 查找 `whisper` / `whisper-cli`。
+    pub asr_executable: Option<PathBuf>,
+    /// openai-whisper 模型名，或 whisper.cpp 的模型文件路径。
+    pub asr_model: Option<String>,
+    /// OCR 可执行文件；空/None 表示从 PATH 查找 `tesseract`。
+    pub ocr_executable: Option<PathBuf>,
+    /// 深度处理前用于理解剧情的分集数；默认前 4 集。
+    pub content_sample_count: Option<u32>,
+    /// 深度处理时是否自动执行“内容提取 + 报审材料生成”编排。
+    pub material_pipeline_enabled: Option<bool>,
 }
 
 impl AppSettings {
@@ -80,6 +92,16 @@ impl AppSettings {
         let min = self.recut_min_sec.unwrap_or(60).clamp(5, 3600);
         let max = self.recut_max_sec.unwrap_or(70).clamp(min + 5, 3600);
         (min, max)
+    }
+
+    /// 参与剧情理解的分集数：默认前 4 集，最多 16 集。
+    pub fn effective_content_sample_count(&self) -> u32 {
+        self.content_sample_count.unwrap_or(4).clamp(1, 16)
+    }
+
+    /// 深度处理默认开启材料流水线；如用户显式关闭则不再自动请求模型。
+    pub fn effective_material_pipeline_enabled(&self) -> bool {
+        self.material_pipeline_enabled.unwrap_or(true)
     }
 }
 
@@ -340,6 +362,21 @@ mod tests {
             ChecklistRules::default().min_episodes
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn content_pipeline_defaults_and_clamps_are_stable() {
+        let mut settings = AppSettings::default();
+        assert_eq!(settings.effective_content_sample_count(), 4);
+        assert!(settings.effective_material_pipeline_enabled());
+
+        settings.content_sample_count = Some(0);
+        assert_eq!(settings.effective_content_sample_count(), 1);
+        settings.content_sample_count = Some(99);
+        assert_eq!(settings.effective_content_sample_count(), 16);
+
+        settings.material_pipeline_enabled = Some(false);
+        assert!(!settings.effective_material_pipeline_enabled());
     }
 
     #[test]

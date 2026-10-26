@@ -11,6 +11,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 mod account;
 mod ai;
+mod content;
 mod dossier;
 mod erase;
 mod jianying;
@@ -385,6 +386,7 @@ pub fn run() {
             account::account_logout,
             account::account_status,
             account::account_change_password,
+            content::model_runtime_status,
             jianying::jianying_detect,
             mount::mount_plan_save,
             mount::mount_plan_load,
