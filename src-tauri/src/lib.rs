@@ -11,6 +11,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 mod account;
 mod ai;
+mod content;
 mod dossier;
 mod erase;
 mod jianying;
@@ -388,6 +389,7 @@ pub fn run() {
             ai::ai_generate_text,
             ai::ai_generate_poster,
             ai::ai_pick_local_poster,
+            content::model_runtime_status,
             jianying::jianying_detect,
             mount::mount_plan_save,
             mount::mount_plan_load,

@@ -41,7 +41,7 @@ const FFMPEG_TIMEOUT_SECS: u64 = 600;
 /// 每次转码开始时复位；没有转码在跑时置位无副作用。
 static TRANSCODE_CANCEL: AtomicBool = AtomicBool::new(false);
 
-fn transcode_cancelled() -> bool {
+pub(crate) fn transcode_cancelled() -> bool {
     TRANSCODE_CANCEL.load(Ordering::SeqCst)
 }
 
@@ -127,6 +127,8 @@ pub struct RuntimeStatus {
     pub install_supported: bool,
     /// 平台标识（macos / windows / linux），前端据此给出对应平台的手动安装指引。
     pub platform: String,
+    /// 内容模型运行时（ASR/OCR），供设置页预检材料线程。
+    pub models: crate::content::ModelRuntimeStatus,
 }
 
 #[tauri::command]
@@ -173,6 +175,7 @@ fn runtime_status_inner(
         python: python_report,
         install_supported: cfg!(any(target_os = "macos", target_os = "windows")),
         platform: std::env::consts::OS.to_string(),
+        models: crate::content::model_runtime(&read_settings(app)?, &runner),
     })
 }
 
@@ -413,7 +416,7 @@ pub struct FailedItem {
 }
 
 /// 跑一条 ffmpeg 命令；失败时把 stderr 首行带回给界面。
-fn run_ffmpeg(program: &Path, args: &[&str]) -> Result<(), String> {
+pub(crate) fn run_ffmpeg(program: &Path, args: &[&str]) -> Result<(), String> {
     let mut spec = CommandSpec::new(program.display().to_string());
     for arg in args {
         spec = spec.arg(*arg);
@@ -622,6 +625,9 @@ pub struct TranscodeRunReport {
     pub output_dir: String,
     pub items: Vec<TranscodeItemReport>,
     pub note: String,
+    /// 深度处理并行材料流水线结果；普通转码为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub materials: Option<crate::content::MaterialPipelineReport>,
 }
 
 /// 视频编码参数：软件 libx264 用 CRF 23（质量优先，沿用历史行为）；
@@ -850,6 +856,7 @@ fn transcode_nudge_blocking(
         mode: "nudge".into(),
         output_dir: output_dir.display().to_string(),
         items,
+        materials: None,
         note: format!(
             "《{drama_name}》每集开头已微调 1~3 帧（{}），输出到新目录，原素材未改动。",
             lanes.describe()
@@ -946,7 +953,7 @@ fn transcode_recut_blocking(
     let mut boundaries: Vec<f64> = Vec::new();
     let mut file_starts: Vec<f64> = Vec::with_capacity(episodes.len());
     let mut offset = 0.0;
-    for (episode, per_file) in episodes.iter().zip(detect_results.into_iter()) {
+    for (episode, per_file) in episodes.iter().zip(detect_results) {
         file_starts.push(offset);
         boundaries.extend(
             per_file
@@ -979,8 +986,7 @@ fn transcode_recut_blocking(
         })
         .filter(|job| !job.spans.is_empty())
         .collect();
-    let job_units: Vec<(usize, &RecutJob)> =
-        jobs.iter().enumerate().map(|(i, job)| (i, job)).collect();
+    let job_units: Vec<(usize, &RecutJob)> = jobs.iter().enumerate().collect();
     let encode_results = run_encode_units(&job_units, lanes.lanes, emit, |job| {
         encode_recut_job(ffmpeg, lanes, job)?;
         let label = format!(
@@ -1016,6 +1022,7 @@ fn transcode_recut_blocking(
         mode: "recut".into(),
         output_dir: output_dir.display().to_string(),
         items,
+        materials: None,
         note: format!(
             "已按场景切点重新分成 {produced_count} 集（统一重编码保证切点精确，{}），输出到新目录，原素材未改动。",
             lanes.describe()
@@ -1123,152 +1130,12 @@ fn encode_recut_job(ffmpeg: &Path, lanes: &EncodeLanes, job: &RecutJob) -> Resul
     Ok(())
 }
 
-/// 材料先行阶段的产出与来源记录（写 AI 制作证明用）。
-#[derive(Debug, Default)]
-struct MaterialSources {
-    title: Option<String>,
-    title_source: String,
-    synopsis: Option<String>,
-    synopsis_source: String,
-    poster: Option<PathBuf>,
-    poster_source: String,
-    storyboard_source: String,
-}
-
-/// trim 后非空才返回（空字符串视同未填写）。
-fn non_empty(value: &Option<String>) -> Option<String> {
-    value
-        .as_deref()
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .map(str::to_string)
-}
-
-/// LLM 来源标签（配置了模型名就带上，便于在证明里溯源）。
-fn ai_source_label(model: &Option<String>) -> String {
-    match non_empty(model) {
-        Some(name) => format!("AI 生成（模型 {name}）"),
-        None => "AI 生成".to_string(),
-    }
-}
-
-/// 从原始素材里均匀抽 `count` 个代表集（不足时循环复用），供过程图抽帧。
-/// 抽帧源是**原始素材**而非成片：材料先行意味着过程图在编码前就要产出。
-fn representative_episodes(episodes: &[ProbedEpisode], count: usize) -> Vec<(PathBuf, f64)> {
-    let total = episodes.len();
-    if total == 0 {
-        return Vec::new();
-    }
-    (0..count)
-        .map(|slot| {
-            let index = if total >= count {
-                slot * (total - 1) / (count - 1).max(1)
-            } else {
-                slot % total
-            };
-            let episode = &episodes[index];
-            (episode.file.path.clone(), episode.spec.duration_sec)
-        })
-        .collect()
-}
-
-/// 当天日期（本地时区按东八区口径，YYYY-MM-DD）。std 没有日期格式化，用民用历算法换算。
-fn local_date_string() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
-        + 8 * 3600;
-    let days = secs.div_euclid(86_400);
-    // Howard Hinnant 的 civil_from_days：days 自 1970-01-01 → (年, 月, 日)。
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { year + 1 } else { year };
-    format!("{year:04}-{month:02}-{day:02}")
-}
-
-/// 写入 AI 制作证明（Grove-Max 同款）：无条件生成一份 txt 落输出目录，
-/// 记录剧名/简介/海报/过程图的来源（AI 生成（模型名）/ 本地提供）、
-/// 制作工具与版本、日期和处理方式，末尾附 AI 声明。
-fn write_ai_proof(
-    app: &AppHandle,
-    drama_name: &str,
-    materials: &MaterialSources,
-    lanes: &EncodeLanes,
-    episode_count: usize,
-    output_dir: &Path,
-) -> Result<PathBuf, String> {
-    let version = app.package_info().version.to_string();
-    let date = local_date_string();
-    let line = |label: &str, value: Option<&str>, source: &str| {
-        let value = value.unwrap_or("未填写");
-        format!("{label}：{value}\n来源：{source}\n")
-    };
-    let mut body = String::new();
-    body.push_str("AI 制作证明\n\n");
-    body.push_str(&format!("生成日期：{date}（本地时间）\n"));
-    body.push_str(&format!("制作工具：DramaDossier v{version}\n"));
-    body.push_str(&format!(
-        "原剧目：{drama_name}（原始素材 {episode_count} 集）\n"
-    ));
-    body.push_str(&format!(
-        "处理方式：按场景切点重组分集并逐集微帧，编码 {}。\n\n",
-        lanes.describe()
-    ));
-    body.push_str(&line(
-        "剧名",
-        materials.title.as_deref(),
-        &materials.title_source,
-    ));
-    body.push_str(&line(
-        "简介",
-        materials.synopsis.as_deref(),
-        &materials.synopsis_source,
-    ));
-    body.push_str(&line(
-        "海报",
-        materials
-            .poster
-            .as_ref()
-            .map(|path| {
-                path.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-            })
-            .unwrap_or(None)
-            .as_deref(),
-        &materials.poster_source,
-    ));
-    body.push_str(&format!(
-        "过程图：过程图-1 ~ 过程图-4（画面抽自原始素材代表集）\n来源：{}\n\n",
-        materials.storyboard_source
-    ));
-    body.push_str(
-        "AI 声明：本目录中的剧名、简介、海报与过程图由人工智能辅助生成或整理，\
-         分集重组与微帧由 DramaDossier 自动化完成，原始视频素材未作改动。\
-         报审前请人工复核上述内容。\n",
-    );
-    let path = output_dir.join("AI制作证明.txt");
-    std::fs::write(&path, body)
-        .map_err(|error| format!("写入 AI 制作证明失败（{}）：{error}", path.display()))?;
-    Ok(path)
-}
-
-/// 深度处理（材料先行）：先产出报审材料（剧名/简介/海报/过程图/AI 制作证明），
-/// 再分集重组到临时中转目录、逐集微帧输出到最终目录（Grove-Max 同款时序）。
+/// 深度处理编码：分集重组到临时中转目录，再逐集微帧输出到最终目录。
 ///
-/// 材料阶段**软失败**：单个材料生成失败只记日志不阻塞编码（剧名/简介可后补）；
-/// AI 素材为空 → 跳过不阻塞。编码按 `lanes` 路并行。
-/// 进度映射：材料 0~10%，重组 10~55%，微帧 55~100%。
+/// 材料流水线由调用方在编码前并行启动，结束编码后汇合，材料失败不回滚成片。
+/// 进度映射：重组 0~50%，微帧 50~100%。
 #[allow(clippy::too_many_arguments)]
 fn transcode_deep_blocking(
-    app: &AppHandle,
     ffmpeg: &Path,
     ffprobe: &Path,
     drama_name: &str,
@@ -1280,177 +1147,18 @@ fn transcode_deep_blocking(
     emit: &(dyn Fn(u64, u64, &str) + Sync),
     produced: &mut Vec<PathBuf>,
 ) -> Result<TranscodeRunReport, String> {
-    // ── 材料先行（0~10%）────────────────────────────
     std::fs::create_dir_all(output_dir)
         .map_err(|error| format!("创建输出目录失败（{}）：{error}", output_dir.display()))?;
-    let mut settings = read_settings(app)?;
-    let mut materials = MaterialSources::default();
-    let llm_label = ai_source_label(&settings.llm_model);
-
-    // 剧名：AI 开且当前为空 → 生成；已有值沿用；AI 关且为空 → 跳过不阻塞（可后补）。
-    let title_ai_on = settings.ai_title_enabled != Some(false);
-    materials.title = non_empty(&settings.drama_title);
-    materials.title_source = if materials.title.is_some() {
-        if title_ai_on {
-            llm_label.clone()
-        } else {
-            "本地提供".to_string()
-        }
-    } else if title_ai_on {
-        emit(1, 100, "材料 · AI 生成剧名");
-        let context = non_empty(&settings.drama_synopsis)
-            .unwrap_or_else(|| format!("剧目目录名：{drama_name}"));
-        match crate::ai::generate_text_blocking(&settings, crate::ai::TextKind::Title, &context) {
-            Ok(text) => {
-                settings.drama_title = Some(text.clone());
-                materials.title = Some(text);
-                llm_label.clone()
-            }
-            Err(error) => {
-                crate::logging::log_event(
-                    "材料",
-                    format!("剧名生成失败（不阻塞，可后补）：{error}"),
-                );
-                "AI 生成失败，未填写".to_string()
-            }
-        }
-    } else {
-        "未填写（本地模式）".to_string()
-    };
-
-    // 简介：同剧名逻辑，生成素材带上（可能刚生成的）剧名。
-    let synopsis_ai_on = settings.ai_synopsis_enabled != Some(false);
-    materials.synopsis = non_empty(&settings.drama_synopsis);
-    materials.synopsis_source = if materials.synopsis.is_some() {
-        if synopsis_ai_on {
-            llm_label.clone()
-        } else {
-            "本地提供".to_string()
-        }
-    } else if synopsis_ai_on {
-        emit(2, 100, "材料 · AI 生成简介");
-        let context = [materials.title.clone(), non_empty(&settings.drama_synopsis)]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join("。");
-        let context = if context.is_empty() {
-            format!("剧目目录名：{drama_name}")
-        } else {
-            context
-        };
-        match crate::ai::generate_text_blocking(&settings, crate::ai::TextKind::Synopsis, &context)
-        {
-            Ok(text) => {
-                settings.drama_synopsis = Some(text.clone());
-                materials.synopsis = Some(text);
-                llm_label.clone()
-            }
-            Err(error) => {
-                crate::logging::log_event(
-                    "材料",
-                    format!("简介生成失败（不阻塞，可后补）：{error}"),
-                );
-                "AI 生成失败，未填写".to_string()
-            }
-        }
-    } else {
-        "未填写（本地模式）".to_string()
-    };
-
-    // 海报：AI 开 → 复用已有（设置里的路径或输出目录内上次的产物），否则生成；
-    // AI 关 → 只复用本地海报，没有就跳过。
-    let poster_ai_on = settings.ai_poster_enabled != Some(false);
-    let poster_in_output = ["png", "jpg", "jpeg", "webp"]
-        .iter()
-        .map(|ext| output_dir.join(format!("剧目海报.{ext}")))
-        .find(|path| path.is_file());
-    let existing_poster = settings
-        .poster_path
-        .as_ref()
-        .filter(|path| path.is_file())
-        .cloned()
-        .or(poster_in_output);
-    if poster_ai_on {
-        if let Some(path) = existing_poster {
-            settings.poster_path = Some(path.clone());
-            materials.poster = Some(path.clone());
-            materials.poster_source = "已生成（本次复用）".to_string();
-        } else {
-            emit(3, 100, "材料 · AI 生成海报");
-            match crate::ai::generate_poster_blocking(&settings, output_dir) {
-                Ok(path) => {
-                    settings.poster_path = Some(path.clone());
-                    materials.poster = Some(path.clone());
-                    materials.poster_source = ai_source_label(&settings.img_model);
-                }
-                Err(error) => {
-                    crate::logging::log_event(
-                        "材料",
-                        format!("海报生成失败（不阻塞，可后补）：{error}"),
-                    );
-                    materials.poster_source = "AI 生成失败，未生成".to_string();
-                }
-            }
-        }
-    } else if let Some(path) = existing_poster {
-        materials.poster = Some(path);
-        materials.poster_source = "本地提供".to_string();
-    } else {
-        materials.poster_source = "未提供（本地模式）".to_string();
-    }
-
-    // 过程图：抽帧源是原始素材的 4 个代表集（编码前就要产出，不能依赖成片）。
-    emit(4, 100, "材料 · 生成过程图");
-    materials.storyboard_source = if crate::ai::storyboard_llm_ready(&settings) {
-        llm_label.clone()
-    } else {
-        "模板生成（未配置 LLM）".to_string()
-    };
-    let picks = representative_episodes(episodes, PROCESS_IMAGE_COUNT);
-    if let Err(error) = generate_process_images_blocking(
-        app,
-        ffmpeg,
-        drama_name,
-        &picks,
-        episodes.len(),
-        output_dir,
-    ) {
-        crate::logging::log_event("材料", format!("过程图生成失败（不影响成片）：{error}"));
-    } else {
-        crate::logging::log_event("材料", format!("过程图已生成到 {}", output_dir.display()));
-    }
-
-    // AI 制作证明：无条件生成一份（Grove-Max 同款「已写入 AI 制作证明」）。
-    emit(5, 100, "材料 · 写入 AI 制作证明");
-    if let Err(error) = write_ai_proof(
-        app,
-        drama_name,
-        &materials,
-        lanes,
-        episodes.len(),
-        output_dir,
-    ) {
-        crate::logging::log_event("材料", format!("AI 制作证明写入失败：{error}"));
-    }
-
-    // 材料回写设置：界面在任务完成后重新加载设置即可看到（进度条文案走 emit）。
-    emit(6, 100, "材料 · 已生成并校验");
-    let settings_path = crate::settings_path(app)?;
-    if let Err(error) = dossier_core::save_settings(&settings_path, &settings) {
-        crate::logging::log_event("材料", format!("材料写回设置失败：{error}"));
-    }
-
-    // ── 编码阶段：重组（10~55%）→ 微帧（55~100%）──────────
+    // ── 编码阶段：重组（0~50%）→ 微帧（50~100%）──────────
     let staging = output_dir.join(".deep-staging");
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging)
         .map_err(|error| format!("创建中转目录失败（{}）：{error}", staging.display()))?;
 
-    // 阶段一：分集重组（产物先落中转目录；done/total 比例映射到 10~55）。
+    // 阶段一：分集重组（产物先落中转目录；done/total 比例映射到 0~50）。
     {
         let step_recut = |done: u64, total: u64, label: &str| {
-            let scaled = 10 + done.min(total) * 45 / total.max(1);
+            let scaled = done.min(total) * 50 / total.max(1);
             emit(scaled, 100, &format!("重组 · {label}"));
         };
         let mut staging_produced: Vec<PathBuf> = Vec::new();
@@ -1500,10 +1208,10 @@ fn transcode_deep_blocking(
         return Err("分集重组没有产出任何片段，无法继续微帧。".into());
     }
 
-    // 阶段二：对每个新集做智能微帧（比例映射到 55~100）。
+    // 阶段二：对每个新集做智能微帧（比例映射到 50~100）。
     let nudge_result = {
         let step_nudge = |done: u64, total: u64, label: &str| {
-            let scaled = 55 + done.min(total) * 45 / total.max(1);
+            let scaled = 50 + done.min(total) * 50 / total.max(1);
             emit(scaled, 100, &format!("微帧 · {label}"));
         };
         transcode_nudge_blocking(
@@ -1524,143 +1232,12 @@ fn transcode_deep_blocking(
         mode: "deep".into(),
         output_dir: output_dir.display().to_string(),
         items: nudge_report.items,
+        materials: None,
         note: format!(
-            "深度处理完成：材料先行（剧名/简介/海报/过程图/AI 制作证明），全剧按场景切点重组后逐集微帧（{}），共 {episode_count} 集，输出到新目录，原素材未改动。",
+            "深度处理完成：材料与编码并行处理，全剧按场景切点重组后逐集微帧（{}），共 {episode_count} 集，输出到新目录，原素材未改动。",
             lanes.describe()
         ),
     })
-}
-
-/// 过程图单图使用的帧数（4 图 × 3 帧）。
-const PROCESS_IMAGE_COUNT: usize = 4;
-// 每图帧数固定为 3（抽帧步长 10%/40%/70% 已按 3 帧写死），暂未引用，注释保留备查。
-// const FRAMES_PER_PROCESS_IMAGE: usize = 3;
-
-/// 生成报审过程图：从给定代表集抽帧 + 分镜概要文字，交给 Pillow 脚本排版出 4 张图。
-///
-/// 材料先行后抽帧源是**原始素材代表集**（`video_specs` 由调用方用
-/// [`representative_episodes`] 产出），不再是成片。概要文字优先用 LLM
-/// （一次调用产 4 段），未配置或失败时退回模板（Python 侧同样兜底）。
-/// 整个函数是「软失败」语义：调用方（deep 流程）只把错误记日志，不影响成片产物。
-fn generate_process_images_blocking(
-    app: &AppHandle,
-    ffmpeg: &Path,
-    drama_name: &str,
-    video_specs: &[(PathBuf, f64)],
-    episode_count: usize,
-    output_dir: &Path,
-) -> Result<(), String> {
-    if video_specs.is_empty() {
-        return Err("没有可用的抽帧素材，跳过过程图".into());
-    }
-    let settings = read_settings(app)?;
-    let drama_title = settings.drama_title.clone().unwrap_or_default();
-
-    // 1) 每个代表集在 10% / 40% / 70% 处各抓一帧（video_specs 已是代表集清单）。
-    let frames_dir = output_dir.join(".process-frames");
-    let _ = std::fs::remove_dir_all(&frames_dir);
-    std::fs::create_dir_all(&frames_dir).map_err(|error| format!("创建抽帧目录失败：{error}"))?;
-    let mut frame_paths: Vec<String> = Vec::new();
-    let sample_points = [0.10f64, 0.40, 0.70];
-    for slot in 0..PROCESS_IMAGE_COUNT {
-        let (video, duration) = &video_specs[slot % video_specs.len()];
-        for (step, pct) in sample_points.iter().enumerate() {
-            let frame_path = frames_dir.join(format!("frame-{slot:02}-{step}.jpg"));
-            let offset = duration * pct;
-            let args = [
-                "-y".to_string(),
-                "-ss".to_string(),
-                format!("{offset:.3}"),
-                "-i".to_string(),
-                video.display().to_string(),
-                "-frames:v".to_string(),
-                "1".to_string(),
-                "-q:v".to_string(),
-                "3".to_string(),
-                frame_path.display().to_string(),
-            ];
-            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            if let Err(error) = run_ffmpeg(ffmpeg, &arg_refs) {
-                let _ = std::fs::remove_dir_all(&frames_dir);
-                return Err(format!("抽帧失败（{}）：{error}", video.display()));
-            }
-            frame_paths.push(frame_path.display().to_string());
-        }
-    }
-
-    // 2) 分镜概要：LLM 优先，失败退模板（模板 JSON 交由 Python 侧兜底也行，这里统一在 Rust 侧生成）。
-    let summaries_path = frames_dir.join("summaries.json");
-    let summaries: Vec<String> = match crate::ai::storyboard_summaries_blocking(
-        &settings,
-        &drama_title,
-        &drama_name.to_string(),
-    ) {
-        Ok(list) => list,
-        Err(_) => (0..PROCESS_IMAGE_COUNT)
-            .map(|index| {
-                format!(
-                    "《{drama_name}》分镜 {}：剧情推进，冲突升级，关键情节在画面中心展开。",
-                    index + 1
-                )
-            })
-            .collect(),
-    };
-    let summaries_payload = serde_json::json!({ "summaries": summaries }).to_string();
-    std::fs::write(&summaries_path, summaries_payload)
-        .map_err(|error| format!("写概要 JSON 失败：{error}"))?;
-
-    // 3) 调 Pillow 脚本排版（脚本与 cloud/.venv 同仓库根，安装版须从项目目录启动才有 cloud 环境）。
-    let python = locate_cloud_python()?;
-    let script = python
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .map(|repo| {
-            repo.join("tools")
-                .join("process_images")
-                .join("make_process_images.py")
-        })
-        .ok_or_else(|| "无法从 Python 路径推断脚本位置".to_string())?;
-    if !script.is_file() {
-        let _ = std::fs::remove_dir_all(&frames_dir);
-        return Err(format!("过程图脚本缺失：{}", script.display()));
-    }
-    let spec = CommandSpec::new(python.display().to_string())
-        .args([
-            script.display().to_string(),
-            "--output-dir".into(),
-            output_dir.display().to_string(),
-            "--title".into(),
-            drama_title.clone(),
-            "--episode-label".into(),
-            format!("全剧 {episode_count} 集"),
-            "--frames".into(),
-            frame_paths.join(","),
-            "--poster".into(),
-            settings
-                .poster_path
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_default(),
-            "--summaries".into(),
-            summaries_path.display().to_string(),
-        ])
-        // 排版是纯 CPU 图像处理，2 分钟封顶防挂死。
-        .timeout(Duration::from_secs(120));
-    let output = SystemRunner::new()
-        .run(&spec)
-        .map_err(|error| format!("过程图进程启动失败：{error}"))?;
-    let frames_cleaned = std::fs::remove_dir_all(&frames_dir);
-    if !output.success() {
-        let _ = frames_cleaned;
-        let stderr_tail: Vec<&str> = output.stderr.lines().rev().take(4).collect();
-        let stderr_tail = stderr_tail.into_iter().rev().collect::<Vec<_>>().join("\n");
-        return Err(format!(
-            "过程图脚本退出码 {}：{stderr_tail}",
-            output.code_label()
-        ));
-    }
-    Ok(())
 }
 
 fn transcode_blocking(
@@ -1726,6 +1303,35 @@ fn transcode_blocking(
     let emit = |done: u64, total: u64, label: &str| {
         emit_task_progress(app, "transcode", done, total, label);
     };
+    // 深度处理先把材料线程拉起来，与编码并行；材料失败不回滚成片。
+    let mut material_job = if mode == "deep" && settings.effective_material_pipeline_enabled() {
+        let runtime = crate::content::model_runtime(&settings, &SystemRunner::new());
+        if !runtime.ready {
+            crate::logging::log_event("材料", format!("运行时未就绪：{}", runtime.guidance));
+        }
+        crate::logging::log_event(
+            "材料",
+            format!(
+                "启动并行流水线：ASR={}，OCR={}",
+                runtime.asr.program, runtime.ocr.program
+            ),
+        );
+        Some(crate::content::start_material_pipeline(
+            app,
+            &settings,
+            &runtime,
+            &ffmpeg,
+            &episodes,
+            &output_dir,
+            crate::content::MaterialProofContext {
+                drama_name: drama.name.clone(),
+                original_episodes: episodes.len(),
+                encoder: lanes.describe(),
+            },
+        ))
+    } else {
+        None
+    };
     let result = match mode {
         "recut" => {
             let target = request
@@ -1746,7 +1352,6 @@ fn transcode_blocking(
             // 单集时长区间一律读设置（页内不再传）；集数由素材总时长反推。
             let (min_sec, max_sec) = settings.effective_recut_range();
             transcode_deep_blocking(
-                &app,
                 &ffmpeg,
                 &ffprobe,
                 &drama.name,
@@ -1769,8 +1374,23 @@ fn transcode_blocking(
             &mut produced,
         ),
     };
+    let materials = material_job
+        .take()
+        .and_then(|job| job.join())
+        .map(|result| {
+            result.unwrap_or_else(|error| {
+                crate::logging::log_event("材料", format!("失败：{error}"));
+                crate::content::MaterialPipelineReport::failed(error)
+            })
+        });
+    if let Some(report) = &materials {
+        crate::logging::log_event("材料", format!("已汇合：{}", report.status));
+    }
     match result {
-        Ok(report) => Ok(report),
+        Ok(mut report) => {
+            report.materials = materials;
+            Ok(report)
+        }
         Err(error) => {
             if transcode_cancelled() {
                 cleanup_transcode_output(&output_dir, dir_existed, &produced);
@@ -1877,7 +1497,7 @@ pub struct DedupDemoReport {
 /// 从当前工作目录与可执行文件位置逐级向上找 `cloud/.venv/bin/python`
 /// （Windows 为 `cloud/.venv/Scripts/python.exe`）。桌面端打包分发不含仓库
 /// 环境，找不到时给出中文指引——这是有意为之：该功能只用于技术验证。
-fn locate_cloud_python() -> Result<PathBuf, String> {
+pub(crate) fn locate_cloud_python() -> Result<PathBuf, String> {
     const REL: &str = if cfg!(target_os = "windows") {
         "cloud/.venv/Scripts/python.exe"
     } else {
@@ -2735,64 +2355,6 @@ mod tests {
         // 这里验证同一进程内两次调用不会 panic 且互不相同（时间项不同）。
         let _ = seed_for("第01集.mp4");
         let _ = seed_for("第01集.mp4");
-    }
-
-    #[test]
-    fn representative_episodes_samples_uniformly_and_reuses() {
-        // 10 集抽 4 个：应命中首、约 1/3、约 2/3、末位，且不重复。
-        let episodes: Vec<ProbedEpisode> = (0..10)
-            .map(|index| probe_at(&format!("/a/第{index:02}集.mp4"), 60.0 + index as f64))
-            .collect();
-        let picks = representative_episodes(&episodes, 4);
-        assert_eq!(picks.len(), 4);
-        let indexes: Vec<usize> = picks
-            .iter()
-            .map(|(path, _)| {
-                episodes
-                    .iter()
-                    .position(|e| e.file.path == *path)
-                    .expect("抽中的路径必须来自原始素材")
-            })
-            .collect();
-        assert_eq!(indexes, vec![0, 3, 6, 9]);
-        // 时长跟集走，供抽帧命令换算中点。
-        assert!((picks[3].1 - 69.0).abs() < 1e-9);
-
-        // 2 集抽 4 个：不足时循环复用，数量仍然凑满。
-        let two = vec![
-            probe_at("/a/第01集.mp4", 60.0),
-            probe_at("/a/第02集.mp4", 61.0),
-        ];
-        let picks = representative_episodes(&two, 4);
-        assert_eq!(picks.len(), 4);
-        assert_eq!(picks[0].0, two[0].file.path);
-        assert_eq!(picks[1].0, two[1].file.path);
-        assert_eq!(picks[2].0, two[0].file.path);
-
-        // 空素材直接返回空，调用方据此跳过过程图。
-        assert!(representative_episodes(&[], 4).is_empty());
-    }
-
-    #[test]
-    fn local_date_string_is_valid_iso_date() {
-        let date = local_date_string();
-        // 格式：YYYY-MM-DD，各段都是数字。
-        assert_eq!(date.len(), 10, "格式必须是 YYYY-MM-DD：{date}");
-        let bytes = date.as_bytes();
-        for (index, byte) in bytes.iter().enumerate() {
-            if index == 4 || index == 7 {
-                assert_eq!(byte, &b'-', "分隔符位置错：{date}");
-            } else {
-                assert!(byte.is_ascii_digit(), "非数字字符：{date}");
-            }
-        }
-        // 东八区口径下年份必然落在 2020~2100，防 civil_from_days 写错量级。
-        let year: i64 = date[..4].parse().expect("年份可解析");
-        assert!((2020..=2100).contains(&year), "年份异常：{date}");
-        let month: u32 = date[5..7].parse().expect("月份可解析");
-        let day: u32 = date[8..10].parse().expect("日可解析");
-        assert!((1..=12).contains(&month), "月份越界：{date}");
-        assert!((1..=31).contains(&day), "日越界：{date}");
     }
 
     #[test]

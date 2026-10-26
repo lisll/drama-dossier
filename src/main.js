@@ -332,6 +332,14 @@ function handleTaskProgress(payload) {
   });
 }
 
+/** 材料线程独立上报；编码线程仍使用 task-progress，界面显示最近到达的阶段。 */
+function handleMaterialProgress(payload) {
+  if (!state.task || !payload) return;
+  // 只换阶段文案，不碰编码进度条的百分比；材料与编码是两条并行时间线。
+  state.taskLabel = payload.label ?? state.taskLabel;
+  renderProgressLabel();
+}
+
 /**
  * 擦除的两个阶段（与 `dossier-inpaint` 的 `LOCATE_STAGE` / `INPAINT_STAGE` 一致）。
  * 阶段名只用于显示，进度本身完全由后端上报，界面不猜。
@@ -517,6 +525,14 @@ function settingsSnapshot() {
       $("#img-api-key")?.value.trim() ?? "",
       $("#img-model")?.value.trim() ?? "",
     ].join("|"),
+    models: [
+      $("#asr-engine")?.value ?? "",
+      $("#asr-executable")?.value.trim() ?? "",
+      $("#asr-model")?.value.trim() ?? "",
+      $("#ocr-executable")?.value.trim() ?? "",
+      $("#content-sample-count")?.value.trim() ?? "",
+      $("#material-pipeline-enabled")?.checked ? "on" : "off",
+    ].join("|"),
   });
 }
 
@@ -542,6 +558,14 @@ function refreshDirtyBadge() {
       state.settings?.imgBaseUrl ?? "",
       state.settings?.imgApiKey ?? "",
       state.settings?.imgModel ?? "",
+    ].join("|"),
+    models: [
+      state.settings?.asrEngine ?? "openai",
+      state.settings?.asrExecutable ?? "",
+      state.settings?.asrModel ?? "",
+      state.settings?.ocrExecutable ?? "",
+      state.settings?.contentSampleCount == null ? "" : String(state.settings.contentSampleCount),
+      state.settings?.materialPipelineEnabled === false ? "off" : "on",
     ].join("|"),
   });
   $("#settings-dirty").classList.toggle("hidden", settingsSnapshot() === saved);
@@ -582,6 +606,14 @@ async function loadSettings() {
     $("#img-base-url").value = settings.imgBaseUrl ?? "";
     $("#img-api-key").value = settings.imgApiKey ?? "";
     $("#img-model").value = settings.imgModel ?? "";
+    // 内容模型运行时：ASR/OCR 抽样与自动材料开关。
+    $("#asr-engine").value = settings.asrEngine ?? "openai";
+    $("#asr-executable").value = settings.asrExecutable ?? "";
+    $("#asr-model").value = settings.asrModel ?? "";
+    $("#ocr-executable").value = settings.ocrExecutable ?? "";
+    $("#content-sample-count").value =
+      settings.contentSampleCount == null ? "" : String(settings.contentSampleCount);
+    $("#material-pipeline-enabled").checked = settings.materialPipelineEnabled !== false;
     // 海报已在历史会话生成过时直接回显预览。
     if (settings.posterPath && settings.posterPath !== $("#poster-path").dataset.saved) {
       $("#poster-path").textContent = settings.posterPath;
@@ -660,6 +692,15 @@ function buildSettingsFromForm(rules) {
     imgBaseUrl: $("#img-base-url").value.trim() || null,
     imgApiKey: $("#img-api-key").value.trim() || null,
     imgModel: $("#img-model").value.trim() || null,
+    asrEngine: $("#asr-engine").value || null,
+    asrExecutable: $("#asr-executable").value.trim() || null,
+    asrModel: $("#asr-model").value.trim() || null,
+    ocrExecutable: $("#ocr-executable").value.trim() || null,
+    contentSampleCount:
+      $("#content-sample-count").value.trim() === ""
+        ? null
+        : Number($("#content-sample-count").value.trim()),
+    materialPipelineEnabled: $("#material-pipeline-enabled").checked,
   };
 }
 
@@ -811,6 +852,15 @@ async function rememberRoot(root) {
     imgBaseUrl: state.settings?.imgBaseUrl ?? null,
     imgApiKey: state.settings?.imgApiKey ?? null,
     imgModel: state.settings?.imgModel ?? null,
+    aiTitleEnabled: state.settings?.aiTitleEnabled ?? null,
+    aiSynopsisEnabled: state.settings?.aiSynopsisEnabled ?? null,
+    aiPosterEnabled: state.settings?.aiPosterEnabled ?? null,
+    asrEngine: state.settings?.asrEngine ?? null,
+    asrExecutable: state.settings?.asrExecutable ?? null,
+    asrModel: state.settings?.asrModel ?? null,
+    ocrExecutable: state.settings?.ocrExecutable ?? null,
+    contentSampleCount: state.settings?.contentSampleCount ?? null,
+    materialPipelineEnabled: state.settings?.materialPipelineEnabled ?? true,
     libraryRoot: root,
   };
   state.settings = settings;
@@ -2104,6 +2154,7 @@ async function executeTranscode() {
       },
       ffprobePath: effectiveFfprobe(),
     });
+    applyGeneratedMaterials(report.materials);
     const rows = report.items
       .map(
         (item) => `<tr>
@@ -2114,7 +2165,7 @@ async function executeTranscode() {
       )
       .join("");
     renderResult("#exec-result", {
-      tone: "ok",
+      tone: ["failed", "partial"].includes(report.materials?.status) ? "warn" : "ok",
       html: `
       <strong>${esc(report.note)}</strong><br />
       输出目录：${esc(report.outputDir)}
@@ -2122,10 +2173,44 @@ async function executeTranscode() {
         rows
           ? `<table><thead><tr><th>来源</th><th>输出</th><th>说明</th></tr></thead><tbody>${rows}</tbody></table>`
           : ""
+      }
+      ${
+        report.materials
+          ? `<details class="tool-block"><summary>并行材料流水线</summary>
+               <p><strong>${esc(materialStatusLabel(report.materials.status))}</strong>
+               ${report.materials.title ? ` · 剧名：${esc(report.materials.title)}` : ""}</p>
+               ${report.materials.synopsis ? `<p class="hint">${esc(report.materials.synopsis)}</p>` : ""}
+               <p class="hint">剧名来源：${esc(report.materials.titleSource ?? "未生成")}；简介来源：${esc(report.materials.synopsisSource ?? "未生成")}；海报来源：${esc(report.materials.posterSource ?? "未生成")}</p>
+               ${report.materials.evidence ? `<p class="hint">证据清单：<code>${esc(report.materials.evidence.manifest)}</code></p>` : ""}
+               ${report.materials.poster ? `<p class="hint">海报：<code>${esc(report.materials.poster)}</code></p>` : ""}
+               ${report.materials.proof ? `<p class="hint">AI 制作证明：<code>${esc(report.materials.proof)}</code></p>` : ""}
+               ${
+                 (report.materials.processImages || []).length
+                   ? `<p class="hint">过程图：${report.materials.processImages
+                       .map((path) => `<code>${esc(path)}</code>`)
+                       .join("、")}</p>`
+                   : ""
+               }
+               ${(report.materials.messages || []).map((message) => `<p class="hint">${esc(message)}</p>`).join("")}
+             </details>`
+          : ""
       }`,
-      paths: [["exec-output", report.outputDir]],
+      paths: [
+        ["exec-output", report.outputDir],
+        [
+          "exec-material",
+          report.materials?.evidence ? `${report.outputDir}/.material-content` : null,
+        ],
+      ],
     });
-    toast("转码完成");
+    toast(
+      report.materials?.status === "failed"
+        ? "转码完成，但自动材料生成失败，详见结果"
+        : report.materials?.status === "partial"
+          ? "转码完成，自动材料有警告，详见结果"
+          : "转码完成",
+      ["failed", "partial"].includes(report.materials?.status),
+    );
     // 材料阶段可能由 AI 生成了剧名/简介/海报并写回设置，重新加载回填界面。
     await loadSettings();
   } catch (error) {
@@ -2145,6 +2230,44 @@ async function executeTranscode() {
     stopButton.disabled = false;
     stopButton.textContent = "停止转码";
     endTask();
+  }
+}
+
+/** 材料状态是后端 token，界面上只显示中文。 */
+function materialStatusLabel(status) {
+  return (
+    { completed: "材料已生成", partial: "材料已生成（有警告）", failed: "材料生成失败", disabled: "材料已关闭" }[
+      status
+    ] ?? status
+  );
+}
+
+/** 深度处理产出的剧名/简介/海报回填到当前页，避免用户再去设置页手工抄一次。 */
+function applyGeneratedMaterials(materials) {
+  if (!materials) return;
+  state.settings = {
+    ...(state.settings ?? {}),
+    dramaTitle: materials.title ?? state.settings?.dramaTitle ?? null,
+    dramaSynopsis: materials.synopsis ?? state.settings?.dramaSynopsis ?? null,
+    // 后端只要生成了新剧名就会同步海报字段：海报失败时状态是空，界面不能继续显示旧图。
+    posterPath: materials.title
+      ? (materials.poster ?? null)
+      : (state.settings?.posterPath ?? null),
+  };
+  if (materials.title) $("#drama-title").value = materials.title;
+  if (materials.synopsis) $("#drama-synopsis").value = materials.synopsis;
+  if (materials.poster) {
+    $("#poster-path").textContent = materials.poster;
+    $("#poster-path").dataset.saved = materials.poster;
+    if (materials.posterDataUrl) {
+      $("#poster-preview").src = materials.posterDataUrl;
+      $("#poster-preview-wrap").classList.remove("hidden");
+    }
+  } else if (materials.title) {
+    $("#poster-preview").src = "";
+    $("#poster-preview-wrap").classList.add("hidden");
+    $("#poster-path").textContent = "";
+    delete $("#poster-path").dataset.saved;
   }
 }
 
@@ -2368,7 +2491,15 @@ $("#install-close").addEventListener("click", () =>
 function renderRuntimeList(status) {
   const tools = [status.ffmpeg, status.ffprobe];
   const missing = tools.filter((tool) => !tool.found || !tool.ok);
-  const rows = [status.ffmpeg, status.ffprobe, status.python]
+  const engineLabel =
+    status.models?.asrEngine === "whisper_cpp" ? "whisper.cpp" : "openai-whisper";
+  const modelRows = status.models
+    ? [
+        { ...status.models.asr, name: `ASR（${engineLabel}）` },
+        { ...status.models.ocr, name: "OCR" },
+      ]
+    : [];
+  const rows = [status.ffmpeg, status.ffprobe, status.python, ...modelRows]
     .map((tool) => {
       const stateClass = tool.found ? (tool.ok ? "pass" : "warn") : "fail";
       return `<tr>
@@ -2381,6 +2512,16 @@ function renderRuntimeList(status) {
   $("#runtime-list").innerHTML = `
     <table><thead><tr><th>组件</th><th>状态</th><th>版本 / 说明</th></tr></thead><tbody>${rows}</tbody></table>
   `;
+  const modelStatus = $("#model-runtime-list");
+  if (modelStatus) {
+    modelStatus.innerHTML = status.models
+      ? `<div class="${status.models.ready ? "status-ready" : "runtime-error"}" style="padding:.5rem .65rem">
+           ${status.models.ready
+             ? "内容模型就绪：材料线程将在深度处理开始时并行运行。"
+             : esc(status.models.guidance)}
+         </div>`
+      : '<div class="empty">尚未检测。</div>';
+  }
   // 竞品样式：引擎未就绪时显示红色错误行（错误码 RUNTIME_NOT_INSTALLED）。
   const errorNode = $("#runtime-error");
   if (missing.length) {
@@ -3071,6 +3212,8 @@ $("#library-root").addEventListener("input", renderEmptyGuide);
 // 设置页任一改动都刷新「未保存」标记，避免改了以为已经生效。
 ["#rule-min-episodes", "#rule-min-duration", "#rule-max-duration", "#rule-max-bitrate",
   "#rule-prefer-portrait", "#settings-output", "#ffprobe-path",
+  "#asr-engine", "#asr-executable", "#asr-model", "#ocr-executable",
+  "#content-sample-count", "#material-pipeline-enabled",
 ].forEach((selector) => {
   const node = $(selector);
   node.addEventListener("input", refreshDirtyBadge);
@@ -3124,6 +3267,7 @@ document.addEventListener("click", (event) => {
 if (tauriEvent?.listen) {
   tauriEvent.listen("probe-progress", (event) => handleProbeProgress(event.payload));
   tauriEvent.listen("task-progress", (event) => handleTaskProgress(event.payload));
+  tauriEvent.listen("material-progress", (event) => handleMaterialProgress(event.payload));
   tauriEvent.listen("erase-progress", (event) => handleEraseProgress(event.payload));
 }
 
