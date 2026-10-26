@@ -1,0 +1,51 @@
+# 剧备授权服务 Caddy 配置模板。把 license.example.com 换成你的域名。
+# Caddy 自动申请 HTTPS 证书；应用只监听 127.0.0.1:8200，外部无法直连。
+{
+	servers {
+		protocols h1 h2
+	}
+}
+
+license.example.com {
+	tls {
+		protocols tls1.2 tls1.3
+	}
+
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+	}
+
+	request_body {
+		max_size 8KB
+	}
+
+	# 只放行四类路径，其余一律 404
+	@client path /v1/activate /v1/refresh /v1/health
+	@admin path /admin /admin/*
+
+	handle @client {
+		reverse_proxy 127.0.0.1:8200 {
+			# 覆盖而不是追加：客户端自带的 X-Forwarded-For 一律丢弃
+			header_up X-Forwarded-For {remote_host}
+		}
+	}
+
+	handle @admin {
+		# 第二道 IP 白名单（与应用内 DD_LICENSE_ADMIN_ALLOW_IPS 保持一致）
+		@not_allowed not remote_ip 203.0.113.10/32
+		respond @not_allowed 404
+		reverse_proxy 127.0.0.1:8200 {
+			header_up X-Forwarded-For {remote_host}
+		}
+	}
+
+	handle {
+		respond 404
+	}
+
+	log {
+		output file /var/log/caddy/dd-license.log
+		format json
+	}
+}

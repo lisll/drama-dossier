@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>剧备 · 授权管理</title>
+    <link rel="stylesheet" href="/admin/static/admin.css" />
+  </head>
+  <body>
+    <div id="banner" class="banner hidden" role="alert"></div>
+
+    <main id="login-view" class="login hidden">
+      <form id="login-form" class="card login-card" autocomplete="off">
+        <h1>剧备 · 授权管理</h1>
+        <label>用户名<input id="login-user" name="username" required maxlength="32" autocomplete="username" /></label>
+        <label>密码<input id="login-pass" name="password" type="password" required maxlength="256" autocomplete="current-password" /></label>
+        <button type="submit" class="primary">登录</button>
+        <p id="login-msg" class="msg" aria-live="polite"></p>
+      </form>
+    </main>
+
+    <div id="app-view" class="app hidden">
+      <header class="topbar">
+        <strong>剧备 · 授权管理</strong>
+        <nav id="nav">
+          <button data-tab="overview" class="active">概览</button>
+          <button data-tab="generate">生成卡密</button>
+          <button data-tab="batches">批次</button>
+          <button data-tab="lookup">卡密查询</button>
+          <button data-tab="machines">已授权电脑</button>
+          <button data-tab="audit">操作日志</button>
+          <button data-tab="account">账号</button>
+        </nav>
+        <span id="who" class="who"></span>
+      </header>
+
+      <section id="tab-overview" class="tab">
+        <div id="alerts" class="alerts"></div>
+        <div class="grid">
+          <div class="card"><h2>卡密统计</h2><table id="plan-stats"></table></div>
+          <div class="card"><h2>电脑</h2><dl id="machine-stats"></dl></div>
+        </div>
+        <div class="card"><h2>最近激活</h2><table id="recent"></table></div>
+      </section>
+
+      <section id="tab-generate" class="tab hidden">
+        <form id="gen-form" class="card form">
+          <h2>生成卡密</h2>
+          <label>卡种<select id="gen-plan" required></select></label>
+          <label>数量<input id="gen-count" type="number" min="1" max="10000" value="10" required /></label>
+          <label>备注<input id="gen-note" maxlength="200" placeholder="例如：渠道 A / 10 月活动" /></label>
+          <label>当前密码（再次确认身份）<input id="gen-pass" type="password" required maxlength="256" autocomplete="current-password" /></label>
+          <button type="submit" class="primary">生成</button>
+          <p id="gen-msg" class="msg" aria-live="polite"></p>
+        </form>
+        <div id="gen-result" class="card hidden">
+          <h2>本批卡密 <span id="gen-batch"></span></h2>
+          <p class="warn">明文只显示这一次，服务器不保存明文。请立即复制或下载保存。</p>
+          <div class="row">
+            <button id="gen-copy">复制全部</button>
+            <button id="gen-download">下载 CSV</button>
+          </div>
+          <textarea id="gen-codes" readonly rows="12"></textarea>
+        </div>
+      </section>
+
+      <section id="tab-batches" class="tab hidden">
+        <div class="card">
+          <h2>批次列表</h2>
+          <table id="batches"></table>
+          <div class="pager" id="batches-pager"></div>
+        </div>
+      </section>
+
+      <section id="tab-lookup" class="tab hidden">
+        <form id="lookup-form" class="card form">
+          <h2>卡密查询</h2>
+          <label>卡密<input id="lookup-code" required maxlength="64" placeholder="DDK-XXXX-XXXX-XXXX-XXXX" /></label>
+          <button type="submit" class="primary">查询</button>
+          <p id="lookup-msg" class="msg" aria-live="polite"></p>
+        </form>
+        <div id="lookup-result" class="card hidden"><dl id="lookup-dl"></dl><button id="lookup-revoke" class="danger hidden">作废这张卡</button></div>
+      </section>
+
+      <section id="tab-machines" class="tab hidden">
+        <div class="card">
+          <h2>已授权电脑</h2>
+          <form id="machine-filter" class="row">
+            <input id="machine-q" maxlength="64" placeholder="机器码前缀（0-9a-f）" />
+            <select id="machine-status">
+              <option value="">全部</option>
+              <option value="active">有效</option>
+              <option value="expired">已过期</option>
+              <option value="revoked">已作废</option>
+            </select>
+            <button type="submit">筛选</button>
+          </form>
+          <table id="machines"></table>
+          <div class="pager" id="machines-pager"></div>
+        </div>
+        <div id="machine-detail" class="card hidden">
+          <h2>电脑详情</h2>
+          <dl id="machine-dl"></dl>
+          <h3>兑换过的卡</h3>
+          <table id="machine-cards"></table>
+          <div class="row">
+            <button id="m-revoke" class="danger">作废</button>
+            <button id="m-unrevoke">恢复</button>
+          </div>
+        </div>
+      </section>
+
+      <section id="tab-audit" class="tab hidden">
+        <div class="card">
+          <h2>操作日志</h2>
+          <form id="audit-filter" class="row">
+            <input id="audit-action" maxlength="64" placeholder="操作类型，如 activate" />
+            <input id="audit-actor" maxlength="64" placeholder="操作人" />
+            <button type="submit">筛选</button>
+          </form>
+          <table id="audit"></table>
+          <div class="pager" id="audit-pager"></div>
+        </div>
+      </section>
+
+      <section id="tab-account" class="tab hidden">
+        <form id="pw-form" class="card form">
+          <h2>修改密码</h2>
+          <label>旧密码<input id="pw-old" type="password" required maxlength="256" autocomplete="current-password" /></label>
+          <label>新密码（至少 16 位）<input id="pw-new" type="password" required minlength="16" maxlength="256" autocomplete="new-password" /></label>
+          <label>再输一次<input id="pw-new2" type="password" required minlength="16" maxlength="256" autocomplete="new-password" /></label>
+          <button type="submit" class="primary">修改</button>
+          <p id="pw-msg" class="msg" aria-live="polite"></p>
+        </form>
+        <div class="card"><button id="logout">退出登录</button></div>
+      </section>
+    </div>
+
+    <dialog id="dlg">
+      <form method="dialog" id="dlg-form">
+        <h2 id="dlg-title"></h2>
+        <p id="dlg-text"></p>
+        <div id="dlg-fields"></div>
+        <p id="dlg-msg" class="msg" aria-live="polite"></p>
+        <div class="row end">
+          <button value="cancel" formnovalidate>取消</button>
+          <button value="ok" id="dlg-ok" class="danger">确认</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="/admin/static/admin.js"></script>
+  </body>
+</html>
