@@ -59,7 +59,7 @@ pub fn transcode_stop() -> Result<bool, String> {
 // ---------------------------------------------------------------------------
 
 /// 应用数据目录下的运行环境安装位置（一键安装的 ffmpeg/ffprobe 放这里）。
-fn app_bin_dir(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn app_bin_dir(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_data_dir()
         .map(|dir| dir.join("bin"))
@@ -1281,9 +1281,10 @@ fn read_local_synopsis(dir: &Path) -> Option<String> {
     }
 }
 
-/// 写入 AI 制作证明（Grove-Max 同款）：无条件生成一份 txt 落输出目录，
+/// 写入 AI 制作证明（Grove-Max 同款）：无条件落一份证明到输出目录，
 /// 记录剧名/简介/海报/过程图的来源（AI 生成（模型名）/ 本地提供）、
 /// 制作工具与版本、日期和处理方式，末尾附 AI 声明。
+/// 优先出图片版（与材料流水线同一套 Pillow 排版），Python 不可用时退回文本版。
 fn write_ai_proof(
     app: &AppHandle,
     drama_name: &str,
@@ -1293,58 +1294,40 @@ fn write_ai_proof(
     output_dir: &Path,
 ) -> Result<PathBuf, String> {
     let version = app.package_info().version.to_string();
-    let date = local_date_string();
-    let line = |label: &str, value: Option<&str>, source: &str| {
-        let value = value.unwrap_or("未填写");
-        format!("{label}：{value}\n来源：{source}\n")
-    };
-    let mut body = String::new();
-    body.push_str("AI 制作证明\n\n");
-    body.push_str(&format!("生成日期：{date}（本地时间）\n"));
-    body.push_str(&format!("制作工具：DramaDossier v{version}\n"));
-    body.push_str(&format!(
-        "原剧目：{drama_name}（原始素材 {episode_count} 集）\n"
-    ));
-    body.push_str(&format!(
-        "处理方式：按场景切点重组分集并逐集微帧，成片输出到「视频成片/」子目录，编码 {}。\n\n",
-        lanes.describe()
-    ));
-    body.push_str(&line(
-        "剧名",
-        materials.title.as_deref(),
-        &materials.title_source,
-    ));
-    body.push_str(&line(
-        "简介",
-        materials.synopsis.as_deref(),
-        &materials.synopsis_source,
-    ));
-    body.push_str(&line(
-        "海报",
-        materials
+    let payload = serde_json::json!({
+        "date": local_date_string(),
+        "version": version,
+        "dramaName": drama_name,
+        "originalEpisodes": episode_count,
+        "encoder": lanes.describe(),
+        "processing": format!(
+            "按场景切点重组分集并逐集微帧，成片输出到「视频成片/」子目录，编码 {}。",
+            lanes.describe()
+        ),
+        "evidence": "未提取（本流程未启用材料线程）",
+        "title": materials.title,
+        "titleSource": materials.title_source,
+        "synopsis": materials.synopsis,
+        "synopsisSource": materials.synopsis_source,
+        "posterName": materials
             .poster
             .as_ref()
-            .map(|path| {
-                path.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-            })
-            .unwrap_or(None)
-            .as_deref(),
-        &materials.poster_source,
-    ));
-    body.push_str(&format!(
-        "过程图：过程图_01 ~ 过程图_04（画面抽自原始素材代表集）\n来源：{}\n\n",
-        materials.storyboard_source
-    ));
-    body.push_str(
-        "AI 声明：本目录中的剧名、简介、海报与过程图由人工智能辅助生成或整理，\
-         分集重组与微帧由 DramaDossier 自动化完成，原始视频素材未作改动。\
-         报审前请人工复核上述内容。\n",
-    );
-    let path = output_dir.join("AI制作证明.txt");
-    std::fs::write(&path, body)
-        .map_err(|error| format!("写入 AI 制作证明失败（{}）：{error}", path.display()))?;
-    Ok(path)
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or_default(),
+        "posterSource": materials.poster_source,
+        "posterPath": materials
+            .poster
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        "processCount": PROCESS_IMAGE_COUNT,
+        "storyboardSource": materials.storyboard_source,
+    });
+    if let Ok(path) = crate::content::write_ai_proof_image(app, output_dir, &payload) {
+        return Ok(path);
+    }
+    crate::content::write_ai_proof_text(output_dir, &payload)
 }
 
 /// 深度处理（材料先行）：先产出报审材料（剧名/简介/海报/过程图/AI 制作证明），
@@ -1505,11 +1488,7 @@ fn transcode_deep_blocking(
 
         // 过程图：抽帧源是原始素材的 4 个代表集（编码前就要产出，不能依赖成片）。
         emit(4, 100, "材料 · 生成过程图");
-        materials.storyboard_source = if crate::ai::storyboard_llm_ready(&settings) {
-            llm_label.clone()
-        } else {
-            "模板生成（未配置 LLM）".to_string()
-        };
+        materials.storyboard_source = "原始素材抽帧".to_string();
         let picks = representative_episodes(episodes, PROCESS_IMAGE_COUNT);
         if let Err(error) = generate_process_images_blocking(
             app,
@@ -1665,31 +1644,30 @@ const PROCESS_IMAGE_COUNT: usize = 4;
 // 每图帧数固定为 3（抽帧步长 10%/40%/70% 已按 3 帧写死），暂未引用，注释保留备查。
 // const FRAMES_PER_PROCESS_IMAGE: usize = 3;
 
-/// 生成报审过程图：从给定代表集抽帧 + 分镜概要文字，交给 Pillow 脚本排版出 4 张图。
+/// 生成报审过程图：从原始素材代表集抽帧，交给 Pillow 脚本排版出 4 张竖屏单帧图。
 ///
-/// 材料先行后抽帧源是**原始素材代表集**（`video_specs` 由调用方用
-/// [`representative_episodes`] 产出），不再是成片。概要文字优先用 LLM
-/// （一次调用产 4 段），未配置或失败时退回模板（Python 侧同样兜底）。
-/// 整个函数是「软失败」语义：调用方（deep 流程）只把错误记日志，不影响成片产物。
+/// 每张图就是一帧原片画面（保留原生画面与硬字幕），仅叠右上角半透明角标
+/// （集号 + 集内时间码），观感对齐剪辑软件导出的分镜帧。整个函数是
+/// 「软失败」语义：调用方（deep 流程）只把错误记日志，不影响成片产物。
 fn generate_process_images_blocking(
     app: &AppHandle,
     ffmpeg: &Path,
-    drama_name: &str,
+    _drama_name: &str,
     video_specs: &[(PathBuf, f64)],
-    episode_count: usize,
+    _episode_count: usize,
     output_dir: &Path,
 ) -> Result<(), String> {
     if video_specs.is_empty() {
         return Err("没有可用的抽帧素材，跳过过程图".into());
     }
-    let settings = read_settings(app)?;
-    let drama_title = settings.drama_title.clone().unwrap_or_default();
 
-    // 1) 每个代表集在 10% / 40% / 70% 处各抓一帧（video_specs 已是代表集清单）。
+    // 1) 每个代表集在 10% / 40% / 70% 处各抓一帧（video_specs 已是代表集清单），
+    //    同时记录帧的真实出处（集号 + 集内时间码）作为角标标签。
     let frames_dir = output_dir.join(".process-frames");
     let _ = std::fs::remove_dir_all(&frames_dir);
     std::fs::create_dir_all(&frames_dir).map_err(|error| format!("创建抽帧目录失败：{error}"))?;
     let mut frame_paths: Vec<String> = Vec::new();
+    let mut frame_labels: Vec<String> = Vec::new();
     let sample_points = [0.10f64, 0.40, 0.70];
     for slot in 0..PROCESS_IMAGE_COUNT {
         let (video, duration) = &video_specs[slot % video_specs.len()];
@@ -1713,63 +1691,31 @@ fn generate_process_images_blocking(
                 let _ = std::fs::remove_dir_all(&frames_dir);
                 return Err(format!("抽帧失败（{}）：{error}", video.display()));
             }
+            let seconds = (*duration * pct) as u64;
+            frame_labels.push(format!(
+                "第{}集 {:02}:{:02}",
+                slot + 1,
+                seconds / 60,
+                seconds % 60
+            ));
             frame_paths.push(frame_path.display().to_string());
         }
     }
 
-    // 2) 分镜概要：LLM 优先，失败退模板（模板 JSON 交由 Python 侧兜底也行，这里统一在 Rust 侧生成）。
-    let summaries_path = frames_dir.join("summaries.json");
-    let summaries: Vec<String> =
-        match crate::ai::storyboard_summaries_blocking(&settings, &drama_title, drama_name) {
-            Ok(list) => list,
-            Err(_) => (0..PROCESS_IMAGE_COUNT)
-                .map(|index| {
-                    format!(
-                        "《{drama_name}》分镜 {}：剧情推进，冲突升级，关键情节在画面中心展开。",
-                        index + 1
-                    )
-                })
-                .collect(),
-        };
-    let summaries_payload = serde_json::json!({ "summaries": summaries }).to_string();
-    std::fs::write(&summaries_path, summaries_payload)
-        .map_err(|error| format!("写概要 JSON 失败：{error}"))?;
-
-    // 3) 调 Pillow 脚本排版（脚本与 cloud/.venv 同仓库根，安装版须从项目目录启动才有 cloud 环境）。
-    let python = locate_cloud_python()?;
-    let script = python
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .map(|repo| {
-            repo.join("tools")
-                .join("process_images")
-                .join("make_process_images.py")
-        })
-        .ok_or_else(|| "无法从 Python 路径推断脚本位置".to_string())?;
-    if !script.is_file() {
+    // 2) 调 Pillow 脚本排版（脚本与解释器解析见 locate_materials_python / materials_script）。
+    let python = locate_materials_python(app)?;
+    let script = materials_script(app, "make_process_images.py").inspect_err(|_| {
         let _ = std::fs::remove_dir_all(&frames_dir);
-        return Err(format!("过程图脚本缺失：{}", script.display()));
-    }
+    })?;
     let spec = CommandSpec::new(python.display().to_string())
         .args([
             script.display().to_string(),
             "--output-dir".into(),
             output_dir.display().to_string(),
-            "--title".into(),
-            drama_title.clone(),
-            "--episode-label".into(),
-            format!("全剧 {episode_count} 集"),
             "--frames".into(),
             frame_paths.join(","),
-            "--poster".into(),
-            settings
-                .poster_path
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_default(),
-            "--summaries".into(),
-            summaries_path.display().to_string(),
+            "--labels".into(),
+            frame_labels.join("|"),
         ])
         // 排版是纯 CPU 图像处理，2 分钟封顶防挂死。
         .timeout(Duration::from_secs(120));
@@ -2085,6 +2031,191 @@ pub(crate) fn locate_cloud_python() -> Result<PathBuf, String> {
     )
 }
 
+// ---------------------------------------------------------------------------
+// 材料生成 Python（Pillow 排版：过程图 / 制作证明图 / 海报水印清理）
+// ---------------------------------------------------------------------------
+
+/// 材料生成专用虚拟环境解释器：`<app_data>/pyenv/`（与一键安装的 bin 目录并列）。
+fn materials_venv_python(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法定位应用数据目录：{error}"))?;
+    let rel = if cfg!(target_os = "windows") {
+        "pyenv/Scripts/python.exe"
+    } else {
+        "pyenv/bin/python"
+    };
+    Ok(dir.join(rel))
+}
+
+/// 解释器是否已装 Pillow：一次子进程探测（成功时约 0.3 秒）。
+fn python_has_pil(python: &Path) -> bool {
+    let spec = CommandSpec::new(python.display().to_string())
+        .args(["-c", "import PIL"])
+        .timeout(Duration::from_secs(20));
+    SystemRunner::new()
+        .run(&spec)
+        .map(|output| output.success())
+        .unwrap_or(false)
+}
+
+/// 自动配置只尝试一次：断网时每次生成材料都白等一轮 pip 超时毫无意义。
+static MATERIALS_PY_PROVISION_TRIED: AtomicBool = AtomicBool::new(false);
+
+/// 自动创建 `<app_data>/pyenv` 虚拟环境并安装 Pillow（需要联网，首次约 30~60 秒）。
+fn provision_materials_python(app: &AppHandle) -> Result<PathBuf, String> {
+    if MATERIALS_PY_PROVISION_TRIED.swap(true, Ordering::SeqCst) {
+        return Err(
+            "材料排版 Python 环境未就绪（本会话已尝试过自动配置）。\
+             请在网络可用后重试，或点「一键配置运行环境」完成安装。"
+                .into(),
+        );
+    }
+    let _ = app.emit(
+        "material-progress",
+        serde_json::json!({
+            "stage": "python",
+            "label": "材料线程：首次配置 Python 排版环境（联网安装 Pillow，约 1 分钟）",
+        }),
+    );
+    let python = materials_venv_python(app)?;
+    if !python.is_file() {
+        let candidates: &[&str] = if cfg!(target_os = "windows") {
+            &["python", "python3"]
+        } else {
+            &["python3", "/usr/bin/python3", "python"]
+        };
+        let base = candidates
+            .iter()
+            .find(|name| {
+                let spec = CommandSpec::new(name.to_string())
+                    .arg("--version")
+                    .timeout(Duration::from_secs(10));
+                SystemRunner::new()
+                    .run(&spec)
+                    .map(|output| output.success())
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| {
+                "未找到可用的 Python 3 解释器。请安装 Python 3.9+（python.org 或系统包管理器），\
+                 或在能访问仓库的环境里使用深度处理。"
+                    .to_string()
+            })?;
+        // venv 根目录 = <app_data>/pyenv（python 位于 pyenv/bin/python，两层 parent 即根）。
+        let venv_dir = python
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "无法推断虚拟环境目录".to_string())?;
+        let venv = CommandSpec::new(base.to_string())
+            .args(["-m", "venv", &venv_dir.display().to_string()])
+            .timeout(Duration::from_secs(120));
+        SystemRunner::new()
+            .run(&venv)
+            .map_err(|error| format!("创建虚拟环境失败：{error}"))?;
+        if !python.is_file() {
+            return Err(format!("虚拟环境创建后未找到解释器：{}", python.display()));
+        }
+    }
+    let pip = python
+        .parent()
+        .map(|dir| {
+            let name = if cfg!(target_os = "windows") {
+                "pip.exe"
+            } else {
+                "pip"
+            };
+            dir.join(name)
+        })
+        .ok_or_else(|| "无法推断 pip 路径".to_string())?;
+    let install = CommandSpec::new(pip.display().to_string())
+        .args([
+            "install",
+            "--quiet",
+            "--disable-pip-version-check",
+            "pillow",
+        ])
+        .timeout(Duration::from_secs(300));
+    let output = SystemRunner::new()
+        .run(&install)
+        .map_err(|error| format!("安装 Pillow 失败（需要联网）：{error}"))?;
+    if !output.success() {
+        // stderr 末尾几行按自然顺序展示（先倒序取尾再反转还原先后）。
+        let mut tail: Vec<&str> = output.stderr.lines().rev().take(3).collect();
+        tail.reverse();
+        let tail = tail.join("\n");
+        return Err(format!(
+            "Pillow 安装失败（退出码 {}）：{}",
+            output.code_label(),
+            if tail.is_empty() { "（无输出）" } else { &tail }
+        ));
+    }
+    if !python_has_pil(&python) {
+        return Err("Pillow 安装完成但导入失败，请检查网络代理设置后重试".into());
+    }
+    crate::logging::log_event("环境", "材料排版 Python 环境配置成功（venv + Pillow）");
+    Ok(python)
+}
+
+/// 定位材料生成 Python：App venv → 开发仓库 cloud/.venv → PATH 自带 Pillow 的解释器 → 自动配置。
+///
+/// 过程图 / 制作证明图 / 海报水印清理都用它跑 Pillow 脚本；打包安装版没有
+/// 仓库布局，靠这里的 App venv 兜底（首次使用时自动联网配置）。
+pub(crate) fn locate_materials_python(app: &AppHandle) -> Result<PathBuf, String> {
+    if let Ok(python) = materials_venv_python(app) {
+        if python.is_file() && python_has_pil(&python) {
+            return Ok(python);
+        }
+    }
+    if let Ok(python) = locate_cloud_python() {
+        if python_has_pil(&python) {
+            return Ok(python);
+        }
+    }
+    for name in ["python3", "python"] {
+        let path = PathBuf::from(name);
+        if python_has_pil(&path) {
+            return Ok(path);
+        }
+    }
+    provision_materials_python(app)
+}
+
+/// 定位材料排版脚本：安装包资源（`resources/process_images` 或 `_up_/tools`）→ 仓库 `tools/process_images`。
+pub(crate) fn materials_script(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
+    if let Ok(root) = app.path().resource_dir() {
+        for rel in ["resources/process_images", "_up_/tools/process_images"] {
+            let candidate = root.join(rel).join(name);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            roots.push(dir.to_path_buf());
+        }
+    }
+    for root in roots {
+        let mut dir = Some(root);
+        while let Some(current) = dir {
+            let candidate = current.join("tools").join("process_images").join(name);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+            dir = current.parent().map(Path::to_path_buf);
+        }
+    }
+    Err(format!(
+        "未找到排版脚本 {name}：既不在安装包资源里，也不在仓库 tools/process_images 目录下"
+    ))
+}
+
 /// V5 去重验证主流程：拼 CLI 参数 → 跑 demo_dedup.py → 收日志 + 读 manifest。
 #[allow(clippy::too_many_arguments)]
 fn dedup_demo_blocking(
@@ -2297,7 +2428,12 @@ pub struct InstallRuntimeReport {
 /// 期间每 0.4 秒轮询一次落盘大小并上报 `install-progress`；
 /// 总大小先用 HEAD 请求探测 content-length，探测不到就只报已下载量。
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-fn download_file(app: &AppHandle, component: &str, url: &str, target: &Path) -> Result<(), String> {
+pub(crate) fn download_file(
+    app: &AppHandle,
+    component: &str,
+    url: &str,
+    target: &Path,
+) -> Result<(), String> {
     let total = probe_content_length(url);
     emit_install_progress(app, component, "connecting", "连接下载源", total, 0);
     let mut command = std::process::Command::new(CURL_PROGRAM);

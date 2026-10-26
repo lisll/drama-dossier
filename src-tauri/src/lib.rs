@@ -16,6 +16,7 @@ mod dossier;
 mod erase;
 mod jianying;
 mod logging;
+mod models_install;
 mod mount;
 mod paths;
 mod toolbox;
@@ -413,6 +414,7 @@ pub fn run() {
             toolbox::transcode_stop,
             toolbox::dedup_demo_execute,
             toolbox::install_runtime,
+            models_install::install_content_models,
             dossier::generate_mount_copy_csv,
             dossier::load_mount_copy,
             dossier::save_mount_copy,

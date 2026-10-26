@@ -2208,6 +2208,14 @@ function renderEnvChip(status) {
   );
   const chip = $("#env-chip");
   chip.classList.remove("ok", "warn", "error");
+  if (!missing.length && status.models && !status.models.ready) {
+    // 转码链路齐了但内容模型（ASR/OCR）缺失：warn 级，不阻断转码，只影响材料质量。
+    chip.classList.add("warn");
+    chip.textContent = "内容模型未就绪";
+    chip.title = status.models.guidance || "ASR/OCR 未安装：报审材料的剧名与简介只能凭剧名盲写。点击查看本机环境详情。";
+    $("#env-chip-detail").textContent = chip.title;
+    return;
+  }
   if (!missing.length) {
     chip.classList.add("ok");
     chip.textContent = "本机环境就绪";
@@ -2232,25 +2240,34 @@ function renderEnvBanner(status) {
   const tools = [status.ffmpeg, status.ffprobe];
   const missing = tools.filter((tool) => !tool.found || !tool.ok);
   const node = $("#env-banner");
-  if (!missing.length) {
-    // 就绪后不占版面；完整探测结果在「设置 → 本机环境」。
-    node.classList.add("hidden");
-    node.innerHTML = "";
-    return;
-  }
   node.classList.remove("hidden", "ok", "warn", "error");
-  node.classList.add("error");
-  const missingText = `运行环境未就绪：缺少 ${esc(
-    missing.map((tool) => tool.name).join("、"),
-  )}。`;
-  if (status.installSupported !== true) {
-    // 没有下载源时不给按钮：点了必然报错，比不提供入口更糟。
-    node.innerHTML = `${missingText}${esc(
-      manualInstallHint(status.platform),
-    )}装好后在「设置 → 本机环境」点「重新检测」。`;
+  if (missing.length) {
+    node.classList.add("error");
+    const missingText = `运行环境未就绪：缺少 ${esc(
+      missing.map((tool) => tool.name).join("、"),
+    )}。`;
+    if (status.installSupported !== true) {
+      // 没有下载源时不给按钮：点了必然报错，比不提供入口更糟。
+      node.innerHTML = `${missingText}${esc(
+        manualInstallHint(status.platform),
+      )}装好后在「设置 → 本机环境」点「重新检测」。`;
+      return;
+    }
+    node.innerHTML = `${missingText}点击「一键配置运行环境」自动下载安装（约 25 MB，需要网络）；也可以在「设置 → 本机环境」手动指定路径。<button id="env-install" class="ghost">一键配置运行环境</button>`;
     return;
   }
-  node.innerHTML = `${missingText}点击「一键配置运行环境」自动下载安装（约 25 MB，需要网络）；也可以在「设置 → 本机环境」手动指定路径。<button id="env-install" class="ghost">一键配置运行环境</button>`;
+  if (status.models && !status.models.ready) {
+    node.classList.add("warn");
+    const reason = esc(
+      status.models.guidance ||
+        "ASR/OCR 未安装，报审材料的剧名与简介只能凭剧名盲写。",
+    );
+    node.innerHTML = `${reason}点击「一键安装内容模型」自动下载安装（ASR 运行时与模型约 200~600 MB，需要网络）。<button id="env-models-install" class="ghost">一键安装内容模型</button>`;
+    return;
+  }
+  // 就绪后不占版面；完整探测结果在「设置 → 本机环境」。
+  node.classList.add("hidden");
+  node.innerHTML = "";
 }
 
 // 一键配置运行环境：后台自动下载安装 ffmpeg/ffprobe 并写回设置，无需手动配置。
@@ -2376,6 +2393,63 @@ $("#install-close").addEventListener("click", () =>
   $("#install-overlay").classList.add("hidden"),
 );
 
+// 一键安装内容模型（ASR whisper + OCR tesseract）：与 runtimeInstall 同一套
+// 进度弹窗交互；组件软失败（一边失败不影响另一边），完成后自动重测环境。
+async function installContentModels() {
+  openInstallModal();
+  const buttons = [
+    ...document.querySelectorAll("#models-install, #env-models-install"),
+  ];
+  const original = new Map(buttons.map((button) => [button, button.textContent]));
+  for (const button of buttons) {
+    button.disabled = true;
+    button.textContent = "正在安装…";
+  }
+  const unlisten = await tauriEvent.listen("install-progress", (event) =>
+    handleInstallProgress(event.payload),
+  );
+  try {
+    const report = await call("install_content_models");
+    const bar = $("#install-bar");
+    bar.classList.remove("indeterminate");
+    bar.style.width = "100%";
+    $("#install-percent").textContent = "100%";
+    $("#install-component").textContent = "完成";
+    $("#install-subtitle").textContent = report.note || "内容模型安装流程结束。";
+    // 部分失败时用红色 toast 明示哪个组件没装上；全成才提示成功。
+    if (report.messages?.length) {
+      toast(report.messages.join("；"), true);
+    } else {
+      toast(report.note || "ASR 与 OCR 均已就绪。");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    $("#install-overlay").classList.add("hidden");
+  } catch (error) {
+    failInstallModal(error);
+  } finally {
+    unlisten();
+    for (const button of buttons) {
+      button.disabled = false;
+      button.textContent = original.get(button);
+    }
+    await loadSettings();
+    await checkRuntime(true);
+  }
+}
+
+// 横幅与设置页模型区的按钮都是动态渲染的，用委托绑定。
+document.addEventListener("click", (event) => {
+  if (event.target instanceof Element && event.target.id === "env-models-install") {
+    installContentModels();
+  }
+});
+const modelListNode = $("#model-runtime-list");
+modelListNode?.addEventListener("click", (event) => {
+  if (event.target instanceof Element && event.target.id === "models-install") {
+    installContentModels();
+  }
+});
+
 function renderRuntimeList(status) {
   const tools = [status.ffmpeg, status.ffprobe];
   const missing = tools.filter((tool) => !tool.found || !tool.ok);
@@ -2406,7 +2480,7 @@ function renderRuntimeList(status) {
       ? `<div class="${status.models.ready ? "status-ready" : "runtime-error"}" style="padding:.5rem .65rem">
            ${status.models.ready
              ? "内容模型就绪：材料线程将在深度处理开始时并行运行。"
-             : esc(status.models.guidance)}
+             : `${esc(status.models.guidance)}<button id="models-install" class="ghost" style="margin-top:.4rem">一键安装内容模型</button>`}
          </div>`
       : '<div class="empty">尚未检测。</div>';
   }

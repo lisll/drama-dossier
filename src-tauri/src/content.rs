@@ -313,6 +313,17 @@ fn extract_episode(
         .build_command(&asr_program, runtime.asr.ok)
         .map_err(|error| error.to_string())?;
     spec.timeout = Some(Duration::from_secs(ASR_TIMEOUT_SECS));
+    // whisper CLI 解码音频统一走 PATH 上的 ffmpeg；GUI 进程 PATH 很干净，
+    // 把当前解析出的 ffmpeg 所在目录前置注入，避免 Windows 打包版报找不到 ffmpeg。
+    if let Some(ffmpeg_dir) = ffmpeg.parent() {
+        let chained = std::env::join_paths(
+            std::iter::once(ffmpeg_dir.to_path_buf())
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
+        )
+        .map(|value| value.display().to_string())
+        .unwrap_or_default();
+        spec.env.push(("PATH".into(), chained));
+    }
     let output = runner
         .run_cancellable(&spec, &crate::toolbox::transcode_cancelled)
         .map_err(|error| format!("ASR 执行失败：{error}"))?;
@@ -613,39 +624,114 @@ fn write_ai_proof(
     process_count: usize,
 ) -> Result<PathBuf, String> {
     let version = app.package_info().version.to_string();
-    let line = |label: &str, value: Option<&str>, source: &str| {
-        format!("{label}：{}\n来源：{source}\n", value.unwrap_or("未填写"))
+    let payload = json!({
+        "date": local_date_string(),
+        "version": version,
+        "dramaName": context.drama_name,
+        "originalEpisodes": context.original_episodes,
+        "encoder": context.encoder,
+        "processing": format!(
+            "按场景切点重组分集并逐集微帧，编码 {}。",
+            context.encoder
+        ),
+        "evidence": evidence.map_or_else(
+            || "未提取（ASR/OCR 未就绪或未启用）".to_string(),
+            |value| format!("本地 ASR/OCR，共 {} 集", value.episodes.len())
+        ),
+        "title": title.unwrap_or_default(),
+        "titleSource": title_source,
+        "synopsis": synopsis.unwrap_or_default(),
+        "synopsisSource": synopsis_source,
+        "posterName": poster
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or_default(),
+        "posterSource": poster_source,
+        "posterPath": poster
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        "processCount": process_count,
+        "storyboardSource": storyboard_source,
+    });
+    // 优先出图片证明；排版 Python 不可用时退回文本版，保证证明文件不缺位。
+    if let Ok(path) = write_ai_proof_image(app, output_dir, &payload) {
+        return Ok(path);
+    }
+    write_ai_proof_text(output_dir, &payload)
+}
+
+/// 调 Pillow 脚本把证明字段渲染成 `AI制作证明.png`（toolbox 兜底证明复用）。
+pub(crate) fn write_ai_proof_image(
+    app: &AppHandle,
+    output_dir: &Path,
+    payload: &serde_json::Value,
+) -> Result<PathBuf, String> {
+    let data_path = output_dir.join(".proof-data.json");
+    std::fs::write(&data_path, payload.to_string())
+        .map_err(|error| format!("写入证明数据失败（{}）：{error}", data_path.display()))?;
+    let cleanup = |error: String| {
+        let _ = std::fs::remove_file(&data_path);
+        error
+    };
+    let python = crate::toolbox::locate_materials_python(app).map_err(cleanup)?;
+    let script = crate::toolbox::materials_script(app, "make_proof_image.py").map_err(cleanup)?;
+    let output_path = output_dir.join("AI制作证明.png");
+    let spec = CommandSpec::new(python.display().to_string())
+        .arg(script.display().to_string())
+        .args(["--data", &data_path.display().to_string()])
+        .args(["--output", &output_path.display().to_string()])
+        .timeout(Duration::from_secs(120));
+    let output = SystemRunner::new()
+        .run(&spec)
+        .map_err(|error| cleanup(format!("证明图片进程启动失败：{error}")))?;
+    let _ = std::fs::remove_file(&data_path);
+    if !output.success() {
+        let mut tail: Vec<&str> = output.stderr.lines().rev().take(3).collect();
+        tail.reverse();
+        let tail = tail.join("\n");
+        return Err(format!(
+            "证明图片脚本退出码 {}：{}",
+            output.code_label(),
+            if tail.is_empty() { "（无输出）" } else { &tail }
+        ));
+    }
+    if !output_path.is_file() {
+        return Err("证明图片脚本未产出文件".into());
+    }
+    Ok(output_path)
+}
+
+/// 兜底文本版证明：字段拼成 `AI制作证明.txt`（排版 Python 不可用时）。
+pub(crate) fn write_ai_proof_text(
+    output_dir: &Path,
+    payload: &serde_json::Value,
+) -> Result<PathBuf, String> {
+    crate::logging::log_event(
+        "材料",
+        "AI 制作证明图片生成失败，已退回文本版（材料排版 Python 环境不可用）",
+    );
+    let get = |key: &str| payload[key].as_str().unwrap_or_default();
+    let line = |label: &str, value: &str, source: &str| {
+        format!("{label}：{}\n来源：{source}\n", if value.is_empty() { "未填写" } else { value })
     };
     let mut body = String::new();
     body.push_str("AI 制作证明\n\n");
-    body.push_str(&format!("生成日期：{}（本地时间）\n", local_date_string()));
-    body.push_str(&format!("制作工具：DramaDossier v{version}\n"));
+    body.push_str(&format!("生成日期：{}（本地时间）\n", get("date")));
+    body.push_str(&format!("制作工具：DramaDossier v{}\n", get("version")));
     body.push_str(&format!(
         "原剧目：{}（原始素材 {} 集）\n",
-        context.drama_name, context.original_episodes
+        get("dramaName"),
+        payload["originalEpisodes"].as_u64().unwrap_or(0)
     ));
+    body.push_str(&format!("处理方式：{}\n\n", get("processing")));
+    body.push_str(&format!("内容证据：{}\n\n", get("evidence")));
+    body.push_str(&line("剧名", get("title"), get("titleSource")));
+    body.push_str(&line("简介", get("synopsis"), get("synopsisSource")));
+    body.push_str(&line("海报", get("posterName"), get("posterSource")));
     body.push_str(&format!(
-        "处理方式：按场景切点重组分集并逐集微帧，编码 {}。\n",
-        context.encoder
-    ));
-    body.push_str(&format!(
-        "内容证据：{}\n\n",
-        evidence.map_or_else(
-            || "未提取（ASR/OCR 未就绪或未启用）".to_string(),
-            |value| format!("本地 ASR/OCR，共 {} 集", value.episodes.len())
-        )
-    ));
-    body.push_str(&line("剧名", title, title_source));
-    body.push_str(&line("简介", synopsis, synopsis_source));
-    body.push_str(&line(
-        "海报",
-        poster
-            .and_then(|path| path.file_name())
-            .and_then(|name| name.to_str()),
-        poster_source,
-    ));
-    body.push_str(&format!(
-        "过程图：已生成 {process_count} 张（画面抽自原始素材代表集）\n来源：{storyboard_source}\n\n"
+        "过程图：已生成 {} 张（画面抽自原始素材代表集）\n来源：{}\n\n",
+        payload["processCount"].as_u64().unwrap_or(0),
+        get("storyboardSource"),
     ));
     body.push_str(
         "AI 声明：本目录中的剧名、简介、海报与过程图由人工智能辅助生成或整理，\
@@ -685,9 +771,6 @@ fn generate_process_images(
     ffmpeg: &Path,
     episodes: &[ProbedEpisode],
     output_dir: &Path,
-    title: &str,
-    summaries: &[String],
-    poster: Option<&Path>,
 ) -> Result<Vec<PathBuf>, String> {
     let frames_dir = output_dir.join(".material-frames");
     let _ = std::fs::remove_dir_all(&frames_dir);
@@ -698,6 +781,7 @@ fn generate_process_images(
     std::fs::create_dir_all(&frames_dir)
         .map_err(|error| format!("创建过程图帧目录失败：{error}"))?;
     let mut frames = Vec::new();
+    let mut labels = Vec::new();
     for slot in 0..4usize {
         if crate::toolbox::transcode_cancelled() {
             let _ = std::fs::remove_dir_all(&frames_dir);
@@ -732,31 +816,25 @@ fn generate_process_images(
                 let _ = std::fs::remove_dir_all(&frames_dir);
                 return Err(format!("抽取过程图帧失败：{error}"));
             }
+            // 帧的真实出处（集号 + 集内时间码），脚本渲染成右上角角标。
+            let seconds = (duration * percent) as u64;
+            labels.push(format!(
+                "第{}集 {:02}:{:02}",
+                slot + 1,
+                seconds / 60,
+                seconds % 60
+            ));
             frames.push(path);
         }
     }
-    let summaries_path = frames_dir.join("summaries.json");
-    std::fs::write(
-        &summaries_path,
-        json!({ "summaries": summaries }).to_string(),
-    )
-    .map_err(|error| format!("写入分镜概要失败：{error}"))?;
-    let python = crate::toolbox::locate_cloud_python()?;
-    let script = python
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .map(|root| root.join("tools/process_images/make_process_images.py"))
-        .ok_or_else(|| "无法从 Python 路径推断过程图脚本".to_string())?;
-    if !script.is_file() {
-        let _ = std::fs::remove_dir_all(&frames_dir);
-        return Err(format!("过程图脚本缺失：{}", script.display()));
-    }
+    let python = crate::toolbox::locate_materials_python(app)?;
+    let script = crate::toolbox::materials_script(app, "make_process_images.py")
+        .inspect_err(|_| {
+            let _ = std::fs::remove_dir_all(&frames_dir);
+        })?;
     let spec = CommandSpec::new(python.display().to_string())
         .arg(script.display().to_string())
         .args(["--output-dir", &output_dir.display().to_string()])
-        .args(["--title", title])
-        .args(["--episode-label", "全剧抽样"])
         .args([
             "--frames",
             &frames
@@ -765,11 +843,7 @@ fn generate_process_images(
                 .collect::<Vec<_>>()
                 .join(","),
         ])
-        .args([
-            "--poster",
-            &poster.map(|p| p.display().to_string()).unwrap_or_default(),
-        ])
-        .args(["--summaries", &summaries_path.display().to_string()])
+        .args(["--labels", &labels.join("|")])
         .timeout(Duration::from_secs(120));
     let output = SystemRunner::new().run(&spec).map_err(|error| {
         let _ = std::fs::remove_dir_all(&frames_dir);
@@ -943,14 +1017,28 @@ fn material_pipeline_blocking(
         "material-progress",
         json!({
             "stage": "ai",
-            "label": if llm_ready { "材料线程：正在生成剧名、简介与分镜" } else { "材料线程：LLM 未配置，整理已有文案" },
+            "label": if llm_ready { "材料线程：正在生成剧名与简介" } else { "材料线程：LLM 未配置，整理已有文案" },
         }),
     );
     let identity = if llm_ready {
         let context = evidence
             .as_ref()
             .map(evidence_prompt)
-            .unwrap_or_else(|| format!("剧目目录名：{}", proof.drama_name));
+            .unwrap_or_else(|| {
+                // ASR/OCR 不可用时至少给出剧目目录名、集数与已有文案，
+                // 否则模型拿不到任何剧情线索，只能输出空洞的模板话。
+                let mut context = format!(
+                    "剧目目录名：{}；原始素材 {} 集。",
+                    proof.drama_name, proof.original_episodes
+                );
+                if let Some(title) = non_empty(&settings.drama_title) {
+                    context.push_str(&format!("已有剧名：{title}。"));
+                }
+                if let Some(synopsis) = non_empty(&settings.drama_synopsis) {
+                    context.push_str(&format!("已有简介：{synopsis}"));
+                }
+                context
+            });
         match ai::material_identity_blocking(settings, &context) {
             Ok(identity) => Some(identity),
             Err(error) => {
@@ -959,7 +1047,7 @@ fn material_pipeline_blocking(
             }
         }
     } else {
-        messages.push("LLM 未配置，剧名/简介沿用已有内容，分镜使用模板。".into());
+        messages.push("LLM 未配置，剧名/简介沿用已有内容。".into());
         None
     };
 
@@ -1001,25 +1089,8 @@ fn material_pipeline_blocking(
         (None, "未填写（本地模式）".into())
     };
 
-    let identity_ready = identity.is_some();
-    let summaries = identity
-        .map(|identity| identity.summaries)
-        .unwrap_or_else(|| {
-            (0..4)
-                .map(|index| {
-                    format!(
-                        "《{}》分镜 {}：剧情推进，冲突升级，关键情节在画面中心展开。",
-                        proof.drama_name,
-                        index + 1
-                    )
-                })
-                .collect()
-        });
-    let storyboard_source = if identity_ready {
-        llm_label
-    } else {
-        "模板生成（未获得 AI 分镜）".into()
-    };
+    // 过程图不再携带分镜概要文字（纯原片帧 + 角标），来源固定为原始素材抽帧。
+    let storyboard_source = "原始素材抽帧".to_string();
 
     let old_poster = existing_poster(settings, output_dir);
     let text_changed = title != existing_title || synopsis != existing_synopsis;
@@ -1078,15 +1149,7 @@ fn material_pipeline_blocking(
             "label": "材料线程：正在生成过程图",
         }),
     );
-    let process_images = match generate_process_images(
-        app,
-        ffmpeg,
-        episodes,
-        output_dir,
-        title.as_deref().unwrap_or(&proof.drama_name),
-        &summaries,
-        poster.as_deref(),
-    ) {
+    let process_images = match generate_process_images(app, ffmpeg, episodes, output_dir) {
         Ok(paths) => paths,
         Err(error) => {
             messages.push(format!("过程图生成失败：{error}"));

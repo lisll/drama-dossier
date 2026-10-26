@@ -72,7 +72,9 @@ fn build_text_prompt(kind: TextKind, context: &str) -> (String, String) {
         TextKind::Synopsis => (
             "你是短剧报审材料的简介撰写。只输出一段简介正文，不要标题、不要分点。".to_string(),
             format!(
-                "请根据以下剧情素材写一段 100 字以内的短剧简介，突出冲突与看点：\n{context}"
+                "请根据以下剧情素材写一段 200 字左右的短剧简介，\
+                 要求交代主角设定与目标、核心冲突如何升级、关键转折与最终结局走向，\
+                 叙事连贯有戏剧张力，不要罗列关键词：\n{context}"
             ),
         ),
     }
@@ -297,47 +299,9 @@ pub(crate) fn poster_blocking(
     save_poster_bytes(output_dir, &bytes)
 }
 
-/// LLM 三项配置是否齐全（供材料阶段判断分镜概要走 AI 还是模板）。
+/// LLM 三项配置是否齐全（供材料阶段判断剧名/简介走 AI 还是沿用已有内容）。
 pub(crate) fn storyboard_llm_ready(settings: &AppSettings) -> bool {
     llm_config(settings).is_ok()
-}
-
-/// 生成过程图所需的 4 段分镜概要：一次 chat 调用产出 JSON 数组。
-///
-/// 失败（未配置/网络/解析）由调用方兜底为模板文字，不阻塞深度处理主流程。
-pub(crate) fn storyboard_summaries_blocking(
-    settings: &AppSettings,
-    drama_title: &str,
-    episode_label: &str,
-) -> Result<Vec<String>, String> {
-    let (base, key, model) = llm_config(settings)?;
-    let system = "你是短剧分镜师。只输出一个 JSON 对象，格式为 {\"summaries\": [\"...\", \"...\", \"...\", \"...\"]}，恰好 4 个元素，每个元素不超过 40 个汉字，描述一个分镜片段的画面与冲突，不要输出任何其他内容。";
-    let user = format!("剧名《{drama_title}》，当前处理到 {episode_label}。请给出 4 段分镜概要。");
-    let body = chat_blocking(&base, &key, &model, system, &user)?;
-    parse_storyboard_summaries(&body)
-}
-
-/// 解析分镜概要 JSON（容忍代码围栏；离线单测覆盖）。
-fn parse_storyboard_summaries(body: &str) -> Result<Vec<String>, String> {
-    let cleaned = body
-        .trim()
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim();
-    let value: serde_json::Value = serde_json::from_str(cleaned)
-        .map_err(|error| format!("分镜概要 JSON 解析失败：{error}"))?;
-    let items = value["summaries"]
-        .as_array()
-        .ok_or_else(|| "分镜概要响应缺少 summaries 数组".to_string())?;
-    let out: Vec<String> = items
-        .iter()
-        .filter_map(|item| item.as_str().map(str::to_string))
-        .collect();
-    if out.len() < 4 {
-        return Err(format!("分镜概要不足 4 段（实际 {} 段）", out.len()));
-    }
-    Ok(out)
 }
 
 /// 自动材料流水线用的组合文本结果。
@@ -345,17 +309,17 @@ fn parse_storyboard_summaries(body: &str) -> Result<Vec<String>, String> {
 pub(crate) struct MaterialIdentity {
     pub title: String,
     pub synopsis: String,
-    pub summaries: Vec<String>,
 }
 
-/// 根据视频内容证据一次性生成剧名、简介与分镜概要。
+/// 根据视频内容证据一次性生成剧名与简介。
 pub(crate) fn material_identity_blocking(
     settings: &AppSettings,
     content_evidence: &str,
 ) -> Result<MaterialIdentity, String> {
     let (base, key, model) = llm_config(settings)?;
     let system = "你是短剧报审材料策划。只输出一个 UTF-8 JSON 对象，不要 Markdown、解释或代码围栏。\
-                  格式：{\"title\":\"8~12字剧名\",\"synopsis\":\"100字内简介\",\"summaries\":[\"4个40字内分镜概要\"]}。\
+                  格式：{\"title\":\"8~12字剧名\",\"synopsis\":\"200字左右简介\"}。\
+                  synopsis 要写成完整故事弧线：主角设定与目标、核心冲突、升级与转折、结局走向，叙事连贯。\
                   内容必须只依据用户提供的视频转写与画面文字证据，不得编造证据之外的关键情节。";
     let user = format!("以下是视频内容证据：\n{content_evidence}\n请生成报审材料。");
     let body = chat_blocking(&base, &key, &model, system, &user)?;
@@ -386,22 +350,9 @@ pub(crate) fn parse_material_identity(body: &str) -> Result<MaterialIdentity, St
             .map(str::to_string)
             .ok_or_else(|| format!("材料 JSON 缺少 {key}"))
     };
-    let title = required("title")?;
-    let synopsis = required("synopsis")?;
-    let summaries = value["summaries"]
-        .as_array()
-        .ok_or_else(|| "材料 JSON 缺少 summaries 数组".to_string())?
-        .iter()
-        .filter_map(|item| item.as_str().map(|text| text.trim().to_string()))
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>();
-    if summaries.len() < 4 {
-        return Err("材料 JSON 的 summaries 至少需要 4 段".into());
-    }
     Ok(MaterialIdentity {
-        title,
-        synopsis,
-        summaries,
+        title: required("title")?,
+        synopsis: required("synopsis")?,
     })
 }
 
@@ -491,32 +442,25 @@ mod tests {
 
     #[test]
     fn parse_material_identity_accepts_fenced_json() {
-        let body = "```json\n{\"title\":\"雪夜进山\",\"synopsis\":\"医生被困山村。\",\
-                    \"summaries\":[\"甲\",\"乙\",\"丙\",\"丁\"]}\n```";
+        let body = "```json\n{\"title\":\"雪夜进山\",\"synopsis\":\"医生被困山村。\"}\n```";
         let parsed = parse_material_identity(body).unwrap();
         assert_eq!(parsed.title, "雪夜进山");
         assert_eq!(parsed.synopsis, "医生被困山村。");
-        assert_eq!(parsed.summaries, vec!["甲", "乙", "丙", "丁"]);
     }
 
     #[test]
     fn parse_material_identity_accepts_json_wrapped_in_prose() {
         let body = "已根据视频证据生成材料：\n\
-                    {\"title\":\"雪夜进山\",\"synopsis\":\"医生被困山村。\",\
-                    \"summaries\":[\"甲\",\"乙\",\"丙\",\"丁\"]}\n\
+                    {\"title\":\"雪夜进山\",\"synopsis\":\"医生被困山村。\"}\n\
                     以上内容仅供参考。";
         let parsed = parse_material_identity(body).unwrap();
         assert_eq!(parsed.title, "雪夜进山");
         assert_eq!(parsed.synopsis, "医生被困山村。");
-        assert_eq!(parsed.summaries, vec!["甲", "乙", "丙", "丁"]);
     }
 
     #[test]
     fn parse_material_identity_requires_complete_fields() {
         assert!(parse_material_identity(r#"{"title":"只有标题"}"#).is_err());
-        assert!(parse_material_identity(
-            r#"{"title":"标题","synopsis":"简介","summaries":["甲","乙","丙"]}"#
-        )
-        .is_err());
+        assert!(parse_material_identity(r#"{"title":"标题","synopsis":"  "}"#).is_err());
     }
 }

@@ -1,41 +1,35 @@
 # -*- coding: utf-8 -*-
-"""过程图排版：把抽帧与分镜概要文字合成为 4 张「AI 工作台」风格的报审过程图。
+"""过程图排版：把原片抽帧输出为 4 张竖屏单帧图，观感对齐剪辑软件导出的分镜帧。
 
-设计对齐 Grove-Max 产物形态（黑底工作台界面：左资产栏 / 中分镜概要卡 / 右视频分镜帧），
-纯本地 Pillow 排版，不依赖网络。调用方（桌面端深度处理流程）传入：
+设计原则（对齐 Grove-Max 的「分镜图帧」形态）：不用任何界面化排版——
+每张过程图就是一张**原片帧原样输出**（原生画面与硬字幕都保留），
+仅在右上角叠一枚半透明小标签（集内时间码 · 分辨率），像剪辑师
+从时间线上随手导出的帧。调用方（桌面端深度处理流程）传入：
 
     python make_process_images.py \
         --output-dir <产物目录> \
         --title <剧名> \
-        --episode-label <"第03集"> \
-        --frames <逗号分隔的 12 张帧图路径> \
-        --poster <海报路径，可选> \
-        --summaries <概要 JSON 文件路径，可选>
+        --episode-label <"全剧抽样"> \
+        --frames <逗号分隔的候选帧（12 张左右，可乱序多源）> \
+        --labels <竖线分隔的帧标签，与帧一一对应（如 "第2集 · 01:23"）> \
+        --poster <可选，忽略> \
+        --summaries <可选，忽略>
 
-输出：<output-dir>/过程图_01.png ~ 过程图_04.png，退出码 0；参数/文件异常时以中文报错退出 1。
+选帧：按亮度过滤黑场/纯色帧后均匀取 4 张（不足时允许复用，取最亮的补位）。
+输出：<output-dir>/过程图_01.png ~ 过程图_04.png，退出码 0；异常时中文报错退出 1。
 """
 
 import argparse
-import json
 import os
 import sys
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps
-
-# 画布与配色（与 Grove 产物截图观感一致：深底、绿点缀、灰层级）。
-CANVAS_W, CANVAS_H = 1600, 1000
-BG = (11, 11, 14)
-PANEL = (22, 22, 27)
-PANEL_LINE = (44, 44, 52)
-TEXT_MAIN = (232, 232, 236)
-TEXT_SUB = (150, 150, 160)
-ACCENT = (52, 199, 123)
-CHIP_BG = (34, 34, 40)
-SUBTITLE_BG = (240, 240, 244)
-SUBTITLE_FG = (24, 24, 28)
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageStat
 
 IMAGE_COUNT = 4
-FRAMES_PER_IMAGE = 3
+# 亮度阈值：均值低于它视为黑场/转场帧，不作为过程图素材。
+MIN_MEAN_BRIGHTNESS = 22.0
+# 竖屏判定：帧高明显大于宽才算竖屏原片帧，否则（异常横屏素材）裁成 9:16。
+MIN_FRAMES = IMAGE_COUNT
 
 
 def fail(message):
@@ -54,187 +48,139 @@ def probe_font(candidates, size):
     return ImageFont.load_default()
 
 
-def font(size, bold=False):
-    """加载中文字体：macOS 优先苹方，Windows 优先微软雅黑。"""
+def font(size):
     candidates = [
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/STHeiti Light.ttc",
-        "C:/Windows/Fonts/msyhbd.ttc" if bold else "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/msyh.ttc",
         "C:/Windows/Fonts/simhei.ttf",
     ]
     return probe_font(candidates, size)
 
 
-def load_image(path, box_w, box_h):
-    """居中裁剪到目标比例并缩放；文件缺失/损坏返回 None，由调用方画占位。"""
+def mean_brightness(image):
+    """灰度均值（0~255）：黑场与全白转场卡都会被过滤。"""
+    gray = image.convert("L").resize((32, 32))
+    return ImageStat.Stat(gray).mean[0]
+
+
+def load_frame(path):
+    """读帧：缺失/损坏返回 None。返回 (PIL.Image, 标签用的宽高)。"""
     if not path or not os.path.isfile(path):
         return None
     try:
         with Image.open(path) as source:
-            return ImageOps.fit(source.convert("RGB"), (box_w, box_h))
+            frame = source.convert("RGB")
+            return frame
     except OSError:
         return None
 
 
-def paste_placeholder(draw, x, y, w, h, label):
-    """图片缺失时的深灰占位块。"""
-    draw.rectangle([x, y, x + w, y + h], fill=(28, 28, 34), outline=PANEL_LINE)
-    draw.text((x + w // 2, y + h // 2), label, font=font(18), fill=TEXT_SUB, anchor="mm")
+def normalize_frame(frame):
+    """竖屏帧原样保留（最真实）；异常横屏帧居中裁成 9:16。"""
+    width, height = frame.size
+    if height > width:
+        return frame
+    target = (int(height * 9 / 16), height)
+    return ImageOps.fit(frame, target)
 
 
-def paste_image(canvas, draw, path, x, y, w, h, label):
-    image = load_image(path, w, h)
-    if image is None:
-        paste_placeholder(draw, x, y, w, h, label)
-        return
-    canvas.paste(image, (x, y))
-    draw.rectangle([x, y, x + w, y + h], outline=PANEL_LINE)
+def pick_frames(paths, labels):
+    """从候选帧中选出 IMAGE_COUNT 张：过滤坏帧/黑场，按来源分组取样。
+
+    候选帧的组织是「若干抽样来源 × 每源多帧」（如 4 集 × 10%/40%/70%），
+    因此均分成 4 组、每组取中间一帧，保证 4 张图来自不同片段而非同一位置。
+    返回 [(frame, label)]；候选全部不可用时返回空列表。
+    """
+    candidates = []
+    for index, path in enumerate(paths):
+        frame = load_frame(path)
+        if frame is None:
+            continue
+        if mean_brightness(frame) < MIN_MEAN_BRIGHTNESS:
+            continue
+        label = labels[index] if index < len(labels) else ""
+        candidates.append((frame, label))
+    if not candidates:
+        return []
+    if len(candidates) <= IMAGE_COUNT:
+        picked = list(candidates)
+    else:
+        chunk = (len(candidates) + IMAGE_COUNT - 1) // IMAGE_COUNT
+        picked = []
+        for index in range(IMAGE_COUNT):
+            group = candidates[index * chunk:(index + 1) * chunk]
+            if group:
+                picked.append(group[len(group) // 2])
+    # 不足 4 张时用已有候选循环补位，保证产出数量稳定。
+    fill = 0
+    while len(picked) < IMAGE_COUNT and candidates:
+        picked.append(candidates[fill % len(candidates)])
+        fill += 1
+    return picked[:IMAGE_COUNT]
 
 
-def wrap_text(text, per_line):
-    """中文按固定字数折行（概要文字多为中文，按字符数切即可）。"""
-    text = (text or "").strip()
-    return [text[index:index + per_line] for index in range(0, len(text), per_line)] or [""]
+def render(frame, label):
+    """原片帧 + 右上角半透明小标签。"""
+    canvas = normalize_frame(frame)
+    width, height = canvas.size
 
+    tag_parts = []
+    if label:
+        tag_parts.append(label)
+    tag_parts.append(f"{width}×{height}")
+    tag_text = "  ".join(tag_parts)
+    tag_font = font(max(22, width // 44))
 
-def fake_timecode(index):
-    """每张图一个确定的伪时间码（同参数重跑输出一致）。"""
-    return f"01:{40 + index * 7:02d}:{(13 + index * 17) % 60:02d}"
-
-
-def chip(draw, x, y, text, chip_font):
-    width = int(chip_font.getlength(text)) + 24
-    draw.rounded_rectangle([x, y, x + width, y + 30], radius=15, fill=CHIP_BG)
-    draw.text((x + 12, y + 15), text, font=chip_font, fill=TEXT_SUB, anchor="lm")
-    return x + width + 12
-
-
-def render_image(index, title, episode_label, frames, poster, summary):
-    """渲染第 index（0 起）张过程图。"""
-    canvas = Image.new("RGB", (CANVAS_W, CANVAS_H), BG)
-    draw = ImageDraw.Draw(canvas)
-    f_title = font(34, bold=True)
-    f_sub = font(20)
-    f_label = font(18)
-    f_body = font(17)
-    f_chip = font(14)
-
-    timecode = fake_timecode(index)
-
-    # ---- 顶栏：剧名 + 集 + 本集概要；右侧制作流程进度（4 段胶囊，当前段高亮）----
-    draw.text((36, 26), title or "未命名短剧", font=f_title, fill=TEXT_MAIN)
-    draw.text(
-        (36 + int(f_title.getlength(title or "未命名短剧")) + 20, 38),
-        f"{episode_label} · 本集概要 · {timecode}",
-        font=f_sub,
-        fill=TEXT_SUB,
+    # 标签底：半透明黑圆角条（RGBA 叠加，观感接近播放器时间码角标）。
+    overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay)
+    text_w = int(tag_font.getlength(tag_text))
+    pad_x, pad_y = width // 60, width // 90
+    box_w = text_w + pad_x * 2
+    box_h = int(tag_font.size * 1.7)
+    x1, y1 = width - pad_x, pad_y
+    x0, y0 = x1 - box_w, y1
+    overlay_draw.rounded_rectangle(
+        [x0, y0, x1, y0 + box_h], radius=box_h // 2, fill=(0, 0, 0, 150)
     )
-    progress_x = CANVAS_W - 36 - (IMAGE_COUNT * 90 - 10)
-    for step in range(IMAGE_COUNT):
-        x0 = progress_x + step * 100
-        fill = ACCENT if step == index else (40, 40, 47)
-        draw.rounded_rectangle([x0, 34, x0 + 90, 46], radius=6, fill=fill)
-    draw.text((CANVAS_W - 36, 62), "制作流程", font=f_label, fill=TEXT_SUB, anchor="ra")
-
-    # ---- 左栏「资产」：海报（或首帧）+ 一张分镜工作空间缩略 ----
-    draw.text((36, 108), "资产", font=f_sub, fill=ACCENT)
-    asset_x, asset_w = 36, 300
-    paste_image(canvas, draw, poster or frames[0], asset_x, 142, asset_w, 400, "资产图")
-    draw.text((asset_x, 556), "角色 / 场景设定", font=f_label, fill=TEXT_SUB)
-    paste_image(canvas, draw, frames[0], asset_x, 592, asset_w, 180, "工作空间")
-    draw.text((asset_x, 786), "分镜工作空间", font=f_label, fill=TEXT_SUB)
-
-    # ---- 中栏「分镜概要」：3 张文字卡（时间码 + 描述 + 标签）----
-    mid_x, mid_w = 356, 660
-    draw.text((mid_x, 108), "分镜概要", font=f_sub, fill=ACCENT)
-    card_gap = 16
-    card_h = (CANVAS_H - 150 - 12 - (FRAMES_PER_IMAGE - 1) * card_gap) // FRAMES_PER_IMAGE
-    lines = wrap_text(summary, 36)
-    for card in range(FRAMES_PER_IMAGE):
-        y0 = 142 + card * (card_h + card_gap)
-        draw.rounded_rectangle(
-            [mid_x, y0, mid_x + mid_w, y0 + card_h], radius=14, fill=PANEL, outline=PANEL_LINE
-        )
-        head_y = y0 + 18
-        draw.ellipse([mid_x + 20, head_y + 8, mid_x + 32, head_y + 20], fill=ACCENT)
-        draw.text(
-            (mid_x + 44, head_y + 14),
-            f"分镜概要 {card + 1}  ·  {timecode}:{card + 1}0",
-            font=f_label,
-            fill=TEXT_MAIN,
-        )
-        for line_index, line in enumerate(lines[:4]):
-            draw.text((mid_x + 24, head_y + 52 + line_index * 28), line, font=f_body, fill=TEXT_SUB)
-        chips_y = y0 + card_h - 44
-        cx = mid_x + 24
-        for chip_text in (f"#{title or '短剧'}", f"#{episode_label}", "#镜头语言"):
-            cx = chip(draw, cx, chips_y, chip_text, f_chip)
-            if cx > mid_x + mid_w - 120:
-                break
-
-    # ---- 右栏「视频分镜」：3 张帧卡（帧 + 底部字幕条）----
-    right_x, right_w = 1036, 528
-    draw.text((right_x, 108), "视频分镜", font=f_sub, fill=ACCENT)
-    frame_h = (CANVAS_H - 150 - 12 - (FRAMES_PER_IMAGE - 1) * card_gap) // FRAMES_PER_IMAGE
-    for slot in range(FRAMES_PER_IMAGE):
-        y0 = 142 + slot * (frame_h + card_gap)
-        frame = frames[(index * FRAMES_PER_IMAGE + slot) % len(frames)]
-        paste_image(canvas, draw, frame, right_x, y0, right_w, frame_h - 44, f"分镜 {slot + 1}")
-        # 字幕条：仿工作台视频卡的底部字幕样式。
-        bar_y0 = y0 + frame_h - 40
-        draw.rectangle([right_x, bar_y0, right_x + right_w, bar_y0 + 36], fill=SUBTITLE_BG)
-        draw.text(
-            (right_x + right_w // 2, bar_y0 + 18),
-            f"{title or '短剧'} · {episode_label} · 镜头 {slot + 1}",
-            font=f_chip,
-            fill=SUBTITLE_FG,
-            anchor="mm",
-        )
-
-    return canvas
+    canvas = Image.alpha_composite(canvas.convert("RGBA"), overlay)
+    draw = ImageDraw.Draw(canvas)
+    draw.text(
+        (x1 - pad_x, y0 + box_h // 2),
+        tag_text,
+        font=tag_font,
+        fill=(255, 255, 255, 235),
+        anchor="rm",
+    )
+    return canvas.convert("RGB")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="生成 4 张报审过程图")
+    parser = argparse.ArgumentParser(description="生成 4 张竖屏过程图（原片帧）")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--title", default="")
-    parser.add_argument("--episode-label", default="第01集")
-    parser.add_argument("--frames", required=True, help="逗号分隔的帧图路径（建议 12 张）")
-    parser.add_argument("--poster", default="")
-    parser.add_argument("--summaries", default="", help="概要 JSON 文件（{\"summaries\": [...]})")
+    parser.add_argument("--episode-label", default="全剧抽样")
+    parser.add_argument("--frames", required=True, help="逗号分隔的候选帧图路径")
+    parser.add_argument("--labels", default="", help="竖线分隔的帧标签（与帧一一对应）")
+    parser.add_argument("--poster", default="", help="兼容保留，不使用")
+    parser.add_argument("--summaries", default="", help="兼容保留，不使用")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
-    frames = [path for path in args.frames.split(",") if path.strip()]
-    if not frames:
+    paths = [path for path in args.frames.split(",") if path.strip()]
+    if not paths:
         fail("未提供任何帧图路径")
+    # 标签用 | 分隔（时间码文本里可能含逗号）。
+    labels = [label.strip() for label in (args.labels.split("|") if args.labels else [])]
 
-    # 概要文字：JSON 里每图一段；不足 4 段时用模板补齐。
-    summaries = []
-    if args.summaries and os.path.isfile(args.summaries):
-        try:
-            with open(args.summaries, encoding="utf-8") as handle:
-                summaries = json.load(handle).get("summaries", [])
-        except (OSError, ValueError) as error:
-            print(f"概要 JSON 解析失败（{error}），使用模板文字", file=sys.stderr)
-    title = args.title or "未命名短剧"
-    for index in range(IMAGE_COUNT):
-        if index >= len(summaries) or not str(summaries[index]).strip():
-            summaries.append(
-                f"《{title}》{args.episode_label} 分镜 {index + 1}：剧情推进，{fake_timecode(index)} 处关键情节，冲突升级。"
-            )
+    picked = pick_frames(paths, labels)
+    if len(picked) < MIN_FRAMES:
+        fail("可用的候选帧不足（全部缺失或为黑场）")
 
-    for index in range(IMAGE_COUNT):
-        canvas = render_image(
-            index,
-            title,
-            args.episode_label,
-            frames,
-            args.poster,
-            str(summaries[index]),
-        )
+    for index, (frame, label) in enumerate(picked):
         out_path = os.path.join(args.output_dir, f"过程图_{index + 1:02d}.png")
-        canvas.save(out_path)
+        render(frame, label).save(out_path)
         print(f"已生成 {out_path}")
 
 
