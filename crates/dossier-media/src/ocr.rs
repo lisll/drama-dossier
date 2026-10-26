@@ -373,6 +373,11 @@ impl RegionFramePlan {
         runner: &dyn CommandRunner,
         ffmpeg: &str,
     ) -> Result<Vec<PathBuf>, OcrError> {
+        // ffmpeg 的 image2 muxer 不会自动创建目录，输出目录必须先行落盘。
+        std::fs::create_dir_all(&self.output_dir).map_err(|error| OcrError::RunFailed {
+            command: "prepare".to_string(),
+            message: format!("创建抽帧目录 {} 失败：{error}", self.output_dir.display()),
+        })?;
         let spec = self.build_command(ffmpeg)?;
         let output = runner.run(&spec).map_err(|error| OcrError::RunFailed {
             command: spec.display(),
@@ -413,6 +418,13 @@ impl RecognizePlan {
             .run(&CommandSpec::new(tesseract.to_string()).arg("--version"))
             .map(|output| output.success())
             .unwrap_or(false);
+        // tesseract 同样不会创建输出目录：TSV 基路径的父目录必须先行落盘。
+        if let Some(parent) = self.output_base.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| OcrError::RunFailed {
+                command: "prepare".to_string(),
+                message: format!("创建识别输出目录失败：{error}"),
+            })?;
+        }
         let spec = self.build_command(tesseract, available)?;
         let output = runner.run(&spec).map_err(|error| OcrError::RunFailed {
             command: spec.display(),
@@ -672,6 +684,32 @@ mod execute_tests {
         let runner = FakeRunner::new().on("ffmpeg", CommandOutput::new(0, "", ""));
         let error = plan.execute(&runner, "ffmpeg").unwrap_err();
         assert!(matches!(error, OcrError::NoFrames(_)), "{error}");
+    }
+
+    /// 回归：ffmpeg 的 image2 muxer 不会建目录，execute 必须自行创建输出目录，
+    /// 否则真实链路在 `.material-content/01/ocr-frames/` 上报 No such file or directory。
+    #[test]
+    fn execute_creates_the_frame_dir_when_missing() {
+        let (_dir, plan) = frame_plan("mkdir");
+        assert!(!plan.output_dir.exists());
+        let runner = FakeRunner::new().on("ffmpeg", CommandOutput::new(0, "", ""));
+        let error = plan.execute(&runner, "ffmpeg").unwrap_err();
+        assert!(matches!(error, OcrError::NoFrames(_)), "{error}");
+        assert!(plan.output_dir.is_dir(), "execute 应创建抽帧输出目录");
+    }
+
+    /// 回归：tesseract 不建目录，TSV 基路径的父目录必须由 execute 创建。
+    #[test]
+    fn recognize_creates_the_output_dir_when_missing() {
+        let (dir, _plan) = frame_plan("recognize-mkdir");
+        let image = dir.0.join("in.mp4");
+        let output_base = dir.0.join("nested/ocr/frame");
+        let plan = RecognizePlan::new(image, output_base.clone());
+        assert!(!output_base.parent().unwrap().exists());
+        let runner = FakeRunner::new().on("tesseract", CommandOutput::new(0, "", ""));
+        let error = plan.execute(&runner, "tesseract").unwrap_err();
+        assert!(matches!(error, OcrError::OutputMissing(_)), "{error}");
+        assert!(output_base.parent().unwrap().is_dir(), "execute 应创建识别输出目录");
     }
 
     #[test]
