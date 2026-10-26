@@ -316,10 +316,9 @@ fn extract_episode(
     // whisper CLI 解码音频统一走 PATH 上的 ffmpeg；GUI 进程 PATH 很干净，
     // 把当前解析出的 ffmpeg 所在目录前置注入，避免 Windows 打包版报找不到 ffmpeg。
     if let Some(ffmpeg_dir) = ffmpeg.parent() {
-        let chained = std::env::join_paths(
-            std::iter::once(ffmpeg_dir.to_path_buf())
-                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
-        )
+        let chained = std::env::join_paths(std::iter::once(ffmpeg_dir.to_path_buf()).chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+        ))
         .map(|value| value.display().to_string())
         .unwrap_or_default();
         spec.env.push(("PATH".into(), chained));
@@ -692,7 +691,11 @@ pub(crate) fn write_ai_proof_image(
         return Err(format!(
             "证明图片脚本退出码 {}：{}",
             output.code_label(),
-            if tail.is_empty() { "（无输出）" } else { &tail }
+            if tail.is_empty() {
+                "（无输出）"
+            } else {
+                &tail
+            }
         ));
     }
     if !output_path.is_file() {
@@ -712,7 +715,10 @@ pub(crate) fn write_ai_proof_text(
     );
     let get = |key: &str| payload[key].as_str().unwrap_or_default();
     let line = |label: &str, value: &str, source: &str| {
-        format!("{label}：{}\n来源：{source}\n", if value.is_empty() { "未填写" } else { value })
+        format!(
+            "{label}：{}\n来源：{source}\n",
+            if value.is_empty() { "未填写" } else { value }
+        )
     };
     let mut body = String::new();
     body.push_str("AI 制作证明\n\n");
@@ -828,8 +834,8 @@ fn generate_process_images(
         }
     }
     let python = crate::toolbox::locate_materials_python(app)?;
-    let script = crate::toolbox::materials_script(app, "make_process_images.py")
-        .inspect_err(|_| {
+    let script =
+        crate::toolbox::materials_script(app, "make_process_images.py").inspect_err(|_| {
             let _ = std::fs::remove_dir_all(&frames_dir);
         })?;
     let spec = CommandSpec::new(python.display().to_string())
@@ -1021,24 +1027,21 @@ fn material_pipeline_blocking(
         }),
     );
     let identity = if llm_ready {
-        let context = evidence
-            .as_ref()
-            .map(evidence_prompt)
-            .unwrap_or_else(|| {
-                // ASR/OCR 不可用时至少给出剧目目录名、集数与已有文案，
-                // 否则模型拿不到任何剧情线索，只能输出空洞的模板话。
-                let mut context = format!(
-                    "剧目目录名：{}；原始素材 {} 集。",
-                    proof.drama_name, proof.original_episodes
-                );
-                if let Some(title) = non_empty(&settings.drama_title) {
-                    context.push_str(&format!("已有剧名：{title}。"));
-                }
-                if let Some(synopsis) = non_empty(&settings.drama_synopsis) {
-                    context.push_str(&format!("已有简介：{synopsis}"));
-                }
-                context
-            });
+        let context = evidence.as_ref().map(evidence_prompt).unwrap_or_else(|| {
+            // ASR/OCR 不可用时至少给出剧目目录名、集数与已有文案，
+            // 否则模型拿不到任何剧情线索，只能输出空洞的模板话。
+            let mut context = format!(
+                "剧目目录名：{}；原始素材 {} 集。",
+                proof.drama_name, proof.original_episodes
+            );
+            if let Some(title) = non_empty(&settings.drama_title) {
+                context.push_str(&format!("已有剧名：{title}。"));
+            }
+            if let Some(synopsis) = non_empty(&settings.drama_synopsis) {
+                context.push_str(&format!("已有简介：{synopsis}"));
+            }
+            context
+        });
         match ai::material_identity_blocking(settings, &context) {
             Ok(identity) => Some(identity),
             Err(error) => {

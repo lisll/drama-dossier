@@ -2066,11 +2066,9 @@ static MATERIALS_PY_PROVISION_TRIED: AtomicBool = AtomicBool::new(false);
 /// 自动创建 `<app_data>/pyenv` 虚拟环境并安装 Pillow（需要联网，首次约 30~60 秒）。
 fn provision_materials_python(app: &AppHandle) -> Result<PathBuf, String> {
     if MATERIALS_PY_PROVISION_TRIED.swap(true, Ordering::SeqCst) {
-        return Err(
-            "材料排版 Python 环境未就绪（本会话已尝试过自动配置）。\
+        return Err("材料排版 Python 环境未就绪（本会话已尝试过自动配置）。\
              请在网络可用后重试，或点「一键配置运行环境」完成安装。"
-                .into(),
-        );
+            .into());
     }
     let _ = app.emit(
         "material-progress",
@@ -2148,7 +2146,11 @@ fn provision_materials_python(app: &AppHandle) -> Result<PathBuf, String> {
         return Err(format!(
             "Pillow 安装失败（退出码 {}）：{}",
             output.code_label(),
-            if tail.is_empty() { "（无输出）" } else { &tail }
+            if tail.is_empty() {
+                "（无输出）"
+            } else {
+                &tail
+            }
         ));
     }
     if !python_has_pil(&python) {

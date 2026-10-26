@@ -206,10 +206,21 @@ fn install_asr(app: &AppHandle) -> Result<String, String> {
     );
     let pip = python
         .parent()
-        .map(|dir| dir.join(if cfg!(target_os = "windows") { "pip.exe" } else { "pip" }))
+        .map(|dir| {
+            dir.join(if cfg!(target_os = "windows") {
+                "pip.exe"
+            } else {
+                "pip"
+            })
+        })
         .ok_or_else(|| "无法推断 pip 路径".to_string())?;
     let spec = dossier_runtime::CommandSpec::new(pip.display().to_string())
-        .args(["install", "--quiet", "--disable-pip-version-check", "openai-whisper"])
+        .args([
+            "install",
+            "--quiet",
+            "--disable-pip-version-check",
+            "openai-whisper",
+        ])
         .timeout(Duration::from_secs(PIP_INSTALL_TIMEOUT_SECS));
     let output = dossier_runtime::SystemRunner::new()
         .run(&spec)
@@ -225,7 +236,14 @@ fn install_asr(app: &AppHandle) -> Result<String, String> {
     // 3) base 模型：load_model 下到应用目录，设置里用绝对路径加载（不占用户缓存）。
     let model_path = models_dir.join("base.pt");
     if !model_path.is_file() {
-        emit_progress(app, "asr", "downloading", "下载 base 模型（约 140MB）", None, 0);
+        emit_progress(
+            app,
+            "asr",
+            "downloading",
+            "下载 base 模型（约 140MB）",
+            None,
+            0,
+        );
         let snippet = format!(
             "import whisper; whisper.load_model('base', download_root=r'{}')",
             models_dir.display()
@@ -296,7 +314,10 @@ fn install_ocr(app: &AppHandle) -> Result<String, String> {
         .args(["install", "--quiet", "tesseract", "tesseract-lang"])
         .timeout(Duration::from_secs(BREW_INSTALL_TIMEOUT_SECS));
     spec.env = vec![
-        ("PATH".into(), "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".into()),
+        (
+            "PATH".into(),
+            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".into(),
+        ),
         ("HOMEBREW_NO_AUTO_UPDATE".into(), "1".into()),
         ("HOMEBREW_NO_INSTALL_CLEANUP".into(), "1".into()),
         // 国内网络直连 raw.githubusercontent.com 常被重置，formula 拉不下来；
@@ -328,7 +349,10 @@ fn install_ocr(app: &AppHandle) -> Result<String, String> {
     persist_settings(app, |settings| {
         settings.ocr_executable = Some(tesseract.clone());
     })?;
-    crate::logging::log_event("环境", "OCR 安装完成（Homebrew tesseract + tesseract-lang）");
+    crate::logging::log_event(
+        "环境",
+        "OCR 安装完成（Homebrew tesseract + tesseract-lang）",
+    );
     Ok(tesseract.display().to_string())
 }
 
@@ -341,7 +365,14 @@ fn install_ocr(app: &AppHandle) -> Result<String, String> {
     if !tesseract.is_file() {
         let setup = dir.join("tesseract-setup.exe");
         crate::toolbox::download_file(app, "ocr", TESSERACT_SETUP_URL, &setup)?;
-        emit_progress(app, "ocr", "extracting", "静默安装 tesseract（约 1~2 分钟）", None, 0);
+        emit_progress(
+            app,
+            "ocr",
+            "extracting",
+            "静默安装 tesseract（约 1~2 分钟）",
+            None,
+            0,
+        );
         use std::os::windows::process::CommandExt;
         let mut command = std::process::Command::new(&setup);
         command
@@ -405,7 +436,14 @@ fn install_content_models_blocking(app: &AppHandle) -> Result<ContentModelsRepor
         messages: Vec::new(),
         note: String::new(),
     };
-    emit_progress(app, "asr", "connecting", "开始安装 ASR（openai-whisper）", None, 0);
+    emit_progress(
+        app,
+        "asr",
+        "connecting",
+        "开始安装 ASR（openai-whisper）",
+        None,
+        0,
+    );
     match install_asr(app) {
         Ok(path) => report.asr_path = Some(path),
         Err(error) => {
@@ -413,7 +451,14 @@ fn install_content_models_blocking(app: &AppHandle) -> Result<ContentModelsRepor
             report.messages.push(format!("ASR 安装失败：{error}"));
         }
     }
-    emit_progress(app, "ocr", "connecting", "开始安装 OCR（tesseract）", None, 0);
+    emit_progress(
+        app,
+        "ocr",
+        "connecting",
+        "开始安装 OCR（tesseract）",
+        None,
+        0,
+    );
     match install_ocr(app) {
         Ok(path) => report.ocr_path = Some(path),
         Err(error) => {
@@ -423,7 +468,8 @@ fn install_content_models_blocking(app: &AppHandle) -> Result<ContentModelsRepor
     }
     emit_progress(app, "ocr", "finished", "内容模型安装流程结束", Some(0), 0);
     if report.asr_path.is_some() && report.ocr_path.is_some() {
-        report.note = "ASR 与 OCR 均已就绪：到「设置 → 本机环境」点「重新检测」后即可启用材料线程。".into();
+        report.note =
+            "ASR 与 OCR 均已就绪：到「设置 → 本机环境」点「重新检测」后即可启用材料线程。".into();
     } else if !report.messages.is_empty() {
         report.note = "部分组件安装失败，请按提示处理或手动安装。".into();
     }
@@ -434,9 +480,10 @@ fn install_content_models_blocking(app: &AppHandle) -> Result<ContentModelsRepor
 #[tauri::command]
 pub async fn install_content_models(app: AppHandle) -> Result<ContentModelsReport, String> {
     crate::logging::log_event("环境", "开始一键安装内容模型（ASR/OCR）");
-    let result = tauri::async_runtime::spawn_blocking(move || install_content_models_blocking(&app))
-        .await
-        .map_err(|error| format!("内容模型安装任务失败：{error}"))?;
+    let result =
+        tauri::async_runtime::spawn_blocking(move || install_content_models_blocking(&app))
+            .await
+            .map_err(|error| format!("内容模型安装任务失败：{error}"))?;
     crate::logging::log_event(
         "环境",
         crate::logging::result_text(&result, |report| {
