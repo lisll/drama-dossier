@@ -30,7 +30,7 @@ import argparse
 import os
 import sys
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageStat
+from PIL import Image, ImageDraw, ImageFont, ImageStat
 
 IMAGE_COUNT = 4
 # 亮度阈值：均值低于它视为黑场/转场帧，不作为过程图素材。
@@ -87,15 +87,6 @@ def load_frame(path):
         return None
 
 
-def normalize_frame(frame):
-    """竖屏帧原样保留（最真实）；异常横屏帧居中裁成 9:16。"""
-    width, height = frame.size
-    if height > width:
-        return frame
-    target = (int(height * 9 / 16), height)
-    return ImageOps.fit(frame, target)
-
-
 def pick_frames(paths):
     """从候选帧中选出 IMAGE_COUNT 张：过滤坏帧/黑场，按来源分组取样。
 
@@ -130,8 +121,10 @@ def pick_frames(paths):
 
 
 def render(frame, index):
-    """照抄 Grove-Max 分镜图帧卡片：深色卡片 + 标题条（#N · 分辨率）+ 原片帧全出血。"""
-    frame = normalize_frame(frame)
+    """照抄 Grove-Max 分镜图帧卡片：深色卡片 + 标题条（#N · 分辨率）+ 原片帧全出血。
+
+    帧保持原样比例与分辨率（竖屏剧出竖卡，横屏剧出横卡），构图不做任何裁切。
+    """
     width, height = frame.size
 
     font_size = max(22, width // 40)
@@ -174,7 +167,7 @@ def render(frame, index):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="生成 4 张竖屏过程图（分镜图帧卡片）")
+    parser = argparse.ArgumentParser(description="生成 4 张过程图（分镜图帧卡片，比例随素材）")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--title", default="", help="兼容保留，不使用")
     parser.add_argument("--episode-label", default="全剧抽样", help="兼容保留，不使用")
