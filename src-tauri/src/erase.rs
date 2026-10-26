@@ -136,6 +136,7 @@ pub fn plan_erase(
     tool_path: Option<String>,
     ffprobe_path: Option<String>,
 ) -> Result<ErasePlan, String> {
+    crate::license::guard()?;
     ensure_distinct_io(&request)?;
     request.progress_json = Some(erase_progress_path(&request.output));
     // 预览里的命令必须和真正执行的同一条：ffprobe 也在这一步解析好填进去。
@@ -168,6 +169,7 @@ pub async fn run_erase(
     ffprobe_path: Option<String>,
     timeout_seconds: Option<u64>,
 ) -> Result<EraseRun, String> {
+    crate::license::guard()?;
     tauri::async_runtime::spawn_blocking(move || {
         run_erase_blocking(&app, request, tool_path, ffprobe_path, timeout_seconds)
     })

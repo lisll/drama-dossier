@@ -1,0 +1,127 @@
+/* 卡密激活层：未授权时盖住整个界面（高于 toast 的 10 与安装弹窗的 20）。 */
+
+.license-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--surface-2, #f3f5f3);
+  color: var(--text, #1f241f);
+}
+
+.license-card {
+  width: min(460px, 100%);
+  padding: 28px 28px 24px;
+  border: 1px solid var(--line-strong, #d2d9d2);
+  border-radius: 12px;
+  background: var(--surface, #fff);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
+}
+
+.license-card h1 {
+  margin: 0 0 6px;
+  font-size: 20px;
+}
+
+.license-card .license-sub {
+  margin: 0 0 20px;
+  color: var(--muted, #5c665e);
+  font-size: 13px;
+}
+
+.license-card label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 13px;
+  color: var(--muted, #5c665e);
+}
+
+.license-card input {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong, #d2d9d2);
+  border-radius: 8px;
+  font: inherit;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.license-card input:focus-visible,
+.license-card button:focus-visible {
+  outline: 2px solid var(--accent, #1d4d2b);
+  outline-offset: 1px;
+}
+
+.license-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.license-card button {
+  padding: 9px 16px;
+  border: 1px solid var(--line-strong, #d2d9d2);
+  border-radius: 8px;
+  background: var(--surface, #fff);
+  font: inherit;
+  cursor: pointer;
+}
+
+.license-card button.license-primary {
+  flex: 1;
+  border-color: var(--accent-fill, #1d4d2b);
+  background: var(--accent-fill, #1d4d2b);
+  color: #fff;
+}
+
+.license-card button:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+.license-msg {
+  min-height: 1.5em;
+  margin: 12px 0 0;
+  font-size: 13px;
+  color: var(--err-text, #ab3a4b);
+}
+
+.license-msg.ok {
+  color: var(--accent-text, #1d4d2b);
+}
+
+.license-machine {
+  margin-top: 22px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line, #e4e8e4);
+  font-size: 13px;
+  color: var(--muted, #5c665e);
+}
+
+.license-machine-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.license-machine code {
+  flex: 1;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--surface-2, #f3f5f3);
+  color: var(--text, #1f241f);
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  word-break: break-all;
+}
+
+.license-machine button {
+  padding: 5px 10px;
+  font-size: 12px;
+}

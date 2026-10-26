@@ -114,6 +114,7 @@ pub fn export_draft(
     options: Option<DraftExportOptions>,
     ffprobe_path: Option<String>,
 ) -> Result<DraftExportResult, String> {
+    crate::license::guard()?;
     let drama = load_drama(&root, &name)?;
     let episodes = probe_all(&drama, ffprobe_path);
     if episodes.is_empty() {
@@ -142,6 +143,7 @@ pub fn generate_mount_copy_csv(
     output_path: String,
     ffprobe_path: Option<String>,
 ) -> Result<MountCopyWriteResult, String> {
+    crate::license::guard()?;
     let drama = load_drama(&root, &name)?;
     let episodes = probe_all(&drama, ffprobe_path);
     if episodes.is_empty() {
