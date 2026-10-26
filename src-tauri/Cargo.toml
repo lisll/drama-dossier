@@ -1,6 +1,6 @@
 [package]
 name = "drama-dossier"
-version = "0.2.17"
+version = "0.2.18"
 description = "短剧报审材料自动生成工具"
 authors = ["DramaDossier contributors"]
 license = "MIT"

@@ -387,6 +387,7 @@ pub fn run() {
             account::account_change_password,
             ai::ai_generate_text,
             ai::ai_generate_poster,
+            ai::ai_pick_local_poster,
             jianying::jianying_detect,
             mount::mount_plan_save,
             mount::mount_plan_load,

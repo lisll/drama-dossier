@@ -2081,6 +2081,129 @@ textarea {
   word-break: break-all;
 }
 
+/* AI 生成配置行式排版（对照 Grove-Max「生成配置」）：一行一项，右侧统一放生成按钮 */
+.ai-config-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ai-config-row {
+  display: grid;
+  grid-template-columns: 3.5em 1fr auto auto;
+  gap: 10px;
+  align-items: start;
+}
+
+/* AI / 本地 来源开关（对照 Grove-Max「生成配置」的开关）：滑动小开关 + AI 角标 */
+.ai-mode {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding-top: 8px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.ai-mode input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.ai-mode-track {
+  width: 30px;
+  height: 17px;
+  border-radius: 999px;
+  background: var(--border, #d8dbe2);
+  position: relative;
+  transition: background 0.15s ease;
+  flex: none;
+}
+
+.ai-mode-track::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.25);
+  transition: left 0.15s ease;
+}
+
+.ai-mode input:checked + .ai-mode-track {
+  background: var(--accent, #3b6ef5);
+}
+
+.ai-mode input:checked + .ai-mode-track::after {
+  left: 15px;
+}
+
+.ai-mode input:focus-visible + .ai-mode-track {
+  outline: 2px solid var(--accent, #3b6ef5);
+  outline-offset: 2px;
+}
+
+.ai-mode-text {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted, #6b7280);
+}
+
+.ai-mode .ai-mode-text {
+  min-width: 1.4em;
+}
+
+/* 海报行的按钮组：AI 生成与本地选择互斥显示 */
+.poster-actions {
+  display: inline-flex;
+  gap: 6px;
+  align-items: start;
+}
+
+.ai-config-row .ai-config-label {
+  padding-top: 9px;
+  font-weight: 600;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.ai-config-row textarea {
+  resize: vertical;
+  min-height: 2.8em;
+}
+
+.ai-config-row .ai-gen {
+  white-space: nowrap;
+  align-self: start;
+}
+
+/* 海报行：中列放状态徽标 / 预览缩略（较独立展示缩小）/ 占位提示 */
+.ai-config-row .poster-cell {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 38px;
+  flex-wrap: wrap;
+}
+
+.ai-config-row .poster-cell .poster-preview-wrap {
+  margin-top: 0;
+  align-items: center;
+}
+
+.ai-config-row .poster-cell .poster-preview-wrap img {
+  width: 64px;
+}
+
+.ai-config-row .poster-cell .poster-empty {
+  margin: 0;
+}
+
 /* 单卡档位：深度处理独占一行 */
 .mode-cards.single {
   grid-template-columns: 1fr;

@@ -91,6 +91,9 @@ impl HardwareSignal {
     pub fn allows(&self, encoder: &str) -> bool {
         if encoder.ends_with("_nvenc") {
             self.cuda
+        } else if encoder.ends_with("_videotoolbox") {
+            // VideoToolbox 是 macOS 系统框架，不依赖设备节点，随编译进 ffmpeg 即可用。
+            cfg!(target_os = "macos")
         } else if encoder.ends_with("_vaapi") {
             self.vaapi
         } else if encoder.ends_with("_v4l2m2m") {
@@ -102,12 +105,17 @@ impl HardwareSignal {
 
     /// 可读描述（写进决策理由里）。
     pub fn describe(&self) -> String {
-        format!(
+        let base = format!(
             "cuda={} vaapi={} v4l2m2m={}",
             if self.cuda { "有" } else { "无" },
             if self.vaapi { "有" } else { "无" },
             if self.v4l2m2m { "有" } else { "无" }
-        )
+        );
+        if cfg!(target_os = "macos") {
+            format!("{base} videotoolbox=系统框架")
+        } else {
+            base
+        }
     }
 }
 
@@ -173,12 +181,14 @@ impl EncoderPlan {
 
 /// 编码目标 → 候选编码器（硬件在前）。
 ///
-/// 顺序即优先级：NVENC（NVIDIA）→ VAAPI（Linux 通用硬件）→ V4L2 M2M（嵌入式/ARM）
-/// → 软件编码器。软件编码器永远在链尾，保证「硬件不可用就自动兜底」。
+/// 顺序即优先级：NVENC（NVIDIA）→ VideoToolbox（macOS 系统框架）→ VAAPI（Linux 通用硬件）
+/// → V4L2 M2M（嵌入式/ARM）→ 软件编码器。软件编码器永远在链尾，
+/// 保证「硬件不可用就自动兜底」——任何机器都能跑。
 pub fn encoder_chain(codec: &str) -> Option<Vec<(&'static str, bool)>> {
     let chain = match codec {
         "h264" | "avc" => vec![
             ("h264_nvenc", true),
+            ("h264_videotoolbox", true),
             ("h264_vaapi", true),
             ("h264_v4l2m2m", true),
             ("libx264", false),
@@ -186,6 +196,7 @@ pub fn encoder_chain(codec: &str) -> Option<Vec<(&'static str, bool)>> {
         ],
         "hevc" | "h265" => vec![
             ("hevc_nvenc", true),
+            ("hevc_videotoolbox", true),
             ("hevc_vaapi", true),
             ("hevc_v4l2m2m", true),
             ("libx265", false),
@@ -1118,6 +1129,22 @@ mod tests {
     }
 
     #[test]
+    fn videotoolbox_selected_on_macos_and_gated_elsewhere() {
+        // macOS 上 VideoToolbox 是系统框架，无需设备信号即可入选；
+        // 其他平台没有该框架，必须回退软件编码。
+        let list = encoders(&["h264_videotoolbox", "libx264"]);
+        let plan = plan_encoder(&list, "h264", true, &HardwareSignal::none()).unwrap();
+        if cfg!(target_os = "macos") {
+            assert_eq!(plan.selected, "h264_videotoolbox");
+            assert!(plan.hardware);
+            assert!(plan.reason.contains("硬件编码器"));
+        } else {
+            assert_eq!(plan.selected, "libx264");
+            assert!(!plan.hardware);
+        }
+    }
+
+    #[test]
     fn reports_unknown_codec_and_empty_chain() {
         let list = encoders(&["libx264"]);
         assert_eq!(
@@ -1130,7 +1157,7 @@ mod tests {
         match error {
             CapsError::NoEncoder { candidates, .. } => {
                 assert!(candidates.contains(&"libx264".to_string()));
-                assert_eq!(candidates.len(), 5);
+                assert_eq!(candidates.len(), 6);
             }
             other => panic!("期望 NoEncoder，得到 {other:?}"),
         }

@@ -10,16 +10,20 @@
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dossier_core::{
-    bitrate_report, load_settings, nudge_frames, output_dir_hits_sources, plan_recut_segments,
-    plan_rename, probe_episode, resolve_product_dir, BitrateItem, EpisodeFile, FfprobeConfig,
-    ProbedEpisode,
+    bitrate_report, load_settings, nudge_frames, output_dir_hits_sources, plan_recut_by_duration,
+    plan_recut_segments, plan_rename, probe_episode, resolve_product_dir, BitrateItem, EpisodeFile,
+    FfprobeConfig, ProbedEpisode,
 };
 use dossier_media::shot::{detect_shots, ShotDetectConfig};
-use dossier_runtime::probe::probe_tool;
+use dossier_runtime::caps::{
+    plan_encoder, verify_encoder_plan, EncoderVerificationConfig, HardwareSignal,
+};
+use dossier_runtime::probe::{probe_ffmpeg_capabilities, probe_gpu, probe_tool};
 use dossier_runtime::{CommandRunner, CommandSpec, SystemRunner, ToolReport};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
@@ -620,17 +624,166 @@ pub struct TranscodeRunReport {
     pub note: String,
 }
 
-/// 统一的重编码参数：画质优先兼容，音频统一 AAC。
-const ENCODE_ARGS: [&str; 10] = [
-    "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k",
-];
+/// 视频编码参数：软件 libx264 用 CRF 23（质量优先，沿用历史行为）；
+/// 硬件编码器（NVENC / VideoToolbox 等）用 6 Mbps 目标码率——
+/// 码率参数在各家硬件编码器间通用，且高于 4 Mbps 报审安全线。
+fn video_encode_args(encoder: &str) -> Vec<String> {
+    if encoder == "libx264" {
+        vec![
+            "-preset".into(),
+            "veryfast".into(),
+            "-crf".into(),
+            "23".into(),
+        ]
+    } else {
+        vec!["-b:v".into(), "6M".into()]
+    }
+}
 
-fn encode_output_args(output: &Path) -> Vec<String> {
-    let mut args: Vec<String> = ENCODE_ARGS.iter().map(|s| s.to_string()).collect();
+fn encode_output_args(output: &Path, encoder: &str) -> Vec<String> {
+    let mut args: Vec<String> = vec!["-c:v".into(), encoder.to_string()];
+    args.extend(video_encode_args(encoder));
+    args.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "128k".into()]);
     args.push("-movflags".into());
     args.push("+faststart".into());
     args.push(output.display().to_string());
     args
+}
+
+// ---------------------------------------------------------------------------
+// 编码器选型与多路并行执行
+// ---------------------------------------------------------------------------
+
+/// 并行编码档位：编码器名 + 路数 + 给界面/日志的决策理由。
+#[derive(Debug, Clone)]
+struct EncodeLanes {
+    encoder: String,
+    lanes: usize,
+    reason: String,
+}
+
+impl EncodeLanes {
+    /// 界面/证明里的可读描述。
+    fn describe(&self) -> String {
+        format!("{}（{} 路并行）", self.encoder, self.lanes)
+    }
+}
+
+/// 探测本机可用的 h264 编码器并决定并行路数：
+/// NVENC / VideoToolbox 等硬件编码器 3 路（Grove-Max 同款）；
+/// 回退 libx264 时 CPU 编码吃满核，降到 2 路避免卡死机器。
+/// 不强制 GPU：任何机器都能跑，只是路数与编码器不同。
+fn detect_encode_lanes(ffmpeg: &Path) -> EncodeLanes {
+    let software_fallback = |reason: String| EncodeLanes {
+        encoder: "libx264".to_string(),
+        lanes: 2,
+        reason,
+    };
+    let runner = SystemRunner::new();
+    let caps = probe_ffmpeg_capabilities(&runner, Some(ffmpeg));
+    if !caps.usable() {
+        return software_fallback("ffmpeg 能力探测失败，回退 libx264 2 路".to_string());
+    }
+    // CUDA 设备信号在 Windows/Linux 上没有统一设备节点，用 nvidia-smi 探测结果补强。
+    let gpu = probe_gpu(&runner);
+    let signal = HardwareSignal::detect().with_cuda(gpu.available);
+    let verified = plan_encoder(&caps.encoders, "h264", true, &signal).and_then(|plan| {
+        verify_encoder_plan(
+            &runner,
+            &EncoderVerificationConfig::new(ffmpeg.display().to_string()),
+            &plan,
+        )
+    });
+    match verified {
+        Ok(plan) if plan.hardware => EncodeLanes {
+            encoder: plan.selected,
+            lanes: 3,
+            reason: plan.reason,
+        },
+        Ok(plan) => EncodeLanes {
+            encoder: plan.selected,
+            lanes: 2,
+            reason: plan.reason,
+        },
+        Err(error) => software_fallback(format!("编码器探测失败（{error}），回退 libx264 2 路")),
+    }
+}
+
+/// 互不依赖的编码单元并行执行：`lanes` 路工作线程从共享计数器领任务。
+///
+/// 单元形如 `(序号, 载荷)`；任一单元失败或用户停止后不再领新任务，
+/// 等在跑的单元收尾，返回首个错误（或「已停止」）。成功单元的产出按序号
+/// 归位到结果槽，调用方拿到的向量长度与 `units` 一致、顺序与输入一致。
+/// `on_done` 在工作线程上回调（已完成数, 总数, 标签），实现须可跨线程共享。
+fn run_encode_units<T, S, F>(
+    units: &[(usize, T)],
+    lanes: usize,
+    on_done: &(dyn Fn(u64, u64, &str) + Sync),
+    run_unit: F,
+) -> Result<Vec<Option<S>>, String>
+where
+    T: Sync,
+    S: Send,
+    F: Fn(&T) -> Result<(S, String), String> + Sync,
+{
+    let total = units.len();
+    if total == 0 {
+        return Ok(Vec::new());
+    }
+    let next = AtomicUsize::new(0);
+    let completed = AtomicUsize::new(0);
+    let first_error: Mutex<Option<String>> = Mutex::new(None);
+    let results: Mutex<Vec<Option<S>>> = Mutex::new((0..total).map(|_| None).collect());
+    std::thread::scope(|scope| {
+        for _ in 0..lanes.max(1).min(total) {
+            scope.spawn(|| loop {
+                // 失败 / 用户停止后不再领新任务；在跑的单元由其内部收尾。
+                if transcode_cancelled() {
+                    return;
+                }
+                if first_error
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .is_some()
+                {
+                    return;
+                }
+                let slot = next.fetch_add(1, Ordering::SeqCst);
+                if slot >= total {
+                    return;
+                }
+                let (index, payload) = &units[slot];
+                match run_unit(payload) {
+                    Ok((value, label)) => {
+                        let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
+                        on_done(done as u64, total as u64, &label);
+                        results.lock().unwrap_or_else(|error| error.into_inner())[*index] =
+                            Some(value);
+                    }
+                    Err(error) => {
+                        let mut guard = first_error
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        if guard.is_none() {
+                            *guard = Some(error);
+                        }
+                    }
+                }
+            });
+        }
+    });
+    if transcode_cancelled() {
+        return Err("已停止".into());
+    }
+    match first_error
+        .into_inner()
+        .unwrap_or_else(|error| error.into_inner())
+    {
+        Some(error) => Err(error),
+        None => Ok(results
+            .into_inner()
+            .unwrap_or_else(|error| error.into_inner())),
+    }
 }
 
 fn seed_for(file_name: &str) -> u64 {
@@ -645,34 +798,20 @@ fn seed_for(file_name: &str) -> u64 {
 }
 
 /// 智能微调：每集从开头裁掉 1~3 帧（帧率未知时按 30fps 折算），输出同名新文件。
+/// 各集互不依赖，`lanes` 路并行执行。
 fn transcode_nudge_blocking(
     ffmpeg: &Path,
+    lanes: &EncodeLanes,
     drama_name: &str,
     episodes: &[ProbedEpisode],
     output_dir: &Path,
-    on_step: &mut dyn FnMut(u64, u64, &str),
+    emit: &(dyn Fn(u64, u64, &str) + Sync),
     produced: &mut Vec<PathBuf>,
 ) -> Result<TranscodeRunReport, String> {
     std::fs::create_dir_all(output_dir)
         .map_err(|error| format!("创建输出目录失败（{}）：{error}", output_dir.display()))?;
-    let mut items = Vec::new();
-    let total = episodes.len() as u64;
-    for (index, episode) in episodes.iter().enumerate() {
-        // 用户点了停止就不再开下一步 ffmpeg；正在跑的那条由 run_ffmpeg 内部杀掉。
-        if transcode_cancelled() {
-            return Err("已停止".into());
-        }
-        // 全剧重编码动辄几分钟，逐集上报让进度条能真的动起来（done = 已完成集数）。
-        on_step(
-            index as u64,
-            total,
-            &format!(
-                "正在微调第 {}/{} 集：{}",
-                index + 1,
-                total,
-                episode.file.file_name
-            ),
-        );
+    let units: Vec<(usize, &ProbedEpisode)> = episodes.iter().enumerate().collect();
+    let results = run_encode_units(&units, lanes.lanes, emit, |episode| {
         let frames = nudge_frames(seed_for(&episode.file.file_name));
         let fps = episode.spec.fps.unwrap_or(30.0).max(1.0);
         let offset = frames as f64 / fps;
@@ -685,24 +824,36 @@ fn transcode_nudge_blocking(
             "-i".into(),
             input_str.clone(),
         ];
-        args.extend(encode_output_args(&output));
+        args.extend(encode_output_args(&output, &lanes.encoder));
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         run_ffmpeg(ffmpeg, &arg_refs).map_err(|error| {
             let _ = std::fs::remove_file(&output);
             format!("{}：{error}", episode.file.file_name)
         })?;
+        let detail = format!("裁掉开头 {frames} 帧（{offset:.4} 秒，{fps:.2} fps）");
+        Ok((
+            (output.clone(), detail),
+            format!("{}：完成", episode.file.file_name),
+        ))
+    })?;
+
+    let mut items = Vec::new();
+    for (episode, (output, detail)) in episodes.iter().zip(results.into_iter().flatten()) {
         produced.push(output.clone());
         items.push(TranscodeItemReport {
-            source: input_str,
+            source: episode.file.path.display().to_string(),
             output: output.display().to_string(),
-            detail: format!("裁掉开头 {frames} 帧（{offset:.4} 秒，{fps:.2} fps）"),
+            detail,
         });
     }
     Ok(TranscodeRunReport {
         mode: "nudge".into(),
         output_dir: output_dir.display().to_string(),
         items,
-        note: format!("《{drama_name}》每集开头已微调 1~3 帧，输出到新目录，原素材未改动。"),
+        note: format!(
+            "《{drama_name}》每集开头已微调 1~3 帧（{}），输出到新目录，原素材未改动。",
+            lanes.describe()
+        ),
     })
 }
 
@@ -739,48 +890,70 @@ fn spans_for_segment(
     spans
 }
 
+/// 重组切段策略：独立重组按「目标集数」等分，深度处理按「单集时长区间」反推集数。
+enum RecutStrategy {
+    TargetCount(usize),
+    DurationRange { min_sec: f64, max_sec: f64 },
+}
+
+/// 一个重组编码任务：目标输出 + 对应的源片段（任务间互不依赖，可并行）。
+struct RecutJob {
+    index: usize,
+    output: PathBuf,
+    spans: Vec<SourceSpan>,
+}
+
 /// 分集重组：全剧拼成一条时间线，在场景切点附近重新分集；切不到精确关键帧，
 /// 因此每个片段统一重编码（保证切点帧级精确）。输出名保持「第NN集」以便再次扫描。
+/// 场景检测与片段编码都按 `lanes` 路并行。
 fn transcode_recut_blocking(
     ffmpeg: &Path,
+    lanes: &EncodeLanes,
     episodes: &[ProbedEpisode],
-    target_count: usize,
+    strategy: RecutStrategy,
     output_dir: &Path,
-    on_step: &mut dyn FnMut(u64, u64, &str),
+    emit: &(dyn Fn(u64, u64, &str) + Sync),
     produced: &mut Vec<PathBuf>,
 ) -> Result<TranscodeRunReport, String> {
     std::fs::create_dir_all(output_dir)
         .map_err(|error| format!("创建输出目录失败（{}）：{error}", output_dir.display()))?;
 
-    // 逐集检测切点，映射到全剧时间线。
-    let mut boundaries: Vec<f64> = Vec::new();
-    let mut file_starts: Vec<f64> = Vec::with_capacity(episodes.len());
-    let mut offset = 0.0;
+    // 阶段一：逐集检测切点（并行，结果按集序合并），映射到全剧时间线。
     let ffmpeg_str = ffmpeg.display().to_string();
-    let detect_total = episodes.len() as u64;
-    for (index, episode) in episodes.iter().enumerate() {
-        // 用户点了停止就不再开下一步 ffmpeg；正在跑的那条由 run_ffmpeg 内部杀掉。
-        if transcode_cancelled() {
-            return Err("已停止".into());
-        }
-        on_step(
-            index as u64,
-            detect_total,
-            &format!(
-                "正在检测场景切点 第 {}/{} 集：{}",
-                index + 1,
-                detect_total,
-                episode.file.file_name
-            ),
-        );
-        file_starts.push(offset);
+    let detect_units: Vec<(usize, &ProbedEpisode)> = episodes.iter().enumerate().collect();
+    emit(0, episodes.len() as u64, "正在检测场景切点");
+    let detect_results = run_encode_units(&detect_units, lanes.lanes, emit, |episode| {
         let report = detect_shots(
             &ffmpeg_str,
             &episode.file.path,
             &ShotDetectConfig::default(),
         )
         .map_err(|error| format!("{} 场景检测失败：{error}", episode.file.file_name))?;
-        boundaries.extend(report.boundaries.iter().map(|b| offset + b.time_sec));
+        let label = format!(
+            "{}：切点 {} 个",
+            episode.file.file_name,
+            report.boundaries.len()
+        );
+        Ok((
+            report
+                .boundaries
+                .iter()
+                .map(|b| b.time_sec)
+                .collect::<Vec<f64>>(),
+            label,
+        ))
+    })?;
+    let mut boundaries: Vec<f64> = Vec::new();
+    let mut file_starts: Vec<f64> = Vec::with_capacity(episodes.len());
+    let mut offset = 0.0;
+    for (episode, per_file) in episodes.iter().zip(detect_results.into_iter()) {
+        file_starts.push(offset);
+        boundaries.extend(
+            per_file
+                .unwrap_or_default()
+                .iter()
+                .map(|time| offset + time),
+        );
         offset += episode.spec.duration_sec;
     }
     let total = offset;
@@ -789,27 +962,98 @@ fn transcode_recut_blocking(
         return Err("全剧总时长为 0，无法重组。".into());
     }
 
-    let segments = plan_recut_segments(&boundaries, total, target_count, 1.0);
-    let mut items = Vec::new();
-    let segment_total = segments.len() as u64;
-    for (index, segment) in segments.iter().enumerate() {
-        if transcode_cancelled() {
-            return Err("已停止".into());
+    let segments = match strategy {
+        RecutStrategy::TargetCount(target) => plan_recut_segments(&boundaries, total, target, 1.0),
+        RecutStrategy::DurationRange { min_sec, max_sec } => {
+            plan_recut_by_duration(&boundaries, total, min_sec, max_sec)
         }
-        on_step(
-            index as u64,
-            segment_total,
-            &format!("正在重组第 {}/{} 集", index + 1, segment_total),
+    };
+    // 预构造编码任务：跨源片段的中间件名带集号，任务间互不冲突。
+    let jobs: Vec<RecutJob> = segments
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| RecutJob {
+            index,
+            output: output_dir.join(format!("第{:02}集.mp4", index + 1)),
+            spans: spans_for_segment(episodes, &file_starts, *segment),
+        })
+        .filter(|job| !job.spans.is_empty())
+        .collect();
+    let job_units: Vec<(usize, &RecutJob)> =
+        jobs.iter().enumerate().map(|(i, job)| (i, job)).collect();
+    let encode_results = run_encode_units(&job_units, lanes.lanes, emit, |job| {
+        encode_recut_job(ffmpeg, lanes, job)?;
+        let label = format!(
+            "第 {} 集：完成（{} 个源片段）",
+            job.index + 1,
+            job.spans.len()
         );
-        let output = output_dir.join(format!("第{:02}集.mp4", index + 1));
-        let spans = spans_for_segment(episodes, &file_starts, *segment);
-        if spans.is_empty() {
-            continue;
-        }
+        Ok((job.output.clone(), label))
+    })?;
 
-        if spans.len() == 1 {
-            // 单源片段：一条命令直达。
-            let span = &spans[0];
+    let mut items = Vec::new();
+    for (job, output) in jobs.iter().zip(encode_results.into_iter().flatten()) {
+        produced.push(output);
+        items.push(TranscodeItemReport {
+            source: job
+                .spans
+                .iter()
+                .map(|span| span.file_name.as_str())
+                .collect::<Vec<_>>()
+                .join(" + "),
+            output: job.output.display().to_string(),
+            detail: format!(
+                "{:.1}s – {:.1}s（{} 个源片段）",
+                job.spans.first().map_or(0.0, |s| s.local_start),
+                job.spans.last().map_or(0.0, |s| s.local_start + s.duration),
+                job.spans.len()
+            ),
+        });
+    }
+
+    let produced_count = items.len();
+    Ok(TranscodeRunReport {
+        mode: "recut".into(),
+        output_dir: output_dir.display().to_string(),
+        items,
+        note: format!(
+            "已按场景切点重新分成 {produced_count} 集（统一重编码保证切点精确，{}），输出到新目录，原素材未改动。",
+            lanes.describe()
+        ),
+    })
+}
+
+/// 执行单个重组编码任务：单源片段一条命令直达；跨源片段先逐源切片，
+/// 再用 concat demuxer 无损拼接（编码参数一致）。失败时清理本次中间文件。
+fn encode_recut_job(ffmpeg: &Path, lanes: &EncodeLanes, job: &RecutJob) -> Result<(), String> {
+    let output = &job.output;
+    let spans = &job.spans;
+    if spans.len() == 1 {
+        // 单源片段：一条命令直达。
+        let span = &spans[0];
+        let mut args: Vec<String> = vec![
+            "-y".into(),
+            "-ss".into(),
+            format!("{:.6}", span.local_start),
+            "-i".into(),
+            span.file.display().to_string(),
+            "-t".into(),
+            format!("{:.6}", span.duration),
+        ];
+        args.extend(encode_output_args(output, &lanes.encoder));
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_ffmpeg(ffmpeg, &arg_refs).map_err(|error| {
+            let _ = std::fs::remove_file(output);
+            format!("第 {} 集：{error}", job.index + 1)
+        })?;
+    } else {
+        // 跨源片段：先逐源切片，再用 concat demuxer 无损拼接（编码参数一致）。
+        let mut part_paths: Vec<PathBuf> = Vec::new();
+        for (part_index, span) in spans.iter().enumerate() {
+            let part = output
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join(format!(".recut-{:02}-part{:02}.mp4", job.index, part_index));
             let mut args: Vec<String> = vec![
                 "-y".into(),
                 "-ss".into(),
@@ -819,143 +1063,404 @@ fn transcode_recut_blocking(
                 "-t".into(),
                 format!("{:.6}", span.duration),
             ];
-            args.extend(encode_output_args(&output));
+            args.extend(encode_output_args(&part, &lanes.encoder));
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            run_ffmpeg(ffmpeg, &arg_refs).map_err(|error| {
-                let _ = std::fs::remove_file(&output);
-                format!("第 {} 集：{error}", index + 1)
-            })?;
-        } else {
-            // 跨源片段：先逐源切片，再用 concat demuxer 无损拼接（编码参数一致）。
-            let mut part_paths: Vec<PathBuf> = Vec::new();
-            for (part_index, span) in spans.iter().enumerate() {
-                let part = output_dir.join(format!(".recut-{index:02}-part{part_index:02}.mp4"));
-                let mut args: Vec<String> = vec![
-                    "-y".into(),
-                    "-ss".into(),
-                    format!("{:.6}", span.local_start),
-                    "-i".into(),
-                    span.file.display().to_string(),
-                    "-t".into(),
-                    format!("{:.6}", span.duration),
-                ];
-                args.extend(encode_output_args(&part));
-                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                if let Err(error) = run_ffmpeg(ffmpeg, &arg_refs) {
-                    for part in &part_paths {
-                        let _ = std::fs::remove_file(part);
-                    }
-                    let _ = std::fs::remove_file(&output);
-                    return Err(format!(
-                        "第 {} 集（{}）：{error}",
-                        index + 1,
-                        span.file_name
-                    ));
-                }
-                part_paths.push(part);
-            }
-
-            let list_path = output_dir.join(format!(".recut-{index:02}-list.txt"));
-            let list_body = part_paths
-                .iter()
-                .map(|part| format!("file '{}'", part.display()))
-                .collect::<Vec<_>>()
-                .join("\n");
-            if let Err(error) = std::fs::write(&list_path, &list_body) {
+            if let Err(error) = run_ffmpeg(ffmpeg, &arg_refs) {
                 for part in &part_paths {
                     let _ = std::fs::remove_file(part);
                 }
-                return Err(format!("写 concat 清单失败：{error}"));
+                let _ = std::fs::remove_file(output);
+                return Err(format!(
+                    "第 {} 集（{}）：{error}",
+                    job.index + 1,
+                    span.file_name
+                ));
             }
-            let list_str = list_path.display().to_string();
-            let output_str = output.display().to_string();
-            let concat_result = run_ffmpeg(
-                ffmpeg,
-                &[
-                    "-y",
-                    "-f",
-                    "concat",
-                    "-safe",
-                    "0",
-                    "-i",
-                    &list_str,
-                    "-c",
-                    "copy",
-                    &output_str,
-                ],
-            );
+            part_paths.push(part);
+        }
+
+        let list_path = output
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(format!(".recut-{:02}-list.txt", job.index));
+        let list_body = part_paths
+            .iter()
+            .map(|part| format!("file '{}'", part.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Err(error) = std::fs::write(&list_path, &list_body) {
             for part in &part_paths {
                 let _ = std::fs::remove_file(part);
             }
-            let _ = std::fs::remove_file(&list_path);
-            concat_result.map_err(|error| {
-                let _ = std::fs::remove_file(&output);
-                format!("第 {} 集：拼接失败：{error}", index + 1)
-            })?;
+            return Err(format!("写 concat 清单失败：{error}"));
         }
-
-        produced.push(output.clone());
-        items.push(TranscodeItemReport {
-            source: spans
-                .iter()
-                .map(|span| span.file_name.as_str())
-                .collect::<Vec<_>>()
-                .join(" + "),
-            output: output.display().to_string(),
-            detail: format!(
-                "{:.1}s – {:.1}s（{} 个源片段）",
-                segment.0,
-                segment.1,
-                spans.len()
-            ),
-        });
+        let list_str = list_path.display().to_string();
+        let output_str = output.display().to_string();
+        let concat_result = run_ffmpeg(
+            ffmpeg,
+            &[
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                &list_str,
+                "-c",
+                "copy",
+                &output_str,
+            ],
+        );
+        for part in &part_paths {
+            let _ = std::fs::remove_file(part);
+        }
+        let _ = std::fs::remove_file(&list_path);
+        concat_result.map_err(|error| {
+            let _ = std::fs::remove_file(output);
+            format!("第 {} 集：拼接失败：{error}", job.index + 1)
+        })?;
     }
-
-    let produced = items.len();
-    Ok(TranscodeRunReport {
-        mode: "recut".into(),
-        output_dir: output_dir.display().to_string(),
-        items,
-        note: format!(
-            "已按场景切点重新分成 {produced} 集（统一重编码保证切点精确），输出到新目录，原素材未改动。"
-        ),
-    })
+    Ok(())
 }
 
-/// 深度处理：先分集重组到临时中转目录，再对每个新集做智能微帧后输出到最终目录。
+/// 材料先行阶段的产出与来源记录（写 AI 制作证明用）。
+#[derive(Debug, Default)]
+struct MaterialSources {
+    title: Option<String>,
+    title_source: String,
+    synopsis: Option<String>,
+    synopsis_source: String,
+    poster: Option<PathBuf>,
+    poster_source: String,
+    storyboard_source: String,
+}
+
+/// trim 后非空才返回（空字符串视同未填写）。
+fn non_empty(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+/// LLM 来源标签（配置了模型名就带上，便于在证明里溯源）。
+fn ai_source_label(model: &Option<String>) -> String {
+    match non_empty(model) {
+        Some(name) => format!("AI 生成（模型 {name}）"),
+        None => "AI 生成".to_string(),
+    }
+}
+
+/// 从原始素材里均匀抽 `count` 个代表集（不足时循环复用），供过程图抽帧。
+/// 抽帧源是**原始素材**而非成片：材料先行意味着过程图在编码前就要产出。
+fn representative_episodes(episodes: &[ProbedEpisode], count: usize) -> Vec<(PathBuf, f64)> {
+    let total = episodes.len();
+    if total == 0 {
+        return Vec::new();
+    }
+    (0..count)
+        .map(|slot| {
+            let index = if total >= count {
+                slot * (total - 1) / (count - 1).max(1)
+            } else {
+                slot % total
+            };
+            let episode = &episodes[index];
+            (episode.file.path.clone(), episode.spec.duration_sec)
+        })
+        .collect()
+}
+
+/// 当天日期（本地时区按东八区口径，YYYY-MM-DD）。std 没有日期格式化，用民用历算法换算。
+fn local_date_string() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+        + 8 * 3600;
+    let days = secs.div_euclid(86_400);
+    // Howard Hinnant 的 civil_from_days：days 自 1970-01-01 → (年, 月, 日)。
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// 写入 AI 制作证明（Grove-Max 同款）：无条件生成一份 txt 落输出目录，
+/// 记录剧名/简介/海报/过程图的来源（AI 生成（模型名）/ 本地提供）、
+/// 制作工具与版本、日期和处理方式，末尾附 AI 声明。
+fn write_ai_proof(
+    app: &AppHandle,
+    drama_name: &str,
+    materials: &MaterialSources,
+    lanes: &EncodeLanes,
+    episode_count: usize,
+    output_dir: &Path,
+) -> Result<PathBuf, String> {
+    let version = app.package_info().version.to_string();
+    let date = local_date_string();
+    let line = |label: &str, value: Option<&str>, source: &str| {
+        let value = value.unwrap_or("未填写");
+        format!("{label}：{value}\n来源：{source}\n")
+    };
+    let mut body = String::new();
+    body.push_str("AI 制作证明\n\n");
+    body.push_str(&format!("生成日期：{date}（本地时间）\n"));
+    body.push_str(&format!("制作工具：DramaDossier v{version}\n"));
+    body.push_str(&format!(
+        "原剧目：{drama_name}（原始素材 {episode_count} 集）\n"
+    ));
+    body.push_str(&format!(
+        "处理方式：按场景切点重组分集并逐集微帧，编码 {}。\n\n",
+        lanes.describe()
+    ));
+    body.push_str(&line(
+        "剧名",
+        materials.title.as_deref(),
+        &materials.title_source,
+    ));
+    body.push_str(&line(
+        "简介",
+        materials.synopsis.as_deref(),
+        &materials.synopsis_source,
+    ));
+    body.push_str(&line(
+        "海报",
+        materials
+            .poster
+            .as_ref()
+            .map(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or(None)
+            .as_deref(),
+        &materials.poster_source,
+    ));
+    body.push_str(&format!(
+        "过程图：过程图-1 ~ 过程图-4（画面抽自原始素材代表集）\n来源：{}\n\n",
+        materials.storyboard_source
+    ));
+    body.push_str(
+        "AI 声明：本目录中的剧名、简介、海报与过程图由人工智能辅助生成或整理，\
+         分集重组与微帧由 DramaDossier 自动化完成，原始视频素材未作改动。\
+         报审前请人工复核上述内容。\n",
+    );
+    let path = output_dir.join("AI制作证明.txt");
+    std::fs::write(&path, body)
+        .map_err(|error| format!("写入 AI 制作证明失败（{}）：{error}", path.display()))?;
+    Ok(path)
+}
+
+/// 深度处理（材料先行）：先产出报审材料（剧名/简介/海报/过程图/AI 制作证明），
+/// 再分集重组到临时中转目录、逐集微帧输出到最终目录（Grove-Max 同款时序）。
 ///
-/// 与 Grove 的 recompose → microFrames 链路一致，本质是两轮编码（质量上 veryfast/CRF23
-/// 两轮后仍可接受）；中转目录成功后清理，中途停止则随 cleanup 一起删除。
-/// 进度映射：重组阶段 0~50%，微帧阶段 50~100%（分母乘 2）。
+/// 材料阶段**软失败**：单个材料生成失败只记日志不阻塞编码（剧名/简介可后补）；
+/// AI 素材为空 → 跳过不阻塞。编码按 `lanes` 路并行。
+/// 进度映射：材料 0~10%，重组 10~55%，微帧 55~100%。
+#[allow(clippy::too_many_arguments)]
 fn transcode_deep_blocking(
     app: &AppHandle,
     ffmpeg: &Path,
     ffprobe: &Path,
     drama_name: &str,
     episodes: &[ProbedEpisode],
-    target_count: usize,
+    min_sec: f64,
+    max_sec: f64,
+    lanes: &EncodeLanes,
     output_dir: &Path,
-    on_step: &mut dyn FnMut(u64, u64, &str),
+    emit: &(dyn Fn(u64, u64, &str) + Sync),
     produced: &mut Vec<PathBuf>,
 ) -> Result<TranscodeRunReport, String> {
+    // ── 材料先行（0~10%）────────────────────────────
+    std::fs::create_dir_all(output_dir)
+        .map_err(|error| format!("创建输出目录失败（{}）：{error}", output_dir.display()))?;
+    let mut settings = read_settings(app)?;
+    let mut materials = MaterialSources::default();
+    let llm_label = ai_source_label(&settings.llm_model);
+
+    // 剧名：AI 开且当前为空 → 生成；已有值沿用；AI 关且为空 → 跳过不阻塞（可后补）。
+    let title_ai_on = settings.ai_title_enabled != Some(false);
+    materials.title = non_empty(&settings.drama_title);
+    materials.title_source = if materials.title.is_some() {
+        if title_ai_on {
+            llm_label.clone()
+        } else {
+            "本地提供".to_string()
+        }
+    } else if title_ai_on {
+        emit(1, 100, "材料 · AI 生成剧名");
+        let context = non_empty(&settings.drama_synopsis)
+            .unwrap_or_else(|| format!("剧目目录名：{drama_name}"));
+        match crate::ai::generate_text_blocking(&settings, crate::ai::TextKind::Title, &context) {
+            Ok(text) => {
+                settings.drama_title = Some(text.clone());
+                materials.title = Some(text);
+                llm_label.clone()
+            }
+            Err(error) => {
+                crate::logging::log_event(
+                    "材料",
+                    format!("剧名生成失败（不阻塞，可后补）：{error}"),
+                );
+                "AI 生成失败，未填写".to_string()
+            }
+        }
+    } else {
+        "未填写（本地模式）".to_string()
+    };
+
+    // 简介：同剧名逻辑，生成素材带上（可能刚生成的）剧名。
+    let synopsis_ai_on = settings.ai_synopsis_enabled != Some(false);
+    materials.synopsis = non_empty(&settings.drama_synopsis);
+    materials.synopsis_source = if materials.synopsis.is_some() {
+        if synopsis_ai_on {
+            llm_label.clone()
+        } else {
+            "本地提供".to_string()
+        }
+    } else if synopsis_ai_on {
+        emit(2, 100, "材料 · AI 生成简介");
+        let context = [materials.title.clone(), non_empty(&settings.drama_synopsis)]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("。");
+        let context = if context.is_empty() {
+            format!("剧目目录名：{drama_name}")
+        } else {
+            context
+        };
+        match crate::ai::generate_text_blocking(&settings, crate::ai::TextKind::Synopsis, &context)
+        {
+            Ok(text) => {
+                settings.drama_synopsis = Some(text.clone());
+                materials.synopsis = Some(text);
+                llm_label.clone()
+            }
+            Err(error) => {
+                crate::logging::log_event(
+                    "材料",
+                    format!("简介生成失败（不阻塞，可后补）：{error}"),
+                );
+                "AI 生成失败，未填写".to_string()
+            }
+        }
+    } else {
+        "未填写（本地模式）".to_string()
+    };
+
+    // 海报：AI 开 → 复用已有（设置里的路径或输出目录内上次的产物），否则生成；
+    // AI 关 → 只复用本地海报，没有就跳过。
+    let poster_ai_on = settings.ai_poster_enabled != Some(false);
+    let poster_in_output = ["png", "jpg", "jpeg", "webp"]
+        .iter()
+        .map(|ext| output_dir.join(format!("剧目海报.{ext}")))
+        .find(|path| path.is_file());
+    let existing_poster = settings
+        .poster_path
+        .as_ref()
+        .filter(|path| path.is_file())
+        .cloned()
+        .or(poster_in_output);
+    if poster_ai_on {
+        if let Some(path) = existing_poster {
+            settings.poster_path = Some(path.clone());
+            materials.poster = Some(path.clone());
+            materials.poster_source = "已生成（本次复用）".to_string();
+        } else {
+            emit(3, 100, "材料 · AI 生成海报");
+            match crate::ai::generate_poster_blocking(&settings, output_dir) {
+                Ok(path) => {
+                    settings.poster_path = Some(path.clone());
+                    materials.poster = Some(path.clone());
+                    materials.poster_source = ai_source_label(&settings.img_model);
+                }
+                Err(error) => {
+                    crate::logging::log_event(
+                        "材料",
+                        format!("海报生成失败（不阻塞，可后补）：{error}"),
+                    );
+                    materials.poster_source = "AI 生成失败，未生成".to_string();
+                }
+            }
+        }
+    } else if let Some(path) = existing_poster {
+        materials.poster = Some(path);
+        materials.poster_source = "本地提供".to_string();
+    } else {
+        materials.poster_source = "未提供（本地模式）".to_string();
+    }
+
+    // 过程图：抽帧源是原始素材的 4 个代表集（编码前就要产出，不能依赖成片）。
+    emit(4, 100, "材料 · 生成过程图");
+    materials.storyboard_source = if crate::ai::storyboard_llm_ready(&settings) {
+        llm_label.clone()
+    } else {
+        "模板生成（未配置 LLM）".to_string()
+    };
+    let picks = representative_episodes(episodes, PROCESS_IMAGE_COUNT);
+    if let Err(error) = generate_process_images_blocking(
+        app,
+        ffmpeg,
+        drama_name,
+        &picks,
+        episodes.len(),
+        output_dir,
+    ) {
+        crate::logging::log_event("材料", format!("过程图生成失败（不影响成片）：{error}"));
+    } else {
+        crate::logging::log_event("材料", format!("过程图已生成到 {}", output_dir.display()));
+    }
+
+    // AI 制作证明：无条件生成一份（Grove-Max 同款「已写入 AI 制作证明」）。
+    emit(5, 100, "材料 · 写入 AI 制作证明");
+    if let Err(error) = write_ai_proof(
+        app,
+        drama_name,
+        &materials,
+        lanes,
+        episodes.len(),
+        output_dir,
+    ) {
+        crate::logging::log_event("材料", format!("AI 制作证明写入失败：{error}"));
+    }
+
+    // 材料回写设置：界面在任务完成后重新加载设置即可看到（进度条文案走 emit）。
+    emit(6, 100, "材料 · 已生成并校验");
+    let settings_path = crate::settings_path(app)?;
+    if let Err(error) = dossier_core::save_settings(&settings_path, &settings) {
+        crate::logging::log_event("材料", format!("材料写回设置失败：{error}"));
+    }
+
+    // ── 编码阶段：重组（10~55%）→ 微帧（55~100%）──────────
     let staging = output_dir.join(".deep-staging");
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging)
         .map_err(|error| format!("创建中转目录失败（{}）：{error}", staging.display()))?;
 
-    // 阶段一：分集重组（产物先落中转目录；done/total 比例映射到 0~50）。
+    // 阶段一：分集重组（产物先落中转目录；done/total 比例映射到 10~55）。
     {
-        let mut step_recut = |done: u64, total: u64, label: &str| {
-            let scaled = done.min(total) * 50 / total.max(1);
-            on_step(scaled, 100, &format!("重组 · {label}"));
+        let step_recut = |done: u64, total: u64, label: &str| {
+            let scaled = 10 + done.min(total) * 45 / total.max(1);
+            emit(scaled, 100, &format!("重组 · {label}"));
         };
         let mut staging_produced: Vec<PathBuf> = Vec::new();
         let recut_result = transcode_recut_blocking(
             ffmpeg,
+            lanes,
             episodes,
-            target_count,
+            RecutStrategy::DurationRange { min_sec, max_sec },
             &staging,
-            &mut step_recut,
+            &step_recut,
             &mut staging_produced,
         );
         if let Err(error) = recut_result {
@@ -995,18 +1500,19 @@ fn transcode_deep_blocking(
         return Err("分集重组没有产出任何片段，无法继续微帧。".into());
     }
 
-    // 阶段二：对每个新集做智能微帧（比例映射到 50~100）。
+    // 阶段二：对每个新集做智能微帧（比例映射到 55~100）。
     let nudge_result = {
-        let mut step_nudge = |done: u64, total: u64, label: &str| {
-            let scaled = 50 + done.min(total) * 50 / total.max(1);
-            on_step(scaled, 100, &format!("微帧 · {label}"));
+        let step_nudge = |done: u64, total: u64, label: &str| {
+            let scaled = 55 + done.min(total) * 45 / total.max(1);
+            emit(scaled, 100, &format!("微帧 · {label}"));
         };
         transcode_nudge_blocking(
             ffmpeg,
+            lanes,
             drama_name,
             &recut_files,
             output_dir,
-            &mut step_nudge,
+            &step_nudge,
             produced,
         )
     };
@@ -1014,25 +1520,13 @@ fn transcode_deep_blocking(
     let nudge_report = nudge_result?;
     let episode_count = nudge_report.items.len();
 
-    // 阶段三：过程图（软失败——失败只记日志，不影响成片产物）。
-    let video_specs: Vec<(PathBuf, f64)> = recut_files
-        .iter()
-        .map(|episode| (episode.file.path.clone(), episode.spec.duration_sec))
-        .collect();
-    if let Err(error) =
-        generate_process_images_blocking(app, &ffmpeg, drama_name, &video_specs, output_dir)
-    {
-        crate::logging::log_event("转码", format!("过程图生成失败（不影响成片）：{error}"));
-    } else {
-        crate::logging::log_event("转码", format!("过程图已生成到 {}", output_dir.display()));
-    }
-
     Ok(TranscodeRunReport {
         mode: "deep".into(),
         output_dir: output_dir.display().to_string(),
         items: nudge_report.items,
         note: format!(
-            "深度处理完成：全剧按场景切点重组后逐集微帧（两轮编码），共 {episode_count} 集，输出到新目录，原素材未改动。"
+            "深度处理完成：材料先行（剧名/简介/海报/过程图/AI 制作证明），全剧按场景切点重组后逐集微帧（{}），共 {episode_count} 集，输出到新目录，原素材未改动。",
+            lanes.describe()
         ),
     })
 }
@@ -1042,24 +1536,27 @@ const PROCESS_IMAGE_COUNT: usize = 4;
 // 每图帧数固定为 3（抽帧步长 10%/40%/70% 已按 3 帧写死），暂未引用，注释保留备查。
 // const FRAMES_PER_PROCESS_IMAGE: usize = 3;
 
-/// 生成报审过程图：从深度处理成片抽帧 + 分镜概要文字，交给 Pillow 脚本排版出 4 张图。
+/// 生成报审过程图：从给定代表集抽帧 + 分镜概要文字，交给 Pillow 脚本排版出 4 张图。
 ///
-/// 概要文字优先用 LLM（一次调用产 4 段），未配置或失败时退回模板（Python 侧同样兜底）。
+/// 材料先行后抽帧源是**原始素材代表集**（`video_specs` 由调用方用
+/// [`representative_episodes`] 产出），不再是成片。概要文字优先用 LLM
+/// （一次调用产 4 段），未配置或失败时退回模板（Python 侧同样兜底）。
 /// 整个函数是「软失败」语义：调用方（deep 流程）只把错误记日志，不影响成片产物。
 fn generate_process_images_blocking(
     app: &AppHandle,
     ffmpeg: &Path,
     drama_name: &str,
     video_specs: &[(PathBuf, f64)],
+    episode_count: usize,
     output_dir: &Path,
 ) -> Result<(), String> {
     if video_specs.is_empty() {
-        return Err("没有可用的成片，跳过过程图".into());
+        return Err("没有可用的抽帧素材，跳过过程图".into());
     }
     let settings = read_settings(app)?;
     let drama_title = settings.drama_title.clone().unwrap_or_default();
 
-    // 1) 均匀抽 4 个代表集（不足 4 集就循环复用），每集在 10% / 40% / 70% 处各抓一帧。
+    // 1) 每个代表集在 10% / 40% / 70% 处各抓一帧（video_specs 已是代表集清单）。
     let frames_dir = output_dir.join(".process-frames");
     let _ = std::fs::remove_dir_all(&frames_dir);
     std::fs::create_dir_all(&frames_dir).map_err(|error| format!("创建抽帧目录失败：{error}"))?;
@@ -1136,7 +1633,7 @@ fn generate_process_images_blocking(
             "--title".into(),
             drama_title.clone(),
             "--episode-label".into(),
-            format!("全剧 {} 集", episode_count_of(video_specs)),
+            format!("全剧 {episode_count} 集"),
             "--frames".into(),
             frame_paths.join(","),
             "--poster".into(),
@@ -1166,11 +1663,6 @@ fn generate_process_images_blocking(
     Ok(())
 }
 
-/// 过程图上标注的集数（取产物个数；空列表由调用方提前拦截）。
-fn episode_count_of(video_specs: &[(PathBuf, f64)]) -> usize {
-    video_specs.len()
-}
-
 fn transcode_blocking(
     app: &AppHandle,
     root: String,
@@ -1183,6 +1675,12 @@ fn transcode_blocking(
     TRANSCODE_CANCEL.store(false, Ordering::SeqCst);
     let ffmpeg = resolve_ffmpeg(app)?;
     let ffprobe = resolve_ffprobe(app, ffprobe_path.as_deref())?;
+    // 编码器选型一次（NVENC / VideoToolbox → 3 路；libx264 → 2 路），全程共用。
+    let lanes = detect_encode_lanes(&ffmpeg);
+    crate::logging::log_event(
+        "转码",
+        format!("编码器：{}，依据：{}", lanes.describe(), lanes.reason),
+    );
     let drama = load_drama(&root, &name)?;
     let episodes = probe_all(&drama, Some(ffprobe.display().to_string()));
     if episodes.is_empty() {
@@ -1224,7 +1722,8 @@ fn transcode_blocking(
     let dir_existed = output_dir.exists();
     let mut produced: Vec<PathBuf> = Vec::new();
 
-    let mut on_step = |done: u64, total: u64, label: &str| {
+    // 并行执行器在工作线程上回调进度；emit_task_progress 只依赖 &AppHandle，可安全共享。
+    let emit = |done: u64, total: u64, label: &str| {
         emit_task_progress(app, "transcode", done, total, label);
     };
     let result = match mode {
@@ -1235,37 +1734,38 @@ fn transcode_blocking(
                 .clamp(1, episodes.len().max(1) * 10);
             transcode_recut_blocking(
                 &ffmpeg,
+                &lanes,
                 &episodes,
-                target,
+                RecutStrategy::TargetCount(target),
                 &output_dir,
-                &mut on_step,
+                &emit,
                 &mut produced,
             )
         }
         "deep" => {
-            // 目标集数一律读设置（页内不再传）；请求值仅作为显式覆盖保留给命令行调用。
-            let target = request
-                .target_count
-                .unwrap_or_else(|| settings.effective_recut_target_count() as usize)
-                .clamp(1, episodes.len().max(1) * 20);
+            // 单集时长区间一律读设置（页内不再传）；集数由素材总时长反推。
+            let (min_sec, max_sec) = settings.effective_recut_range();
             transcode_deep_blocking(
                 &app,
                 &ffmpeg,
                 &ffprobe,
                 &drama.name,
                 &episodes,
-                target,
+                f64::from(min_sec),
+                f64::from(max_sec),
+                &lanes,
                 &output_dir,
-                &mut on_step,
+                &emit,
                 &mut produced,
             )
         }
         _ => transcode_nudge_blocking(
             &ffmpeg,
+            &lanes,
             &drama.name,
             &episodes,
             &output_dir,
-            &mut on_step,
+            &emit,
             &mut produced,
         ),
     };
@@ -2235,6 +2735,64 @@ mod tests {
         // 这里验证同一进程内两次调用不会 panic 且互不相同（时间项不同）。
         let _ = seed_for("第01集.mp4");
         let _ = seed_for("第01集.mp4");
+    }
+
+    #[test]
+    fn representative_episodes_samples_uniformly_and_reuses() {
+        // 10 集抽 4 个：应命中首、约 1/3、约 2/3、末位，且不重复。
+        let episodes: Vec<ProbedEpisode> = (0..10)
+            .map(|index| probe_at(&format!("/a/第{index:02}集.mp4"), 60.0 + index as f64))
+            .collect();
+        let picks = representative_episodes(&episodes, 4);
+        assert_eq!(picks.len(), 4);
+        let indexes: Vec<usize> = picks
+            .iter()
+            .map(|(path, _)| {
+                episodes
+                    .iter()
+                    .position(|e| e.file.path == *path)
+                    .expect("抽中的路径必须来自原始素材")
+            })
+            .collect();
+        assert_eq!(indexes, vec![0, 3, 6, 9]);
+        // 时长跟集走，供抽帧命令换算中点。
+        assert!((picks[3].1 - 69.0).abs() < 1e-9);
+
+        // 2 集抽 4 个：不足时循环复用，数量仍然凑满。
+        let two = vec![
+            probe_at("/a/第01集.mp4", 60.0),
+            probe_at("/a/第02集.mp4", 61.0),
+        ];
+        let picks = representative_episodes(&two, 4);
+        assert_eq!(picks.len(), 4);
+        assert_eq!(picks[0].0, two[0].file.path);
+        assert_eq!(picks[1].0, two[1].file.path);
+        assert_eq!(picks[2].0, two[0].file.path);
+
+        // 空素材直接返回空，调用方据此跳过过程图。
+        assert!(representative_episodes(&[], 4).is_empty());
+    }
+
+    #[test]
+    fn local_date_string_is_valid_iso_date() {
+        let date = local_date_string();
+        // 格式：YYYY-MM-DD，各段都是数字。
+        assert_eq!(date.len(), 10, "格式必须是 YYYY-MM-DD：{date}");
+        let bytes = date.as_bytes();
+        for (index, byte) in bytes.iter().enumerate() {
+            if index == 4 || index == 7 {
+                assert_eq!(byte, &b'-', "分隔符位置错：{date}");
+            } else {
+                assert!(byte.is_ascii_digit(), "非数字字符：{date}");
+            }
+        }
+        // 东八区口径下年份必然落在 2020~2100，防 civil_from_days 写错量级。
+        let year: i64 = date[..4].parse().expect("年份可解析");
+        assert!((2020..=2100).contains(&year), "年份异常：{date}");
+        let month: u32 = date[5..7].parse().expect("月份可解析");
+        let day: u32 = date[8..10].parse().expect("日可解析");
+        assert!((1..=12).contains(&month), "月份越界：{date}");
+        assert!((1..=31).contains(&day), "日越界：{date}");
     }
 
     #[test]

@@ -56,8 +56,16 @@ pub struct AppSettings {
     pub img_model: Option<String>,
     /// 深度处理输出目录；`None` 表示写在剧目目录内（同 `resolve_product_dir` 语义）。
     pub deep_output_dir: Option<PathBuf>,
-    /// 深度处理重组目标集数；`None` 表示使用默认 90 集。
-    pub recut_target_count: Option<u32>,
+    /// 深度处理重组的单集最短时长（秒）；`None` 表示默认 60。
+    pub recut_min_sec: Option<u32>,
+    /// 深度处理重组的单集最长时长（秒）；`None` 表示默认 70。
+    pub recut_max_sec: Option<u32>,
+    /// 剧名来源开关：`None`/`true` 表示 AI 生成，`false` 表示本地手动填写。
+    pub ai_title_enabled: Option<bool>,
+    /// 简介来源开关：`None`/`true` 表示 AI 生成，`false` 表示本地手动填写。
+    pub ai_synopsis_enabled: Option<bool>,
+    /// 海报来源开关：`None`/`true` 表示 AI 生成，`false` 表示本地图片。
+    pub ai_poster_enabled: Option<bool>,
 }
 
 impl AppSettings {
@@ -66,9 +74,12 @@ impl AppSettings {
         self.rules.clone().unwrap_or_default()
     }
 
-    /// 深度处理重组目标集数的生效值：未配置时默认 90 集。
-    pub fn effective_recut_target_count(&self) -> u32 {
-        self.recut_target_count.unwrap_or(90).clamp(2, 500)
+    /// 深度处理重组单集时长区间的生效值：未配置时默认 60~70 秒。
+    /// 集数不再直接配置，由「素材总时长 ÷ 单集目标时长」反推。
+    pub fn effective_recut_range(&self) -> (u32, u32) {
+        let min = self.recut_min_sec.unwrap_or(60).clamp(5, 3600);
+        let max = self.recut_max_sec.unwrap_or(70).clamp(min + 5, 3600);
+        (min, max)
     }
 }
 

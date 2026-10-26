@@ -23,6 +23,10 @@ Thumbs.db
 .env
 .env.*
 
+# IDE 本地产物（分享缓存、会话计划）
+.trae/
+.trae-html-share-packages/
+
 # NarraFork 本地工作目录（计划、附件缓存）
 .narrafork/
 

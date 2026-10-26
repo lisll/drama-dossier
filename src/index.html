@@ -235,7 +235,7 @@
             </div>
 
             <div id="transcode-body">
-              <!-- 卡 0：剧名 / 简介 / 海报（对照 Grove-Max 同名能力；云端版接入前走用户自配 API） -->
+              <!-- 卡 0：剧名 / 简介 / 海报（对照 Grove-Max「生成配置」行式排版；云端版接入前走用户自配 API） -->
               <section class="panel">
                 <section class="panel-header">
                   <h3>剧名 / 简介 / 海报</h3>
@@ -247,29 +247,52 @@
                   <button type="button" class="link" data-goto-sub="rules">设置 → 生成设置</button>
                   配置 LLM / 生图 API。
                 </p>
-                <div class="form-grid">
-                  <label>剧名
-                    <span class="path-row form-field-row">
-                      <input id="drama-title" type="text" placeholder="手动填写，或点击「AI 生成」自动起名" />
-                      <button id="ai-title" type="button" class="ghost">AI 生成</button>
+                <div class="ai-config-rows">
+                  <div class="ai-config-row">
+                    <span class="ai-config-label">剧名</span>
+                    <input id="drama-title" type="text" placeholder="手动填写，或点击右侧按钮 AI 起名" />
+                    <label class="ai-mode" title="开启 = AI 生成；关闭 = 本地手动">
+                      <input id="ai-title-mode" type="checkbox" checked />
+                      <span class="ai-mode-track"></span>
+                      <span class="ai-mode-text">AI</span>
+                    </label>
+                    <button id="ai-title" type="button" class="ghost ai-gen">AI 生成</button>
+                  </div>
+                  <div class="ai-config-row">
+                    <span class="ai-config-label">简介</span>
+                    <textarea id="drama-synopsis" rows="2" spellcheck="false" placeholder="一句话讲清故事主线（100 字内效果最佳）；也可点击右侧按钮 AI 生成"></textarea>
+                    <label class="ai-mode" title="开启 = AI 生成；关闭 = 本地手动">
+                      <input id="ai-synopsis-mode" type="checkbox" checked />
+                      <span class="ai-mode-track"></span>
+                      <span class="ai-mode-text">AI</span>
+                    </label>
+                    <button id="ai-synopsis" type="button" class="ghost ai-gen">AI 生成</button>
+                  </div>
+                  <div class="ai-config-row">
+                    <span class="ai-config-label">海报</span>
+                    <div class="poster-cell">
+                      <span id="poster-status" class="badge hidden"></span>
+                      <div id="poster-preview-wrap" class="poster-preview-wrap hidden">
+                        <img id="poster-preview" alt="海报预览" />
+                        <span id="poster-path" class="poster-path"></span>
+                      </div>
+                      <span class="poster-empty hint">生成后在此预览（竖版 9:16）</span>
+                    </div>
+                    <label class="ai-mode" title="开启 = AI 生成；关闭 = 选择本地图片">
+                      <input id="ai-poster-mode" type="checkbox" checked />
+                      <span class="ai-mode-track"></span>
+                      <span class="ai-mode-text">AI</span>
+                    </label>
+                    <span class="poster-actions">
+                      <button id="ai-poster" type="button" class="ghost ai-gen">AI 生成</button>
+                      <button id="ai-poster-local" type="button" class="ghost hidden">选择本地图片</button>
                     </span>
-                  </label>
-                </div>
-                <label class="ai-label synopsis-label">简介
-                  <textarea id="drama-synopsis" rows="3" spellcheck="false" placeholder="一句话讲清故事主线（100 字内效果最佳）；也可点击下方按钮 AI 生成"></textarea>
-                </label>
-                <div class="option-row">
-                  <button id="ai-synopsis" type="button" class="ghost">AI 生成简介</button>
-                  <button id="ai-poster" type="button" class="ghost">AI 生成海报</button>
-                  <span id="poster-status" class="badge hidden"></span>
-                </div>
-                <div id="poster-preview-wrap" class="poster-preview-wrap hidden">
-                  <img id="poster-preview" alt="海报预览" />
-                  <span id="poster-path" class="poster-path"></span>
+                  </div>
                 </div>
               </section>
 
-              <!-- 卡 1：生成报审包（Grove「生成配置」卡样式） -->
+              <!-- 卡 1：生成报审包（按需求暂时隐藏，代码保留；恢复时取消本注释并还原
+                   main.js 中「报审包入口（暂时隐藏）」标记的两处绑定与 #output-dir 占位提示）
               <section class="panel">
                 <section class="panel-header">
                   <h3>生成报审包</h3>
@@ -296,6 +319,7 @@
                   合规说明：剧备只整理使用者提供的真实材料，不伪造签名、印章或时间戳；报审包固定包含内容权属声明模板。
                 </p>
               </section>
+              -->
 
               <!-- 卡 2：转码处理 → 深度处理（合并「智能微帧 + 分集重组」两步，对照 Grove-Max「深度处理」） -->
               <section class="panel">
@@ -319,7 +343,7 @@
                 <div class="mode-cards single">
                   <div class="mode-card active deep-card">
                     <strong>深度处理</strong>
-                    <span>自动执行两步：先按场景切点重新分集（重组），再对每个新集裁掉开头微帧（微帧），最后统一编码并生成过程图。</span>
+                    <span>材料先行：先自动准备剧名 / 简介 / 海报 / 过程图并写入 AI 制作证明，再按场景切点重新分集（重组）并逐集微帧。编码按机器能力自动选路：有硬件编码器（显卡 / Apple 芯片）时 3 路并行，否则 CPU 2 路并行。</span>
                   </div>
                 </div>
 
@@ -332,7 +356,7 @@
                 <p class="hint">
                   输出目录与目标集数统一在
                   <button type="button" class="link" data-goto-sub="rules">设置 → 生成设置 → 转码设置</button>
-                  中配置；未配置输出目录时写到剧目目录/深度处理。全程不改动原素材，全剧两轮重编码，耗时较长。
+                  中配置；未配置输出目录时写到剧目目录/深度处理。全程不改动原素材；剧名等 AI 材料缺失时不阻塞，处理完成后可回设置页补生成。
                 </p>
                 <div class="option-row">
                   <button id="exec-run" data-long-task class="success">开始深度处理</button>
@@ -761,15 +785,18 @@
                 <label>默认输出目录（产物根目录）<input id="settings-output" type="text" placeholder="留空时写在剧目目录内；填了会写到 该目录/剧名/报审包" /></label>
               </div>
 
-              <!-- 转码设置：深度处理的输出目录与重组目标集数（对照 Grove-Max「转码设置」） -->
+              <!-- 转码设置：深度处理的单集时长区间与输出目录（对照 Grove-Max「转码设置」） -->
               <section class="panel-header">
                 <h3>转码设置</h3>
                 <span class="badge">深度处理</span>
               </section>
-              <p class="hint">「深度处理」的分集重组目标集数与输出目录在此配置；未配置输出目录时写到剧目目录/深度处理。</p>
+              <p class="hint">「深度处理」按单集时长自动计算集数（每集落在区间内、吸附场景切点），输出目录也在此配置；未配置输出目录时写到剧目目录/深度处理。编码自动适配本机：检测到硬件编码器（NVIDIA 显卡 / Apple 芯片）用 3 路并行，否则 CPU 2 路并行，无需手动配置。</p>
               <div class="form-grid">
-                <label>重组目标集数
-                  <input id="recut-target-count" type="number" min="2" max="500" step="1" placeholder="留空默认 90" />
+                <label>单集最短时长（秒）
+                  <input id="recut-min-sec" type="number" min="5" max="3600" step="1" placeholder="留空默认 60" />
+                </label>
+                <label>单集最长时长（秒）
+                  <input id="recut-max-sec" type="number" min="5" max="3600" step="1" placeholder="留空默认 70" />
                 </label>
                 <label>深度处理输出目录
                   <span class="path-row form-field-row">

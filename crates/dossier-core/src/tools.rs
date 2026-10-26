@@ -163,6 +163,61 @@ pub fn plan_recut_segments(
     segments
 }
 
+/// 按单集时长区间切全局时间线：每段尽量落在 `[min_sec, max_sec]`，
+/// 优先吸附区间内离目标时长（区间中点）最近的场景切点，无切点时硬切在目标点。
+///
+/// 与 `plan_recut_segments` 的差别：那里由「目标集数」反推每段时长，
+/// 这里由「单集目标时长」决定段数——素材总时长 ÷ 区间中点 ≈ 集数。
+/// 结尾剩余不足 `min_sec` 时并入前一段（前一段最长 `max_sec + 剩余`），避免碎尾段。
+pub fn plan_recut_by_duration(
+    boundaries_sec: &[f64],
+    total_sec: f64,
+    min_sec: f64,
+    max_sec: f64,
+) -> Vec<(f64, f64)> {
+    // 与 plan_recut_segments 相同的 NaN 拒绝语义；区间非法（min ≥ max）同样拒绝。
+    let sane = |value: f64| value.partial_cmp(&0.0) == Some(std::cmp::Ordering::Greater);
+    if !sane(total_sec)
+        || !sane(min_sec)
+        || max_sec.partial_cmp(&min_sec) != Some(std::cmp::Ordering::Greater)
+    {
+        return vec![];
+    }
+    if total_sec <= max_sec {
+        return vec![(0.0, total_sec)];
+    }
+    let target = (min_sec + max_sec) / 2.0;
+    let mut sorted: Vec<f64> = boundaries_sec.to_vec();
+    sorted.sort_by(|left, right| left.total_cmp(right));
+    let mut cuts: Vec<f64> = Vec::new();
+    let mut pos = 0.0;
+    while total_sec - pos > max_sec {
+        let lower = pos + min_sec;
+        let upper = pos + max_sec;
+        let goal = pos + target;
+        let chosen = sorted
+            .iter()
+            .copied()
+            .filter(|value| *value > lower && *value < upper)
+            .min_by(|left, right| (left - goal).abs().total_cmp(&(right - goal).abs()))
+            .unwrap_or(goal);
+        cuts.push(chosen);
+        pos = chosen;
+    }
+    if total_sec - pos < min_sec {
+        // 尾段太碎：去掉最后一刀，把剩余全部并进前一段。
+        cuts.pop();
+    }
+    let mut segments = Vec::with_capacity(cuts.len() + 1);
+    let mut start = 0.0;
+    for cut in cuts {
+        segments.push((start, cut));
+        start = cut;
+    }
+    segments.push((start, total_sec));
+    segments
+}
+
 /// 智能微调的帧数：1~3 帧，由种子决定（执行层用文件名+时间做种子实现“每次不同”）。
 pub fn nudge_frames(seed: u64) -> u32 {
     (seed % 3 + 1) as u32
@@ -467,6 +522,43 @@ mod tests {
         // 目标段数多到超过可用时长时，应少切而不是产生碎片。
         let segments = plan_recut_segments(&[2.0], 3.0, 50, 1.0);
         assert!(segments.iter().all(|(start, end)| end - start >= 1.0));
+    }
+
+    #[test]
+    fn recut_by_duration_keeps_segments_in_range() {
+        // 650 秒、无切点：按中点 65 秒等距切，每段都落在 60~70。
+        let even = plan_recut_by_duration(&[], 650.0, 60.0, 70.0);
+        assert_eq!(even.len(), 10);
+        assert!(even
+            .iter()
+            .all(|(start, end)| (end - start) >= 60.0 && (end - start) <= 70.0));
+
+        // 区间内有场景切点 → 吸附切点（每段仍在区间内）。
+        let boundaries: Vec<f64> = (1..10).map(|k| k as f64 * 65.0 + 2.0).collect();
+        let snapped = plan_recut_by_duration(&boundaries, 650.0, 60.0, 70.0);
+        assert_eq!(snapped.len(), 10);
+        assert!(snapped
+            .iter()
+            .all(|(start, end)| (end - start) >= 60.0 && (end - start) <= 70.0));
+        assert!((snapped[0].1 - 67.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn recut_by_duration_merges_tiny_tail_and_handles_short_total() {
+        // 总长不足一个 max → 整剧一段。
+        assert_eq!(
+            plan_recut_by_duration(&[], 50.0, 60.0, 70.0),
+            vec![(0.0, 50.0)]
+        );
+        // 尾段不足 min → 并入前一段（130 秒：切 65 后剩 65 ≥ 60，仍是两段）。
+        let two = plan_recut_by_duration(&[], 130.0, 60.0, 70.0);
+        assert_eq!(two.len(), 2);
+        // 120 秒：切 65 后剩 55 < 60 → 合并成一段。
+        let merged = plan_recut_by_duration(&[], 120.0, 60.0, 70.0);
+        assert_eq!(merged, vec![(0.0, 120.0)]);
+        // 非法区间与坏总长一律拒绝。
+        assert!(plan_recut_by_duration(&[], 0.0, 60.0, 70.0).is_empty());
+        assert!(plan_recut_by_duration(&[], 650.0, 70.0, 60.0).is_empty());
     }
 
     #[test]

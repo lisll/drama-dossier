@@ -77,8 +77,8 @@ pub use settings::{
 };
 pub use tools::{
     bitrate_report, episode_target_name, nudge_frames, output_dir_hits_sources,
-    plan_recut_segments, plan_rename, same_path, validate_mount_csv, BitrateItem, MountCsvCheck,
-    MountCsvIssue, RenameItem, RenamePlan,
+    plan_recut_by_duration, plan_recut_segments, plan_rename, same_path, validate_mount_csv,
+    BitrateItem, MountCsvCheck, MountCsvIssue, RenameItem, RenamePlan,
 };
 pub use transcode::{advise_episode, plan_normalization, NormalizationPlan, TranscodeTarget};
 pub use types::{CheckStatus, Drama, EpisodeFile, EpisodeSpec, ProbedEpisode};

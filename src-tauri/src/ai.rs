@@ -249,6 +249,73 @@ pub async fn ai_generate_text(
         .map_err(|error| format!("AI 文本任务失败：{error}"))?
 }
 
+/// 深度处理材料阶段的 blocking 生成入口：按设置生成剧名或简介（须在 spawn_blocking 中调用）。
+pub(crate) fn generate_text_blocking(
+    settings: &AppSettings,
+    kind: TextKind,
+    context: &str,
+) -> Result<String, String> {
+    let (base, key, model) = llm_config(settings)?;
+    let (system, user) = build_text_prompt(kind, context);
+    chat_blocking(&base, &key, &model, &system, &user)
+}
+
+/// 生成竖版海报并落盘（blocking，须在 spawn_blocking 中调用）。
+///
+/// 从命令入口抽出的公共实现：命令（手动按钮）与深度处理材料阶段共用，
+/// 落点都是 `output_dir/剧目海报.png`。返回落盘路径。
+pub(crate) fn generate_poster_blocking(
+    settings: &AppSettings,
+    output_dir: &Path,
+) -> Result<PathBuf, String> {
+    let (base, key, model) = img_config(settings)?;
+    let title = settings.drama_title.clone().unwrap_or_default();
+    let synopsis = settings.drama_synopsis.clone().unwrap_or_default();
+    let prompt = build_poster_prompt(&title, &synopsis);
+    let client = http_client()?;
+    let post = |payload: serde_json::Value| -> Result<String, String> {
+        let response = client
+            .post(format!("{base}/images/generations"))
+            .bearer_auth(&key)
+            .json(&payload)
+            .send()
+            .map_err(|error| format!("连接生图 API 失败：{error}。请检查网络与 API 地址。"))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .map_err(|error| format!("读取生图响应失败：{error}"))?;
+        if !status.is_success() {
+            let detail = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|value| value["error"]["message"].as_str().map(str::to_string))
+                .unwrap_or_else(|| body.chars().take(200).collect::<String>());
+            return Err(format!("生图 API 返回 {status}：{detail}"));
+        }
+        Ok(body)
+    };
+    // 先按竖版尺寸请求；部分兼容服务不支持 size 参数，报错后去掉重试一次。
+    // 不发 n：火山方舟图片接口未定义该参数（固定单图），OpenAI 规范缺省值也是 1。
+    let with_size = json!({"model": model, "prompt": prompt, "size": "1024x1792"});
+    let body = match post(with_size) {
+        Ok(body) => body,
+        Err(error) if error.contains("size") => post(json!({"model": model, "prompt": prompt}))?,
+        Err(error) => return Err(error),
+    };
+    let bytes = match parse_image_payload(&body)? {
+        ImagePayload::Base64(b64) => decode_base64(&b64)?,
+        ImagePayload::Url(url) => client
+            .get(url)
+            .send()
+            .map_err(|error| format!("下载海报失败：{error}"))?
+            .error_for_status()
+            .map_err(|error| format!("下载海报失败：{error}"))?
+            .bytes()
+            .map_err(|error| format!("读取海报数据失败：{error}"))?
+            .to_vec(),
+    };
+    save_poster_bytes(output_dir, &bytes)
+}
+
 /// 生成竖版海报（OpenAI 兼容 /images/generations），落盘到 outputDir；
 /// 返回 {path, dataUrl}，path 供展示落盘位置，dataUrl 供界面直接预览。
 #[tauri::command]
@@ -257,61 +324,15 @@ pub async fn ai_generate_poster(
     output_dir: String,
 ) -> Result<serde_json::Value, String> {
     let settings = crate::toolbox::read_settings(&app)?;
-    let (base, key, model) = img_config(&settings)?;
-    let title = settings.drama_title.clone().unwrap_or_default();
-    let synopsis = settings.drama_synopsis.clone().unwrap_or_default();
-    let prompt = build_poster_prompt(&title, &synopsis);
     let output = PathBuf::from(output_dir);
     if output.as_os_str().is_empty() {
         return Err("请先在设置中配置深度处理输出目录，再生成海报。".to_string());
     }
     tauri::async_runtime::spawn_blocking(move || {
-        let client = http_client()?;
-        let post = |payload: serde_json::Value| -> Result<String, String> {
-            let response = client
-                .post(format!("{base}/images/generations"))
-                .bearer_auth(&key)
-                .json(&payload)
-                .send()
-                .map_err(|error| format!("连接生图 API 失败：{error}。请检查网络与 API 地址。"))?;
-            let status = response.status();
-            let body = response.text().map_err(|error| format!("读取生图响应失败：{error}"))?;
-            if !status.is_success() {
-                let detail = serde_json::from_str::<serde_json::Value>(&body)
-                    .ok()
-                    .and_then(|value| value["error"]["message"].as_str().map(str::to_string))
-                    .unwrap_or_else(|| body.chars().take(200).collect::<String>());
-                return Err(format!("生图 API 返回 {status}：{detail}"));
-            }
-            Ok(body)
-        };
-        // 先按竖版尺寸请求；部分兼容服务不支持 size 参数，报错后去掉重试一次。
-        let with_size = json!({"model": model, "prompt": prompt, "n": 1, "size": "1024x1792"});
-        let body = match post(with_size) {
-            Ok(body) => body,
-            Err(error) if error.contains("size") => post(json!({"model": model, "prompt": prompt, "n": 1}))?,
-            Err(error) => return Err(error),
-        };
-        match parse_image_payload(&body)? {
-            ImagePayload::Base64(b64) => {
-                let bytes = decode_base64(&b64)?;
-                let path = save_poster_bytes(&output, &bytes)?;
-                Ok((path, bytes))
-            }
-            ImagePayload::Url(url) => {
-                let bytes = client
-                    .get(url)
-                    .send()
-                    .map_err(|error| format!("下载海报失败：{error}"))?
-                    .error_for_status()
-                    .map_err(|error| format!("下载海报失败：{error}"))?
-                    .bytes()
-                    .map_err(|error| format!("读取海报数据失败：{error}"))?
-                    .to_vec();
-                let path = save_poster_bytes(&output, &bytes)?;
-                Ok((path, bytes))
-            }
-        }
+        let path = generate_poster_blocking(&settings, &output)?;
+        let bytes = std::fs::read(&path)
+            .map_err(|error| format!("读取海报文件失败（{}）：{error}", path.display()))?;
+        Ok((path, bytes))
     })
     .await
     .map_err(|error| format!("AI 海报任务失败：{error}"))?
@@ -328,6 +349,11 @@ pub async fn ai_generate_poster(
             "dataUrl": format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)),
         })
     })
+}
+
+/// LLM 三项配置是否齐全（供材料阶段判断分镜概要走 AI 还是模板）。
+pub(crate) fn storyboard_llm_ready(settings: &AppSettings) -> bool {
+    llm_config(settings).is_ok()
 }
 
 /// 生成过程图所需的 4 段分镜概要：一次 chat 调用产出 JSON 数组。
@@ -368,6 +394,60 @@ fn parse_storyboard_summaries(body: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// 选择本地海报图片（png/jpg/webp），复制到深度处理输出目录并返回预览数据。
+/// 用于海报来源切到「本地」时的手动导入；复制产物按原扩展名命名「剧目海报.<ext>」。
+#[tauri::command]
+pub async fn ai_pick_local_poster(
+    app: tauri::AppHandle,
+    output_dir: String,
+) -> Result<serde_json::Value, String> {
+    let _ = crate::toolbox::read_settings(&app)?;
+    let output = PathBuf::from(output_dir);
+    if output.as_os_str().is_empty() {
+        return Err("请先在设置中配置深度处理输出目录，再导入本地海报。".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let picked = rfd::FileDialog::new()
+            .set_title("选择本地海报图片")
+            .add_filter("图片", &["png", "jpg", "jpeg", "webp"])
+            .pick_file()
+            .ok_or_else(|| "未选择图片。".to_string())?;
+        let bytes = std::fs::read(&picked)
+            .map_err(|error| format!("读取图片失败（{}）：{error}", picked.display()))?;
+        let ext = picked
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("png")
+            .to_ascii_lowercase();
+        let ext = if ext == "jpeg" {
+            "jpg".to_string()
+        } else {
+            ext
+        };
+        std::fs::create_dir_all(&output)
+            .map_err(|error| format!("创建输出目录失败（{}）：{error}", output.display()))?;
+        let target = output.join(format!("剧目海报.{ext}"));
+        std::fs::write(&target, &bytes)
+            .map_err(|error| format!("复制海报失败（{}）：{error}", target.display()))?;
+        let mime = match ext.as_str() {
+            "png" => "image/png",
+            "jpg" => "image/jpeg",
+            "webp" => "image/webp",
+            _ => "application/octet-stream",
+        };
+        use base64::Engine as _;
+        Ok(json!({
+            "path": target.display().to_string(),
+            "dataUrl": format!(
+                "data:{mime};base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(&bytes)
+            ),
+        }))
+    })
+    .await
+    .map_err(|error| format!("导入本地海报失败：{error}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,8 +461,7 @@ mod tests {
     #[test]
     fn parse_chat_content_strips_code_fence() {
         // 兼容服务可能把整个响应体包在围栏里，应能剥掉并取出 content。
-        let body =
-            "```json\n{\"choices\":[{\"message\":{\"content\":\"重生之逆袭\"}}]}\n```";
+        let body = "```json\n{\"choices\":[{\"message\":{\"content\":\"重生之逆袭\"}}]}\n```";
         assert_eq!(parse_chat_content(body).unwrap(), "重生之逆袭");
     }
 

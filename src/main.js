@@ -475,9 +475,12 @@ function renderDefaultHints() {
   const root = state.settings?.outputDir?.trim()
     ? stripPath(state.settings.outputDir.trim())
     : "";
-  $("#output-dir").placeholder = root
-    ? `留空时生成到 ${root}/<剧名>/报审包`
-    : "留空时生成到 剧目目录/报审包";
+  // 报审包入口暂时隐藏：#output-dir 不在 DOM，占位提示仅在卡片恢复后生效。
+  const outputDirField = $("#output-dir");
+  if (outputDirField)
+    outputDirField.placeholder = root
+      ? `留空时生成到 ${root}/<剧名>/报审包`
+      : "留空时生成到 剧目目录/报审包";
   // 深度处理合并后 #exec-output 已下架，输出目录提示改由「设置 → 转码设置」承担。
   $("#deep-output-dir").placeholder = root
     ? `留空时写到 ${root}/<剧名>/深度处理`
@@ -499,7 +502,11 @@ function settingsSnapshot() {
     ffprobe: $("#ffprobe-path").value.trim(),
     output: $("#settings-output").value.trim(),
     deepOutput: $("#deep-output-dir")?.value.trim() ?? "",
-    recutTarget: $("#recut-target-count")?.value.trim() ?? "",
+    recutMinSec: $("#recut-min-sec")?.value.trim() ?? "",
+    recutMaxSec: $("#recut-max-sec")?.value.trim() ?? "",
+    aiTitleMode: $("#ai-title-mode")?.checked ?? true,
+    aiSynopsisMode: $("#ai-synopsis-mode")?.checked ?? true,
+    aiPosterMode: $("#ai-poster-mode")?.checked ?? true,
     llm: [
       $("#llm-base-url")?.value.trim() ?? "",
       $("#llm-api-key")?.value.trim() ?? "",
@@ -520,7 +527,12 @@ function refreshDirtyBadge() {
     ffprobe: state.settings?.ffprobePath ?? "",
     output: state.settings?.outputDir ?? "",
     deepOutput: state.settings?.deepOutputDir ?? "",
-    recutTarget: state.settings?.recutTargetCount == null ? "" : String(state.settings.recutTargetCount),
+    recutMinSec: state.settings?.recutMinSec == null ? "" : String(state.settings.recutMinSec),
+    recutMaxSec: state.settings?.recutMaxSec == null ? "" : String(state.settings.recutMaxSec),
+    // 开关缺省语义 = AI（None 视为 true）。
+    aiTitleMode: state.settings?.aiTitleEnabled !== false,
+    aiSynopsisMode: state.settings?.aiSynopsisEnabled !== false,
+    aiPosterMode: state.settings?.aiPosterEnabled !== false,
     llm: [
       state.settings?.llmBaseUrl ?? "",
       state.settings?.llmApiKey ?? "",
@@ -553,8 +565,15 @@ async function loadSettings() {
     if (settings.aiTemplate) $("#ai-template").value = settings.aiTemplate;
     // 转码设置（深度处理）与 AI 接口配置。
     if (settings.deepOutputDir) $("#deep-output-dir").value = settings.deepOutputDir;
-    if (settings.recutTargetCount != null)
-      $("#recut-target-count").value = String(settings.recutTargetCount);
+    if (settings.recutMinSec != null)
+      $("#recut-min-sec").value = String(settings.recutMinSec);
+    if (settings.recutMaxSec != null)
+      $("#recut-max-sec").value = String(settings.recutMaxSec);
+    // 三项来源开关：settings 里 None / 缺失都视为「AI 生成」。
+    $("#ai-title-mode").checked = settings.aiTitleEnabled !== false;
+    $("#ai-synopsis-mode").checked = settings.aiSynopsisEnabled !== false;
+    $("#ai-poster-mode").checked = settings.aiPosterEnabled !== false;
+    applyAiModes();
     $("#drama-title").value = settings.dramaTitle ?? "";
     $("#drama-synopsis").value = settings.dramaSynopsis ?? "";
     $("#llm-base-url").value = settings.llmBaseUrl ?? "";
@@ -620,13 +639,21 @@ function buildSettingsFromForm(rules) {
     jianyingDraftDir: $("#jianying-draft-dir").value.trim() || null,
     // 转码设置（深度处理）+ 剧名/简介/海报 + AI 接口（云端版接入前的自配方案）。
     deepOutputDir: $("#deep-output-dir").value.trim() || null,
-    recutTargetCount:
-      $("#recut-target-count").value.trim() === ""
+    recutMinSec:
+      $("#recut-min-sec").value.trim() === ""
         ? null
-        : Number($("#recut-target-count").value.trim()),
+        : Number($("#recut-min-sec").value.trim()),
+    recutMaxSec:
+      $("#recut-max-sec").value.trim() === ""
+        ? null
+        : Number($("#recut-max-sec").value.trim()),
     dramaTitle: $("#drama-title").value.trim() || null,
     dramaSynopsis: $("#drama-synopsis").value.trim() || null,
     posterPath: state.settings?.posterPath ?? null,
+    // 来源开关（true = AI 生成 / false = 本地手动）。
+    aiTitleEnabled: $("#ai-title-mode")?.checked ?? true,
+    aiSynopsisEnabled: $("#ai-synopsis-mode")?.checked ?? true,
+    aiPosterEnabled: $("#ai-poster-mode")?.checked ?? true,
     llmBaseUrl: $("#llm-base-url").value.trim() || null,
     llmApiKey: $("#llm-api-key").value.trim() || null,
     llmModel: $("#llm-model").value.trim() || null,
@@ -703,9 +730,55 @@ async function aiGeneratePoster() {
     $("#poster-preview-wrap").classList.remove("hidden");
     $("#poster-path").textContent = poster.path ?? "";
     $("#poster-path").dataset.saved = poster.path ?? "";
+    // 预览出现后收起「生成后在此预览」占位提示。
+    $(".poster-empty")?.classList.add("hidden");
     state.settings = { ...(state.settings ?? {}), posterPath: poster.path ?? null };
     endTask();
     toast("海报已生成并保存");
+  } catch (error) {
+    endTask();
+    toast(String(error), true);
+  }
+}
+
+/**
+ * 应用三项来源开关：AI 开 = 禁用手动输入并显示「AI 生成」；
+ * AI 关 = 启用手动编辑（海报行则显示「选择本地图片」）。
+ */
+function applyAiModes() {
+  const rows = [
+    { mode: "#ai-title-mode", button: "#ai-title", manual: null, input: "#drama-title" },
+    { mode: "#ai-synopsis-mode", button: "#ai-synopsis", manual: null, input: "#drama-synopsis" },
+    {
+      mode: "#ai-poster-mode",
+      button: "#ai-poster",
+      manual: "#ai-poster-local",
+      input: null,
+    },
+  ];
+  rows.forEach(({ mode, button, manual, input }) => {
+    const aiOn = $(mode)?.checked ?? true;
+    $(button)?.classList.toggle("hidden", !aiOn);
+    if (manual) $(manual)?.classList.toggle("hidden", aiOn);
+    if (input) $(input).disabled = aiOn;
+  });
+}
+
+/** 本地海报导入：选图 → 复制到深度处理输出目录 → 回显预览。 */
+async function pickLocalPoster() {
+  if (!beginTask("正在导入本地海报")) return;
+  try {
+    await persistDramaMeta();
+    const outputDir = state.settings?.deepOutputDir ?? "";
+    const poster = await call("ai_pick_local_poster", { outputDir });
+    $("#poster-preview").src = poster.dataUrl ?? "";
+    $("#poster-preview-wrap").classList.remove("hidden");
+    $("#poster-path").textContent = poster.path ?? "";
+    $("#poster-path").dataset.saved = poster.path ?? "";
+    $(".poster-empty")?.classList.add("hidden");
+    state.settings = { ...(state.settings ?? {}), posterPath: poster.path ?? null };
+    endTask();
+    toast("本地海报已导入");
   } catch (error) {
     endTask();
     toast(String(error), true);
@@ -727,7 +800,8 @@ async function rememberRoot(root) {
     jianyingDraftDir: state.settings?.jianyingDraftDir ?? null,
     // 转码设置（深度处理）+ 剧名/简介/海报 + AI 接口，同样原样带回。
     deepOutputDir: state.settings?.deepOutputDir ?? null,
-    recutTargetCount: state.settings?.recutTargetCount ?? null,
+    recutMinSec: state.settings?.recutMinSec ?? null,
+    recutMaxSec: state.settings?.recutMaxSec ?? null,
     dramaTitle: state.settings?.dramaTitle ?? null,
     dramaSynopsis: state.settings?.dramaSynopsis ?? null,
     posterPath: state.settings?.posterPath ?? null,
@@ -966,7 +1040,7 @@ function selectDrama(index) {
   $("#checklist").innerHTML = '<div class="empty">尚未探测分集规格。</div>';
   $("#episode-body").innerHTML =
     '<tr><td colspan="5" class="empty">尚未探测。</td></tr>';
-  $("#generate-result").classList.add("hidden");
+  $("#generate-result")?.classList.add("hidden");
   // 剧目切换后，工具箱里的旧计划和旧结论全部作废：
   // 否则上一部剧的结论会挂在新剧目的上下文条下面，看起来像当前结果。
   invalidatePlans();
@@ -1997,16 +2071,26 @@ function stripPath(value) {
 // }
 
 async function executeTranscode() {
-  // 深度处理（重组 + 微帧合并）：目标集数与输出目录一律以设置为准，
-  // 前端不传，后端从 settings.deep_output_dir / recut_target_count 读取。
+  // 深度处理（重组 + 微帧合并）：单集时长区间与输出目录一律以设置为准，
+  // 前端不传，后端从 settings.recut_min_sec / recut_max_sec / deep_output_dir 读取。
   const mode = $("#exec-mode").value || "deep";
   const outputDir = null;
-  const modeLabel = "深度处理（重组 + 微帧）";
-  if (!beginTask(`正在执行${modeLabel}（两轮全剧重编码，可能需要较长时间）`)) return;
+  const modeLabel = "深度处理（材料生成 + 重组 + 微帧）";
+  if (!beginTask(`正在执行${modeLabel}（两轮并行编码，可能需要较长时间）`)) return;
+  // 材料先行：后端从落盘设置读取剧名/简介/海报与 AI 开关，
+  // 执行前先把表单内容静默保存（保存失败不阻塞转码）。
+  try {
+    await persistDramaMeta();
+  } catch (error) {
+    toast(`设置保存失败（转码继续）：${error}`, true);
+  }
   const stopButton = $("#exec-stop");
   stopButton.classList.remove("hidden");
   stopButton.disabled = false;
   stopButton.textContent = "停止转码";
+  // 新一轮开始前清掉上一轮的结果区（例如「已按要求停止转码…」的残留提示）；
+  // beginTask 未通过时不会走到这里，上一轮结果保持原样。
+  clearResult("#exec-result");
   try {
     const drama = selectedDrama();
     const report = await call("transcode_execute", {
@@ -2042,6 +2126,8 @@ async function executeTranscode() {
       paths: [["exec-output", report.outputDir]],
     });
     toast("转码完成");
+    // 材料阶段可能由 AI 生成了剧名/简介/海报并写回设置，重新加载回填界面。
+    await loadSettings();
   } catch (error) {
     const message = String(error);
     const stopped = message.includes("停止");
@@ -2816,6 +2902,18 @@ $("#env-workdir").addEventListener("keydown", (event) => {
 $("#ai-title").addEventListener("click", () => aiGenerateText("title"));
 $("#ai-synopsis").addEventListener("click", () => aiGenerateText("synopsis"));
 $("#ai-poster").addEventListener("click", aiGeneratePoster);
+$("#ai-poster-local").addEventListener("click", pickLocalPoster);
+// 来源开关：切换即生效（联动控件显隐）并静默保存，免去回设置页手动保存。
+[
+  ["#ai-title-mode", "aiTitleEnabled"],
+  ["#ai-synopsis-mode", "aiSynopsisEnabled"],
+  ["#ai-poster-mode", "aiPosterEnabled"],
+].forEach(([selector]) => {
+  $(selector).addEventListener("change", () => {
+    applyAiModes();
+    persistDramaMeta();
+  });
+});
 $("#deep-output-pick").addEventListener("click", () => browse("#deep-output-dir"));
 // ============ 挂载 ============
 // 挂载与发布卡暂时下架（HTML 已整块注释）：功能函数保留，仅注释事件绑定，恢复时一并取消注释。
@@ -2952,10 +3050,11 @@ $("#dedup-demo-run").addEventListener("click", runDedupDemo);
 $("#publish-copy-generate").addEventListener("click", generatePublishCopy);
 $("#publish-copy-load").addEventListener("click", loadPublishCopy);
 $("#publish-copy-preview").addEventListener("click", previewPublishCopy);
-$("#browse-output").addEventListener("click", () => browse("#output-dir"));
+// 报审包入口（暂时隐藏）：卡片注释后以下绑定一并停用；恢复时取消注释即可。
+// $("#browse-output").addEventListener("click", () => browse("#output-dir"));
 $("#scan").addEventListener("click", scan);
 $("#analyze").addEventListener("click", analyze);
-$("#generate").addEventListener("click", generate);
+// $("#generate").addEventListener("click", generate);
 $("#save-settings").addEventListener("click", saveSettings);
 $("#reset-settings").addEventListener("click", () => {
   fillRules(DEFAULT_RULES);
@@ -2986,7 +3085,8 @@ $("#library-root").addEventListener("input", renderEmptyGuide);
   "#rule-min-episodes", "#rule-min-duration", "#rule-max-duration",
   "#rule-max-bitrate",
 ].forEach((selector) => {
-  $(selector).addEventListener("input", () => setFieldError(selector, null));
+  // 报审包字段（#total-investment / #actor-ratio）随卡片暂时隐藏，元素缺失时跳过。
+  $(selector)?.addEventListener("input", () => setFieldError(selector, null));
 });
 
 // 结果区里的「打开目录 / 复制路径」用事件委托，避免把路径拼进 HTML。
