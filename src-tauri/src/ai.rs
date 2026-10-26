@@ -22,17 +22,6 @@ pub enum TextKind {
     Synopsis,
 }
 
-impl TextKind {
-    /// 从前端传来的 kind 字符串解析；未知值返回错误。
-    fn parse(kind: &str) -> Result<Self, String> {
-        match kind.trim() {
-            "title" => Ok(TextKind::Title),
-            "synopsis" => Ok(TextKind::Synopsis),
-            other => Err(format!("未知的 AI 文本任务类型：{other}")),
-        }
-    }
-}
-
 /// 取出必填的非空配置项；未配置时返回带指引的提示。
 fn required_field<'a>(
     value: &'a Option<String>,
@@ -231,24 +220,6 @@ fn save_poster_bytes(output_dir: &Path, bytes: &[u8]) -> Result<PathBuf, String>
     Ok(path)
 }
 
-/// 生成剧名或简介（OpenAI 兼容 /chat/completions），返回文本供前端回填。
-#[tauri::command]
-pub async fn ai_generate_text(
-    app: tauri::AppHandle,
-    kind: String,
-    context: String,
-) -> Result<String, String> {
-    let text_kind = TextKind::parse(&kind)?;
-    let (base, key, model) = {
-        let settings = crate::toolbox::read_settings(&app)?;
-        llm_config(&settings)?
-    };
-    let (system, user) = build_text_prompt(text_kind, &context);
-    tauri::async_runtime::spawn_blocking(move || chat_blocking(&base, &key, &model, &system, &user))
-        .await
-        .map_err(|error| format!("AI 文本任务失败：{error}"))?
-}
-
 /// 深度处理材料阶段的 blocking 生成入口：按设置生成剧名或简介（须在 spawn_blocking 中调用）。
 pub(crate) fn generate_text_blocking(
     settings: &AppSettings,
@@ -316,41 +287,6 @@ pub(crate) fn generate_poster_blocking(
     save_poster_bytes(output_dir, &bytes)
 }
 
-/// 生成竖版海报（OpenAI 兼容 /images/generations），落盘到 outputDir；
-/// 返回 {path, dataUrl}，path 供展示落盘位置，dataUrl 供界面直接预览。
-#[tauri::command]
-pub async fn ai_generate_poster(
-    app: tauri::AppHandle,
-    output_dir: String,
-) -> Result<serde_json::Value, String> {
-    let settings = crate::toolbox::read_settings(&app)?;
-    let output = PathBuf::from(output_dir);
-    if output.as_os_str().is_empty() {
-        return Err("请先在设置中配置深度处理输出目录，再生成海报。".to_string());
-    }
-    tauri::async_runtime::spawn_blocking(move || {
-        let path = generate_poster_blocking(&settings, &output)?;
-        let bytes = std::fs::read(&path)
-            .map_err(|error| format!("读取海报文件失败（{}）：{error}", path.display()))?;
-        Ok((path, bytes))
-    })
-    .await
-    .map_err(|error| format!("AI 海报任务失败：{error}"))?
-    .map(|(path, bytes)| {
-        // 顺带返回 dataUrl，前端可直接拿来做海报预览（CSP 已放行 data: 图片）。
-        use base64::Engine as _;
-        let mime = if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
-            "image/png"
-        } else {
-            "image/jpeg"
-        };
-        json!({
-            "path": path.display().to_string(),
-            "dataUrl": format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)),
-        })
-    })
-}
-
 /// LLM 三项配置是否齐全（供材料阶段判断分镜概要走 AI 还是模板）。
 pub(crate) fn storyboard_llm_ready(settings: &AppSettings) -> bool {
     llm_config(settings).is_ok()
@@ -392,60 +328,6 @@ fn parse_storyboard_summaries(body: &str) -> Result<Vec<String>, String> {
         return Err(format!("分镜概要不足 4 段（实际 {} 段）", out.len()));
     }
     Ok(out)
-}
-
-/// 选择本地海报图片（png/jpg/webp），复制到深度处理输出目录并返回预览数据。
-/// 用于海报来源切到「本地」时的手动导入；复制产物按原扩展名命名「剧目海报.<ext>」。
-#[tauri::command]
-pub async fn ai_pick_local_poster(
-    app: tauri::AppHandle,
-    output_dir: String,
-) -> Result<serde_json::Value, String> {
-    let _ = crate::toolbox::read_settings(&app)?;
-    let output = PathBuf::from(output_dir);
-    if output.as_os_str().is_empty() {
-        return Err("请先在设置中配置深度处理输出目录，再导入本地海报。".to_string());
-    }
-    tauri::async_runtime::spawn_blocking(move || {
-        let picked = rfd::FileDialog::new()
-            .set_title("选择本地海报图片")
-            .add_filter("图片", &["png", "jpg", "jpeg", "webp"])
-            .pick_file()
-            .ok_or_else(|| "未选择图片。".to_string())?;
-        let bytes = std::fs::read(&picked)
-            .map_err(|error| format!("读取图片失败（{}）：{error}", picked.display()))?;
-        let ext = picked
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or("png")
-            .to_ascii_lowercase();
-        let ext = if ext == "jpeg" {
-            "jpg".to_string()
-        } else {
-            ext
-        };
-        std::fs::create_dir_all(&output)
-            .map_err(|error| format!("创建输出目录失败（{}）：{error}", output.display()))?;
-        let target = output.join(format!("剧目海报.{ext}"));
-        std::fs::write(&target, &bytes)
-            .map_err(|error| format!("复制海报失败（{}）：{error}", target.display()))?;
-        let mime = match ext.as_str() {
-            "png" => "image/png",
-            "jpg" => "image/jpeg",
-            "webp" => "image/webp",
-            _ => "application/octet-stream",
-        };
-        use base64::Engine as _;
-        Ok(json!({
-            "path": target.display().to_string(),
-            "dataUrl": format!(
-                "data:{mime};base64,{}",
-                base64::engine::general_purpose::STANDARD.encode(&bytes)
-            ),
-        }))
-    })
-    .await
-    .map_err(|error| format!("导入本地海报失败：{error}"))?
 }
 
 #[cfg(test)]
@@ -523,13 +405,6 @@ mod tests {
         assert_eq!(base, "https://api.x.com/v1");
         assert_eq!(key, "sk-test");
         assert_eq!(model, "demo");
-    }
-
-    #[test]
-    fn text_kind_parses_known_values_only() {
-        assert_eq!(TextKind::parse("title"), Ok(TextKind::Title));
-        assert_eq!(TextKind::parse("synopsis"), Ok(TextKind::Synopsis));
-        assert!(TextKind::parse("other").is_err());
     }
 
     #[test]

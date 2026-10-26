@@ -2058,30 +2058,7 @@ textarea {
   resize: vertical;
 }
 
-/* 海报预览：竖版 9:16 缩略 + 落盘路径说明 */
-.poster-preview-wrap {
-  display: flex;
-  align-items: flex-start;
-  gap: 14px;
-  margin-top: 4px;
-}
-
-.poster-preview-wrap img {
-  width: 132px;
-  aspect-ratio: 9 / 16;
-  object-fit: cover;
-  border-radius: 10px;
-  border: 1px solid var(--line, rgba(0, 0, 0, 0.12));
-  background: rgba(0, 0, 0, 0.04);
-}
-
-.poster-path {
-  color: var(--muted);
-  font-size: 12px;
-  word-break: break-all;
-}
-
-/* AI 生成配置行式排版（对照 Grove-Max「生成配置」）：一行一项，右侧统一放生成按钮 */
+/* AI 生成配置行式排版（对照 Grove-Max「生成配置」）：一行一项，右侧放 AI 来源开关 */
 .ai-config-rows {
   display: flex;
   flex-direction: column;
@@ -2090,7 +2067,7 @@ textarea {
 
 .ai-config-row {
   display: grid;
-  grid-template-columns: 3.5em 1fr auto auto;
+  grid-template-columns: 3.5em 1fr auto;
   gap: 10px;
   align-items: start;
 }
@@ -2158,11 +2135,11 @@ textarea {
   min-width: 1.4em;
 }
 
-/* 海报行的按钮组：AI 生成与本地选择互斥显示 */
-.poster-actions {
-  display: inline-flex;
-  gap: 6px;
-  align-items: start;
+/* 简介 / 海报行没有输入框：中列放一句来源说明（对齐行内文字基线） */
+.ai-config-row .ai-config-desc {
+  padding-top: 9px;
+  color: var(--muted);
+  font-size: 13px;
 }
 
 .ai-config-row .ai-config-label {
@@ -2170,38 +2147,6 @@ textarea {
   font-weight: 600;
   color: var(--muted);
   white-space: nowrap;
-}
-
-.ai-config-row textarea {
-  resize: vertical;
-  min-height: 2.8em;
-}
-
-.ai-config-row .ai-gen {
-  white-space: nowrap;
-  align-self: start;
-}
-
-/* 海报行：中列放状态徽标 / 预览缩略（较独立展示缩小）/ 占位提示 */
-.ai-config-row .poster-cell {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  min-height: 38px;
-  flex-wrap: wrap;
-}
-
-.ai-config-row .poster-cell .poster-preview-wrap {
-  margin-top: 0;
-  align-items: center;
-}
-
-.ai-config-row .poster-cell .poster-preview-wrap img {
-  width: 64px;
-}
-
-.ai-config-row .poster-cell .poster-empty {
-  margin: 0;
 }
 
 /* 单卡档位：深度处理独占一行 */

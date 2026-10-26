@@ -235,58 +235,46 @@
             </div>
 
             <div id="transcode-body">
-              <!-- 卡 0：剧名 / 简介 / 海报（对照 Grove-Max「生成配置」行式排版；云端版接入前走用户自配 API） -->
+              <!-- 卡 0：剧名 / 简介 / 海报（深度处理时一并生成，这里只留来源开关与剧名微调；
+                   独立的「AI 生成」按钮与简介输入框、海报预览已移除——这些不再是单独功能） -->
               <section class="panel">
                 <section class="panel-header">
                   <h3>剧名 / 简介 / 海报</h3>
                   <span class="badge">AI 辅助</span>
                 </section>
                 <p class="hint">
-                  支持一键 AI 生成，也可直接手动填写；内容随「设置 → 保存设置」持久化，
-                  深度处理的过程图与海报会使用这里的内容。首次使用请先到
+                  三项在「深度处理」时自动生成并一起写入输出目录（剧名 / 简介.txt / 剧目海报 / 过程图 / AI 制作证明）；
+                  素材目录已有的简介与封面会优先复用，无需手动填写或上传。API 在
                   <button type="button" class="link" data-goto-sub="rules">设置 → 生成设置</button>
-                  配置 LLM / 生图 API。
+                  配置。
                 </p>
                 <div class="ai-config-rows">
                   <div class="ai-config-row">
                     <span class="ai-config-label">剧名</span>
-                    <input id="drama-title" type="text" placeholder="手动填写，或点击右侧按钮 AI 起名" />
-                    <label class="ai-mode" title="开启 = AI 生成；关闭 = 本地手动">
+                    <input id="drama-title" type="text" placeholder="AI 生成后自动回填；关闭 AI 时可手动填写" />
+                    <label class="ai-mode" title="开启 = 深度处理时 AI 生成；关闭 = 使用手动填写">
                       <input id="ai-title-mode" type="checkbox" checked />
                       <span class="ai-mode-track"></span>
                       <span class="ai-mode-text">AI</span>
                     </label>
-                    <button id="ai-title" type="button" class="ghost ai-gen">AI 生成</button>
                   </div>
                   <div class="ai-config-row">
                     <span class="ai-config-label">简介</span>
-                    <textarea id="drama-synopsis" rows="2" spellcheck="false" placeholder="一句话讲清故事主线（100 字内效果最佳）；也可点击右侧按钮 AI 生成"></textarea>
-                    <label class="ai-mode" title="开启 = AI 生成；关闭 = 本地手动">
+                    <span class="ai-config-desc">AI 生成，随成片写入输出目录「简介.txt」；素材目录已有简介时直接复用</span>
+                    <label class="ai-mode" title="开启 = 深度处理时 AI 生成；关闭 = 只复用素材目录里的简介">
                       <input id="ai-synopsis-mode" type="checkbox" checked />
                       <span class="ai-mode-track"></span>
                       <span class="ai-mode-text">AI</span>
                     </label>
-                    <button id="ai-synopsis" type="button" class="ghost ai-gen">AI 生成</button>
                   </div>
                   <div class="ai-config-row">
                     <span class="ai-config-label">海报</span>
-                    <div class="poster-cell">
-                      <span id="poster-status" class="badge hidden"></span>
-                      <div id="poster-preview-wrap" class="poster-preview-wrap hidden">
-                        <img id="poster-preview" alt="海报预览" />
-                        <span id="poster-path" class="poster-path"></span>
-                      </div>
-                      <span class="poster-empty hint">生成后在此预览（竖版 9:16）</span>
-                    </div>
-                    <label class="ai-mode" title="开启 = AI 生成；关闭 = 选择本地图片">
+                    <span class="ai-config-desc">AI 生成竖版海报，随成片写入输出目录；素材目录已有封面时直接复用</span>
+                    <label class="ai-mode" title="开启 = 深度处理时 AI 生成；关闭 = 只复用素材目录里的封面">
                       <input id="ai-poster-mode" type="checkbox" checked />
                       <span class="ai-mode-track"></span>
                       <span class="ai-mode-text">AI</span>
                     </label>
-                    <span class="poster-actions">
-                      <button id="ai-poster" type="button" class="ghost ai-gen">AI 生成</button>
-                      <button id="ai-poster-local" type="button" class="ghost hidden">选择本地图片</button>
-                    </span>
                   </div>
                 </div>
               </section>

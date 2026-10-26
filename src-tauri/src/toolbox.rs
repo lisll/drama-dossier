@@ -1194,6 +1194,86 @@ fn local_date_string() -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+/// 在素材目录里找封面图：文件名含「封面 / cover / poster」的图片（与清单规则同口径）。
+/// 报审素材目录按规范都会带封面，深度处理直接复用，无需用户手动上传。
+fn find_local_cover(dir: &Path) -> Option<PathBuf> {
+    let image_exts = ["jpg", "jpeg", "png", "webp"];
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.to_ascii_lowercase())
+                    .is_some_and(|ext| image_exts.contains(&ext.as_str()))
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        let lower = name.to_ascii_lowercase();
+                        ["封面", "cover", "poster"]
+                            .iter()
+                            .any(|keyword| lower.contains(keyword))
+                    })
+        })
+        .collect();
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
+/// 把素材目录里的封面复制为输出目录的「剧目海报.<ext>」；找不到或复制失败返回 None。
+fn copy_local_cover(dir: &Path, output_dir: &Path) -> Option<PathBuf> {
+    let source = find_local_cover(dir)?;
+    let ext = source
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())?;
+    std::fs::create_dir_all(output_dir).ok()?;
+    let target = output_dir.join(format!("剧目海报.{ext}"));
+    std::fs::copy(&source, &target).ok()?;
+    Some(target)
+}
+
+/// 读素材目录里的简介文本：文件名含「简介 / intro / synopsis」的 txt/md（与清单规则同口径）。
+/// 返回 trim 后的非空内容。
+fn read_local_synopsis(dir: &Path) -> Option<String> {
+    let text_exts = ["txt", "md"];
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.to_ascii_lowercase())
+                    .is_some_and(|ext| text_exts.contains(&ext.as_str()))
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        let lower = name.to_ascii_lowercase();
+                        ["简介", "intro", "synopsis"]
+                            .iter()
+                            .any(|keyword| lower.contains(keyword))
+                    })
+        })
+        .collect();
+    candidates.sort();
+    let path = candidates.into_iter().next()?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    let text = text.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
 /// 写入 AI 制作证明（Grove-Max 同款）：无条件生成一份 txt 落输出目录，
 /// 记录剧名/简介/海报/过程图的来源（AI 生成（模型名）/ 本地提供）、
 /// 制作工具与版本、日期和处理方式，末尾附 AI 声明。
@@ -1219,7 +1299,7 @@ fn write_ai_proof(
         "原剧目：{drama_name}（原始素材 {episode_count} 集）\n"
     ));
     body.push_str(&format!(
-        "处理方式：按场景切点重组分集并逐集微帧，编码 {}。\n\n",
+        "处理方式：按场景切点重组分集并逐集微帧，成片输出到「视频成片/」子目录，编码 {}。\n\n",
         lanes.describe()
     ));
     body.push_str(&line(
@@ -1246,7 +1326,7 @@ fn write_ai_proof(
         &materials.poster_source,
     ));
     body.push_str(&format!(
-        "过程图：过程图-1 ~ 过程图-4（画面抽自原始素材代表集）\n来源：{}\n\n",
+        "过程图：过程图_01 ~ 过程图_04（画面抽自原始素材代表集）\n来源：{}\n\n",
         materials.storyboard_source
     ));
     body.push_str(
@@ -1272,6 +1352,7 @@ fn transcode_deep_blocking(
     ffmpeg: &Path,
     ffprobe: &Path,
     drama_name: &str,
+    drama_dir: &Path,
     episodes: &[ProbedEpisode],
     min_sec: f64,
     max_sec: f64,
@@ -1286,8 +1367,16 @@ fn transcode_deep_blocking(
     let mut settings = read_settings(app)?;
     let mut materials = MaterialSources::default();
     let llm_label = ai_source_label(&settings.llm_model);
+    // 本地简介：设置里已存的优先，其次素材目录里的 简介*.txt（报审素材按规范都带，清单也要求）。
+    let settings_synopsis = non_empty(&settings.drama_synopsis);
+    let file_synopsis = if settings_synopsis.is_some() {
+        None
+    } else {
+        read_local_synopsis(drama_dir)
+    };
+    let local_synopsis = settings_synopsis.clone().or(file_synopsis.clone());
 
-    // 剧名：AI 开且当前为空 → 生成；已有值沿用；AI 关且为空 → 跳过不阻塞（可后补）。
+    // 剧名：AI 开且当前为空 → 生成（素材用简介）；已有值沿用；AI 关且为空 → 跳过不阻塞（可后补）。
     let title_ai_on = settings.ai_title_enabled != Some(false);
     materials.title = non_empty(&settings.drama_title);
     materials.title_source = if materials.title.is_some() {
@@ -1298,7 +1387,8 @@ fn transcode_deep_blocking(
         }
     } else if title_ai_on {
         emit(1, 100, "材料 · AI 生成剧名");
-        let context = non_empty(&settings.drama_synopsis)
+        let context = local_synopsis
+            .clone()
             .unwrap_or_else(|| format!("剧目目录名：{drama_name}"));
         match crate::ai::generate_text_blocking(&settings, crate::ai::TextKind::Title, &context) {
             Ok(text) => {
@@ -1318,27 +1408,23 @@ fn transcode_deep_blocking(
         "未填写（本地模式）".to_string()
     };
 
-    // 简介：同剧名逻辑，生成素材带上（可能刚生成的）剧名。
+    // 简介：设置已存 → 素材目录 简介*.txt → AI 生成 → 跳过，逐级兜底且都不阻塞。
     let synopsis_ai_on = settings.ai_synopsis_enabled != Some(false);
-    materials.synopsis = non_empty(&settings.drama_synopsis);
-    materials.synopsis_source = if materials.synopsis.is_some() {
+    materials.synopsis = local_synopsis.clone();
+    materials.synopsis_source = if settings_synopsis.is_some() {
         if synopsis_ai_on {
             llm_label.clone()
         } else {
             "本地提供".to_string()
         }
+    } else if file_synopsis.is_some() {
+        "本地提供（素材目录）".to_string()
     } else if synopsis_ai_on {
         emit(2, 100, "材料 · AI 生成简介");
-        let context = [materials.title.clone(), non_empty(&settings.drama_synopsis)]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join("。");
-        let context = if context.is_empty() {
-            format!("剧目目录名：{drama_name}")
-        } else {
-            context
-        };
+        let context = materials
+            .title
+            .clone()
+            .unwrap_or_else(|| format!("剧目目录名：{drama_name}"));
         match crate::ai::generate_text_blocking(&settings, crate::ai::TextKind::Synopsis, &context)
         {
             Ok(text) => {
@@ -1357,9 +1443,12 @@ fn transcode_deep_blocking(
     } else {
         "未填写（本地模式）".to_string()
     };
+    // 简介落到设置：海报提示词与后续复用都读这里（任务末尾随材料一并写回）。
+    if settings.drama_synopsis.is_none() {
+        settings.drama_synopsis = materials.synopsis.clone();
+    }
 
-    // 海报：AI 开 → 复用已有（设置里的路径或输出目录内上次的产物），否则生成；
-    // AI 关 → 只复用本地海报，没有就跳过。
+    // 海报：复用已有（设置里的路径或输出目录内上次的产物）→ AI 生成 → 复制素材目录封面 → 跳过。
     let poster_ai_on = settings.ai_poster_enabled != Some(false);
     let poster_in_output = ["png", "jpg", "jpeg", "webp"]
         .iter()
@@ -1371,33 +1460,34 @@ fn transcode_deep_blocking(
         .filter(|path| path.is_file())
         .cloned()
         .or(poster_in_output);
-    if poster_ai_on {
-        if let Some(path) = existing_poster {
-            settings.poster_path = Some(path.clone());
-            materials.poster = Some(path.clone());
-            materials.poster_source = "已生成（本次复用）".to_string();
-        } else {
-            emit(3, 100, "材料 · AI 生成海报");
-            match crate::ai::generate_poster_blocking(&settings, output_dir) {
-                Ok(path) => {
-                    settings.poster_path = Some(path.clone());
-                    materials.poster = Some(path.clone());
-                    materials.poster_source = ai_source_label(&settings.img_model);
-                }
-                Err(error) => {
-                    crate::logging::log_event(
-                        "材料",
-                        format!("海报生成失败（不阻塞，可后补）：{error}"),
-                    );
-                    materials.poster_source = "AI 生成失败，未生成".to_string();
-                }
+    if let Some(path) = existing_poster {
+        settings.poster_path = Some(path.clone());
+        materials.poster = Some(path.clone());
+        materials.poster_source = "已生成（本次复用）".to_string();
+    } else if poster_ai_on {
+        emit(3, 100, "材料 · AI 生成海报");
+        match crate::ai::generate_poster_blocking(&settings, output_dir) {
+            Ok(path) => {
+                settings.poster_path = Some(path.clone());
+                materials.poster = Some(path.clone());
+                materials.poster_source = ai_source_label(&settings.img_model);
+            }
+            Err(error) => {
+                crate::logging::log_event(
+                    "材料",
+                    format!("海报生成失败（不阻塞，可后补）：{error}"),
+                );
+                materials.poster_source = "AI 生成失败，未生成".to_string();
             }
         }
-    } else if let Some(path) = existing_poster {
-        materials.poster = Some(path);
-        materials.poster_source = "本地提供".to_string();
-    } else {
-        materials.poster_source = "未提供（本地模式）".to_string();
+    }
+    // 兜底：还没海报就复制素材目录的封面（报审素材按规范都带封面）。
+    if materials.poster.is_none() {
+        if let Some(path) = copy_local_cover(drama_dir, output_dir) {
+            settings.poster_path = Some(path.clone());
+            materials.poster = Some(path);
+            materials.poster_source = "本地提供（素材封面）".to_string();
+        }
     }
 
     // 过程图：抽帧源是原始素材的 4 个代表集（编码前就要产出，不能依赖成片）。
@@ -1422,7 +1512,19 @@ fn transcode_deep_blocking(
     }
 
     // AI 制作证明：无条件生成一份（Grove-Max 同款「已写入 AI 制作证明」）。
-    emit(5, 100, "材料 · 写入 AI 制作证明");
+    emit(5, 100, "材料 · 写出简介与 AI 制作证明");
+    // 简介落盘：输出目录带一份 简介.txt（AI 生成或素材目录原有，随成片一起交付）。
+    if let Some(text) = materials
+        .synopsis
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        let synopsis_path = output_dir.join("简介.txt");
+        if let Err(error) = std::fs::write(&synopsis_path, text) {
+            crate::logging::log_event("材料", format!("简介.txt 写入失败（不影响成片）：{error}"));
+        }
+    }
     if let Err(error) = write_ai_proof(
         app,
         drama_name,
@@ -1501,6 +1603,8 @@ fn transcode_deep_blocking(
     }
 
     // 阶段二：对每个新集做智能微帧（比例映射到 55~100）。
+    // 成片单独放「视频成片/」子目录（Grove-Max 同款结构），材料与视频分层清晰。
+    let final_video_dir = output_dir.join("视频成片");
     let nudge_result = {
         let step_nudge = |done: u64, total: u64, label: &str| {
             let scaled = 55 + done.min(total) * 45 / total.max(1);
@@ -1511,7 +1615,7 @@ fn transcode_deep_blocking(
             lanes,
             drama_name,
             &recut_files,
-            output_dir,
+            &final_video_dir,
             &step_nudge,
             produced,
         )
@@ -1525,7 +1629,7 @@ fn transcode_deep_blocking(
         output_dir: output_dir.display().to_string(),
         items: nudge_report.items,
         note: format!(
-            "深度处理完成：材料先行（剧名/简介/海报/过程图/AI 制作证明），全剧按场景切点重组后逐集微帧（{}），共 {episode_count} 集，输出到新目录，原素材未改动。",
+            "深度处理完成：材料先行（剧名/简介/海报/过程图/AI 制作证明），全剧按场景切点重组后逐集微帧（{}），共 {episode_count} 集，成片在「视频成片/」子目录，原素材未改动。",
             lanes.describe()
         ),
     })
@@ -1750,6 +1854,7 @@ fn transcode_blocking(
                 &ffmpeg,
                 &ffprobe,
                 &drama.name,
+                &drama.dir,
                 &episodes,
                 f64::from(min_sec),
                 f64::from(max_sec),
@@ -1791,6 +1896,7 @@ fn transcode_blocking(
 
 /// 停止后清理本次转码产物：目录是本次新建的 → 整目录删除；
 /// 目录早已存在 → 只删本次写出的文件，再尝试删掉空目录（删不掉说明还有别的内容，留着不动）。
+/// 深度处理的成片在「视频成片/」子目录，一并尝试清掉空壳。
 fn cleanup_transcode_output(output_dir: &Path, dir_existed: bool, produced: &[PathBuf]) {
     if !dir_existed {
         let _ = std::fs::remove_dir_all(output_dir);
@@ -1799,6 +1905,7 @@ fn cleanup_transcode_output(output_dir: &Path, dir_existed: bool, produced: &[Pa
     for path in produced {
         let _ = std::fs::remove_file(path);
     }
+    let _ = std::fs::remove_dir(output_dir.join("视频成片"));
     let _ = std::fs::remove_dir(output_dir);
 }
 
@@ -2793,6 +2900,53 @@ mod tests {
         let day: u32 = date[8..10].parse().expect("日可解析");
         assert!((1..=12).contains(&month), "月份越界：{date}");
         assert!((1..=31).contains(&day), "日越界：{date}");
+    }
+
+    #[test]
+    fn local_cover_and_synopsis_discovery_follows_checklist_names() {
+        let dir =
+            std::env::temp_dir().join(format!("dossier-test-materials-{}", uuid_like_suffix()));
+        std::fs::create_dir_all(&dir).expect("创建临时素材目录");
+        // 非候选文件不应被选中：视频、无关名字的图片。
+        std::fs::write(dir.join("第01集.mp4"), b"x").unwrap();
+        std::fs::write(dir.join("剧照.jpg"), b"x").unwrap();
+        // 大小写不敏感的 cover 命中；按文件名排序取第一个（ASCII 字节序在中文之前）。
+        std::fs::write(dir.join("Cover.PNG"), b"png").unwrap();
+        std::fs::write(dir.join("封面.jpg"), b"jpg").unwrap();
+        // 简介命中；「说明.txt」不含关键词，不应干扰。
+        std::fs::write(dir.join("简介.txt"), "\n  一段简介正文。\n").unwrap();
+        std::fs::write(dir.join("说明.txt"), "不是简介").unwrap();
+
+        let cover = find_local_cover(&dir).expect("应找到封面");
+        assert_eq!(cover.file_name().unwrap().to_str(), Some("Cover.PNG"));
+        let synopsis = read_local_synopsis(&dir).expect("应读到简介");
+        assert_eq!(synopsis, "一段简介正文。");
+
+        // 复制封面到输出目录：扩展名统一小写「剧目海报.png」。
+        let out_dir = dir.join("输出");
+        let copied = copy_local_cover(&dir, &out_dir).expect("应复制封面");
+        assert!(copied.is_file());
+        assert_eq!(copied.file_name().unwrap().to_str(), Some("剧目海报.png"));
+
+        // 空目录：全都返回 None。
+        let empty = dir.join("空");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(find_local_cover(&empty).is_none());
+        assert!(read_local_synopsis(&empty).is_none());
+        assert!(copy_local_cover(&empty, &out_dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 测试专用的唯一后缀（避免引入 uuid 依赖，时间戳 + 计数足够）。
+    fn uuid_like_suffix() -> u128 {
+        use std::sync::atomic::AtomicU64;
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        (std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos())
+        .wrapping_add(count as u128)
     }
 
     #[test]

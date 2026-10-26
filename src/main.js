@@ -575,18 +575,12 @@ async function loadSettings() {
     $("#ai-poster-mode").checked = settings.aiPosterEnabled !== false;
     applyAiModes();
     $("#drama-title").value = settings.dramaTitle ?? "";
-    $("#drama-synopsis").value = settings.dramaSynopsis ?? "";
     $("#llm-base-url").value = settings.llmBaseUrl ?? "";
     $("#llm-api-key").value = settings.llmApiKey ?? "";
     $("#llm-model").value = settings.llmModel ?? "";
     $("#img-base-url").value = settings.imgBaseUrl ?? "";
     $("#img-api-key").value = settings.imgApiKey ?? "";
     $("#img-model").value = settings.imgModel ?? "";
-    // 海报已在历史会话生成过时直接回显预览。
-    if (settings.posterPath && settings.posterPath !== $("#poster-path").dataset.saved) {
-      $("#poster-path").textContent = settings.posterPath;
-      $("#poster-path").dataset.saved = settings.posterPath;
-    }
     if (state.root) $("#env-workdir").value = state.root;
     renderDefaultHints();
     renderEmptyGuide();
@@ -648,7 +642,8 @@ function buildSettingsFromForm(rules) {
         ? null
         : Number($("#recut-max-sec").value.trim()),
     dramaTitle: $("#drama-title").value.trim() || null,
-    dramaSynopsis: $("#drama-synopsis").value.trim() || null,
+    // 简介输入框已移除：简介由深度处理自动生成（或复用素材目录），这里原样带回避免丢失。
+    dramaSynopsis: state.settings?.dramaSynopsis ?? null,
     posterPath: state.settings?.posterPath ?? null,
     // 来源开关（true = AI 生成 / false = 本地手动）。
     aiTitleEnabled: $("#ai-title-mode")?.checked ?? true,
@@ -681,107 +676,14 @@ async function persistDramaMeta() {
   refreshDirtyBadge();
 }
 
-// ============ AI 生成：剧名 / 简介 / 海报（OpenAI 兼容自配 API） ============
-
-/** 生成剧名或简介并回填输入框；kind 传 title / synopsis，素材取对方字段的当前值。 */
-async function aiGenerateText(kind) {
-  const title = $("#drama-title").value.trim();
-  const synopsis = $("#drama-synopsis").value.trim();
-  // 素材：生成剧名用简介，生成简介用剧名 + 已写了一半的简介；两者全空时给出引导。
-  const context =
-    kind === "title"
-      ? synopsis || title
-      : [title, synopsis].filter(Boolean).join("。");
-  if (!context) {
-    toast(
-      kind === "title"
-        ? "请先手动填写一些剧情简介作为素材，再生成剧名"
-        : "请先填写剧名或简单描述剧情方向，再生成简介",
-      true,
-    );
-    return;
-  }
-  if (!beginTask(kind === "title" ? "正在 AI 生成剧名" : "正在 AI 生成简介")) return;
-  try {
-    const text = await call("ai_generate_text", { kind, context });
-    if (kind === "title") {
-      $("#drama-title").value = text;
-    } else {
-      $("#drama-synopsis").value = text;
-    }
-    endTask();
-    toast(kind === "title" ? "剧名已生成并回填" : "简介已生成并回填");
-  } catch (error) {
-    endTask();
-    toast(String(error), true);
-  }
-}
-
-/** 生成竖版海报：先静默落盘剧名/简介（生图提示词要用），再调用生图 API 并回显预览。 */
-async function aiGeneratePoster() {
-  if (!beginTask("正在 AI 生成海报（生图通常需要 10~30 秒）")) return;
-  try {
-    // 后端从设置读剧名/简介拼提示词，生成前先把表单内容静默保存。
-    await persistDramaMeta();
-    const outputDir = state.settings?.deepOutputDir ?? "";
-    const poster = await call("ai_generate_poster", { outputDir });
-    const preview = $("#poster-preview");
-    preview.src = poster.dataUrl ?? "";
-    $("#poster-preview-wrap").classList.remove("hidden");
-    $("#poster-path").textContent = poster.path ?? "";
-    $("#poster-path").dataset.saved = poster.path ?? "";
-    // 预览出现后收起「生成后在此预览」占位提示。
-    $(".poster-empty")?.classList.add("hidden");
-    state.settings = { ...(state.settings ?? {}), posterPath: poster.path ?? null };
-    endTask();
-    toast("海报已生成并保存");
-  } catch (error) {
-    endTask();
-    toast(String(error), true);
-  }
-}
-
 /**
- * 应用三项来源开关：AI 开 = 禁用手动输入并显示「AI 生成」；
- * AI 关 = 启用手动编辑（海报行则显示「选择本地图片」）。
+ * 应用三项来源开关：AI 开 = 剧名输入框只读（结果由深度处理自动回填）；
+ * AI 关 = 剧名可手动填写。简介 / 海报没有输入框，开关只影响深度处理时的来源。
  */
 function applyAiModes() {
-  const rows = [
-    { mode: "#ai-title-mode", button: "#ai-title", manual: null, input: "#drama-title" },
-    { mode: "#ai-synopsis-mode", button: "#ai-synopsis", manual: null, input: "#drama-synopsis" },
-    {
-      mode: "#ai-poster-mode",
-      button: "#ai-poster",
-      manual: "#ai-poster-local",
-      input: null,
-    },
-  ];
-  rows.forEach(({ mode, button, manual, input }) => {
-    const aiOn = $(mode)?.checked ?? true;
-    $(button)?.classList.toggle("hidden", !aiOn);
-    if (manual) $(manual)?.classList.toggle("hidden", aiOn);
-    if (input) $(input).disabled = aiOn;
-  });
-}
-
-/** 本地海报导入：选图 → 复制到深度处理输出目录 → 回显预览。 */
-async function pickLocalPoster() {
-  if (!beginTask("正在导入本地海报")) return;
-  try {
-    await persistDramaMeta();
-    const outputDir = state.settings?.deepOutputDir ?? "";
-    const poster = await call("ai_pick_local_poster", { outputDir });
-    $("#poster-preview").src = poster.dataUrl ?? "";
-    $("#poster-preview-wrap").classList.remove("hidden");
-    $("#poster-path").textContent = poster.path ?? "";
-    $("#poster-path").dataset.saved = poster.path ?? "";
-    $(".poster-empty")?.classList.add("hidden");
-    state.settings = { ...(state.settings ?? {}), posterPath: poster.path ?? null };
-    endTask();
-    toast("本地海报已导入");
-  } catch (error) {
-    endTask();
-    toast(String(error), true);
+  const titleInput = $("#drama-title");
+  if (titleInput) {
+    titleInput.disabled = $("#ai-title-mode")?.checked ?? true;
   }
 }
 
@@ -2898,11 +2800,8 @@ $("#env-workdir-pick").addEventListener("click", envWorkdirPick);
 $("#env-workdir").addEventListener("keydown", (event) => {
   if (event.key === "Enter") envWorkdirApply();
 });
-// ============ AI 生成（剧名 / 简介 / 海报）与转码设置 ============
-$("#ai-title").addEventListener("click", () => aiGenerateText("title"));
-$("#ai-synopsis").addEventListener("click", () => aiGenerateText("synopsis"));
-$("#ai-poster").addEventListener("click", aiGeneratePoster);
-$("#ai-poster-local").addEventListener("click", pickLocalPoster);
+// ============ AI 开关与转码设置 ============
+// 剧名/简介/海报不再有独立「AI 生成」按钮：三项在深度处理流程中一并生成。
 // 来源开关：切换即生效（联动控件显隐）并静默保存，免去回设置页手动保存。
 [
   ["#ai-title-mode", "aiTitleEnabled"],
