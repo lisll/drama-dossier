@@ -709,7 +709,10 @@ mod execute_tests {
         let runner = FakeRunner::new().on("tesseract", CommandOutput::new(0, "", ""));
         let error = plan.execute(&runner, "tesseract").unwrap_err();
         assert!(matches!(error, OcrError::OutputMissing(_)), "{error}");
-        assert!(output_base.parent().unwrap().is_dir(), "execute 应创建识别输出目录");
+        assert!(
+            output_base.parent().unwrap().is_dir(),
+            "execute 应创建识别输出目录"
+        );
     }
 
     #[test]
