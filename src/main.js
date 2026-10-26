@@ -478,9 +478,10 @@ function renderDefaultHints() {
   $("#output-dir").placeholder = root
     ? `留空时生成到 ${root}/<剧名>/报审包`
     : "留空时生成到 剧目目录/报审包";
-  $("#exec-output").placeholder = root
-    ? `留空时写到 ${root}/<剧名>/微调输出 或 /重组输出`
-    : "留空时写到剧目目录/微调输出 或 /重组输出";
+  // 深度处理合并后 #exec-output 已下架，输出目录提示改由「设置 → 转码设置」承担。
+  $("#deep-output-dir").placeholder = root
+    ? `留空时写到 ${root}/<剧名>/深度处理`
+    : "留空时写到 剧目目录/深度处理";
   $("#library-root").placeholder = state.settings?.libraryRoot
     ? `上次扫描：${state.settings.libraryRoot}`
     : "选择或输入剧集素材根目录";
@@ -497,6 +498,18 @@ function settingsSnapshot() {
     rules,
     ffprobe: $("#ffprobe-path").value.trim(),
     output: $("#settings-output").value.trim(),
+    deepOutput: $("#deep-output-dir")?.value.trim() ?? "",
+    recutTarget: $("#recut-target-count")?.value.trim() ?? "",
+    llm: [
+      $("#llm-base-url")?.value.trim() ?? "",
+      $("#llm-api-key")?.value.trim() ?? "",
+      $("#llm-model")?.value.trim() ?? "",
+    ].join("|"),
+    img: [
+      $("#img-base-url")?.value.trim() ?? "",
+      $("#img-api-key")?.value.trim() ?? "",
+      $("#img-model")?.value.trim() ?? "",
+    ].join("|"),
   });
 }
 
@@ -506,6 +519,18 @@ function refreshDirtyBadge() {
     rules: { ...DEFAULT_RULES, ...(state.settings?.rules ?? {}) },
     ffprobe: state.settings?.ffprobePath ?? "",
     output: state.settings?.outputDir ?? "",
+    deepOutput: state.settings?.deepOutputDir ?? "",
+    recutTarget: state.settings?.recutTargetCount == null ? "" : String(state.settings.recutTargetCount),
+    llm: [
+      state.settings?.llmBaseUrl ?? "",
+      state.settings?.llmApiKey ?? "",
+      state.settings?.llmModel ?? "",
+    ].join("|"),
+    img: [
+      state.settings?.imgBaseUrl ?? "",
+      state.settings?.imgApiKey ?? "",
+      state.settings?.imgModel ?? "",
+    ].join("|"),
   });
   $("#settings-dirty").classList.toggle("hidden", settingsSnapshot() === saved);
 }
@@ -526,6 +551,23 @@ async function loadSettings() {
     if (settings.jianyingDraftDir)
       $("#jianying-draft-dir").value = settings.jianyingDraftDir;
     if (settings.aiTemplate) $("#ai-template").value = settings.aiTemplate;
+    // 转码设置（深度处理）与 AI 接口配置。
+    if (settings.deepOutputDir) $("#deep-output-dir").value = settings.deepOutputDir;
+    if (settings.recutTargetCount != null)
+      $("#recut-target-count").value = String(settings.recutTargetCount);
+    $("#drama-title").value = settings.dramaTitle ?? "";
+    $("#drama-synopsis").value = settings.dramaSynopsis ?? "";
+    $("#llm-base-url").value = settings.llmBaseUrl ?? "";
+    $("#llm-api-key").value = settings.llmApiKey ?? "";
+    $("#llm-model").value = settings.llmModel ?? "";
+    $("#img-base-url").value = settings.imgBaseUrl ?? "";
+    $("#img-api-key").value = settings.imgApiKey ?? "";
+    $("#img-model").value = settings.imgModel ?? "";
+    // 海报已在历史会话生成过时直接回显预览。
+    if (settings.posterPath && settings.posterPath !== $("#poster-path").dataset.saved) {
+      $("#poster-path").textContent = settings.posterPath;
+      $("#poster-path").dataset.saved = settings.posterPath;
+    }
     if (state.root) $("#env-workdir").value = state.root;
     renderDefaultHints();
     renderEmptyGuide();
@@ -545,18 +587,7 @@ async function saveSettings() {
     return;
   }
   try {
-    const settings = {
-      rules,
-      // ffmpegPath 由「一键配置运行环境」写入，界面无输入框，保存时原样带回避免丢失。
-      ffmpegPath: loadedSettings?.ffmpegPath ?? state.settings?.ffmpegPath ?? null,
-      ffprobePath: $("#ffprobe-path").value.trim() || null,
-      outputDir: $("#settings-output").value.trim() || null,
-      libraryRoot: state.settings?.libraryRoot ?? null,
-      // 设置独立视图新增的三项。
-      aiTemplate: $("#ai-template").value.trim() || null,
-      jianyingDir: $("#jianying-dir").value.trim() || null,
-      jianyingDraftDir: $("#jianying-draft-dir").value.trim() || null,
-    };
+    const settings = buildSettingsFromForm(rules);
     const path = await call("save_app_settings", { settings });
     state.settings = settings;
     loadedSettings = settings;
@@ -568,6 +599,116 @@ async function saveSettings() {
     checkRuntime(true);
   } catch (error) {
     reportError(error);
+  }
+}
+
+/**
+ * 从表单收集完整设置对象（saveSettings 与 AI 静默持久化共用），
+ * 保证任何一条保存路径都不会遗漏字段而抹掉其他配置。
+ */
+function buildSettingsFromForm(rules) {
+  return {
+    rules,
+    // ffmpegPath 由「一键配置运行环境」写入，界面无输入框，保存时原样带回避免丢失。
+    ffmpegPath: loadedSettings?.ffmpegPath ?? state.settings?.ffmpegPath ?? null,
+    ffprobePath: $("#ffprobe-path").value.trim() || null,
+    outputDir: $("#settings-output").value.trim() || null,
+    libraryRoot: state.settings?.libraryRoot ?? null,
+    // 设置独立视图新增的三项。
+    aiTemplate: $("#ai-template").value.trim() || null,
+    jianyingDir: $("#jianying-dir").value.trim() || null,
+    jianyingDraftDir: $("#jianying-draft-dir").value.trim() || null,
+    // 转码设置（深度处理）+ 剧名/简介/海报 + AI 接口（云端版接入前的自配方案）。
+    deepOutputDir: $("#deep-output-dir").value.trim() || null,
+    recutTargetCount:
+      $("#recut-target-count").value.trim() === ""
+        ? null
+        : Number($("#recut-target-count").value.trim()),
+    dramaTitle: $("#drama-title").value.trim() || null,
+    dramaSynopsis: $("#drama-synopsis").value.trim() || null,
+    posterPath: state.settings?.posterPath ?? null,
+    llmBaseUrl: $("#llm-base-url").value.trim() || null,
+    llmApiKey: $("#llm-api-key").value.trim() || null,
+    llmModel: $("#llm-model").value.trim() || null,
+    imgBaseUrl: $("#img-base-url").value.trim() || null,
+    imgApiKey: $("#img-api-key").value.trim() || null,
+    imgModel: $("#img-model").value.trim() || null,
+  };
+}
+
+/**
+ * 静默持久化剧名/简介等 AI 元数据：AI 生成海报前调用，
+ * 后端从落盘设置读取剧名与简介来拼生图提示词。
+ */
+async function persistDramaMeta() {
+  let rules;
+  try {
+    rules = readRulesForm(false);
+  } catch {
+    rules = state.settings?.rules ?? null;
+  }
+  const settings = buildSettingsFromForm(rules);
+  state.settings = settings;
+  loadedSettings = settings;
+  await call("save_app_settings", { settings });
+  refreshDirtyBadge();
+}
+
+// ============ AI 生成：剧名 / 简介 / 海报（OpenAI 兼容自配 API） ============
+
+/** 生成剧名或简介并回填输入框；kind 传 title / synopsis，素材取对方字段的当前值。 */
+async function aiGenerateText(kind) {
+  const title = $("#drama-title").value.trim();
+  const synopsis = $("#drama-synopsis").value.trim();
+  // 素材：生成剧名用简介，生成简介用剧名 + 已写了一半的简介；两者全空时给出引导。
+  const context =
+    kind === "title"
+      ? synopsis || title
+      : [title, synopsis].filter(Boolean).join("。");
+  if (!context) {
+    toast(
+      kind === "title"
+        ? "请先手动填写一些剧情简介作为素材，再生成剧名"
+        : "请先填写剧名或简单描述剧情方向，再生成简介",
+      true,
+    );
+    return;
+  }
+  if (!beginTask(kind === "title" ? "正在 AI 生成剧名" : "正在 AI 生成简介")) return;
+  try {
+    const text = await call("ai_generate_text", { kind, context });
+    if (kind === "title") {
+      $("#drama-title").value = text;
+    } else {
+      $("#drama-synopsis").value = text;
+    }
+    endTask();
+    toast(kind === "title" ? "剧名已生成并回填" : "简介已生成并回填");
+  } catch (error) {
+    endTask();
+    toast(String(error), true);
+  }
+}
+
+/** 生成竖版海报：先静默落盘剧名/简介（生图提示词要用），再调用生图 API 并回显预览。 */
+async function aiGeneratePoster() {
+  if (!beginTask("正在 AI 生成海报（生图通常需要 10~30 秒）")) return;
+  try {
+    // 后端从设置读剧名/简介拼提示词，生成前先把表单内容静默保存。
+    await persistDramaMeta();
+    const outputDir = state.settings?.deepOutputDir ?? "";
+    const poster = await call("ai_generate_poster", { outputDir });
+    const preview = $("#poster-preview");
+    preview.src = poster.dataUrl ?? "";
+    $("#poster-preview-wrap").classList.remove("hidden");
+    $("#poster-path").textContent = poster.path ?? "";
+    $("#poster-path").dataset.saved = poster.path ?? "";
+    state.settings = { ...(state.settings ?? {}), posterPath: poster.path ?? null };
+    endTask();
+    toast("海报已生成并保存");
+  } catch (error) {
+    endTask();
+    toast(String(error), true);
   }
 }
 
@@ -584,6 +725,18 @@ async function rememberRoot(root) {
     aiTemplate: state.settings?.aiTemplate ?? null,
     jianyingDir: state.settings?.jianyingDir ?? null,
     jianyingDraftDir: state.settings?.jianyingDraftDir ?? null,
+    // 转码设置（深度处理）+ 剧名/简介/海报 + AI 接口，同样原样带回。
+    deepOutputDir: state.settings?.deepOutputDir ?? null,
+    recutTargetCount: state.settings?.recutTargetCount ?? null,
+    dramaTitle: state.settings?.dramaTitle ?? null,
+    dramaSynopsis: state.settings?.dramaSynopsis ?? null,
+    posterPath: state.settings?.posterPath ?? null,
+    llmBaseUrl: state.settings?.llmBaseUrl ?? null,
+    llmApiKey: state.settings?.llmApiKey ?? null,
+    llmModel: state.settings?.llmModel ?? null,
+    imgBaseUrl: state.settings?.imgBaseUrl ?? null,
+    imgApiKey: state.settings?.imgApiKey ?? null,
+    imgModel: state.settings?.imgModel ?? null,
     libraryRoot: root,
   };
   state.settings = settings;
@@ -1826,38 +1979,30 @@ function stripPath(value) {
 /**
  * 「执行转码」的输出目录：留空 = 默认写到剧目目录下的子目录；
  * 填了就和素材目录比一次，相同则就地拦下（否则会把输出写回原素材）。
+ * 深度处理合并后输出目录改由「设置 → 转码设置」下发，此函数仅保留备查（旧双档位时代）。
  */
-function transcodeOutputOverride() {
-  const value = $("#exec-output").value.trim();
-  setFieldError("#exec-output", null);
-  if (!value) return null;
-  const drama = state.dramas[state.selected];
-  if (drama && stripPath(value) === stripPath(drama.dir)) {
-    setFieldError(
-      "#exec-output",
-      "输出目录不能就是素材目录，那会覆盖原素材；留空会自动写到剧目目录的子目录。",
-    );
-    return undefined;
-  }
-  return value;
-}
+// function transcodeOutputOverride() {
+//   const value = $("#exec-output").value.trim();
+//   setFieldError("#exec-output", null);
+//   if (!value) return null;
+//   const drama = state.dramas[state.selected];
+//   if (drama && stripPath(value) === stripPath(drama.dir)) {
+//     setFieldError(
+//       "#exec-output",
+//       "输出目录不能就是素材目录，那会覆盖原素材；留空会自动写到剧目目录的子目录。",
+//     );
+//     return undefined;
+//   }
+//   return value;
+// }
 
 async function executeTranscode() {
-  const mode = $("#exec-mode").value;
-  const targetRaw = $("#exec-target").value.trim();
-  setFieldError("#exec-target", null);
-  if (targetRaw !== "" && !(Number.isInteger(Number(targetRaw)) && Number(targetRaw) > 0)) {
-    setFieldError("#exec-target", "目标集数必须是大于 0 的整数。");
-    toast("请先修正标红的输入项", true);
-    return;
-  }
-  const outputDir = transcodeOutputOverride();
-  if (outputDir === undefined) {
-    toast("输出目录不能是素材目录，请换一个目录", true);
-    return;
-  }
-  const modeLabel = mode === "recut" ? "分集重组" : "智能微调";
-  if (!beginTask(`正在执行${modeLabel}（全剧重编码，可能需要几分钟）`)) return;
+  // 深度处理（重组 + 微帧合并）：目标集数与输出目录一律以设置为准，
+  // 前端不传，后端从 settings.deep_output_dir / recut_target_count 读取。
+  const mode = $("#exec-mode").value || "deep";
+  const outputDir = null;
+  const modeLabel = "深度处理（重组 + 微帧）";
+  if (!beginTask(`正在执行${modeLabel}（两轮全剧重编码，可能需要较长时间）`)) return;
   const stopButton = $("#exec-stop");
   stopButton.classList.remove("hidden");
   stopButton.disabled = false;
@@ -1870,7 +2015,7 @@ async function executeTranscode() {
       outputRoot: state.settings?.outputDir ?? null,
       request: {
         mode,
-        targetCount: targetRaw === "" ? null : Number(targetRaw),
+        targetCount: null,
         outputDir,
       },
       ffprobePath: effectiveFfprobe(),
@@ -2588,13 +2733,14 @@ async function mountPlanSave() {
 
 // ============ 转码：模式卡片与整页阻断 ============
 
-function selectTranscodeMode(mode) {
-  $("#exec-mode").value = mode;
-  $("#mode-nudge").classList.toggle("active", mode === "nudge");
-  $("#mode-recut").classList.toggle("active", mode === "recut");
-  // 目标集数只对分集重组有意义。
-  $("#exec-target-wrap").classList.toggle("hidden", mode !== "recut");
-}
+// 旧双档位（智能微帧 / 分集重组）合并为「深度处理」后不再需要切换逻辑，注释保留备查。
+// function selectTranscodeMode(mode) {
+//   $("#exec-mode").value = mode;
+//   $("#mode-nudge").classList.toggle("active", mode === "nudge");
+//   $("#mode-recut").classList.toggle("active", mode === "recut");
+//   // 目标集数只对分集重组有意义。
+//   $("#exec-target-wrap").classList.toggle("hidden", mode !== "recut");
+// }
 
 // 运行环境未就绪时整页阻断（竞品行为）。
 function renderTranscodeGate() {
@@ -2666,6 +2812,11 @@ $("#env-workdir-pick").addEventListener("click", envWorkdirPick);
 $("#env-workdir").addEventListener("keydown", (event) => {
   if (event.key === "Enter") envWorkdirApply();
 });
+// ============ AI 生成（剧名 / 简介 / 海报）与转码设置 ============
+$("#ai-title").addEventListener("click", () => aiGenerateText("title"));
+$("#ai-synopsis").addEventListener("click", () => aiGenerateText("synopsis"));
+$("#ai-poster").addEventListener("click", aiGeneratePoster);
+$("#deep-output-pick").addEventListener("click", () => browse("#deep-output-dir"));
 // ============ 挂载 ============
 // 挂载与发布卡暂时下架（HTML 已整块注释）：功能函数保留，仅注释事件绑定，恢复时一并取消注释。
 // document.querySelectorAll("#mount-steps .step").forEach((node) => {
@@ -2676,8 +2827,9 @@ $("#env-workdir").addEventListener("keydown", (event) => {
 // $("#mount-csv-save").addEventListener("click", mountCsvSave);
 // $("#mount-plan-save").addEventListener("click", mountPlanSave);
 // ============ 转码 ============
-$("#mode-nudge").addEventListener("click", () => selectTranscodeMode("nudge"));
-$("#mode-recut").addEventListener("click", () => selectTranscodeMode("recut"));
+// 旧双档位卡已合并为「深度处理」，切换绑定注释保留（HTML 中两张 mode-card 也已注释）。
+// $("#mode-nudge").addEventListener("click", () => selectTranscodeMode("nudge"));
+// $("#mode-recut").addEventListener("click", () => selectTranscodeMode("recut"));
 $("#gate-install").addEventListener("click", runtimeInstall);
 // ============ 原有模块 ============
 $("#rename-plan").addEventListener("click", buildRenamePlan);
@@ -2827,7 +2979,8 @@ $("#library-root").addEventListener("input", renderEmptyGuide);
 });
 
 // 用户改了「本次覆盖」的路径就清掉旧的字段错误提示。
-["#exec-output", "#exec-target", "#erase-input", "#erase-output", "#erase-regions",
+// （#exec-output / #exec-target 随双档位下架，已从清单移除。）
+["#erase-input", "#erase-output", "#erase-regions",
   "#total-investment", "#actor-ratio", "#bitrate-min", "#diff-left", "#diff-right",
   "#draft-dir", "#dedup-demo-input", "#dedup-demo-output",
   "#rule-min-episodes", "#rule-min-duration", "#rule-max-duration",

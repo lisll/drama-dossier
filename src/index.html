@@ -235,6 +235,40 @@
             </div>
 
             <div id="transcode-body">
+              <!-- 卡 0：剧名 / 简介 / 海报（对照 Grove-Max 同名能力；云端版接入前走用户自配 API） -->
+              <section class="panel">
+                <section class="panel-header">
+                  <h3>剧名 / 简介 / 海报</h3>
+                  <span class="badge">AI 辅助</span>
+                </section>
+                <p class="hint">
+                  支持一键 AI 生成，也可直接手动填写；内容随「设置 → 保存设置」持久化，
+                  深度处理的过程图与海报会使用这里的内容。首次使用请先到
+                  <button type="button" class="link" data-goto-sub="rules">设置 → 生成设置</button>
+                  配置 LLM / 生图 API。
+                </p>
+                <div class="form-grid">
+                  <label>剧名
+                    <span class="path-row form-field-row">
+                      <input id="drama-title" type="text" placeholder="手动填写，或点击「AI 生成」自动起名" />
+                      <button id="ai-title" type="button" class="ghost">AI 生成</button>
+                    </span>
+                  </label>
+                </div>
+                <label class="ai-label synopsis-label">简介
+                  <textarea id="drama-synopsis" rows="3" spellcheck="false" placeholder="一句话讲清故事主线（100 字内效果最佳）；也可点击下方按钮 AI 生成"></textarea>
+                </label>
+                <div class="option-row">
+                  <button id="ai-synopsis" type="button" class="ghost">AI 生成简介</button>
+                  <button id="ai-poster" type="button" class="ghost">AI 生成海报</button>
+                  <span id="poster-status" class="badge hidden"></span>
+                </div>
+                <div id="poster-preview-wrap" class="poster-preview-wrap hidden">
+                  <img id="poster-preview" alt="海报预览" />
+                  <span id="poster-path" class="poster-path"></span>
+                </div>
+              </section>
+
               <!-- 卡 1：生成报审包（Grove「生成配置」卡样式） -->
               <section class="panel">
                 <section class="panel-header">
@@ -263,11 +297,13 @@
                 </p>
               </section>
 
-              <!-- 卡 2：转码处理（Grove「处理档位」双卡样式） -->
+              <!-- 卡 2：转码处理 → 深度处理（合并「智能微帧 + 分集重组」两步，对照 Grove-Max「深度处理」） -->
               <section class="panel">
                 <section class="panel-header">
-                  <h3>转码处理</h3>
+                  <h3>深度处理</h3>
+                  <span class="badge">重组 + 微帧</span>
                 </section>
+                <!-- 旧双档位卡（智能微帧 / 分集重组）已合并为「深度处理」一步执行，注释保留备查。
                 <div class="mode-cards">
                   <button class="mode-card active" id="mode-nudge" data-mode="nudge">
                     <strong>智能微帧</strong>
@@ -278,18 +314,32 @@
                     <span>按场景切点把全剧重新分集，可指定目标集数。</span>
                   </button>
                 </div>
-                <input id="exec-mode" type="hidden" value="nudge" />
+                -->
+                <input id="exec-mode" type="hidden" value="deep" />
+                <div class="mode-cards single">
+                  <div class="mode-card active deep-card">
+                    <strong>深度处理</strong>
+                    <span>自动执行两步：先按场景切点重新分集（重组），再对每个新集裁掉开头微帧（微帧），最后统一编码并生成过程图。</span>
+                  </div>
+                </div>
 
+                <!-- 目标集数与输出目录已移至「设置 → 生成设置 → 转码设置」，页内只读提示。
                 <div class="form-grid">
                   <label id="exec-target-wrap" class="hidden">目标集数<input id="exec-target" type="number" min="1" step="1" placeholder="留空保持原集数" /></label>
                   <label>输出目录<input id="exec-output" type="text" placeholder="留空时写到剧目目录/微调输出 或 /重组输出" /></label>
                 </div>
+                -->
+                <p class="hint">
+                  输出目录与目标集数统一在
+                  <button type="button" class="link" data-goto-sub="rules">设置 → 生成设置 → 转码设置</button>
+                  中配置；未配置输出目录时写到剧目目录/深度处理。全程不改动原素材，全剧两轮重编码，耗时较长。
+                </p>
                 <div class="option-row">
-                  <button id="exec-run" data-long-task class="success">执行转码</button>
+                  <button id="exec-run" data-long-task class="success">开始深度处理</button>
                   <!-- 转码进行中才显示；不带 data-long-task，任务期间必须保持可点 -->
                   <button id="exec-stop" class="danger hidden">停止转码</button>
                 </div>
-                <p class="hint">两种模式都输出到新目录，绝不改动原素材；全剧重编码，耗时较长。点「停止转码」会立刻终止并删除本次输出目录。</p>
+                <p class="hint">点「停止转码」会立刻终止并删除本次输出目录。</p>
                 <div id="exec-result" class="result hidden"></div>
 
                 <details class="tool-block" id="tool-transcode-advice">
@@ -710,6 +760,43 @@
               <div class="form-grid">
                 <label>默认输出目录（产物根目录）<input id="settings-output" type="text" placeholder="留空时写在剧目目录内；填了会写到 该目录/剧名/报审包" /></label>
               </div>
+
+              <!-- 转码设置：深度处理的输出目录与重组目标集数（对照 Grove-Max「转码设置」） -->
+              <section class="panel-header">
+                <h3>转码设置</h3>
+                <span class="badge">深度处理</span>
+              </section>
+              <p class="hint">「深度处理」的分集重组目标集数与输出目录在此配置；未配置输出目录时写到剧目目录/深度处理。</p>
+              <div class="form-grid">
+                <label>重组目标集数
+                  <input id="recut-target-count" type="number" min="2" max="500" step="1" placeholder="留空默认 90" />
+                </label>
+                <label>深度处理输出目录
+                  <span class="path-row form-field-row">
+                    <input id="deep-output-dir" type="text" placeholder="留空时写到 剧目目录/深度处理" />
+                    <button id="deep-output-pick" type="button" class="ghost">浏览</button>
+                  </span>
+                </label>
+              </div>
+
+              <!-- AI 接口配置：OpenAI 兼容协议（base_url + api_key + model），云端版接入前的折中方案 -->
+              <section class="panel-header">
+                <h3>AI 接口</h3>
+                <span class="badge">OpenAI 兼容</span>
+              </section>
+              <p class="hint">
+                用于「剧名 / 简介 / 海报」与过程图分镜概要的 AI 生成。填写 OpenAI 兼容服务的
+                接口地址（如 https://api.xxx.com/v1）、API Key 与模型名；Key 只保存在本机配置文件，不上传。
+              </p>
+              <div class="form-grid">
+                <label>LLM 接口地址（base_url）<input id="llm-base-url" type="text" placeholder="https://api.xxx.com/v1" /></label>
+                <label>LLM API Key<input id="llm-api-key" type="password" placeholder="sk-…" autocomplete="off" /></label>
+                <label>LLM 模型名<input id="llm-model" type="text" placeholder="如 gpt-4o-mini / deepseek-chat" /></label>
+                <label>生图接口地址（base_url）<input id="img-base-url" type="text" placeholder="https://api.xxx.com/v1" /></label>
+                <label>生图 API Key<input id="img-api-key" type="password" placeholder="sk-…" autocomplete="off" /></label>
+                <label>生图模型名<input id="img-model" type="text" placeholder="如 gpt-image-1 / flux-dev" /></label>
+              </div>
+
               <div class="option-row">
                 <button id="save-settings" class="primary">保存设置</button>
                 <button id="reset-settings" class="ghost">恢复默认</button>

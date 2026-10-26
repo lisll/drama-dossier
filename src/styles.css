@@ -2044,6 +2044,56 @@ textarea {
   margin-bottom: 12px;
 }
 
+/* ============ 转码页：AI 生成（剧名/简介/海报）与深度处理卡 ============ */
+
+/* form-grid 内的 label 里再放 input+按钮 的横排（path-row 复用），占满格宽 */
+.form-field-row {
+  display: flex;
+  width: 100%;
+}
+
+/* 简介输入区：跟随 ai-label 的纵向栅格，宽度铺满 */
+.synopsis-label textarea {
+  width: 100%;
+  resize: vertical;
+}
+
+/* 海报预览：竖版 9:16 缩略 + 落盘路径说明 */
+.poster-preview-wrap {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  margin-top: 4px;
+}
+
+.poster-preview-wrap img {
+  width: 132px;
+  aspect-ratio: 9 / 16;
+  object-fit: cover;
+  border-radius: 10px;
+  border: 1px solid var(--line, rgba(0, 0, 0, 0.12));
+  background: rgba(0, 0, 0, 0.04);
+}
+
+.poster-path {
+  color: var(--muted);
+  font-size: 12px;
+  word-break: break-all;
+}
+
+/* 单卡档位：深度处理独占一行 */
+.mode-cards.single {
+  grid-template-columns: 1fr;
+}
+
+.mode-cards .deep-card {
+  cursor: default;
+}
+
+.mode-cards .deep-card:hover {
+  transform: none;
+}
+
 /* 运行日志面板：等宽字体 + 固定高度滚动，配合「复制日志」按钮使用 */
 .log-panel {
   max-height: 260px;

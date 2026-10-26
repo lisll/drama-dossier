@@ -1,6 +1,6 @@
 [package]
 name = "drama-dossier"
-version = "0.2.16"
+version = "0.2.17"
 description = "短剧报审材料自动生成工具"
 authors = ["DramaDossier contributors"]
 license = "MIT"
@@ -16,6 +16,9 @@ dossier-media = { path = "../crates/dossier-media" }
 dossier-runtime = { path = "../crates/dossier-runtime" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# AI 能力调用（OpenAI 兼容）：TLS 用 rustls，避免本机 openssl 的存量兼容问题。
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+base64 = "0.22"
 tauri = { version = "2", features = [] }
 rfd = "0.15"
 

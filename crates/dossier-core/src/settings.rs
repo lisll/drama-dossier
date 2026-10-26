@@ -32,16 +32,43 @@ pub struct AppSettings {
     pub library_root: Option<PathBuf>,
     /// AI 提示词模板（设置-AI 子页编辑；后续云端拉取后也缓存在这里）。
     pub ai_template: Option<String>,
-    /// 剪映安装目录；`None` 表示使用自动探测结果。
+    /// 剧映安装目录；`None` 表示使用自动探测结果。
     pub jianying_dir: Option<PathBuf>,
     /// 剪映草稿目录；`None` 表示使用剪映默认路径。
     pub jianying_draft_dir: Option<PathBuf>,
+    /// 报审材料：剧名（AI 生成或手动填写，转码页回填）。
+    pub drama_title: Option<String>,
+    /// 报审材料：简介（AI 生成或手动填写，转码页回填）。
+    pub drama_synopsis: Option<String>,
+    /// 报审材料：海报图片路径（AI 生成后落盘）。
+    pub poster_path: Option<PathBuf>,
+    /// LLM API 基础地址（OpenAI 兼容，如 https://api.deepseek.com/v1）；空表示未配置。
+    pub llm_base_url: Option<String>,
+    /// LLM API 密钥；仅落本机 settings.json，不打印日志。
+    pub llm_api_key: Option<String>,
+    /// LLM 模型名（如 deepseek-chat）。
+    pub llm_model: Option<String>,
+    /// 生图 API 基础地址（OpenAI images 兼容）；空表示未配置。
+    pub img_base_url: Option<String>,
+    /// 生图 API 密钥；仅落本机 settings.json，不打印日志。
+    pub img_api_key: Option<String>,
+    /// 生图模型名（如 some-text2img-v2）。
+    pub img_model: Option<String>,
+    /// 深度处理输出目录；`None` 表示写在剧目目录内（同 `resolve_product_dir` 语义）。
+    pub deep_output_dir: Option<PathBuf>,
+    /// 深度处理重组目标集数；`None` 表示使用默认 90 集。
+    pub recut_target_count: Option<u32>,
 }
 
 impl AppSettings {
     /// 生效的检查规则：用户覆盖优先，否则使用内置默认。
     pub fn effective_rules(&self) -> ChecklistRules {
         self.rules.clone().unwrap_or_default()
+    }
+
+    /// 深度处理重组目标集数的生效值：未配置时默认 90 集。
+    pub fn effective_recut_target_count(&self) -> u32 {
+        self.recut_target_count.unwrap_or(90).clamp(2, 500)
     }
 }
 
@@ -324,6 +351,8 @@ mod tests {
             ai_template: Some("你是短剧报审材料撰写助手…".to_string()),
             jianying_dir: Some(PathBuf::from("/Applications/JianyingPro.app")),
             jianying_draft_dir: None,
+            // 演示用例只关心旧字段；新增配置项走默认值即可。
+            ..AppSettings::default()
         };
         save_settings(&path, &settings).unwrap();
 

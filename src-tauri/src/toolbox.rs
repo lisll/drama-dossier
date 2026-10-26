@@ -922,6 +922,255 @@ fn transcode_recut_blocking(
     })
 }
 
+/// 深度处理：先分集重组到临时中转目录，再对每个新集做智能微帧后输出到最终目录。
+///
+/// 与 Grove 的 recompose → microFrames 链路一致，本质是两轮编码（质量上 veryfast/CRF23
+/// 两轮后仍可接受）；中转目录成功后清理，中途停止则随 cleanup 一起删除。
+/// 进度映射：重组阶段 0~50%，微帧阶段 50~100%（分母乘 2）。
+fn transcode_deep_blocking(
+    app: &AppHandle,
+    ffmpeg: &Path,
+    ffprobe: &Path,
+    drama_name: &str,
+    episodes: &[ProbedEpisode],
+    target_count: usize,
+    output_dir: &Path,
+    on_step: &mut dyn FnMut(u64, u64, &str),
+    produced: &mut Vec<PathBuf>,
+) -> Result<TranscodeRunReport, String> {
+    let staging = output_dir.join(".deep-staging");
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging)
+        .map_err(|error| format!("创建中转目录失败（{}）：{error}", staging.display()))?;
+
+    // 阶段一：分集重组（产物先落中转目录；done/total 比例映射到 0~50）。
+    {
+        let mut step_recut = |done: u64, total: u64, label: &str| {
+            let scaled = done.min(total) * 50 / total.max(1);
+            on_step(scaled, 100, &format!("重组 · {label}"));
+        };
+        let mut staging_produced: Vec<PathBuf> = Vec::new();
+        let recut_result = transcode_recut_blocking(
+            ffmpeg,
+            episodes,
+            target_count,
+            &staging,
+            &mut step_recut,
+            &mut staging_produced,
+        );
+        if let Err(error) = recut_result {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+    }
+
+    // 收集中转目录里的重组产物（固定名 第NN集.mp4，按文件名排序保证集序）。
+    let mut recut_files: Vec<ProbedEpisode> = Vec::new();
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&staging)
+        .map_err(|error| format!("读取中转目录失败：{error}"))?
+        .filter_map(|entry| entry.ok().map(|value| value.path()))
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("mp4"))
+        .collect();
+    entries.sort();
+    let ffprobe_cfg = dossier_core::FfprobeConfig {
+        bin: Some(ffprobe.to_path_buf()),
+    };
+    for path in &entries {
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let episode_file = EpisodeFile {
+            path: path.clone(),
+            file_name: file_name.clone(),
+            size_bytes: std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0),
+            episode_number: None,
+        };
+        let probed = probe_episode(&episode_file, &ffprobe_cfg)
+            .map_err(|error| format!("探测重组产物 {file_name} 失败：{error}"))?;
+        recut_files.push(probed);
+    }
+    if recut_files.is_empty() {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err("分集重组没有产出任何片段，无法继续微帧。".into());
+    }
+
+    // 阶段二：对每个新集做智能微帧（比例映射到 50~100）。
+    let nudge_result = {
+        let mut step_nudge = |done: u64, total: u64, label: &str| {
+            let scaled = 50 + done.min(total) * 50 / total.max(1);
+            on_step(scaled, 100, &format!("微帧 · {label}"));
+        };
+        transcode_nudge_blocking(
+            ffmpeg,
+            drama_name,
+            &recut_files,
+            output_dir,
+            &mut step_nudge,
+            produced,
+        )
+    };
+    let _ = std::fs::remove_dir_all(&staging);
+    let nudge_report = nudge_result?;
+    let episode_count = nudge_report.items.len();
+
+    // 阶段三：过程图（软失败——失败只记日志，不影响成片产物）。
+    let video_specs: Vec<(PathBuf, f64)> = recut_files
+        .iter()
+        .map(|episode| (episode.file.path.clone(), episode.spec.duration_sec))
+        .collect();
+    if let Err(error) =
+        generate_process_images_blocking(app, &ffmpeg, drama_name, &video_specs, output_dir)
+    {
+        crate::logging::log_event("转码", format!("过程图生成失败（不影响成片）：{error}"));
+    } else {
+        crate::logging::log_event("转码", format!("过程图已生成到 {}", output_dir.display()));
+    }
+
+    Ok(TranscodeRunReport {
+        mode: "deep".into(),
+        output_dir: output_dir.display().to_string(),
+        items: nudge_report.items,
+        note: format!(
+            "深度处理完成：全剧按场景切点重组后逐集微帧（两轮编码），共 {episode_count} 集，输出到新目录，原素材未改动。"
+        ),
+    })
+}
+
+/// 过程图单图使用的帧数（4 图 × 3 帧）。
+const PROCESS_IMAGE_COUNT: usize = 4;
+// 每图帧数固定为 3（抽帧步长 10%/40%/70% 已按 3 帧写死），暂未引用，注释保留备查。
+// const FRAMES_PER_PROCESS_IMAGE: usize = 3;
+
+/// 生成报审过程图：从深度处理成片抽帧 + 分镜概要文字，交给 Pillow 脚本排版出 4 张图。
+///
+/// 概要文字优先用 LLM（一次调用产 4 段），未配置或失败时退回模板（Python 侧同样兜底）。
+/// 整个函数是「软失败」语义：调用方（deep 流程）只把错误记日志，不影响成片产物。
+fn generate_process_images_blocking(
+    app: &AppHandle,
+    ffmpeg: &Path,
+    drama_name: &str,
+    video_specs: &[(PathBuf, f64)],
+    output_dir: &Path,
+) -> Result<(), String> {
+    if video_specs.is_empty() {
+        return Err("没有可用的成片，跳过过程图".into());
+    }
+    let settings = read_settings(app)?;
+    let drama_title = settings.drama_title.clone().unwrap_or_default();
+
+    // 1) 均匀抽 4 个代表集（不足 4 集就循环复用），每集在 10% / 40% / 70% 处各抓一帧。
+    let frames_dir = output_dir.join(".process-frames");
+    let _ = std::fs::remove_dir_all(&frames_dir);
+    std::fs::create_dir_all(&frames_dir).map_err(|error| format!("创建抽帧目录失败：{error}"))?;
+    let mut frame_paths: Vec<String> = Vec::new();
+    let sample_points = [0.10f64, 0.40, 0.70];
+    for slot in 0..PROCESS_IMAGE_COUNT {
+        let (video, duration) = &video_specs[slot % video_specs.len()];
+        for (step, pct) in sample_points.iter().enumerate() {
+            let frame_path = frames_dir.join(format!("frame-{slot:02}-{step}.jpg"));
+            let offset = duration * pct;
+            let args = [
+                "-y".to_string(),
+                "-ss".to_string(),
+                format!("{offset:.3}"),
+                "-i".to_string(),
+                video.display().to_string(),
+                "-frames:v".to_string(),
+                "1".to_string(),
+                "-q:v".to_string(),
+                "3".to_string(),
+                frame_path.display().to_string(),
+            ];
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            if let Err(error) = run_ffmpeg(ffmpeg, &arg_refs) {
+                let _ = std::fs::remove_dir_all(&frames_dir);
+                return Err(format!("抽帧失败（{}）：{error}", video.display()));
+            }
+            frame_paths.push(frame_path.display().to_string());
+        }
+    }
+
+    // 2) 分镜概要：LLM 优先，失败退模板（模板 JSON 交由 Python 侧兜底也行，这里统一在 Rust 侧生成）。
+    let summaries_path = frames_dir.join("summaries.json");
+    let summaries: Vec<String> = match crate::ai::storyboard_summaries_blocking(
+        &settings,
+        &drama_title,
+        &drama_name.to_string(),
+    ) {
+        Ok(list) => list,
+        Err(_) => (0..PROCESS_IMAGE_COUNT)
+            .map(|index| {
+                format!(
+                    "《{drama_name}》分镜 {}：剧情推进，冲突升级，关键情节在画面中心展开。",
+                    index + 1
+                )
+            })
+            .collect(),
+    };
+    let summaries_payload = serde_json::json!({ "summaries": summaries }).to_string();
+    std::fs::write(&summaries_path, summaries_payload)
+        .map_err(|error| format!("写概要 JSON 失败：{error}"))?;
+
+    // 3) 调 Pillow 脚本排版（脚本与 cloud/.venv 同仓库根，安装版须从项目目录启动才有 cloud 环境）。
+    let python = locate_cloud_python()?;
+    let script = python
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .map(|repo| {
+            repo.join("tools")
+                .join("process_images")
+                .join("make_process_images.py")
+        })
+        .ok_or_else(|| "无法从 Python 路径推断脚本位置".to_string())?;
+    if !script.is_file() {
+        let _ = std::fs::remove_dir_all(&frames_dir);
+        return Err(format!("过程图脚本缺失：{}", script.display()));
+    }
+    let spec = CommandSpec::new(python.display().to_string())
+        .args([
+            script.display().to_string(),
+            "--output-dir".into(),
+            output_dir.display().to_string(),
+            "--title".into(),
+            drama_title.clone(),
+            "--episode-label".into(),
+            format!("全剧 {} 集", episode_count_of(video_specs)),
+            "--frames".into(),
+            frame_paths.join(","),
+            "--poster".into(),
+            settings
+                .poster_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            "--summaries".into(),
+            summaries_path.display().to_string(),
+        ])
+        // 排版是纯 CPU 图像处理，2 分钟封顶防挂死。
+        .timeout(Duration::from_secs(120));
+    let output = SystemRunner::new()
+        .run(&spec)
+        .map_err(|error| format!("过程图进程启动失败：{error}"))?;
+    let frames_cleaned = std::fs::remove_dir_all(&frames_dir);
+    if !output.success() {
+        let _ = frames_cleaned;
+        let stderr_tail: Vec<&str> = output.stderr.lines().rev().take(4).collect();
+        let stderr_tail = stderr_tail.into_iter().rev().collect::<Vec<_>>().join("\n");
+        return Err(format!(
+            "过程图脚本退出码 {}：{stderr_tail}",
+            output.code_label()
+        ));
+    }
+    Ok(())
+}
+
+/// 过程图上标注的集数（取产物个数；空列表由调用方提前拦截）。
+fn episode_count_of(video_specs: &[(PathBuf, f64)]) -> usize {
+    video_specs.len()
+}
+
 fn transcode_blocking(
     app: &AppHandle,
     root: String,
@@ -941,17 +1190,29 @@ fn transcode_blocking(
     }
 
     let mode = request.mode.as_str();
-    if !matches!(mode, "nudge" | "recut") {
-        return Err(format!("未知转码模式：{mode}（支持 nudge / recut）"));
+    if !matches!(mode, "nudge" | "recut" | "deep") {
+        return Err(format!("未知转码模式：{mode}（支持 nudge / recut / deep）"));
     }
+    // 深度处理的输出目录与目标集数一律以设置为准（页内不再单独收集）：
+    // 设置里的「深度处理输出目录」等价于本次覆盖值；没配则走产物根目录 → 剧目目录的通用规则。
+    let settings = read_settings(app)?;
+    let effective_override = if mode == "deep" {
+        settings
+            .deep_output_dir
+            .clone()
+            .or_else(|| request.output_dir.clone().map(PathBuf::from))
+    } else {
+        request.output_dir.clone().map(PathBuf::from)
+    };
     let subdir = match mode {
         "recut" => "重组输出",
+        "deep" => "深度处理",
         _ => "微调输出",
     };
     // 与报审包同一套落点规则（`dossier_core::resolve_product_dir`）：
     // 本次覆盖 → 设置里的产物根目录下的 `<剧名>/<子目录>` → 剧目目录内的同名子目录。
     let output_dir = resolve_product_dir(
-        request.output_dir.as_deref().map(Path::new),
+        effective_override.as_deref(),
         output_root.as_deref().map(Path::new),
         &drama.dir,
         &drama.name,
@@ -974,6 +1235,24 @@ fn transcode_blocking(
                 .clamp(1, episodes.len().max(1) * 10);
             transcode_recut_blocking(
                 &ffmpeg,
+                &episodes,
+                target,
+                &output_dir,
+                &mut on_step,
+                &mut produced,
+            )
+        }
+        "deep" => {
+            // 目标集数一律读设置（页内不再传）；请求值仅作为显式覆盖保留给命令行调用。
+            let target = request
+                .target_count
+                .unwrap_or_else(|| settings.effective_recut_target_count() as usize)
+                .clamp(1, episodes.len().max(1) * 20);
+            transcode_deep_blocking(
+                &app,
+                &ffmpeg,
+                &ffprobe,
+                &drama.name,
                 &episodes,
                 target,
                 &output_dir,

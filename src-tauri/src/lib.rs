@@ -10,6 +10,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
 mod account;
+mod ai;
 mod dossier;
 mod erase;
 mod jianying;
@@ -384,6 +385,8 @@ pub fn run() {
             account::account_logout,
             account::account_status,
             account::account_change_password,
+            ai::ai_generate_text,
+            ai::ai_generate_poster,
             jianying::jianying_detect,
             mount::mount_plan_save,
             mount::mount_plan_load,
