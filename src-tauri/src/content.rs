@@ -206,6 +206,31 @@ pub(crate) fn model_runtime(
             ocr.detail = "缺少 chi_sim 中文语言包".into();
         }
     }
+    // 按降级链决定 OCR 最终用哪个后端（PaddleOCR → RapidOCR → 系统 OCR → tesseract）。
+    // 目前只有 tesseract 与"系统 OCR 是否存在"能可靠探测，前两级先按"是否配置了入口"判断；
+    // 选中的后端名写进 detail，界面与日志据此说明当前实际在用哪一个。
+    let backend_env = dossier_media::ocr_backend::Environment {
+        // 前两级：设置里给了可执行入口才算装了（安装流程在阶段 3 后续补上）
+        paddle_program: None,
+        rapid_program: None,
+        system_available: system_ocr_available(runner),
+        tesseract: if ocr.ok {
+            Some((PathBuf::from(ocr.program.clone()), true))
+        } else {
+            None
+        },
+    };
+    let (backend, skipped) = dossier_media::ocr_backend::select(&backend_env);
+    if let Some(selection) = &backend {
+        if selection.backend != dossier_media::ocr_backend::Backend::Tesseract {
+            // 选中的是非 tesseract 后端：把 OCR 视为可用，并注明用的是哪一个
+            ocr.ok = true;
+            ocr.detail = format!("使用 {}", selection.backend.label());
+        }
+    } else {
+        ocr.ok = false;
+        ocr.detail = dossier_media::ocr_backend::unavailable_hint(&skipped);
+    }
 
     let asr_model = settings.asr_model.clone().unwrap_or_else(|| {
         if engine == AsrEngine::WhisperCpp {
@@ -226,26 +251,66 @@ pub(crate) fn model_runtime(
     {
         problems.push("ASR 模型缺失".into());
     }
-    if !ocr.ok {
-        problems.push("OCR 可执行文件不可用".into());
-    }
+    // OCR 是**可选增强**：缺了只是少一路证据，不应把整个内容模型判为未就绪。
+    // 就绪只看 ASR（对白是主证据）；OCR 的情况单独写进 guidance 说明后果。
     let ready = problems.is_empty();
+    let ocr_note = if ocr.ok {
+        String::new()
+    } else {
+        format!("（OCR 未启用，材料只依据对白：{}）", ocr.detail)
+    };
+    let mut guidance = if ready {
+        String::new()
+    } else {
+        format!(
+            "请在「设置 → 目录与引擎 → 内容模型」配置：{}。ASR 支持 openai-whisper 或 whisper.cpp；\
+             OCR 可选（PaddleOCR / RapidOCR / 系统 OCR / tesseract 任一可用即可）。",
+            problems.join("；")
+        )
+    };
+    guidance.push_str(&ocr_note);
     ModelRuntimeStatus {
         asr,
         asr_engine: engine,
         asr_model,
         ocr,
         ready,
-        guidance: if ready {
-            String::new()
-        } else {
-            format!(
-                "请在「设置 → 目录与引擎 → 内容模型」配置：{}。ASR 支持 openai-whisper 或 whisper.cpp；\
-                 OCR 需要 tesseract（含 chi_sim）。",
-                problems.join("；")
-            )
-        },
+        guidance,
     }
+}
+
+/// 系统自带 OCR 是否可用。
+///
+/// - Windows：`Windows.Media.Ocr` 只有在系统装了中文 OCR 语言包时才认得出中文，
+///   语言包是从「设置 → 应用 → 可选功能」安装的，并非所有机器都有。这里用
+///   `powershell Get-WindowsCapability` 查询（比直接调 WinRT 简单且不会引入新依赖）；
+///   查询失败一律按"不可用"处理，交给下一级。
+/// - macOS：Vision 框架随系统提供，10.15+ 均可用，直接认为可用。
+/// - 其他平台：不可用。
+#[cfg(target_os = "windows")]
+fn system_ocr_available(runner: &dyn CommandRunner) -> bool {
+    let spec = CommandSpec::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Get-WindowsCapability -Online -Name 'Language.OCR*zh-CN*').State",
+        ])
+        .timeout(Duration::from_secs(30));
+    runner
+        .run(&spec)
+        .map(|output| output.success() && output.combined().contains("Installed"))
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn system_ocr_available(_runner: &dyn CommandRunner) -> bool {
+    true
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn system_ocr_available(_runner: &dyn CommandRunner) -> bool {
+    false
 }
 
 /// 把一集视频转成“对白 + 画面文字”证据。
@@ -1321,8 +1386,19 @@ mod tests {
             .on_match("tesseract", "--list-langs", CommandOutput::ok("eng"))
             .on("tesseract", CommandOutput::ok("tesseract 5"));
         let missing = model_runtime(&settings, &no_chinese);
-        assert!(!missing.ready);
-        assert!(missing.guidance.contains("chi_sim"));
+        // OCR 是可选增强：缺中文语言包不影响"内容模型就绪"，只降级为仅用对白
+        assert!(missing.ready, "OCR 缺失不应阻塞就绪：{}", missing.guidance);
+        assert!(
+            missing.guidance.contains("只依据对白"),
+            "要说明后果：{}",
+            missing.guidance
+        );
+        // 降级链的说明里要点名 tesseract 缺的是什么
+        assert!(
+            missing.guidance.contains("tesseract"),
+            "要说明是哪一级不可用：{}",
+            missing.guidance
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

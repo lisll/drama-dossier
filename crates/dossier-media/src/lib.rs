@@ -24,6 +24,7 @@
 
 pub mod asr;
 pub mod ocr;
+pub mod ocr_backend;
 pub mod render;
 pub mod separate;
 pub mod shot;
