@@ -209,7 +209,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: .
-          args: ${{ matrix.args }}      - name: Upload Windows bundle
+          args: ${{ matrix.args }}
+      - name: Upload Windows bundle
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
