@@ -290,6 +290,9 @@ fn evermeet_source(name: &'static str) -> Source {
 /// 查 evermeet 的当前版本与 zip 字节数。任何一步失败都返回 `None`，由调用方用兜底值。
 #[cfg(target_os = "macos")]
 fn evermeet_info(name: &str) -> Option<(String, u64)> {
+    // 函数内导入：放到文件顶部会在非 macOS 上成为未使用导入（CI 以 -D warnings 拦截）
+    use dossier_runtime::CommandRunner;
+
     let url = format!("https://evermeet.cx/ffmpeg/info/{name}/release");
     let spec = dossier_runtime::CommandSpec::new("/usr/bin/curl")
         .args(["-sSL", "--max-time", "15", &url])
