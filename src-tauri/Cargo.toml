@@ -9,6 +9,12 @@ edition = "2021"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+default = ["license-test-mode"]
+# TEST-MODE：离线测试版授权（固定测试卡密，不联网）。测试通过后连同 license_test_mode.rs 一起删除，
+# 见 docs/LICENSING.md「删除测试版」。填入正式公钥后仍开着这个开关会直接编译失败。
+license-test-mode = ["dossier-cardkey/test-issuer"]
+
 [dependencies]
 dossier-core = { path = "../crates/dossier-core" }
 dossier-inpaint = { path = "../crates/dossier-inpaint" }

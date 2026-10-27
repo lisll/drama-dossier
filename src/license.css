@@ -26,6 +26,22 @@
   font-size: 20px;
 }
 
+/* TEST-MODE：测试版标识 */
+.license-badge {
+  margin-left: 8px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--warn-soft, #fff3d6);
+  color: var(--warn-text, #7a4b00);
+  font-size: 12px;
+  font-weight: 600;
+  vertical-align: middle;
+}
+
+.license-badge[hidden] {
+  display: none;
+}
+
 .license-card .license-sub {
   margin: 0 0 20px;
   color: var(--muted, #5c665e);

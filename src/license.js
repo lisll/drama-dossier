@@ -36,15 +36,22 @@
 
   // 按最新状态更新激活层：提示文字、按钮是否可用、是否显示「联网重试」
   function render(status) {
-    const { msg, submit, retry, code, copy } = overlay.parts;
+    const { msg, submit, retry, code, copy, badge, sub, input } = overlay.parts;
     setMsg(msg, status.reason === "not_activated" ? "" : status.message || "");
     code.textContent = status.machineCode || "读取失败";
     code.title = status.machineId || "";
     copy.disabled = !status.machineId;
-    const online = status.serverConfigured !== false;
-    submit.disabled = !online;
-    retry.hidden = !(online && RETRYABLE.has(status.reason));
-    if (!online) setMsg(msg, "授权服务器未配置，请联系客服获取正式版本。");
+    // 老版本后端没有 canActivate 字段时，退回只看 serverConfigured
+    const canActivate = status.canActivate ?? status.serverConfigured !== false;
+    submit.disabled = !canActivate;
+    retry.hidden = !(status.serverConfigured !== false && RETRYABLE.has(status.reason));
+    // TEST-MODE：测试版明确标出来，避免和正式版混淆
+    badge.hidden = !status.testMode;
+    if (status.testMode) {
+      sub.textContent = "这是内部测试版，请输入测试卡密。激活后离线可用 30 天，到期后再输入一次即可续用。";
+      input.placeholder = "DDK-TEST-CARD-2345-6789";
+    }
+    if (!canActivate) setMsg(msg, "授权服务器未配置，请联系客服获取正式版本。");
   }
 
   function build() {
@@ -54,10 +61,16 @@
     overlay.setAttribute("aria-labelledby", "license-title");
 
     const card = el("form", { className: "license-card", noValidate: true });
-    card.append(
-      el("h1", { id: "license-title" }, "激活剧备"),
-      el("p", { className: "license-sub" }, "请输入购买获得的卡密。激活需要联网，之后离线也能使用，软件会定期自动续期。"),
+    const title = el("h1", { id: "license-title" }, "激活剧备");
+    const badge = el("span", { className: "license-badge" }, "测试版授权");
+    badge.hidden = true;
+    title.append(badge);
+    const sub = el(
+      "p",
+      { className: "license-sub" },
+      "请输入购买获得的卡密。激活需要联网，之后离线也能使用，软件会定期自动续期。",
     );
+    card.append(title, sub);
 
     const label = el("label", { htmlFor: "license-card-input" }, "卡密");
     const input = el("input", {
@@ -120,7 +133,7 @@
       }),
     );
 
-    overlay.parts = { msg, submit, retry, code, copy, input };
+    overlay.parts = { msg, submit, retry, code, copy, input, badge, sub };
     overlay.append(card);
     document.body.append(overlay);
     input.focus();

@@ -21,7 +21,10 @@ pub use decide::{decide, Active, LockReason, Verdict};
 pub use ed25519_dalek::SigningKey;
 #[cfg(any(test, feature = "test-issuer"))]
 pub use issue::{issue_token, public_key_b64, signing_key};
-pub use keys::{key_id, parse_key_list, production_keys, KeyError, TrustedKey};
+pub use keys::{
+    key_id, parse_key_list, production_keys, KeyError, TrustedKey, PRODUCTION_KEYS,
+    TEST_VECTOR_KEYS,
+};
 pub use machine::{derive_machine_id, display_code, read_machine_id, MachineError, Platform};
 pub use seal::{check_seal, seal};
 pub use token::{verify_token, Claims, Plan, TokenError, SIGNING_CONTEXT};

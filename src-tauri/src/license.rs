@@ -115,29 +115,39 @@ fn ctx() -> Option<&'static Ctx> {
     CTX.get()
 }
 
-#[cfg(debug_assertions)]
+// TEST-MODE：防止测试版混进正式版。填了正式公钥又没关测试开关，直接编译失败。
+#[cfg(feature = "license-test-mode")]
+const _: () = assert!(
+    dossier_cardkey::PRODUCTION_KEYS.is_empty(),
+    "已填入正式公钥：请先按 docs/LICENSING.md「删除测试版」删除 license-test-mode，再发布正式版"
+);
+
+/// 调试构建默认跳过授权检查，本地开发不必激活；想在调试构建里测授权，设置
+/// `DD_LICENSE_DEV_BYPASS=0`。正式版（release）里没有这段代码；自动测试（cfg(test)）
+/// 也不跳过，测试照样走真实检查。
+#[cfg(all(debug_assertions, not(test)))]
 fn dev_bypass() -> bool {
-    let on = std::env::var("DD_LICENSE_DEV_BYPASS").is_ok_and(|v| v == "1");
+    let on = std::env::var("DD_LICENSE_DEV_BYPASS").map_or(true, |v| v != "0");
     if on {
         static WARNED: AtomicBool = AtomicBool::new(false);
         if !WARNED.swap(true, Ordering::Relaxed) {
             log_event(
                 "授权",
-                "警告：DD_LICENSE_DEV_BYPASS=1，调试构建已跳过授权检查（正式版不存在此开关）",
+                "警告：调试构建默认跳过授权检查（设置 DD_LICENSE_DEV_BYPASS=0 可启用；正式版不存在此开关）",
             );
         }
     }
     on
 }
 
-#[cfg(not(debug_assertions))]
+#[cfg(not(all(debug_assertions, not(test))))]
 #[inline(always)]
 fn dev_bypass() -> bool {
     false
 }
 
-/// 信任的公钥。release 构建只认 `PRODUCTION_KEYS`；debug 构建可用
-/// `DD_LICENSE_DEV_PUBKEYS`（逗号分隔 base64url）连本地测试服务器。
+/// 信任的公钥。优先级：debug 构建的 `DD_LICENSE_DEV_PUBKEYS`（连本地测试服务器）
+/// → 测试版内置测试公钥（TEST-MODE）→ `PRODUCTION_KEYS`。
 #[inline(always)]
 fn trusted_keys() -> Result<&'static [TrustedKey], dossier_cardkey::KeyError> {
     #[cfg(debug_assertions)]
@@ -161,7 +171,22 @@ fn trusted_keys() -> Result<&'static [TrustedKey], dossier_cardkey::KeyError> {
             return Ok(keys);
         }
     }
+    #[cfg(feature = "license-test-mode")] // TEST-MODE
+    {
+        static TEST: OnceLock<Result<Vec<TrustedKey>, dossier_cardkey::KeyError>> = OnceLock::new();
+        return TEST
+            .get_or_init(|| parse_key_list(&[crate::license_test_mode::public_key().as_str()]))
+            .as_ref()
+            .map(Vec::as_slice)
+            .map_err(Clone::clone);
+    }
+    #[allow(unreachable_code)]
     production_keys()
+}
+
+/// 是否为离线测试版（TEST-MODE）。
+const fn test_mode() -> bool {
+    cfg!(feature = "license-test-mode")
 }
 
 /// 完整判定：读盘 → 金丝雀 → 校验码 → 验签 → 机器码 → 时钟 → 有效期。不使用任何缓存。
@@ -541,12 +566,17 @@ pub struct LicenseStatus {
     exp: Option<u64>,
     machine_code: Option<String>,
     machine_id: Option<String>,
-    /// 能否联网激活 / 续签（服务器地址已配置）
+    /// 能否联网续签（服务器地址已配置）
     server_configured: bool,
+    /// 能否在激活页输入卡密（正式版 = 服务器已配置；测试版始终可以）
+    can_activate: bool,
+    /// 离线测试版（TEST-MODE），界面据此显示「测试版授权」
+    test_mode: bool,
 }
 
 fn status_from(v: &Verdict) -> LicenseStatus {
     let mid = ctx().and_then(|c| c.state.machine_id().ok());
+    let server_configured = server_base().is_ok();
     let base = LicenseStatus {
         active: false,
         reason: None,
@@ -557,7 +587,9 @@ fn status_from(v: &Verdict) -> LicenseStatus {
         exp: None,
         machine_code: mid.map(display_code),
         machine_id: mid.map(str::to_string),
-        server_configured: server_base().is_ok(),
+        server_configured,
+        can_activate: server_configured || test_mode(),
+        test_mode: test_mode(),
     };
     match v {
         Verdict::Active(a) => LicenseStatus {
@@ -605,22 +637,41 @@ pub async fn license_activate(card: String) -> Result<LicenseStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let c = ctx().ok_or("授权模块未初始化")?;
         let mid = c.state.machine_id().map_err(str::to_string)?.to_string();
-        log_event("授权", "提交卡密激活");
-        let token = match post(
-            "/v1/activate",
-            serde_json::json!({ "card": code, "machine_id": mid, "app_version": c.app_version }),
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                if let CallError::Rejected { code, .. } = &e {
-                    log_event("授权", format!("激活被拒绝：{code}"));
-                }
-                return Err(e.message());
+        // TEST-MODE：测试版只接受测试卡密，本机签发后走与正式版相同的 accept_token
+        #[cfg(feature = "license-test-mode")]
+        {
+            if !crate::license_test_mode::is_test_card(&code) {
+                log_event("授权", "测试版收到非测试卡密，已拒绝");
+                return Err(format!(
+                    "测试版只接受测试卡密 {}",
+                    crate::license_test_mode::TEST_CARD
+                ));
             }
-        };
-        let v = accept_token(c, token)?;
-        log_event("授权", "激活成功");
-        Ok(status_from(&v))
+            log_event("授权", "使用测试卡密离线激活");
+            let token = crate::license_test_mode::issue(&mid, now_secs());
+            let v = accept_token(c, token)?;
+            log_event("授权", "测试版激活成功");
+            return Ok(status_from(&v));
+        }
+        #[allow(unreachable_code)]
+        {
+            log_event("授权", "提交卡密激活");
+            let token = match post(
+                "/v1/activate",
+                serde_json::json!({ "card": code, "machine_id": mid, "app_version": c.app_version }),
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    if let CallError::Rejected { code, .. } = &e {
+                        log_event("授权", format!("激活被拒绝：{code}"));
+                    }
+                    return Err(e.message());
+                }
+            };
+            let v = accept_token(c, token)?;
+            log_event("授权", "激活成功");
+            Ok(status_from(&v))
+        }
     })
     .await
     .map_err(|e| format!("激活任务异常：{e}"))?

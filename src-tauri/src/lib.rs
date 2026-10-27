@@ -17,6 +17,8 @@ mod erase;
 mod jianying;
 mod license;
 mod license_state;
+#[cfg(feature = "license-test-mode")] // TEST-MODE
+mod license_test_mode;
 mod logging;
 mod mount;
 mod paths;
