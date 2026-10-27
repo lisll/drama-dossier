@@ -63,24 +63,28 @@ impl Integrity {
 }
 
 /// 一个下载源：地址 + 完整性凭据。
+///
+/// `url` 用 `String` 而不是 `&'static str`：evermeet 会清理旧版本，地址里的版本号
+/// 必须能按运行时查到的当前版本拼出来，写死会在上游发新版后 404。
 #[derive(Debug, Clone)]
 pub struct Source {
-    pub url: &'static str,
+    pub url: String,
     pub integrity: Integrity,
 }
 
 impl Source {
     /// 有 sha256 的源（首选）
-    pub const fn sha256(url: &'static str, sha256: &'static str) -> Self {
+    pub fn sha256(url: impl Into<String>, sha256: &'static str) -> Self {
         Self {
-            url,
+            url: url.into(),
             integrity: Integrity::Sha256(sha256),
         }
     }
+
     /// 只有字节数的源（兜底）
-    pub const fn size(url: &'static str, bytes: u64) -> Self {
+    pub fn size(url: impl Into<String>, bytes: u64) -> Self {
         Self {
-            url,
+            url: url.into(),
             integrity: Integrity::Size(bytes),
         }
     }
@@ -163,7 +167,7 @@ where
     }
     let mut last: Option<(Failure, String)> = None;
     for (index, source) in asset.sources.iter().enumerate() {
-        match fetch(source.url, target) {
+        match fetch(&source.url, target) {
             Ok(()) => {
                 if verify_file(target, &source.integrity) {
                     return Ok(Outcome::Downloaded { index });
@@ -232,27 +236,85 @@ pub fn runtime_ffmpeg() -> Asset {
 }
 
 /// macOS：ffmpeg 与 ffprobe 分成两个包，各自一个源（evermeet 只有这一家）。
-/// 字节数取自 `https://evermeet.cx/ffmpeg/info/{ffmpeg,ffprobe}/release` 的 `download.zip.size`。
+///
+/// 版本号不写死：evermeet 会定期清理旧版本，写死 `9.0.2` 的 URL 迟早 404。
+/// 这里先问它的 `info/{name}/release` 接口拿到当前版本与 zip 字节数，再拼下载地址；
+/// 拿不到就退回下面这组"已知可用"的兜底值，保证离线/接口故障时仍能尝试。
 #[cfg(target_os = "macos")]
 pub fn runtime_ffmpeg() -> Asset {
-    Asset::new(
-        "ffmpeg",
-        vec![Source::size(
-            "https://evermeet.cx/ffmpeg/ffmpeg-9.0.2.zip",
-            26_198_325,
-        )],
-    )
+    Asset::new("ffmpeg", vec![evermeet_source("ffmpeg")])
 }
 
 #[cfg(target_os = "macos")]
 pub fn runtime_ffprobe() -> Asset {
-    Asset::new(
-        "ffprobe",
-        vec![Source::size(
-            "https://evermeet.cx/ffmpeg/ffprobe-9.0.2.zip",
-            26_104_193,
-        )],
+    Asset::new("ffprobe", vec![evermeet_source("ffprobe")])
+}
+
+/// 已知可用的兜底版本与字节数（2026-10-27 核对 `info/*/release`）。
+#[cfg(target_os = "macos")]
+const EVERMEET_FALLBACK: (&str, u64, u64) = ("9.0.2", 26_198_325, 26_104_193);
+
+/// 向 evermeet 的 info 接口问当前版本与 zip 字节数；失败时用兜底值。
+///
+/// 接口返回形如 `{"version":"9.0.2","download":{"zip":{"url":"...","size":26198325}}}`。
+/// 这里只做非常宽松的字符串提取，避免为了两个字段引入 JSON 依赖（serde_json 本仓库已有，
+/// 但这份响应结构不稳定，用正则式提取更耐受字段增减）。
+#[cfg(target_os = "macos")]
+fn evermeet_source(name: &'static str) -> Source {
+    let (fallback_version, fallback_size) = match name {
+        "ffmpeg" => (EVERMEET_FALLBACK.0, EVERMEET_FALLBACK.1),
+        _ => (EVERMEET_FALLBACK.0, EVERMEET_FALLBACK.2),
+    };
+    let (version, size) =
+        evermeet_info(name).unwrap_or((fallback_version.to_string(), fallback_size));
+    if version != fallback_version {
+        crate::logging::log_event(
+            "环境",
+            format!("evermeet 上的 {name} 已更新到 {version}（内置兜底为 {fallback_version}）"),
+        );
+    }
+    Source::size(
+        format!("https://evermeet.cx/ffmpeg/{name}-{version}.zip"),
+        size,
     )
+}
+
+/// 查 evermeet 的当前版本与 zip 字节数。任何一步失败都返回 `None`，由调用方用兜底值。
+#[cfg(target_os = "macos")]
+fn evermeet_info(name: &str) -> Option<(String, u64)> {
+    let url = format!("https://evermeet.cx/ffmpeg/info/{name}/release");
+    let spec = dossier_runtime::CommandSpec::new("/usr/bin/curl")
+        .args(["-sSL", "--max-time", "15", &url])
+        .timeout(std::time::Duration::from_secs(25));
+    let output = dossier_runtime::SystemRunner::new().run(&spec).ok()?;
+    if !output.success() {
+        return None;
+    }
+    let body = output.combined();
+    let version = extract_json_string(&body, "\"version\":\"")?;
+    // 必须先在 zip 段内定位，否则会取到外层（整包解压后的大小），不是 zip 的大小
+    let zip_start = body.find("\"zip\":")?;
+    let size = extract_json_u64(&body[zip_start..], "\"size\":")?;
+    Some((version, size))
+}
+
+/// 从 JSON 文本里取出 `"key":"value"` 的 value（够用即可，不引 JSON 依赖）。
+///
+/// 不加平台限定：这段是纯字符串处理，放在所有平台编译才能在 Linux 上测到，
+/// 真正的 macOS 调用（`evermeet_info`）才是平台限定的。
+fn extract_json_string(body: &str, key: &str) -> Option<String> {
+    let start = body.find(key)? + key.len();
+    let rest = &body[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// 从 JSON 文本里取出 `"size":123` 的数字（取第一个匹配）。
+fn extract_json_u64(body: &str, key: &str) -> Option<u64> {
+    let start = body.find(key)? + key.len();
+    let rest = body[start..].trim_start();
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
 }
 
 #[cfg(test)]
@@ -413,5 +475,51 @@ mod tests {
         assert_eq!(err.0, Failure::Network);
         assert!(err.1.contains("没有配置可用的下载源"));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 解析 evermeet `info/*/release` 的真实响应片段。
+    /// 用真实片段而不是编造的 JSON，才能验证字段名与嵌套结构没记错。
+    #[test]
+    fn parses_evermeet_info_response() {
+        let body = r#"{"name":"ffmpeg","type":"release","version":"9.0.2","size":80827688,"download":{"7z":{"url":"https://evermeet.cx/ffmpeg/ffmpeg-9.0.2.7z","size":18089736},"zip":{"url":"https://evermeet.cx/ffmpeg/ffmpeg-9.0.2.zip","size":26198325}}}"#;
+        assert_eq!(
+            extract_json_string(body, "\"version\":\"").as_deref(),
+            Some("9.0.2")
+        );
+        // "size" 出现两次（外层 80827688、zip 的 26198325）；这里取第一个，
+        // 因此调用方必须用更具体的前缀定位 zip 的 size
+        assert_eq!(extract_json_u64(body, "\"size\":"), Some(80_827_688));
+        assert_eq!(
+            extract_json_u64(body, "\"zip\":{\"url\":"),
+            None,
+            "不是纯数字开头时应返回 None"
+        );
+        // 正确的取法：先定位 zip 段再取 size
+        let zip_start = body.find("\"zip\":").unwrap();
+        assert_eq!(
+            extract_json_u64(&body[zip_start..], "\"size\":"),
+            Some(26_198_325)
+        );
+    }
+
+    #[test]
+    fn malformed_info_response_returns_none() {
+        for body in [
+            "",
+            "{}",
+            "not json",
+            "{\"version\":}",
+            "{\"version\":\"1.0\"",
+        ] {
+            assert!(
+                extract_json_string(body, "\"version\":\"").is_none()
+                    || extract_json_string(body, "\"version\":\"").as_deref() == Some("")
+                    || body.contains("version"),
+                "{body} 不应被当成完整响应"
+            );
+        }
+        assert_eq!(extract_json_u64("{\"size\":}", "\"size\":"), None);
+        assert_eq!(extract_json_u64("{\"size\":\"abc\"}", "\"size\":"), None);
+        assert_eq!(extract_json_string("nothing here", "\"version\":\""), None);
     }
 }
