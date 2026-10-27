@@ -144,7 +144,12 @@ jobs:
           curl -sSL --retry 5 --max-time 900 -o "$model" \
             https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
           # 与客户端下载路径使用同一份期望值（HF 的 LFS oid 即 sha256）
-          actual=$(shasum -a 256 "$model" | awk '{print $1}')
+          # Windows 的 Git Bash 只有 sha256sum、没有 shasum；macOS 两者都可能有，优先 sha256sum
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual=$(sha256sum "$model" | awk '{print $1}')
+          else
+            actual=$(shasum -a 256 "$model" | awk '{print $1}')
+          fi
           expected=60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe
           if [ "$actual" != "$expected" ]; then
             echo "::error::ggml-base.bin 校验失败：期望 $expected，实际 $actual"
