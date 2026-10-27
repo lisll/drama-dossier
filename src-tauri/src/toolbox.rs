@@ -333,6 +333,7 @@ pub fn apply_rename(
     name: String,
     items: Vec<RenameRequestItem>,
 ) -> Result<usize, String> {
+    crate::license::guard()?;
     let drama = load_drama(&root, &name)?;
     let dir = drama.dir;
 
@@ -572,6 +573,7 @@ pub async fn fix_bitrate(
     min_kbps: Option<u64>,
     ffprobe_path: Option<String>,
 ) -> Result<FixBitrateReport, String> {
+    crate::license::guard()?;
     // 测试期关键日志：码率修复同样是长任务，入口与结果留痕。
     crate::logging::log_event("码率", format!("开始：{name}（阈值 {:?} kbps）", min_kbps));
     let result = tauri::async_runtime::spawn_blocking(move || {
@@ -1953,6 +1955,7 @@ pub async fn transcode_execute(
     ffprobe_path: Option<String>,
     output_root: Option<String>,
 ) -> Result<TranscodeRunReport, String> {
+    crate::license::guard()?;
     // 测试期关键日志：转码是最耗时的长任务，入口参数与落点必须留痕。
     crate::logging::log_event(
         "转码",
@@ -2335,6 +2338,7 @@ pub async fn dedup_demo_execute(
     watermark: Option<String>,
     time_stretch: Option<String>,
 ) -> Result<DedupDemoReport, String> {
+    crate::license::guard()?;
     let input = input.trim().to_string();
     if input.is_empty() {
         return Err("请先填写输入视频路径。".into());

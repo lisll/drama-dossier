@@ -1,0 +1,47 @@
+# /etc/systemd/system/dd-license.service
+# 用低权限专用账号运行，并开启 systemd 沙箱。
+[Unit]
+Description=DramaDossier license server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ddlicense
+Group=ddlicense
+WorkingDirectory=/var/lib/dd-license
+EnvironmentFile=/etc/dd-license/env
+ExecStart=/opt/dd-license/.venv/bin/license-admin serve --host 127.0.0.1 --port 8200
+Restart=on-failure
+RestartSec=3
+
+# ---- 沙箱 ----
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+ReadWritePaths=/var/lib/dd-license
+ReadOnlyPaths=/etc/dd-license
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

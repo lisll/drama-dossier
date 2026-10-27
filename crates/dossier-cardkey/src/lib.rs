@@ -1,0 +1,30 @@
+//! 剧备授权凭证：离线验签、机器码、时钟防回拨、授权文件校验码与使用权判定。
+//!
+//! 协议与服务端 `license-server/src/dd_license/token.py` 一致，两端由
+//! `tests/vectors_v1.json` 逐条对拍。本 crate 是纯逻辑：不依赖 Tauri、不发网络请求，
+//! 机器码读取之外不碰文件系统。
+
+pub mod card;
+pub mod clock;
+pub mod decide;
+#[cfg(any(test, feature = "test-issuer"))]
+pub mod issue;
+pub mod keys;
+pub mod machine;
+pub mod seal;
+pub mod token;
+
+pub use card::{normalize_card, CARD_ALPHABET};
+pub use clock::{check_clock, next_last_seen, ClockVerdict, ROLLBACK_TOLERANCE_SECS};
+pub use decide::{decide, Active, LockReason, Verdict};
+#[cfg(any(test, feature = "test-issuer"))]
+pub use ed25519_dalek::SigningKey;
+#[cfg(any(test, feature = "test-issuer"))]
+pub use issue::{issue_token, public_key_b64, signing_key};
+pub use keys::{
+    key_id, parse_key_list, production_keys, KeyError, TrustedKey, PRODUCTION_KEYS,
+    TEST_VECTOR_KEYS,
+};
+pub use machine::{derive_machine_id, display_code, read_machine_id, MachineError, Platform};
+pub use seal::{check_seal, seal};
+pub use token::{verify_token, Claims, Plan, TokenError, SIGNING_CONTEXT};

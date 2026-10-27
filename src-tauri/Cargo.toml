@@ -9,9 +9,16 @@ edition = "2021"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+default = ["license-test-mode"]
+# TEST-MODE：离线测试版授权（固定测试卡密，不联网）。测试通过后连同 license_test_mode.rs 一起删除，
+# 见 docs/LICENSING.md「删除测试版」。填入正式公钥后仍开着这个开关会直接编译失败。
+license-test-mode = ["dossier-cardkey/test-issuer"]
+
 [dependencies]
 dossier-core = { path = "../crates/dossier-core" }
 dossier-inpaint = { path = "../crates/dossier-inpaint" }
+dossier-cardkey = { path = "../crates/dossier-cardkey" }
 dossier-media = { path = "../crates/dossier-media" }
 dossier-runtime = { path = "../crates/dossier-runtime" }
 serde = { version = "1", features = ["derive"] }
@@ -21,6 +28,10 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 base64 = "0.22"
 tauri = { version = "2", features = [] }
 rfd = "0.15"
+
+[dev-dependencies]
+# 单元测试要在本机签发凭证来驱动授权状态机
+dossier-cardkey = { path = "../crates/dossier-cardkey", features = ["test-issuer"] }
 
 [lib]
 name = "drama_dossier_lib"

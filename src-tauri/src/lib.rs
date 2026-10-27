@@ -15,6 +15,10 @@ mod content;
 mod dossier;
 mod erase;
 mod jianying;
+mod license;
+mod license_state;
+#[cfg(feature = "license-test-mode")] // TEST-MODE
+mod license_test_mode;
 mod logging;
 mod models_install;
 mod mount;
@@ -254,6 +258,7 @@ fn generate_package(
     ffprobe_path: Option<String>,
     rules: Option<ChecklistRules>,
 ) -> Result<PackageResult, String> {
+    crate::license::guard()?;
     let root = PathBuf::from(root);
     // 测试期关键日志：生成是最容易出问题的链路，入口参数与落点都要留痕。
     logging::log_event(
@@ -370,9 +375,14 @@ pub fn run() {
                 .app_config_dir()
                 .unwrap_or_else(|_| std::env::temp_dir().join("drama-dossier"));
             logging::init(fallback);
+            license::init(app.handle());
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
+        .invoke_handler(license::gate(tauri::generate_handler![
+            license::license_status,
+            license::license_activate,
+            license::license_refresh,
+            license::license_machine_code,
             pick_folder,
             scan_library,
             load_app_settings,
@@ -420,7 +430,7 @@ pub fn run() {
             dossier::save_mount_copy,
             dossier::transition_mount_copy_row,
             dossier::preview_mount_copy_publish
-        ])
+        ]))
         .run(tauri::generate_context!())
         .expect("failed to run DramaDossier");
 }

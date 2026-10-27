@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/dossier-core",
     "crates/dossier-inpaint",
+    "crates/dossier-cardkey",
     "crates/dossier-media",
     "crates/dossier-runtime",
     "src-tauri",

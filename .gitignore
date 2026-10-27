@@ -38,6 +38,9 @@ tools/model_worker/models/
 
 # 云端制作系统运行目录（数据库 / 对象存储 / 工作目录 / 签名密钥，全部可删可重建）
 cloud/var/
+# 授权服务默认运行目录：数据库与 Ed25519 签名私钥，绝不能入库
+license-server/var/
+*.pem
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm

@@ -82,6 +82,7 @@ fn build_text_prompt(kind: TextKind, context: &str) -> (String, String) {
 
 /// blocking 客户端（统一超时与 UA 标识）。
 fn http_client() -> Result<reqwest::blocking::Client, String> {
+    crate::license::guard()?;
     reqwest::blocking::Client::builder()
         .timeout(HTTP_TIMEOUT)
         .user_agent("DramaDossier/0.2")
