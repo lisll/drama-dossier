@@ -88,14 +88,50 @@ jobs:
           New-Item -ItemType Directory -Force src-tauri/resources/ffmpeg | Out-Null
           Copy-Item "$bin\ffmpeg.exe","$bin\ffprobe.exe" src-tauri/resources/ffmpeg/
           Get-ChildItem src-tauri/resources/ffmpeg | ForEach-Object { "{0}  {1:N1} MB" -f $_.Name, ($_.Length/1MB) }
+      # macOS 包内置 ffmpeg/ffprobe：与 Windows 同一思路，用安装包资源实现运行时零下载。
+      # 两个矩阵项架构不同（arm64 / x86_64），evermeet 只提供 x86_64 构建，
+      # arm64 上通过 Rosetta 2 运行（自检会在缺 Rosetta 时明确提示）。
+      # 下载后校验字节数，与客户端下载路径用的是同一份期望值。
+      - name: 预置 ffmpeg 到安装包资源（macOS）
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p src-tauri/resources/ffmpeg
+          fetch() {
+            local name="$1" expect="$2"
+            local url="https://evermeet.cx/ffmpeg/${name}-9.0.2.zip"
+            local zip="$RUNNER_TEMP/${name}.zip"
+            curl -sSL --retry 5 --max-time 600 -o "$zip" "$url"
+            local size
+            size=$(wc -c < "$zip" | tr -d ' ')
+            if [ "$size" != "$expect" ]; then
+              echo "::error::${name}.zip 字节数不符：期望 $expect，实际 $size"
+              exit 1
+            fi
+            unzip -o -q "$zip" -d src-tauri/resources/ffmpeg
+            rm -f "$zip"
+          }
+          fetch ffmpeg 26198325
+          fetch ffprobe 26104193
+          chmod +x src-tauri/resources/ffmpeg/ffmpeg src-tauri/resources/ffmpeg/ffprobe
+          ls -lh src-tauri/resources/ffmpeg
+          # 自检：Intel runner 直接能跑；arm64 runner 需要 Rosetta 2。
+          # 这一步只做“能跑就打印版本”，跑不起来也不让打包失败——
+          # 运行时自检（self_check_installed）会在用户机器上给出明确提示。
+          if ./src-tauri/resources/ffmpeg/ffmpeg -version >/dev/null 2>&1; then
+            ./src-tauri/resources/ffmpeg/ffmpeg -version | head -1
+          else
+            echo "::warning::内置 ffmpeg 在当前 runner 上无法执行（arm64 可能缺 Rosetta 2），已跳过自检"
+            file src-tauri/resources/ffmpeg/ffmpeg || true
+          fi
       - name: Build desktop bundles
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: .
-          args: ${{ matrix.args }}
-      - name: Upload Windows bundle
+          args: ${{ matrix.args }}      - name: Upload Windows bundle
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
