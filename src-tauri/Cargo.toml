@@ -12,7 +12,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 dossier-core = { path = "../crates/dossier-core" }
 dossier-inpaint = { path = "../crates/dossier-inpaint" }
-dossier-license = { path = "../crates/dossier-license" }
+dossier-cardkey = { path = "../crates/dossier-cardkey" }
 dossier-media = { path = "../crates/dossier-media" }
 dossier-runtime = { path = "../crates/dossier-runtime" }
 serde = { version = "1", features = ["derive"] }

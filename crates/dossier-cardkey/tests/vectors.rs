@@ -1,6 +1,6 @@
 //! 与 Python 服务端逐条对拍：vectors_v1.json 由 license-server/tests/vectors.py 生成。
 
-use dossier_license::{
+use dossier_cardkey::{
     decide, parse_key_list, LockReason, Verdict, ROLLBACK_TOLERANCE_SECS, SIGNING_CONTEXT,
 };
 use serde_json::Value;
@@ -86,7 +86,7 @@ fn unconfigured_keys_always_lock() {
         c["machine_id"].as_str().unwrap(),
         0,
         0,
-        Err(dossier_license::KeyError::Empty),
+        Err(dossier_cardkey::KeyError::Empty),
     );
     assert_eq!(v, Verdict::Locked(LockReason::NotConfigured));
 }
@@ -94,8 +94,8 @@ fn unconfigured_keys_always_lock() {
 #[test]
 fn production_list_is_empty_or_free_of_test_keys() {
     // 生产公钥为空时必须锁定（NotConfigured），不能退回去信任测试公钥
-    match dossier_license::production_keys() {
-        Err(dossier_license::KeyError::Empty) => {}
+    match dossier_cardkey::production_keys() {
+        Err(dossier_cardkey::KeyError::Empty) => {}
         Ok(keys) => assert!(!keys.is_empty()),
         Err(e) => panic!("生产公钥配置错误：{e}"),
     }

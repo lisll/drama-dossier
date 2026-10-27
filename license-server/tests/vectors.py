@@ -1,4 +1,4 @@
-"""生成与 Rust 客户端共用的测试向量（crates/dossier-license/tests/vectors_v1.json）。
+"""生成与 Rust 客户端共用的测试向量（crates/dossier-cardkey/tests/vectors_v1.json）。
 
 用公开测试种子签名，确定性输出。Python 端测试会核对文件与生成器一致，
 防止有人只改了一边的协议。
@@ -20,7 +20,7 @@ from dd_license.token import SIGNING_CONTEXT, Claims, canonical_json, sign
 
 TEST_SEED = bytes(range(32))
 OTHER_SEED = bytes(range(32, 64))
-VECTOR_PATH = Path(__file__).resolve().parents[2] / "crates" / "dossier-license" / "tests" / "vectors_v1.json"
+VECTOR_PATH = Path(__file__).resolve().parents[2] / "crates" / "dossier-cardkey" / "tests" / "vectors_v1.json"
 
 IAT = 1_800_000_000
 DAY = 86400

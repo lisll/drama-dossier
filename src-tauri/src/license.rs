@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use dossier_license::{
+use dossier_cardkey::{
     decide, display_code, parse_key_list, production_keys, read_machine_id, LockReason, TrustedKey,
     Verdict,
 };
@@ -153,7 +153,7 @@ fn write_stored(c: &Ctx, s: &Stored) -> Result<(), String> {
 /// 信任的公钥。release 构建只认 `PRODUCTION_KEYS`；debug 构建可用
 /// `DD_LICENSE_DEV_PUBKEYS`（逗号分隔 base64url）连本地测试服务器。
 #[inline(always)]
-fn trusted_keys() -> Result<&'static [TrustedKey], dossier_license::KeyError> {
+fn trusted_keys() -> Result<&'static [TrustedKey], dossier_cardkey::KeyError> {
     #[cfg(debug_assertions)]
     {
         static DEV: OnceLock<Option<Vec<TrustedKey>>> = OnceLock::new();
@@ -196,7 +196,7 @@ fn evaluate_full() -> Verdict {
     let now = now_secs();
     let v = decide(&stored.token, mid, now, stored.last_seen, trusted_keys());
     if v.is_active() {
-        if let Some(next) = dossier_license::next_last_seen(now, stored.last_seen) {
+        if let Some(next) = dossier_cardkey::next_last_seen(now, stored.last_seen) {
             let _ = write_stored(
                 c,
                 &Stored {
@@ -609,7 +609,7 @@ pub fn license_machine_code() -> Result<String, String> {
 
 #[tauri::command]
 pub async fn license_activate(card: String) -> Result<LicenseStatus, String> {
-    let code = dossier_license::normalize_card(&card).ok_or("卡密格式不正确，请检查后重新输入")?;
+    let code = dossier_cardkey::normalize_card(&card).ok_or("卡密格式不正确，请检查后重新输入")?;
     tauri::async_runtime::spawn_blocking(move || {
         let c = ctx().ok_or("授权模块未初始化")?;
         let mid = c.machine_id.clone()?;

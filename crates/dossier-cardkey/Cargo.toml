@@ -1,5 +1,5 @@
 [package]
-name = "dossier-license"
+name = "dossier-cardkey"
 version = "0.1.0"
 edition = "2021"
 description = "剧备授权凭证离线验签、机器码、时钟防回拨与使用权判定（纯逻辑，不依赖 Tauri、不发网络请求）"

@@ -11,7 +11,7 @@
 | 部分 | 位置 |
 |---|---|
 | 授权服务器 + 网页管理后台 | [license-server/](../license-server/README.md) |
-| 验签、机器码、时钟检查、判定（纯逻辑） | `crates/dossier-license` |
+| 验签、机器码、时钟检查、判定（纯逻辑） | `crates/dossier-cardkey` |
 | 桌面端命令、闸门、功能内验权、守护线程 | `src-tauri/src/license.rs` |
 | 激活页 | `src/license.js`、`src/license.css` |
 
@@ -66,7 +66,7 @@ payload 是 JSON 对象，序列化时按键名排序、使用紧凑分隔符、
 5. 时钟回拨（`now + 600 < max(last_seen, iat)` 视为回拨）
 6. 有效期
 
-两端的实现由 `crates/dossier-license/tests/vectors_v1.json` 中的 36 条测试向量逐条对照。这些向量由 `license-server/tests/vectors.py` 生成，修改协议后必须重新生成，并且一起提交。
+两端的实现由 `crates/dossier-cardkey/tests/vectors_v1.json` 中的 36 条测试向量逐条对照。这些向量由 `license-server/tests/vectors.py` 生成，修改协议后必须重新生成，并且一起提交。
 
 ### 卡种规则
 
@@ -108,7 +108,7 @@ payload 是 JSON 对象，序列化时按键名排序、使用紧凑分隔符、
 合并到 master 之前必须全部完成。否则打 `app-v*` tag 时，CI 会自动发布 Release，而发出去的安装包谁都激活不了，程序会锁定，不会放行。
 
 1. [ ] 按 [license-server/README.md](../license-server/README.md) 部署服务器，并确认 `license-admin doctor` 的每一项都通过。
-2. [ ] 把 `license-admin keygen` 输出的公钥填进 `crates/dossier-license/src/keys.rs` 里的 `PRODUCTION_KEYS`。
+2. [ ] 把 `license-admin keygen` 输出的公钥填进 `crates/dossier-cardkey/src/keys.rs` 里的 `PRODUCTION_KEYS`。
 3. [ ] 把服务器的 HTTPS 地址填进 `src-tauri/src/license.rs` 里的 `LICENSE_SERVER`。
 4. [ ] 运行 `scripts/check.sh` 并全部通过。
 5. [ ] 在 Windows 和 macOS 上各手动测试一次：首次打开会出现激活页 → 输入卡密后激活成功 → 断网后可以继续使用 → 在后台作废这台电脑 → 联网后被锁定。

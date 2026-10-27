@@ -2,7 +2,7 @@
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use dossier_license::{decide, parse_key_list, LockReason, Plan, Verdict, SIGNING_CONTEXT};
+use dossier_cardkey::{decide, parse_key_list, LockReason, Plan, Verdict, SIGNING_CONTEXT};
 use ed25519_dalek::{Signer, SigningKey};
 
 const M1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -39,7 +39,7 @@ fn token(sk: &SigningKey, plan: &str, until: Option<u64>, exp: u64) -> String {
     )
 }
 
-fn keys() -> Vec<dossier_license::TrustedKey> {
+fn keys() -> Vec<dossier_cardkey::TrustedKey> {
     let pk = URL_SAFE_NO_PAD.encode(seed().verifying_key().as_bytes());
     parse_key_list(&[pk.as_str()]).unwrap()
 }
