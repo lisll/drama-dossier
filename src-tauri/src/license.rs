@@ -4,14 +4,14 @@
 //! 1. 前端激活页（`src/license.js`）——只是体验层；
 //! 2. [`gate`]：包住 `invoke_handler`，未授权时拒绝白名单外的**所有**命令（新增命令默认被锁）；
 //! 3. [`guard`]：主要功能函数第一行调用，每次从磁盘重读凭证并**完整重验签**，不信任缓存；
-//! 4. 守护线程：随机 3–9 分钟重验一次，每 24 小时联网续签，失效即全局锁定并通知前端；
+//! 4. 守护线程：随机 3–9 分钟重验一次，每 24 小时联网续签，状态变化即通知前端；
 //! 5. 金丝雀：用内置的「已知坏签名 / 已知好签名」各验一次，验签被改成恒真就会立刻暴露。
 //!
+//! 状态与判定规则在 [`crate::license_state`]；这里只负责接线、联网和通知。
 //! 正常使用时全部在本机计算（几十微秒），不联网、不弹窗；只有授权真的失效才会提示。
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dossier_cardkey::{
@@ -21,6 +21,7 @@ use dossier_cardkey::{
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::license_state::{ReadOutcome, State};
 use crate::logging::log_event;
 
 // ------------------------------------------------------------------ 配置
@@ -29,7 +30,10 @@ use crate::logging::log_event;
 const LICENSE_SERVER: &str = "";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 const REFRESH_EVERY_SECS: u64 = 24 * 3600;
-/// 未授权时也放行的命令：授权自身、看日志（方便把日志发给客服）。
+/// 续签失败后多久重试
+const REFRESH_RETRY_SECS: u64 = 3600;
+/// 未授权时也放行的命令：授权自身、看日志（方便把日志发给客服）、
+/// 停止正在跑的长任务和查询其状态（授权中途失效时，用户必须能停下来）。
 const ALLOWED_WITHOUT_LICENSE: &[&str] = &[
     "license_status",
     "license_activate",
@@ -37,6 +41,16 @@ const ALLOWED_WITHOUT_LICENSE: &[&str] = &[
     "license_machine_code",
     "open_log_dir",
     "read_recent_logs",
+    "transcode_stop",
+    "erase_status",
+];
+/// 服务器明确表示「这台电脑不能再用这份授权」的错误码。只有这几种才锁定，
+/// 其余任何错误（404/422/413、代理或防火墙返回的页面等）都按「暂时连不上」处理。
+const REVOKING_ERRORS: &[&str] = &[
+    "token_invalid",
+    "machine_revoked",
+    "license_expired",
+    "not_activated",
 ];
 
 // ------------------------------------------------------------------ 字符串轻度混淆
@@ -77,29 +91,18 @@ fn locked_message() -> String {
     hidden!(b"LICENSE_LOCKED:")
 }
 
-// ------------------------------------------------------------------ 状态
-
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-struct Stored {
-    token: String,
-    #[serde(default)]
-    last_seen: u64,
-}
+// ------------------------------------------------------------------ 全局状态
 
 struct Ctx {
-    path: PathBuf,
-    machine_id: Result<String, String>,
+    state: State,
     app_version: String,
 }
 
 static CTX: OnceLock<Ctx> = OnceLock::new();
 static APP: OnceLock<AppHandle> = OnceLock::new();
-/// 闸门的快速路径缓存：最近一次判定是否有效 + 该结论在何时之前可信（=凭证 exp）。
-static ACTIVE_UNTIL: AtomicU64 = AtomicU64::new(0);
-/// 只进不出的锁定标志：一旦发现篡改或失效就置位，只有联网激活/续签成功才清除。
-static HARD_LOCK: AtomicBool = AtomicBool::new(false);
-static IO_LOCK: Mutex<()> = Mutex::new(());
 static LAST_REFRESH: AtomicU64 = AtomicU64::new(0);
+/// 上一次通知前端时的结论；只有变化时才发事件
+static LAST_NOTIFIED_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -133,23 +136,6 @@ fn dev_bypass() -> bool {
     false
 }
 
-fn read_stored(c: &Ctx) -> Option<Stored> {
-    let _g = IO_LOCK.lock().ok()?;
-    let text = std::fs::read_to_string(&c.path).ok()?;
-    serde_json::from_str(&text).ok()
-}
-
-fn write_stored(c: &Ctx, s: &Stored) -> Result<(), String> {
-    let _g = IO_LOCK.lock().map_err(|_| "授权文件锁异常".to_string())?;
-    if let Some(dir) = c.path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("无法创建配置目录：{e}"))?;
-    }
-    let tmp = c.path.with_extension("json.tmp");
-    let text = serde_json::to_string(s).map_err(|e| e.to_string())?;
-    std::fs::write(&tmp, text).map_err(|e| format!("写入授权文件失败：{e}"))?;
-    std::fs::rename(&tmp, &c.path).map_err(|e| format!("保存授权文件失败：{e}"))
-}
-
 /// 信任的公钥。release 构建只认 `PRODUCTION_KEYS`；debug 构建可用
 /// `DD_LICENSE_DEV_PUBKEYS`（逗号分隔 base64url）连本地测试服务器。
 #[inline(always)]
@@ -177,60 +163,34 @@ fn trusted_keys() -> Result<&'static [TrustedKey], dossier_cardkey::KeyError> {
     }
     production_keys()
 }
-/// 完整判定：读盘 → 金丝雀 → 验签 → 机器码 → 时钟 → 有效期。不使用任何缓存。
+
+/// 完整判定：读盘 → 金丝雀 → 校验码 → 验签 → 机器码 → 时钟 → 有效期。不使用任何缓存。
 #[inline(always)]
 fn evaluate_full() -> Verdict {
     let Some(c) = ctx() else {
         return Verdict::Locked(LockReason::NotConfigured);
     };
-    if !canary_ok() {
-        return Verdict::Locked(LockReason::Tampered);
+    let (v, note) = c.state.evaluate(now_secs(), trusted_keys(), canary_ok());
+    if let Some(note) = note {
+        log_event("授权", note);
     }
-    let mid = match &c.machine_id {
-        Ok(m) => m,
-        Err(_) => return Verdict::Locked(LockReason::MachineUnavailable),
-    };
-    let Some(stored) = read_stored(c) else {
-        return Verdict::Locked(LockReason::NotActivated);
-    };
-    let now = now_secs();
-    let v = decide(&stored.token, mid, now, stored.last_seen, trusted_keys());
-    if v.is_active() {
-        if let Some(next) = dossier_cardkey::next_last_seen(now, stored.last_seen) {
-            let _ = write_stored(
-                c,
-                &Stored {
-                    token: stored.token,
-                    last_seen: next,
-                },
-            );
-        }
-    }
+    notify_if_changed(&v);
     v
 }
 
-fn apply_verdict(v: &Verdict) {
-    match v {
-        Verdict::Active(a) => {
-            ACTIVE_UNTIL.store(a.until.map_or(a.exp, |u| u.min(a.exp)), Ordering::SeqCst);
-        }
-        Verdict::Locked(reason) => {
-            let was_active = ACTIVE_UNTIL.swap(0, Ordering::SeqCst) != 0;
-            HARD_LOCK.store(true, Ordering::SeqCst);
-            if was_active {
-                log_event("授权", format!("授权失效：{}", reason.code()));
-                notify_locked(*reason);
-            }
-        }
+/// 结论变化时通知前端（有效 ↔ 锁定）。携带完整状态，前端不必再查一次。
+fn notify_if_changed(v: &Verdict) {
+    let active = v.is_active();
+    if LAST_NOTIFIED_ACTIVE.swap(active, Ordering::SeqCst) == active {
+        return;
     }
-}
-
-fn notify_locked(reason: LockReason) {
+    if let Verdict::Locked(reason) = v {
+        log_event("授权", format!("授权失效：{}", reason.code()));
+    } else {
+        log_event("授权", "授权恢复有效");
+    }
     if let Some(app) = APP.get() {
-        let _ = app.emit(
-            "license-changed",
-            serde_json::json!({ "active": false, "reason": reason.code(), "message": reason.message() }),
-        );
+        let _ = app.emit("license-changed", status_from(v));
     }
 }
 
@@ -243,7 +203,7 @@ fn is_active_fast() -> bool {
     if dev_bypass() {
         return true;
     }
-    !HARD_LOCK.load(Ordering::SeqCst) && now_secs() < ACTIVE_UNTIL.load(Ordering::SeqCst)
+    ctx().is_some_and(|c| c.state.is_active_fast(now_secs()))
 }
 
 // ------------------------------------------------------------------ 第③层：功能内验权
@@ -256,16 +216,10 @@ pub fn guard() -> Result<(), String> {
     if dev_bypass() {
         return Ok(());
     }
-    if HARD_LOCK.load(Ordering::SeqCst) {
-        return Err(locked_error(LockReason::Revoked));
-    }
-    let v = evaluate_full();
-    let r = match &v {
+    match evaluate_full() {
         Verdict::Active(_) => Ok(()),
-        Verdict::Locked(reason) => Err(locked_error(*reason)),
-    };
-    apply_verdict(&v);
-    r
+        Verdict::Locked(reason) => Err(locked_error(reason)),
+    }
 }
 
 // ------------------------------------------------------------------ 第②层：总闸门
@@ -284,10 +238,10 @@ where
         if allowed_without_license(command) || is_active_fast() {
             return inner(invoke);
         }
-        let reason = if ctx().is_none() {
-            LockReason::NotConfigured
-        } else {
-            LockReason::NotActivated
+        // 快速路径不放行时再完整判一次：刚激活、或另一窗口刚续签成功时不会被误拒
+        let reason = match evaluate_full() {
+            Verdict::Active(_) => return inner(invoke),
+            Verdict::Locked(r) => r,
         };
         invoke.resolver.reject(locked_error(reason));
         true
@@ -343,19 +297,60 @@ fn server_base() -> Result<String, String> {
     validate_base(LICENSE_SERVER)
 }
 
+/// 只接受 HTTPS；明文 HTTP 只允许主机名恰好是本机回环地址（本地联调用）。
 fn validate_base(base: &str) -> Result<String, String> {
     let base = base.trim_end_matches('/');
-    let local = base.starts_with("http://127.0.0.1") || base.starts_with("http://localhost");
-    if !(base.starts_with("https://") || local) {
+    let url = reqwest::Url::parse(base).map_err(|_| "授权服务器地址格式错误".to_string())?;
+    // Url 解析后主机名已规范化（小写、IPv4 点分十进制），可以直接比较
+    let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1"));
+    let ok = match url.scheme() {
+        "https" => url.host_str().is_some_and(|h| !h.is_empty()),
+        "http" => loopback,
+        _ => false,
+    };
+    if !ok || !url.username().is_empty() || url.password().is_some() {
         return Err("授权服务器地址必须是 HTTPS".to_string());
     }
     Ok(base.to_string())
 }
 
-/// 服务器明确拒绝（4xx 业务错误）与网络失败要分开：前者锁定，后者只是暂时连不上。
+/// 服务器明确停用与「暂时连不上」要分开：前者锁定，后者凭证有效期内照常使用。
+#[derive(Debug)]
 enum CallError {
-    Rejected { code: String, message: String },
+    /// 服务器明确拒绝：激活时原样提示；续签时锁定
+    Rejected {
+        code: String,
+        message: String,
+    },
     Network(String),
+}
+
+/// 把 HTTP 状态码 + 响应体归类。单独拆出来便于逐一测试。
+fn classify_failure(status: u16, body: &str) -> CallError {
+    let parsed = serde_json::from_str::<ServerError>(body).ok();
+    match parsed {
+        // 激活接口的业务错误（卡密不存在、已被使用等）都是 4xx + JSON，需要原样告诉用户；
+        // 续签只对 REVOKING_ERRORS 锁定，由调用方用 is_revoking() 判断。
+        Some(e) if (400..500).contains(&status) && status != 429 => CallError::Rejected {
+            code: e.error,
+            message: e.message,
+        },
+        Some(e) => CallError::Network(e.message),
+        None => CallError::Network(format!("授权服务器返回异常（HTTP {status}）")),
+    }
+}
+
+impl CallError {
+    /// 续签时：是不是「这台电脑不能再用这份授权」的明确答复
+    fn is_revoking(&self) -> bool {
+        matches!(self, CallError::Rejected { code, .. } if REVOKING_ERRORS.contains(&code.as_str()))
+    }
+
+    fn message(&self) -> String {
+        match self {
+            CallError::Rejected { message, .. } | CallError::Network(message) => message.clone(),
+        }
+    }
 }
 
 fn post(path: &str, body: serde_json::Value) -> Result<String, CallError> {
@@ -379,106 +374,116 @@ fn post(path: &str, body: serde_json::Value) -> Result<String, CallError> {
             .map_err(|_| CallError::Network("服务器响应格式错误".to_string()))?;
         return Ok(out.token);
     }
-    match serde_json::from_str::<ServerError>(&text) {
-        Ok(e) if status.is_client_error() && status.as_u16() != 429 => Err(CallError::Rejected {
-            code: e.error,
-            message: e.message,
-        }),
-        Ok(e) => Err(CallError::Network(e.message)),
-        Err(_) => Err(CallError::Network(format!(
-            "授权服务器返回异常（{status}）"
-        ))),
-    }
+    Err(classify_failure(status.as_u16(), &text))
 }
 
 /// 收到新凭证：先本地完整验签，通过才落盘，绝不保存一个自己验不过的凭证。
 fn accept_token(c: &Ctx, token: String) -> Result<Verdict, String> {
-    let mid = c.machine_id.as_ref().map_err(|e| e.clone())?;
-    let now = now_secs();
-    let v = decide(&token, mid, now, 0, trusted_keys());
-    if let Verdict::Locked(reason) = v {
-        log_event(
-            "授权",
-            format!("服务器下发的凭证未通过本地校验：{}", reason.code()),
-        );
-        return Err(reason.message().to_string());
+    match c
+        .state
+        .accept(token, now_secs(), trusted_keys(), canary_ok())
+    {
+        Ok(v) => {
+            LAST_REFRESH.store(now_secs(), Ordering::SeqCst);
+            notify_if_changed(&v);
+            Ok(v)
+        }
+        Err(reason) => {
+            log_event(
+                "授权",
+                format!("服务器下发的凭证未通过本地校验：{}", reason.code()),
+            );
+            Err(reason.message().to_string())
+        }
     }
-    if !canary_ok() {
-        return Err(LockReason::Tampered.message().to_string());
-    }
-    write_stored(
-        c,
-        &Stored {
-            token,
-            last_seen: now,
-        },
-    )?;
-    HARD_LOCK.store(false, Ordering::SeqCst);
-    LAST_REFRESH.store(now, Ordering::SeqCst);
-    apply_verdict(&v);
-    Ok(v)
 }
 
 fn refresh_blocking() -> Result<Verdict, String> {
     let c = ctx().ok_or("授权模块未初始化")?;
-    let mid = c.machine_id.clone()?;
-    let stored = read_stored(c).ok_or_else(|| LockReason::NotActivated.message().to_string())?;
+    let mid = c.state.machine_id().map_err(str::to_string)?.to_string();
+    let token = match c.state.read() {
+        ReadOutcome::Ok(s) => s.token,
+        _ => return Err(LockReason::NotActivated.message().to_string()),
+    };
     match post(
         "/v1/refresh",
-        serde_json::json!({ "token": stored.token, "machine_id": mid, "app_version": c.app_version }),
+        serde_json::json!({ "token": token, "machine_id": mid, "app_version": c.app_version }),
     ) {
-        Ok(token) => accept_token(c, token),
-        Err(CallError::Rejected { code, message }) => {
-            log_event("授权", format!("续签被服务器拒绝：{code}"));
-            apply_verdict(&Verdict::Locked(LockReason::Revoked));
-            Err(message)
+        Ok(fresh) => accept_token(c, fresh),
+        Err(e) if e.is_revoking() => {
+            if let CallError::Rejected { code, .. } = &e {
+                log_event("授权", format!("续签被服务器拒绝：{code}"));
+            }
+            if let Err(io) = c.state.mark_revoked(&token) {
+                log_event(
+                    "授权",
+                    format!("停用标记写入失败（本次运行仍保持锁定）：{io}"),
+                );
+            }
+            notify_if_changed(&Verdict::Locked(LockReason::Revoked));
+            Err(e.message())
         }
-        Err(CallError::Network(msg)) => Err(msg),
+        Err(e) => Err(e.message()),
     }
 }
 
 // ------------------------------------------------------------------ 第④层：守护线程
 
-fn spawn_daemon() {
-    std::thread::Builder::new()
+/// 是否该联网续签了：有凭证、距上次成功续签已满 24 小时（失败后 1 小时重试）。
+fn refresh_due(now: u64) -> bool {
+    now.saturating_sub(LAST_REFRESH.load(Ordering::SeqCst)) >= REFRESH_EVERY_SECS
+}
+
+fn try_refresh(trigger: &str) {
+    if dev_bypass() || server_base().is_err() {
+        return;
+    }
+    match refresh_blocking() {
+        Ok(_) => log_event("授权", format!("{trigger}：续签成功")),
+        Err(e) => {
+            // 1 小时后重试：把「上次续签」记成 (24h - 1h) 之前
+            LAST_REFRESH.store(
+                now_secs().saturating_sub(REFRESH_EVERY_SECS - REFRESH_RETRY_SECS),
+                Ordering::SeqCst,
+            );
+            log_event(
+                "授权",
+                format!("{trigger}：续签未成功（1 小时后重试）：{e}"),
+            );
+        }
+    }
+}
+
+fn spawn_daemon(refresh_now: bool) {
+    let spawned = std::thread::Builder::new()
         .name("dd-housekeeping".into())
-        .spawn(|| {
-            // 启动后先等一会儿再联网，避免拖慢首屏
-            std::thread::sleep(Duration::from_secs(20));
+        .spawn(move || {
+            if refresh_now {
+                // 凭证已过期（例如一周没开软件）：立即续签，不让用户干等
+                try_refresh("启动");
+            } else {
+                // 正常情况：先等一会儿再联网，避免拖慢首屏
+                std::thread::sleep(Duration::from_secs(20));
+            }
             loop {
-                let v = if dev_bypass() {
-                    None
-                } else {
-                    Some(evaluate_full())
-                };
-                if let Some(v) = &v {
-                    apply_verdict(v);
-                }
-                let has_token = ctx().and_then(read_stored).is_some();
-                let due = now_secs().saturating_sub(LAST_REFRESH.load(Ordering::SeqCst))
-                    >= REFRESH_EVERY_SECS;
-                if has_token && due && !dev_bypass() {
-                    match refresh_blocking() {
-                        Ok(_) => log_event("授权", "后台续签成功"),
-                        // 连不上不打扰用户：凭证还在有效期内就继续用
-                        Err(e) => {
-                            LAST_REFRESH.store(
-                                now_secs().saturating_sub(REFRESH_EVERY_SECS - 3600),
-                                Ordering::SeqCst,
-                            );
-                            log_event("授权", format!("后台续签未成功（1 小时后重试）：{e}"));
-                        }
+                if !dev_bypass() {
+                    let _ = evaluate_full();
+                    let has_token =
+                        ctx().is_some_and(|c| matches!(c.state.read(), ReadOutcome::Ok(_)));
+                    if has_token && refresh_due(now_secs()) {
+                        try_refresh("后台");
                     }
                 }
                 std::thread::sleep(Duration::from_secs(jitter_secs()));
             }
-        })
-        .map(|_| ())
-        .unwrap_or_else(|e| {
-            // 守护线程起不来就直接锁定，不能悄悄少一层检查
-            log_event("授权", format!("守护线程启动失败：{e}"));
-            HARD_LOCK.store(true, Ordering::SeqCst);
         });
+    if let Err(e) = spawned {
+        // 守护线程起不来就直接锁定，不能悄悄少一层检查
+        log_event("授权", format!("守护线程启动失败：{e}"));
+        if let Some(c) = ctx() {
+            c.state.mark_tampered();
+        }
+    }
 }
 
 /// 180–540 秒的随机间隔（不引入 rand 依赖，用系统时间的纳秒部分做种子足够）。
@@ -508,35 +513,23 @@ pub fn init(app: &AppHandle) {
         e.to_string()
     });
     let _ = CTX.set(Ctx {
-        path,
-        machine_id,
+        state: State::new(path, machine_id),
         app_version: app.package_info().version.to_string(),
     });
     let _ = APP.set(app.clone());
     if !canary_ok() {
         log_event("授权", "启动自检失败");
-        HARD_LOCK.store(true, Ordering::SeqCst);
-    } else {
-        HARD_LOCK.store(false, Ordering::SeqCst);
-        let v = evaluate_full();
-        if v.is_active() {
-            ACTIVE_UNTIL.store(
-                match &v {
-                    Verdict::Active(a) => a.until.map_or(a.exp, |u| u.min(a.exp)),
-                    _ => 0,
-                },
-                Ordering::SeqCst,
-            );
-        } else {
-            HARD_LOCK.store(true, Ordering::SeqCst);
-        }
     }
-    spawn_daemon();
+    let v = evaluate_full();
+    LAST_NOTIFIED_ACTIVE.store(v.is_active(), Ordering::SeqCst);
+    // 凭证过期但本地还有授权文件：可能只是很久没联网，立即续签
+    let refresh_now = matches!(v, Verdict::Locked(LockReason::Expired));
+    spawn_daemon(refresh_now);
 }
 
 // ------------------------------------------------------------------ IPC 命令
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct LicenseStatus {
     active: bool,
@@ -548,12 +541,12 @@ pub struct LicenseStatus {
     exp: Option<u64>,
     machine_code: Option<String>,
     machine_id: Option<String>,
+    /// 能否联网激活 / 续签（服务器地址已配置）
     server_configured: bool,
 }
 
 fn status_from(v: &Verdict) -> LicenseStatus {
-    let c = ctx();
-    let mid = c.and_then(|c| c.machine_id.as_ref().ok());
+    let mid = ctx().and_then(|c| c.state.machine_id().ok());
     let base = LicenseStatus {
         active: false,
         reason: None,
@@ -562,8 +555,8 @@ fn status_from(v: &Verdict) -> LicenseStatus {
         plan_label: None,
         until: None,
         exp: None,
-        machine_code: mid.map(|m| display_code(m)),
-        machine_id: mid.cloned(),
+        machine_code: mid.map(display_code),
+        machine_id: mid.map(str::to_string),
         server_configured: server_base().is_ok(),
     };
     match v {
@@ -593,18 +586,17 @@ pub fn license_status() -> LicenseStatus {
         s.message = "调试构建已跳过授权检查".into();
         return s;
     }
-    let v = evaluate_full();
-    apply_verdict(&v);
-    if v.is_active() {
-        HARD_LOCK.store(false, Ordering::SeqCst);
-    }
-    status_from(&v)
+    // 只判断、不清任何锁：停用标记在文件里，篡改标记在内存里，都不归这里管
+    status_from(&evaluate_full())
 }
 
 #[tauri::command]
 pub fn license_machine_code() -> Result<String, String> {
     let c = ctx().ok_or("授权模块未初始化")?;
-    c.machine_id.clone()
+    c.state
+        .machine_id()
+        .map(str::to_string)
+        .map_err(str::to_string)
 }
 
 #[tauri::command]
@@ -612,18 +604,19 @@ pub async fn license_activate(card: String) -> Result<LicenseStatus, String> {
     let code = dossier_cardkey::normalize_card(&card).ok_or("卡密格式不正确，请检查后重新输入")?;
     tauri::async_runtime::spawn_blocking(move || {
         let c = ctx().ok_or("授权模块未初始化")?;
-        let mid = c.machine_id.clone()?;
+        let mid = c.state.machine_id().map_err(str::to_string)?.to_string();
         log_event("授权", "提交卡密激活");
         let token = match post(
             "/v1/activate",
             serde_json::json!({ "card": code, "machine_id": mid, "app_version": c.app_version }),
         ) {
             Ok(t) => t,
-            Err(CallError::Rejected { code, message }) => {
-                log_event("授权", format!("激活被拒绝：{code}"));
-                return Err(message);
+            Err(e) => {
+                if let CallError::Rejected { code, .. } = &e {
+                    log_event("授权", format!("激活被拒绝：{code}"));
+                }
+                return Err(e.message());
             }
-            Err(CallError::Network(m)) => return Err(m),
         };
         let v = accept_token(c, token)?;
         log_event("授权", "激活成功");
@@ -662,11 +655,73 @@ mod tests {
             "load_app_settings",
             "LICENSE_STATUS",
             "license_status ",
+            "transcode_stop2",
             "",
             "some_future_command",
         ] {
             assert!(!allowed_without_license(cmd), "{cmd} 不应在白名单里");
         }
+    }
+
+    /// 白名单里的每个命令都必须真的存在，防止拼错导致「锁定后停不下转码」又悄悄回来
+    #[test]
+    fn whitelist_commands_exist() {
+        let lib = include_str!("lib.rs");
+        for cmd in ALLOWED_WITHOUT_LICENSE {
+            let found = ["license", "logging", "toolbox", "erase"]
+                .iter()
+                .any(|m| lib.contains(&format!("{m}::{cmd},")))
+                || lib.contains(&format!("            {cmd},"));
+            assert!(found, "白名单命令 {cmd} 没有在 generate_handler! 里注册");
+        }
+    }
+
+    #[test]
+    fn only_explicit_revoking_codes_lock() {
+        let body = |code: &str| format!(r#"{{"error":"{code}","message":"x"}}"#);
+        for code in REVOKING_ERRORS {
+            for status in [401, 403] {
+                assert!(
+                    classify_failure(status, &body(code)).is_revoking(),
+                    "{status} {code} 应锁定"
+                );
+            }
+        }
+        // 这些都不能让续签锁定
+        let cases: &[(u16, String)] = &[
+            (404, body("not_found")),
+            (422, body("bad_request")),
+            (413, body("too_large")),
+            (411, body("too_large")),
+            (400, body("bad_request")),
+            (429, body("rate_limited")),
+            (500, body("internal")),
+            (502, "<html>Bad Gateway</html>".into()),
+            (403, "<html>Forbidden by WAF</html>".into()),
+            (404, "".into()),
+            (403, body("card_used")),
+            // 错误码在白名单里但状态码是 5xx：服务器自己出错，不算明确答复
+            (500, body("machine_revoked")),
+        ];
+        for (status, b) in cases {
+            assert!(
+                !classify_failure(*status, b).is_revoking(),
+                "{status} {b} 不应锁定"
+            );
+        }
+    }
+
+    #[test]
+    fn activation_errors_are_shown_verbatim() {
+        let e = classify_failure(
+            409,
+            r#"{"error":"card_used","message":"这张卡密已被其他电脑使用"}"#,
+        );
+        assert!(matches!(&e, CallError::Rejected { code, .. } if code == "card_used"));
+        assert_eq!(e.message(), "这张卡密已被其他电脑使用");
+        let e = classify_failure(502, "<html>");
+        assert!(matches!(e, CallError::Network(_)));
+        assert!(e.message().contains("502"));
     }
 
     #[test]
@@ -688,16 +743,30 @@ mod tests {
         if ctx().is_none() && !dev_bypass() {
             let e = guard().unwrap_err();
             assert!(e.starts_with("LICENSE_LOCKED:"), "{e}");
+            assert!(!is_active_fast());
         }
     }
 
     #[test]
     fn server_must_be_https() {
-        assert!(validate_base("http://evil.example").is_err());
-        assert!(validate_base("https://license.example.com/")
-            .unwrap()
-            .ends_with(".com"));
+        for bad in [
+            "http://evil.example",
+            "http://localhost.evil.example",
+            "http://127.0.0.1.evil.example",
+            "http://127.0.0.2:8200",
+            "ftp://license.example.com",
+            "https://user:pw@license.example.com",
+            "license.example.com",
+            "",
+        ] {
+            assert!(validate_base(bad).is_err(), "{bad} 不应被接受");
+        }
+        assert_eq!(
+            validate_base("https://license.example.com/").unwrap(),
+            "https://license.example.com"
+        );
         assert!(validate_base("http://127.0.0.1:8200").is_ok());
+        assert!(validate_base("http://LOCALHOST:8200").is_ok());
     }
 
     #[test]
@@ -708,9 +777,8 @@ mod tests {
         }
     }
 
-    /// guard 的主要开销是金丝雀两次验签 + 凭证一次验签。这里测真实的验签路径
-    /// （canary_ok 内含两次完整 decide），而不是未初始化时的快速失败分支。
-    /// 阈值只在 release 下断言：debug 构建里 ed25519 未优化，数字没有参考意义。
+    /// guard 的主要开销是金丝雀两次验签 + 凭证一次验签。阈值只在 release 下断言：
+    /// debug 构建里 ed25519 未优化，数字没有参考意义。
     #[test]
     fn guard_crypto_path_is_fast() {
         const N: u32 = 2_000;
@@ -725,31 +793,36 @@ mod tests {
         }
     }
 
-    /// 完整路径：金丝雀 2 次 + 读盘 + 凭证 1 次验签，与 guard() 在已激活时做的事完全相同。
+    /// 完整路径：金丝雀 2 次 + 读盘 + 校验码 + 凭证 1 次验签 + 按需写回，与 guard() 一致。
     #[test]
     fn full_check_path_is_fast() {
-        // 用金丝雀的好凭证模拟磁盘上的授权文件
-        let dir = std::env::temp_dir().join(format!("dd-license-bench-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("license.json");
-        std::fs::write(
-            &path,
-            serde_json::to_string(&Stored {
-                token: CANARY_GOOD.into(),
-                last_seen: 0,
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        let keys = parse_key_list(&[CANARY_KEY]).unwrap();
-        const N: u32 = 2_000;
+        use dossier_cardkey::{issue_token, public_key_b64, signing_key, Plan};
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/license-bench")
+            .join(std::process::id().to_string());
+        let _ = std::fs::remove_dir_all(&dir);
+        let sk = signing_key([3u8; 32]);
+        let keys = parse_key_list(&[public_key_b64(&sk).as_str()]).unwrap();
+        let mid = "ab".repeat(32);
+        let now = 1_800_000_000;
+        let state = State::new(dir.join("license.json"), Ok(mid.clone()));
+        let tok = issue_token(
+            &sk,
+            1,
+            &mid,
+            Plan::Year,
+            Some(now + 9_000_000),
+            now,
+            now + 604_800,
+        );
+        assert!(state.accept(tok, now, Ok(&keys), true).unwrap().is_active());
+        const N: u64 = 2_000;
         let t = std::time::Instant::now();
-        for _ in 0..N {
-            assert!(canary_ok());
-            let s: Stored = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-            assert!(decide(&s.token, CANARY_MID, CANARY_NOW, s.last_seen, Ok(&keys)).is_active());
+        for i in 0..N {
+            let (v, _) = state.evaluate(now + i, Ok(&keys), canary_ok());
+            assert!(v.is_active());
         }
-        let per = t.elapsed() / N;
+        let per = t.elapsed() / N as u32;
         let _ = std::fs::remove_dir_all(&dir);
         eprintln!("完整验权路径平均耗时 {per:?}");
         if !cfg!(debug_assertions) {
@@ -761,7 +834,8 @@ mod tests {
     ///
     /// ```text
     /// DD_LICENSE_SERVER=http://127.0.0.1:端口 DD_LICENSE_DEV_PUBKEYS=<pubkey> \
-    /// DD_E2E_CARDS=卡1,卡2 cargo test -p drama-dossier license::tests::e2e -- --ignored --nocapture
+    /// DD_E2E_CARDS=卡1,卡2 DD_E2E_DIR=<目录> DD_E2E_REVOKED_FLAG=<标记文件> \
+    /// cargo test -p drama-dossier license::tests::e2e -- --ignored --nocapture
     /// ```
     #[test]
     #[ignore]
@@ -771,14 +845,14 @@ mod tests {
             .split(',')
             .map(str::to_string)
             .collect();
-        let dir = std::env::temp_dir().join(format!("dd-license-e2e-{}", std::process::id()));
+        let dir = std::path::PathBuf::from(std::env::var("DD_E2E_DIR").expect("需要 DD_E2E_DIR"));
         let _ = std::fs::remove_dir_all(&dir);
         // 不依赖本机真实机器码，用固定值，便于在后台按前缀查找
         let mid = "e2e0".repeat(16);
+        let path = dir.join("license.json");
         assert!(CTX
             .set(Ctx {
-                path: dir.join("license.json"),
-                machine_id: Ok(mid.clone()),
+                state: State::new(path.clone(), Ok(mid.clone())),
                 app_version: "e2e".into(),
             })
             .is_ok());
@@ -800,28 +874,24 @@ mod tests {
             "/v1/activate",
             serde_json::json!({"card": cards[0], "machine_id": mid, "app_version": "e2e"}),
         )
-        .unwrap_or_else(|e| match e {
-            CallError::Rejected { message, .. } | CallError::Network(message) => {
-                panic!("激活失败：{message}")
-            }
-        });
+        .unwrap_or_else(|e| panic!("激活失败：{}", e.message()));
         let v = accept_token(ctx().unwrap(), token).expect("本地验签应通过");
         assert!(v.is_active(), "{v:?}");
         assert!(guard().is_ok(), "激活后 guard 应放行");
         assert!(is_active_fast(), "激活后闸门应放行");
         eprintln!("激活成功：{v:?}");
 
-        // 4. 授权文件被篡改：guard 立刻锁定
-        let path = dir.join("license.json");
+        // 4. 授权文件被篡改：guard 立刻锁定；改回原样后自动恢复（不会一次失败锁死整次运行）
         let original = std::fs::read_to_string(&path).unwrap();
-        let mut stored: Stored = serde_json::from_str(&original).unwrap();
-        stored.token = stored.token.replacen('e', "f", 1);
-        std::fs::write(&path, serde_json::to_string(&stored).unwrap()).unwrap();
+        let mut stored: serde_json::Value = serde_json::from_str(&original).unwrap();
+        stored["last_seen"] = serde_json::json!(0);
+        std::fs::write(&path, stored.to_string()).unwrap();
         assert!(guard().is_err(), "篡改后的授权文件必须被拒");
         assert!(!is_active_fast(), "篡改被发现后闸门也要锁定");
         std::fs::write(&path, &original).unwrap();
+        assert!(guard().is_ok(), "恢复原文件后应自动放行");
 
-        // 5. 续签：走 refresh_blocking，成功后解除锁定
+        // 5. 续签：走 refresh_blocking
         let v = refresh_blocking().expect("续签应成功");
         assert!(v.is_active());
         assert!(guard().is_ok());
@@ -839,23 +909,33 @@ mod tests {
                 "/v1/activate",
                 serde_json::json!({"card": second, "machine_id": mid, "app_version": "e2e"}),
             )
-            .unwrap_or_else(|_| panic!("第二张卡激活失败"));
+            .unwrap_or_else(|e| panic!("第二张卡激活失败：{}", e.message()));
             let v2 = accept_token(ctx().unwrap(), token).unwrap();
             eprintln!("叠加后：{v2:?}");
         }
 
-        // 8. 等待后台作废（由测试脚本在另一个进程里调用管理接口），然后续签必须被拒并锁定
+        // 8. 后台作废（测试脚本在另一个进程里调用管理接口并创建标记文件）后：
+        //    续签被拒并锁定；模拟重启（新的 State 读同一个文件）仍然锁定
         if let Ok(flag) = std::env::var("DD_E2E_REVOKED_FLAG") {
-            for _ in 0..60 {
+            for _ in 0..120 {
                 if std::path::Path::new(&flag).exists() {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(500));
             }
+            assert!(std::path::Path::new(&flag).exists(), "等不到作废标记文件");
             let e = refresh_blocking().expect_err("作废后续签必须失败");
             eprintln!("作废后续签：{e}");
             assert!(guard().is_err(), "作废后 guard 必须锁定");
             assert!(!is_active_fast(), "作废后闸门必须锁定");
+            let rebooted = State::new(path.clone(), Ok(mid.clone()));
+            let (v, _) = rebooted.evaluate(now_secs(), trusted_keys(), canary_ok());
+            assert_eq!(
+                v,
+                Verdict::Locked(LockReason::Revoked),
+                "重启后必须仍然锁定"
+            );
+            eprintln!("重启后仍锁定：{v:?}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

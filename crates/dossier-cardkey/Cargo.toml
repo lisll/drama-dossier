@@ -5,9 +5,14 @@ edition = "2021"
 description = "剧备授权凭证离线验签、机器码、时钟防回拨与使用权判定（纯逻辑，不依赖 Tauri、不发网络请求）"
 license = "MIT"
 
+[features]
+# 本机签发凭证（只给测试版与单元测试用；正式版不得开启，见 docs/LICENSING.md）。
+test-issuer = []
+
 [dependencies]
 base64 = "=0.22.1"
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
+hmac = "=0.12.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

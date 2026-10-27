@@ -22,6 +22,10 @@ pub enum LockReason {
     Tampered,
     /// 服务器明确拒绝（作废 / 到期 / 凭证无效）
     Revoked,
+    /// 授权状态长时间写不进磁盘（文件被设为只读等）
+    Unpersisted,
+    /// 授权文件暂时读不到（被占用、权限问题）；下次检查会自动重试
+    Unreadable,
 }
 
 impl LockReason {
@@ -38,6 +42,8 @@ impl LockReason {
             Self::Expired => "expired",
             Self::Tampered => "tampered",
             Self::Revoked => "revoked",
+            Self::Unpersisted => "unpersisted",
+            Self::Unreadable => "unreadable",
         }
     }
 
@@ -54,6 +60,10 @@ impl LockReason {
             Self::ClockRollback => "检测到系统时间异常，请校正系统时间后联网重试。",
             Self::Expired => "授权已过期或长时间未联网续期，请联网后重试，或输入新的卡密。",
             Self::Revoked => "授权已失效，请输入新的卡密或联系客服。",
+            Self::Unpersisted => "无法保存授权状态，请检查授权文件所在目录是否可写。",
+            Self::Unreadable => {
+                "暂时无法读取授权文件，请稍后重试；若持续出现请检查杀毒软件或文件权限。"
+            }
         }
     }
 }

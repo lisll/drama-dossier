@@ -16,6 +16,7 @@ mod dossier;
 mod erase;
 mod jianying;
 mod license;
+mod license_state;
 mod logging;
 mod mount;
 mod paths;

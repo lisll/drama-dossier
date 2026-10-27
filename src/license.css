@@ -73,6 +73,10 @@
   cursor: pointer;
 }
 
+.license-card button[hidden] {
+  display: none;
+}
+
 .license-card button.license-primary {
   flex: 1;
   border-color: var(--accent-fill, #1d4d2b);

@@ -23,6 +23,10 @@ base64 = "0.22"
 tauri = { version = "2", features = [] }
 rfd = "0.15"
 
+[dev-dependencies]
+# 单元测试要在本机签发凭证来驱动授权状态机
+dossier-cardkey = { path = "../crates/dossier-cardkey", features = ["test-issuer"] }
+
 [lib]
 name = "drama_dossier_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]

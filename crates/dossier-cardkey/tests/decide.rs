@@ -124,6 +124,8 @@ fn every_lock_reason_has_user_message() {
         Expired,
         Tampered,
         Revoked,
+        Unpersisted,
+        Unreadable,
     ] {
         assert!(!r.message().is_empty() && !r.code().is_empty());
     }
