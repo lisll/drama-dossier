@@ -179,6 +179,36 @@ pub(crate) fn model_runtime(
     settings: &AppSettings,
     runner: &dyn CommandRunner,
 ) -> ModelRuntimeStatus {
+    model_runtime_with_probe(settings, runner, OcrBackendProbe::detect())
+}
+
+/// OCR 降级链前两级（PaddleOCR / 系统 OCR）的本机探测结果。
+///
+/// 这两级无法用 FakeRunner 桩掉（是纯本机探测，不走命令行），生产路径来自
+/// 真实探测；单元测试注入固定值，避免结果随测试机环境漂移——中文 Windows
+/// 自带系统 OCR 中文语言包，会把「tesseract 缺 chi_sim」的用例误判成可用。
+#[derive(Debug, Clone)]
+pub(crate) struct OcrBackendProbe {
+    pub paddle_program: Option<PathBuf>,
+    pub system_available: bool,
+}
+
+impl OcrBackendProbe {
+    /// 真实探测本机；生产调用统一走这里。
+    pub(crate) fn detect() -> Self {
+        Self {
+            paddle_program: dossier_media::ocr::paddle::find_program(),
+            system_available: dossier_media::ocr::system::available(),
+        }
+    }
+}
+
+/// 同 [`model_runtime`]，但 OCR 前两级后端的探测结果由调用方注入（测试用）。
+pub(crate) fn model_runtime_with_probe(
+    settings: &AppSettings,
+    runner: &dyn CommandRunner,
+    probe: OcrBackendProbe,
+) -> ModelRuntimeStatus {
     let engine = AsrEngine::parse(settings.asr_engine.as_deref());
     let executable = settings
         .asr_executable
@@ -212,13 +242,12 @@ pub(crate) fn model_runtime(
     }
     // 按降级链决定 OCR 最终用哪个后端（PaddleOCR → 系统 OCR → tesseract）。
     // 每一级都要先确认「本机现在真的有它」，再参与选择；探测失败不报错，只跳过。
-    let paddle_program = dossier_media::ocr::paddle::find_program();
     let backend_env = dossier_media::ocr_backend::Environment {
-        paddle_program,
+        paddle_program: probe.paddle_program,
         // RapidOCR 本轮不做（引擎选型未定），自检恒为「没有」，降级链会跳过这一级。
         rapid_program: None,
-        // 与实际识别用同一个系统接口判断，不需要管理员权限（见 ocr::system::available）。
-        system_available: dossier_media::ocr::system::available(),
+        // 与实际识别用同一个系统接口判断，不需要管理员权限（见 OcrBackendProbe::detect）。
+        system_available: probe.system_available,
         tesseract: if ocr.ok {
             Some((PathBuf::from(ocr.program.clone()), true))
         } else {
@@ -1384,14 +1413,19 @@ mod tests {
                 CommandOutput::ok("eng\nchi_sim"),
             )
             .on("tesseract", CommandOutput::ok("tesseract 5"));
-        let ready = model_runtime(&settings, &runner);
+        // 假设本机没有 PaddleOCR、也没有系统 OCR：tesseract 是唯一后端。
+        let probe = OcrBackendProbe {
+            paddle_program: None,
+            system_available: false,
+        };
+        let ready = model_runtime_with_probe(&settings, &runner, probe.clone());
         assert!(ready.ready, "{}", ready.guidance);
 
         let no_chinese = FakeRunner::new()
             .on(&whisper_program, CommandOutput::ok("whisper 1.0"))
             .on_match("tesseract", "--list-langs", CommandOutput::ok("eng"))
             .on("tesseract", CommandOutput::ok("tesseract 5"));
-        let missing = model_runtime(&settings, &no_chinese);
+        let missing = model_runtime_with_probe(&settings, &no_chinese, probe);
         // OCR 是可选增强：缺中文语言包不影响"内容模型就绪"，只降级为仅用对白
         assert!(missing.ready, "OCR 缺失不应阻塞就绪：{}", missing.guidance);
         assert!(
@@ -1404,6 +1438,51 @@ mod tests {
             missing.guidance.contains("tesseract"),
             "要说明是哪一级不可用：{}",
             missing.guidance
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 中文 Windows 自带系统 OCR：tesseract 缺 chi_sim 时，降级链应选中系统 OCR，
+    /// 材料仍然就绪且不提示「只依据对白」。此前该分支依赖真实机器探测、无法桩掉，
+    /// 导致同一用例在中文系统上必然失败（见 OcrBackendProbe 的说明）。
+    #[test]
+    fn model_runtime_falls_back_to_system_ocr_when_tesseract_lacks_chinese() {
+        let root = std::env::temp_dir().join(format!(
+            "dossier-model-runtime-system-ocr-{}-{}",
+            std::process::id(),
+            std::time::UNIX_EPOCH.elapsed().unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let whisper = root.join("whisper");
+        std::fs::write(&whisper, b"fake").unwrap();
+        let mut settings = AppSettings::default();
+        let whisper_program = whisper.display().to_string();
+        settings.asr_executable = Some(whisper);
+
+        let no_chinese = FakeRunner::new()
+            .on(&whisper_program, CommandOutput::ok("whisper 1.0"))
+            .on_match("tesseract", "--list-langs", CommandOutput::ok("eng"))
+            .on("tesseract", CommandOutput::ok("tesseract 5"));
+        let probe = OcrBackendProbe {
+            paddle_program: None,
+            system_available: true,
+        };
+        let status = model_runtime_with_probe(&settings, &no_chinese, probe);
+        assert!(
+            status.ready,
+            "系统 OCR 兜底不应阻塞就绪：{}",
+            status.guidance
+        );
+        assert!(
+            status.ocr.ok,
+            "系统 OCR 应被视为可用：{}",
+            status.ocr.detail
+        );
+        assert_eq!(status.ocr.detail, "使用 系统 OCR");
+        assert!(
+            !status.guidance.contains("只依据对白"),
+            "OCR 可用就不该提示只依据对白：{}",
+            status.guidance
         );
         let _ = std::fs::remove_dir_all(root);
     }
