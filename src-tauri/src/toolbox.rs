@@ -129,6 +129,10 @@ pub struct RuntimeStatus {
     pub platform: String,
     /// 内容模型运行时（ASR/OCR），供设置页预检材料线程。
     pub models: crate::content::ModelRuntimeStatus,
+    /// NVIDIA 显卡概要（例如 "NVIDIA GeForce RTX 4060（8188 MB 显存，驱动 551.23）"）。
+    /// 没有 NVIDIA 显卡时为 `None`。界面把它显示在「本机环境」列表里，
+    /// 让用户知道 ASR 到底跑在 GPU 还是 CPU 上，而不是只看到一个"已就绪"。
+    pub gpu: Option<String>,
 }
 
 #[tauri::command]
@@ -176,6 +180,7 @@ fn runtime_status_inner(
         install_supported: cfg!(any(target_os = "macos", target_os = "windows")),
         platform: std::env::consts::OS.to_string(),
         models: crate::content::model_runtime(&read_settings(app)?, &runner),
+        gpu: nvidia_summary(),
     })
 }
 
@@ -2646,6 +2651,26 @@ fn install_one(
     let _ = std::fs::remove_dir_all(&staging);
     let _ = std::fs::remove_file(&zip_path);
     result.map(|_| false)
+}
+
+/// 本机是否有可用的 NVIDIA 显卡（供 ASR 决定装 CUDA 版还是 CPU 版 torch）。
+/// 复用已有的 `probe_gpu`（读 `nvidia-smi` 的设备表），不新增探测逻辑。
+pub(crate) fn nvidia_gpu_present() -> bool {
+    probe_gpu(&SystemRunner::new()).available
+}
+
+/// 本机显卡概要：给界面展示"检测到什么卡 / 没检测到"，并说明 ASR 走 CPU 还是 GPU。
+/// 非 NVIDIA（含 Apple Silicon）返回 `None` —— 这类机器由平台默认路径处理，不需要 CUDA 包。
+pub(crate) fn nvidia_summary() -> Option<String> {
+    let report = probe_gpu(&SystemRunner::new());
+    if !report.available {
+        return None;
+    }
+    let device = report.devices.first()?;
+    Some(format!(
+        "{}（{} MB 显存，驱动 {}）",
+        device.name, device.memory_total_mb, device.driver_version
+    ))
 }
 
 /// 安装后自检：把「下载成功但跑不起来」拦在报告给用户之前。

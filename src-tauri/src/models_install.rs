@@ -37,6 +37,31 @@ const CHI_SIM_SOURCES: &[&str] = &[
 
 /// pip 安装要拉 torch（mac 约 60MB / win 约 200MB）再装 whisper 本体，给足超时。
 const PIP_INSTALL_TIMEOUT_SECS: u64 = 1800;
+
+/// PyPI 主源：清华镜像。镜像不可用时 pip 会自动落到官方源，不会因此装不上。
+const PYPI_MIRROR: &str = "https://pypi.tuna.tsinghua.edu.cn/simple";
+/// PyTorch 的 CUDA 轮子源。CUDA 版 torch **不在 PyPI**，必须单独指定；
+/// 选 cu121 是因为它对 NVIDIA 驱动版本的要求最宽松（对应 525+），覆盖面最广。
+/// 升级时同步改这里，并更新 `installed_torch_variant` 的后缀判断依据。
+const PYTORCH_CUDA_INDEX: &str = "https://download.pytorch.org/whl/cu121";
+
+/// 读出当前 venv 里 torch 的版本串（例如 `2.3.1+cu121` 或 `2.3.1`）。
+/// 读不到返回 `None`——调用方按"没有 CUDA"处理，不阻塞安装。
+fn installed_torch_variant(python: &Path) -> Option<String> {
+    let spec = dossier_runtime::CommandSpec::new(python.display().to_string())
+        .args(["-c", "import torch; print(torch.__version__)"])
+        .timeout(Duration::from_secs(60));
+    let output = dossier_runtime::SystemRunner::new().run(&spec).ok()?;
+    if !output.success() {
+        return None;
+    }
+    let line = output.stdout.lines().next()?.trim().to_string();
+    if line.is_empty() {
+        None
+    } else {
+        Some(line)
+    }
+}
 /// base 模型约 140MB，网络慢时可能要几分钟。
 const MODEL_DOWNLOAD_TIMEOUT_SECS: u64 = 1800;
 /// Homebrew 装 tesseract + 全语言包约几十 MB，brew 首次可能更新索引。
@@ -196,14 +221,18 @@ fn install_asr(app: &AppHandle) -> Result<String, String> {
     }
 
     // 2) openai-whisper（重跑幂等：已装则 pip 秒回）。
-    emit_progress(
-        app,
-        "asr",
-        "downloading",
-        "下载 ASR 运行时（whisper，含 torch 约 60~200MB）",
-        None,
-        0,
-    );
+    //
+    // 关键：PyPI 默认装的是 **CPU 版 torch**。要用上 NVIDIA 显卡必须显式指定
+    // PyTorch 的 CUDA 源（--extra-index-url），否则"有显卡也跑在 CPU 上"。
+    // 国内环境再加 PyPI 镜像作为主源，两者是不同域名，任一不通都会失败，
+    // 所以源地址集中在这里，失败信息里带上用的是哪个源。
+    let wants_cuda = cfg!(target_os = "windows") && crate::toolbox::nvidia_gpu_present();
+    let stage = if wants_cuda {
+        "下载 ASR 运行时（whisper + CUDA 版 torch，约 1~2GB）"
+    } else {
+        "下载 ASR 运行时（whisper，含 CPU 版 torch 约 60~200MB）"
+    };
+    emit_progress(app, "asr", "downloading", stage, None, 0);
     let pip = python
         .parent()
         .map(|dir| {
@@ -214,14 +243,26 @@ fn install_asr(app: &AppHandle) -> Result<String, String> {
             })
         })
         .ok_or_else(|| "无法推断 pip 路径".to_string())?;
-    let spec = dossier_runtime::CommandSpec::new(pip.display().to_string())
+    let mut spec = dossier_runtime::CommandSpec::new(pip.display().to_string())
         .args([
             "install",
             "--quiet",
             "--disable-pip-version-check",
-            "openai-whisper",
+            // 国内镜像作为主源；镜像不可用时 pip 会自动回落到 PyPI 默认源
+            "--index-url",
+            PYPI_MIRROR,
         ])
         .timeout(Duration::from_secs(PIP_INSTALL_TIMEOUT_SECS));
+    if wants_cuda {
+        // CUDA 轮子不在 PyPI 镜像里，必须显式指向 PyTorch 官方源
+        spec = spec.args([
+            "--extra-index-url",
+            PYTORCH_CUDA_INDEX,
+            "torch",
+            "torchaudio",
+        ]);
+    }
+    spec = spec.arg("openai-whisper");
     let output = dossier_runtime::SystemRunner::new()
         .run(&spec)
         .map_err(|error| format!("安装 openai-whisper 失败（需要网络）：{error}"))?;
@@ -231,6 +272,24 @@ fn install_asr(app: &AppHandle) -> Result<String, String> {
             "openai-whisper 安装失败（退出码 {}）：{detail}",
             output.code_label()
         ));
+    }
+    // 装完核验：装了 CUDA 版就检查 torch 是否真的带 CUDA 标记，不能只看 pip 退出码
+    if wants_cuda {
+        match installed_torch_variant(&python) {
+            Some(variant) if variant.contains("+cu") => {
+                crate::logging::log_event("环境", format!("ASR 已启用 GPU：torch {variant}"));
+            }
+            other => {
+                // 不致命：CPU 版仍能跑，只是慢。但要如实告知，不让用户以为在吃显卡
+                crate::logging::log_event(
+                    "环境",
+                    format!(
+                        "ASR 未装上 CUDA 版 torch（实际：{:?}），将使用 CPU 模式",
+                        other.unwrap_or_else(|| "未知".into())
+                    ),
+                );
+            }
+        }
     }
 
     // 3) base 模型：load_model 下到应用目录，设置里用绝对路径加载（不占用户缓存）。

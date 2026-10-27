@@ -66,6 +66,16 @@ pub struct AsrPlan {
     /// CPU 线程数；`None` 用工具默认值。
     #[serde(default)]
     pub threads: Option<u32>,
+    /// 是否请求 GPU 加速；`None` 用工具默认值（两种实现默认都启用 GPU，这里只在明确不用时传 `Some(false)`）。
+    ///
+    /// 两种实现的参数不同，已按各自源码核对（2026-10-27）：
+    /// - openai-whisper：`--device cuda|mps|cpu`，需要显式指定；
+    /// - whisper.cpp：默认 `use_gpu = true`，用 `-ng`（`--no-gpu`）关闭，用 `-dev N` 选设备。
+    #[serde(default)]
+    pub gpu: Option<bool>,
+    /// whisper.cpp 的 GPU 设备序号；`None` 用默认（0）。
+    #[serde(default)]
+    pub gpu_device: Option<u32>,
 }
 
 impl AsrPlan {
@@ -82,6 +92,8 @@ impl AsrPlan {
             model: model.into(),
             language: None,
             threads: None,
+            gpu: None,
+            gpu_device: None,
         }
     }
 
@@ -145,6 +157,15 @@ impl AsrPlan {
                 if let Some(threads) = self.threads {
                     spec = spec.args(["--threads", &threads.to_string()]);
                 }
+                // openai-whisper 默认 device=null，由 torch 自己选；只有显式给 `--device` 才可控
+                if let Some(gpu) = self.gpu {
+                    let device = if gpu {
+                        self.preferred_gpu_device()
+                    } else {
+                        "cpu"
+                    };
+                    spec = spec.args(["--device", device]);
+                }
                 Ok(spec)
             }
             WhisperFlavor::WhisperCpp => {
@@ -159,8 +180,24 @@ impl AsrPlan {
                 if let Some(threads) = self.threads {
                     spec = spec.args(["-t", &threads.to_string()]);
                 }
+                // whisper.cpp 默认 use_gpu=true；不用 GPU 时必须显式 `-ng`
+                if self.gpu == Some(false) {
+                    spec = spec.arg("-ng");
+                } else if let Some(device) = self.gpu_device {
+                    spec = spec.args(["-dev", &device.to_string()]);
+                }
                 Ok(spec)
             }
+        }
+    }
+
+    /// 按当前平台给出 openai-whisper 的 `--device` 取值。
+    /// Apple Silicon 用 `mps`，其余有 NVIDIA 的机器用 `cuda`；调用方已保证 `gpu == Some(true)`。
+    fn preferred_gpu_device(&self) -> &'static str {
+        if cfg!(target_os = "macos") {
+            "mps"
+        } else {
+            "cuda"
         }
     }
 }
@@ -274,6 +311,50 @@ mod tests {
         assert!(spec.args.contains(&"--language".to_string()));
         assert!(spec.args.contains(&"zh".to_string()));
         assert!(spec.args.contains(&"8".to_string()));
+    }
+
+    /// 核对两种实现的 GPU 参数（参数名取自各自源码，2026-10-27）：
+    /// openai-whisper 需要显式 `--device`；whisper.cpp 默认开 GPU，关闭要 `-ng`。
+    #[test]
+    fn gpu_flags_follow_each_tool_convention() {
+        // openai：不设 gpu 时不传 --device（让工具自己选）
+        let mut openai = plan("gpu", WhisperFlavor::OpenAi);
+        let bare = openai.build_command("whisper", true).unwrap();
+        assert!(!bare.args.contains(&"--device".to_string()));
+
+        // openai：要求 GPU 时按平台给 cuda / mps
+        openai.gpu = Some(true);
+        let gpu = openai.build_command("whisper", true).unwrap();
+        let idx = gpu.args.iter().position(|a| a == "--device").unwrap();
+        let expected = if cfg!(target_os = "macos") {
+            "mps"
+        } else {
+            "cuda"
+        };
+        assert_eq!(gpu.args[idx + 1], expected);
+
+        // openai：明确不用 GPU 时传 cpu
+        openai.gpu = Some(false);
+        let cpu = openai.build_command("whisper", true).unwrap();
+        let idx = cpu.args.iter().position(|a| a == "--device").unwrap();
+        assert_eq!(cpu.args[idx + 1], "cpu");
+
+        // whisper.cpp：默认不传 -ng（工具默认就用 GPU）
+        let mut cpp = plan("gpu-cpp", WhisperFlavor::WhisperCpp);
+        let default = cpp.build_command("whisper-cli", true).unwrap();
+        assert!(!default.args.contains(&"-ng".to_string()));
+
+        // whisper.cpp：明确不用 GPU 时传 -ng
+        cpp.gpu = Some(false);
+        let nong = cpp.build_command("whisper-cli", true).unwrap();
+        assert!(nong.args.contains(&"-ng".to_string()));
+
+        // whisper.cpp：指定设备序号时传 -dev N
+        cpp.gpu = Some(true);
+        cpp.gpu_device = Some(1);
+        let dev = cpp.build_command("whisper-cli", true).unwrap();
+        let idx = dev.args.iter().position(|a| a == "-dev").unwrap();
+        assert_eq!(dev.args[idx + 1], "1");
     }
 
     #[test]

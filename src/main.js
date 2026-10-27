@@ -2471,8 +2471,14 @@ function renderRuntimeList(status) {
       </tr>`;
     })
     .join("");
+  // 显卡一行：复用同一张表，不新增控件。没有 NVIDIA 显卡时如实说明 ASR 走 CPU。
+  const gpuRow = `<tr>
+        <td>显卡加速</td>
+        <td class="status-${status.gpu ? "pass" : "warn"}">${status.gpu ? "可用" : "未检测到"}</td>
+        <td>${esc(status.gpu ?? "未检测到 NVIDIA 显卡，语音识别使用 CPU")}</td>
+      </tr>`;
   $("#runtime-list").innerHTML = `
-    <table><thead><tr><th>组件</th><th>状态</th><th>版本 / 说明</th></tr></thead><tbody>${rows}</tbody></table>
+    <table><thead><tr><th>组件</th><th>状态</th><th>版本 / 说明</th></tr></thead><tbody>${rows}${gpuRow}</tbody></table>
   `;
   const modelStatus = $("#model-runtime-list");
   if (modelStatus) {

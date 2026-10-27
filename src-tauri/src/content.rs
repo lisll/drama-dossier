@@ -211,7 +211,10 @@ pub(crate) fn model_runtime(
         if engine == AsrEngine::WhisperCpp {
             String::new()
         } else {
-            "small".to_string()
+            // 默认从 small 升到 medium：抽样音频只有 240 秒，GPU 上 medium 的耗时仍在
+            // 数秒级（显存实测 3.3~4.4 GB，8 GB 卡足够），中文准确率比 small 明显更好。
+            // 没有 GPU 时由 whisper 自己回落 CPU，只是慢一些，不影响结果。
+            "medium".to_string()
         }
     });
     let mut problems: Vec<String> = Vec::new();
@@ -308,6 +311,11 @@ fn extract_episode(
         runtime.asr_model.clone(),
     );
     plan.language = Some("zh".into());
+    // 显卡意图：有 NVIDIA 显卡就明确要求 GPU，没有则明确要求 CPU。
+    // 前者让 openai-whisper 传 --device cuda/mps、whisper.cpp 用默认 GPU；
+    // 后者让 whisper.cpp 传 -ng，避免它在没显卡的机器上白试一次。
+    let has_gpu = crate::toolbox::nvidia_gpu_present() || cfg!(target_os = "macos");
+    plan.gpu = Some(has_gpu);
     let runner = SystemRunner::new();
     let mut spec = plan
         .build_command(&asr_program, runtime.asr.ok)
