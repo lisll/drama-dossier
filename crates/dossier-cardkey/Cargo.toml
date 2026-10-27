@@ -23,3 +23,5 @@ ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std
 
 [target.'cfg(windows)'.dependencies]
 winreg = "=0.56.0"
+# 读 SMBIOS 主板 UUID（GetSystemFirmwareTable）；版本与依赖树里已有的保持一致
+windows-sys = { version = "=0.61.2", features = ["Win32_System_SystemInformation"] }
