@@ -51,6 +51,9 @@ pub enum Integrity {
     Sha256(&'static str),
     /// 只有期望的字节数（来源：发布方提供的元数据接口）
     Size(u64),
+    /// 没有可用的固定凭据：上游每日重建、不发布哈希。
+    /// 只能靠 HTTPS 与调用方的自检把关；用的时候必须在代码里写明为什么。
+    None,
 }
 
 impl Integrity {
@@ -58,6 +61,7 @@ impl Integrity {
         match self {
             Integrity::Sha256(_) => "sha256",
             Integrity::Size(_) => "字节数",
+            Integrity::None => "无（仅 HTTPS 与自检）",
         }
     }
 }
@@ -130,7 +134,8 @@ pub fn file_sha256(path: &Path) -> Result<String, String> {
         .collect())
 }
 
-/// 按凭据校验文件：sha256 逐一字节比对；只有字节数时比对文件长度。
+/// 按凭据校验文件：sha256 逐一字节比对；只有字节数时比对文件长度；
+/// `None` 表示没有可校验的凭据，只要文件存在且非空就放行（调用方必须自己再自检）。
 pub fn verify_file(path: &Path, integrity: &Integrity) -> bool {
     match integrity {
         Integrity::Sha256(expected) => match file_sha256(path) {
@@ -139,6 +144,9 @@ pub fn verify_file(path: &Path, integrity: &Integrity) -> bool {
         },
         Integrity::Size(expected) => std::fs::metadata(path)
             .map(|meta| meta.is_file() && meta.len() == *expected)
+            .unwrap_or(false),
+        Integrity::None => std::fs::metadata(path)
+            .map(|meta| meta.is_file() && meta.len() > 0)
             .unwrap_or(false),
     }
 }
@@ -315,6 +323,28 @@ fn extract_json_u64(body: &str, key: &str) -> Option<u64> {
     let rest = body[start..].trim_start();
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
     digits.parse().ok()
+}
+
+/// Windows 的 CUDA 版 whisper-cli（安装包只带 CPU 版，检测到显卡后再下这个）。
+///
+/// 为什么不内置：官方 CUDA 预编译包是 285 MB（cu11.8）到 685 MB（cu12.4），
+/// 比整个应用还大。
+///
+/// 完整性：这里**没有可用的固定 sha256**——whisper.cpp 的预编译资产只出现在
+/// nightly 预发布里，每次构建哈希都变；官方稳定版则完全不提供二进制。
+/// 所以用 `Integrity::None`，只能靠 HTTPS 与"装完能跑起来"的自检把关。
+/// 这与 ffmpeg 的两个源（都有官方哈希）处理方式不同，是明确的取舍。
+/// 若上游开始发布带固定版本的资产，应立刻补上 sha256。
+#[cfg(target_os = "windows")]
+pub fn whisper_cuda() -> Asset {
+    Asset::new(
+        "whisper-cuda",
+        vec![Source {
+            url: "https://github.com/ggml-org/whisper.cpp/releases/download/b5454/whisper-bin-x64.zip"
+                .to_string(),
+            integrity: Integrity::None,
+        }],
+    )
 }
 
 #[cfg(test)]

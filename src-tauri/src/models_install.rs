@@ -12,6 +12,8 @@
 //! 每个组件独立软失败：一边失败不影响另一边的成果，错误进报告 messages。
 
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "windows")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use dossier_core::{save_settings, AppSettings};
@@ -20,6 +22,31 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::toolbox::read_settings;
+
+/// CUDA 版 whisper 的后台下载取消标志（仅 Windows 使用）。
+///
+/// 单独一个标志而不是复用转码的取消开关：两者互不相干，
+/// 用户在转码页点「停止」不应该顺手掐掉正在下载的 GPU 加速包。
+/// 退出程序或离开设置页时置位，下载线程在下一次轮询时退出并清理半成品。
+#[cfg(target_os = "windows")]
+static CUDA_DOWNLOAD_CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// 请求取消 CUDA 包下载（幂等）。
+#[cfg(target_os = "windows")]
+pub(crate) fn cancel_cuda_download() {
+    CUDA_DOWNLOAD_CANCEL.store(true, Ordering::SeqCst);
+}
+
+#[cfg(target_os = "windows")]
+fn cuda_download_cancelled() -> bool {
+    CUDA_DOWNLOAD_CANCEL.load(Ordering::SeqCst)
+}
+
+/// 退出程序时调用：把后台下载停掉，避免进程退出时留下半成品。
+pub(crate) fn cancel_background_downloads() {
+    #[cfg(target_os = "windows")]
+    cancel_cuda_download();
+}
 
 /// Windows 用 UB-Mannheim 的 tesseract 安装器（Inno Setup，静默参数官方支持）。
 /// 钉住已知可用版本；升级时换这里的版本号。
@@ -144,7 +171,202 @@ fn python_works(program: &Path) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// ASR：venv + openai-whisper + base 模型
+// Windows：检测到 NVIDIA 显卡时，后台把 CPU 版换成 CUDA 版
+// ---------------------------------------------------------------------------
+
+/// CUDA 版 whisper 的资源名。版本与 CI 内置的 CPU 版同源（同一份 whisper.cpp 源码），
+/// 但 CUDA 版需要显卡驱动配合，所以走"检测到再下载"而不是内置。
+#[cfg(target_os = "windows")]
+const WHISPER_CUDA_ASSET: &str = "whisper-cli-cuda";
+
+/// 后台尝试把 CPU 版 whisper-cli 换成 CUDA 版。
+///
+/// 触发条件：Windows + 装的是内置 CPU 版 + `nvidia-smi` 报有可用显卡。
+/// 行为：下载到临时文件 → 校验 → 原子替换；期间 CPU 版照常可用，失败只记日志。
+/// 取消：用户离开设置页或退出程序时置 `CUDA_DOWNLOAD_CANCEL`，下次轮询退出并删掉半成品。
+#[cfg(target_os = "windows")]
+fn upgrade_whisper_to_cuda(app: &AppHandle) {
+    if !crate::toolbox::nvidia_gpu_present() {
+        return;
+    }
+    let Ok(root) = app_data(app) else { return };
+    let bin_dir = root.join("whisper");
+    let target = bin_dir.join("whisper-cli.exe");
+    if !target.is_file() {
+        return;
+    }
+    // 已经换过就不再重复下载：用同目录的标记文件判断
+    let stamp = bin_dir.join("cuda.ready");
+    if stamp.is_file() {
+        return;
+    }
+    let tmp = bin_dir.join("whisper-cli.exe.cuda-tmp");
+    CUDA_DOWNLOAD_CANCEL.store(false, Ordering::SeqCst);
+    emit_progress(
+        app,
+        "asr",
+        "downloading",
+        "检测到 NVIDIA 显卡，正在下载 GPU 加速包（约 285 MB）",
+        None,
+        0,
+    );
+    let asset = crate::downloads::whisper_cuda();
+    let result = crate::downloads::fetch_with_fallback(&asset, &tmp, |url, path| {
+        if cuda_download_cancelled() {
+            return Err(crate::downloads::Failure::Network);
+        }
+        crate::toolbox::download_file(app, WHISPER_CUDA_ASSET, url, path)
+            .map_err(|_| crate::downloads::Failure::Network)
+    });
+    match result {
+        Ok(_) if !cuda_download_cancelled() => {
+            // 原子替换：先备份 CPU 版，替换失败能回滚
+            let backup = bin_dir.join("whisper-cli.exe.cpu");
+            let _ = std::fs::rename(&target, &backup);
+            match std::fs::rename(&tmp, &target) {
+                Ok(()) => {
+                    let _ = std::fs::write(&stamp, "1");
+                    let _ = std::fs::remove_file(&backup);
+                    crate::logging::log_event("环境", "ASR 已升级为 CUDA 版（GPU 加速）");
+                    emit_progress(app, "asr", "finished", "GPU 加速包已安装", Some(0), 0);
+                }
+                Err(error) => {
+                    let _ = std::fs::rename(&backup, &target);
+                    crate::logging::log_event(
+                        "环境",
+                        format!("替换 CUDA 版失败（已保留 CPU 版）：{error}"),
+                    );
+                }
+            }
+        }
+        _ => {
+            let _ = std::fs::remove_file(&tmp);
+            crate::logging::log_event(
+                "环境",
+                if cuda_download_cancelled() {
+                    "GPU 加速包下载已取消（继续使用 CPU 版）".into()
+                } else {
+                    "GPU 加速包下载失败（继续使用 CPU 版）".to_string()
+                },
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn upgrade_whisper_to_cuda(_app: &AppHandle) {}
+
+// ---------------------------------------------------------------------------
+// 内置 whisper.cpp：零下载、无 Python
+// ---------------------------------------------------------------------------
+
+/// 安装包内置的 whisper 资源目录（CI 在打包时预置 whisper-cli 与 base 模型）。
+/// 返回 `None` 表示这个构建里没有内置资源，调用方退回 pip 流程。
+fn bundled_whisper_dir(app: &AppHandle) -> Option<PathBuf> {
+    use tauri::Manager;
+    let root = app.path().resource_dir().ok()?;
+    let exe = if cfg!(target_os = "windows") {
+        "whisper-cli.exe"
+    } else {
+        "whisper-cli"
+    };
+    // Tauri v2 把 `resources/whisper/**/*` 落在 `<resource_dir>/resources/whisper`；
+    // 兼容再查一层 `<resource_dir>/whisper`，防打包器行为差异。
+    let dir = [root.join("resources").join("whisper"), root.join("whisper")]
+        .into_iter()
+        .find(|dir| dir.join(exe).is_file());
+    if dir.is_none() {
+        crate::logging::log_event(
+            "环境",
+            "安装包未内置 whisper.cpp，退回 Python + pip 流程（本地开发或旧安装包属正常）",
+        );
+    }
+    dir
+}
+
+/// 用内置资源完成 ASR 安装；返回 `Ok(Some(路径))` 表示已装好，
+/// `Ok(None)` 表示没有内置资源、应退回 pip，`Err` 表示内置资源存在但安装失败。
+fn install_bundled_whisper(app: &AppHandle, models_dir: &Path) -> Result<Option<String>, String> {
+    let Some(bundled) = bundled_whisper_dir(app) else {
+        return Ok(None);
+    };
+    let exe = if cfg!(target_os = "windows") {
+        "whisper-cli.exe"
+    } else {
+        "whisper-cli"
+    };
+    let bin_src = bundled.join(exe);
+    let model_src = bundled.join("models").join("ggml-base.bin");
+    if !model_src.is_file() {
+        // 二进制在、模型不在：宁可退回 pip，也不要装出一半
+        crate::logging::log_event(
+            "环境",
+            format!(
+                "内置 whisper 缺少模型文件 {}，退回 pip 流程",
+                model_src.display()
+            ),
+        );
+        return Ok(None);
+    }
+
+    let root = app_data(app)?;
+    let bin_dir = root.join("whisper");
+    std::fs::create_dir_all(&bin_dir).map_err(|error| format!("创建目录失败：{error}"))?;
+    let bin = bin_dir.join(exe);
+    let model = models_dir.join("ggml-base.bin");
+
+    emit_progress(
+        app,
+        "asr",
+        "installing",
+        "正在安装语音识别（安装包内置）",
+        None,
+        0,
+    );
+    // 复制二进制；失败（被占用等）就如实报错，让用户重试，不静默降级到 pip
+    std::fs::copy(&bin_src, &bin)
+        .map_err(|error| format!("复制 whisper-cli 失败（可能被占用，请关闭后重试）：{error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .map_err(|error| format!("设置可执行权限失败：{error}"))?;
+    }
+    // 模型体积大（约 141 MB），已存在且大小一致就跳过复制
+    let same = std::fs::metadata(&model)
+        .and_then(|meta| std::fs::metadata(&model_src).map(|src| meta.len() == src.len()))
+        .unwrap_or(false);
+    if !same {
+        std::fs::copy(&model_src, &model)
+            .map_err(|error| format!("复制 base 模型失败：{error}"))?;
+    }
+
+    // whisper.cpp 的模型是文件路径，不是模型名
+    persist_settings(app, |settings| {
+        settings.asr_executable = Some(bin.clone());
+        settings.asr_model = Some(model.display().to_string());
+        settings.asr_engine = Some("whisper_cpp".into());
+    })?;
+    emit_progress(
+        app,
+        "asr",
+        "finished",
+        "语音识别已就绪（whisper.cpp）",
+        Some(0),
+        0,
+    );
+    crate::logging::log_event(
+        "环境",
+        format!("ASR 安装完成（内置 whisper.cpp）：{}", bin.display()),
+    );
+    // Windows 上如果检测到 NVIDIA 显卡，接着把 CPU 版换成 CUDA 版：
+    // 先保证有可用结果，再后台提升；失败或取消都不影响已经能用的 CPU 版。
+    upgrade_whisper_to_cuda(app);
+    Ok(Some(bin.display().to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// ASR：venv + openai-whisper + base 模型（内置资源缺失时的兜底路径）
 // ---------------------------------------------------------------------------
 
 /// ASR 虚拟环境解释器路径（两平台布局不同）。
@@ -196,6 +418,12 @@ fn install_asr(app: &AppHandle) -> Result<String, String> {
     let root = app_data(app)?;
     let models_dir = root.join("models").join("whisper");
     std::fs::create_dir_all(&models_dir).map_err(|error| format!("创建模型目录失败：{error}"))?;
+
+    // 0) 优先用安装包内置的 whisper.cpp：零下载、无 Python 依赖、Windows 走 CPU、
+    //    Apple Silicon 走 Metal。内置缺失（本地开发、旧版安装包）才退回下面的 pip 流程。
+    if let Some(done) = install_bundled_whisper(app, &models_dir)? {
+        return Ok(done);
+    }
 
     // 1) venv（已存在则跳过创建，直接进入依赖检查）。
     if !python.is_file() {

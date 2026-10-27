@@ -432,6 +432,12 @@ pub fn run() {
             dossier::transition_mount_copy_row,
             dossier::preview_mount_copy_publish
         ]))
-        .run(tauri::generate_context!())
-        .expect("failed to run DramaDossier");
+        .build(tauri::generate_context!())
+        .expect("failed to build DramaDossier")
+        .run(|_app, event| {
+            // 退出前把后台下载（GPU 加速包）停掉，避免留下半成品文件
+            if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
+                models_install::cancel_background_downloads();
+            }
+        });
 }

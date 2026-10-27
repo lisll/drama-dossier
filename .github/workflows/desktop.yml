@@ -73,6 +73,84 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      # 内容模型：把 whisper.cpp 编出来 + 内置 base 模型，用户端零下载、无 Python 依赖。
+      #
+      # 为什么自己编而不是下现成的：官方稳定版 release 不带任何预编译资产，
+      # macOS 侧只发 xcframework、没有 CLI 可执行文件；Windows 的 CUDA 包 285~685 MB
+      # 不适合内置（有显卡的用户由客户端后台自动下载，见 downloads 模块）。
+      - name: 准备构建工具（CMake）
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Windows runner 自带 cmake；macOS runner 需要确认存在，缺了就用 brew 装
+          if ! command -v cmake >/dev/null 2>&1; then
+            echo "cmake 缺失，尝试安装"
+            if [ "$RUNNER_OS" = "macOS" ]; then brew install cmake; else choco install cmake -y; fi
+          fi
+          cmake --version | head -1
+      - name: 拉取 whisper.cpp 源码
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git "$RUNNER_TEMP/whisper.cpp"
+          cd "$RUNNER_TEMP/whisper.cpp"
+          echo "whisper.cpp commit: $(git rev-parse HEAD)"
+      - name: 编译 whisper-cli（Windows，CPU 版）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $src = "$env:RUNNER_TEMP\whisper.cpp"
+          cmake -S $src -B "$env:RUNNER_TEMP\wbuild" -DCMAKE_BUILD_TYPE=Release -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=ON
+          if ($LASTEXITCODE -ne 0) { throw "cmake 配置失败" }
+          cmake --build "$env:RUNNER_TEMP\wbuild" --config Release --target whisper-cli -j 4
+          if ($LASTEXITCODE -ne 0) { throw "whisper-cli 编译失败" }
+          $exe = Get-ChildItem -Recurse -Filter whisper-cli.exe "$env:RUNNER_TEMP\wbuild" | Select-Object -First 1
+          if (-not $exe) { throw "找不到 whisper-cli.exe" }
+          New-Item -ItemType Directory -Force src-tauri/resources/whisper | Out-Null
+          Copy-Item $exe.FullName src-tauri/resources/whisper/
+          # 静态链接时还需要同目录的 dll；一并带上，缺了也能跑就不再复制
+          Get-ChildItem $exe.DirectoryName -Filter *.dll -ErrorAction SilentlyContinue |
+            Copy-Item -Destination src-tauri/resources/whisper/ -ErrorAction SilentlyContinue
+          Get-ChildItem src-tauri/resources/whisper | ForEach-Object { "{0}  {1:N1} MB" -f $_.Name, ($_.Length/1MB) }
+      - name: 编译 whisper-cli（macOS，arm64 + x86_64 通用，含 Metal）
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/whisper.cpp"
+          # 一次产出 arm64 + x86_64 通用二进制；Metal 按官方 CI 的做法嵌入
+          cmake -S "$src" -B "$RUNNER_TEMP/wbuild" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_BUILD_EXAMPLES=ON \
+            -DGGML_METAL=ON \
+            -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+          cmake --build "$RUNNER_TEMP/wbuild" --config Release --target whisper-cli -j 4
+          bin="$(find "$RUNNER_TEMP/wbuild" -type f -name whisper-cli -perm -u+x | head -1)"
+          if [ -z "$bin" ]; then echo "::error::找不到 whisper-cli"; exit 1; fi
+          file "$bin"
+          mkdir -p src-tauri/resources/whisper
+          cp "$bin" src-tauri/resources/whisper/whisper-cli
+          chmod +x src-tauri/resources/whisper/whisper-cli
+          ./src-tauri/resources/whisper/whisper-cli --help >/dev/null && echo "自检通过"
+          ls -lh src-tauri/resources/whisper
+      - name: 内置 base 模型
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p src-tauri/resources/whisper/models
+          model=src-tauri/resources/whisper/models/ggml-base.bin
+          curl -sSL --retry 5 --max-time 900 -o "$model" \
+            https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
+          # 与客户端下载路径使用同一份期望值（HF 的 LFS oid 即 sha256）
+          actual=$(shasum -a 256 "$model" | awk '{print $1}')
+          expected=60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::ggml-base.bin 校验失败：期望 $expected，实际 $actual"
+            exit 1
+          fi
+          ls -lh "$model"
       # Windows 包内置 ffmpeg/ffprobe（与 build-windows.yml 同源逻辑）：
       # 用户端「一键配置运行环境」从安装包资源复制，零下载。
       - name: 预置 ffmpeg 到安装包资源
