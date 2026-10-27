@@ -8,17 +8,35 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-if ! ls /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys >/dev/null 2>&1; then
-  echo "没有找到任何 authorized_keys，拒绝关闭密码登录（会把自己锁在外面）" >&2
+# 至少要有一个「非空」的 authorized_keys：空文件照样会让密钥登录失败
+has_key=0
+for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
+  if [ -f "$f" ] && grep -qE '^(ssh-|ecdsa-|sk-)' "$f"; then
+    has_key=1
+    break
+  fi
+done
+if [ "$has_key" -ne 1 ]; then
+  echo "没有找到任何包含公钥的 authorized_keys，拒绝关闭密码登录（会把自己锁在外面）" >&2
+  exit 1
+fi
+
+# SSH 实际监听的端口以 sshd 的生效配置为准，不能假设是 22
+ssh_ports=$(sshd -T 2>/dev/null | awk '$1 == "port" { print $2 }' | sort -u)
+if [ -z "$ssh_ports" ]; then
+  echo "无法从 sshd -T 读取 SSH 端口，停止（请先确认 sshd 配置能正常解析）" >&2
   exit 1
 fi
 
 apt-get update -q
 apt-get install -y -q ufw fail2ban unattended-upgrades
 
+echo "即将放行的端口：SSH $(echo "$ssh_ports" | tr '\n' ' ')、80、443；其余入站全部拒绝"
 ufw default deny incoming
 ufw default allow outgoing
-ufw allow 22/tcp
+for p in $ssh_ports; do
+  ufw allow "$p/tcp"
+done
 ufw allow 80/tcp
 ufw allow 443/tcp
 ufw --force enable
@@ -40,4 +58,4 @@ id ddlicense >/dev/null 2>&1 || useradd --system --home /var/lib/dd-license --sh
 install -d -o ddlicense -g ddlicense -m 0700 /var/lib/dd-license
 install -d -o root -g ddlicense -m 0750 /etc/dd-license
 
-echo "完成：ufw 只开 22/80/443，SSH 仅密钥登录，fail2ban 与自动安全更新已开启。"
+echo "完成：ufw 只开 SSH($(echo "$ssh_ports" | tr '\n' ' '))/80/443，SSH 仅密钥登录，fail2ban 与自动安全更新已开启。"

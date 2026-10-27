@@ -178,3 +178,22 @@ def test_disabled_admin_cannot_login(client, auth):
     auth.set_disabled("boss", True)
     r = client.post("/admin/api/login", json={"username": "boss", "password": ADMIN_PW}, headers=ORIGIN)
     assert r.status_code == 401
+
+
+def test_non_ascii_csrf_header_is_403_not_500(admin):
+    client, _ = admin
+    body = {"plan": "year", "count": 1, "note": "x", "password": ADMIN_PW}
+    # httpx 对 str 请求头强制 ASCII；浏览器或脚本却可以发任意字节，这里直接传字节来模拟。
+    # 旧代码里 compare_digest(str, str) 遇到非 ASCII 会抛 TypeError，变成 500
+    headers = [(b"origin", b"http://testserver"), (b"x-csrf-token", "caf\u00e9".encode("utf-8"))]
+    r = client.post("/admin/api/batches", json=body, headers=headers)
+    assert r.status_code == 403
+    assert r.json()["error"] == "csrf"
+
+
+def test_non_ascii_session_cookie_is_401_not_500(client):
+    # 旧代码对非 ASCII 的会话 Cookie 做 token.encode("ascii")，会抛 UnicodeEncodeError（500）
+    cookie = (b"cookie", "dd_admin=caf\u00e9".encode("utf-8"))
+    assert client.get("/admin/api/me", headers=[cookie]).status_code == 401
+    headers = [cookie, (b"origin", b"http://testserver"), (b"x-csrf-token", b"x")]
+    assert client.post("/admin/api/logout", headers=headers).status_code == 401

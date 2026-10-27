@@ -84,7 +84,8 @@ def parse_payload(payload: bytes) -> Claims:
         raise TokenError(f"payload 不是合法 JSON：{exc}") from None
     if not isinstance(obj, dict) or set(obj) != set(PAYLOAD_FIELDS):
         raise TokenError("payload 字段不符")
-    if obj["v"] != 1 or isinstance(obj["v"], bool):
+    # 与 Rust 端一致：版本号必须是整数 1（1.0、true 都拒绝）
+    if not _is_int(obj["v"]) or obj["v"] != 1:
         raise TokenError("不支持的凭证版本")
     if not (isinstance(obj["kid"], str) and len(obj["kid"]) == 16):
         raise TokenError("kid 格式错误")

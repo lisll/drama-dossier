@@ -17,7 +17,7 @@ from .config import Settings
 from .db import Database
 from .errors import LicenseError
 from .ratelimit import RateLimiter
-from .service import LicenseService
+from .service import LicenseService, check_mid
 
 log = logging.getLogger("dd_license")
 
@@ -147,7 +147,9 @@ def create_app(settings: Settings, service: LicenseService, auth: AdminAuth, lim
     def activate(body: ActivateIn, request: Request):
         ip = client_ip(request, settings)
         limiter.hit(f"act:ip:{ip}", 30, HOUR)
-        limiter.hit(f"act:mid:{body.machine_id}", 10, HOUR)
+        # 先校验格式再按机器码计数：随便编的机器码不能在限流器里占一条记录
+        mid = check_mid(body.machine_id)
+        limiter.hit(f"act:mid:{mid}", 10, HOUR)
         issued = service.activate(body.card, body.machine_id, body.app_version, ip)
         return issued.to_dict()
 
@@ -155,7 +157,8 @@ def create_app(settings: Settings, service: LicenseService, auth: AdminAuth, lim
     def refresh(body: RefreshIn, request: Request):
         ip = client_ip(request, settings)
         limiter.hit(f"ref:ip:{ip}", 600, HOUR)
-        limiter.hit(f"ref:mid:{body.machine_id}", 60, HOUR)
+        mid = check_mid(body.machine_id)
+        limiter.hit(f"ref:mid:{mid}", 60, HOUR)
         issued = service.refresh(body.token, body.machine_id, body.app_version, ip)
         d = issued.to_dict()
         d.pop("already_redeemed", None)

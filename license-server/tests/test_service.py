@@ -6,6 +6,7 @@ import pytest
 from dd_license import db as dbmod
 from dd_license import service as svcmod
 from dd_license.errors import LicenseError
+from dd_license.keys import b64url, b64url_decode
 from dd_license.token import verify
 
 from .conftest import mid
@@ -166,8 +167,17 @@ def test_refresh_rejects_other_machine_and_forged(service):
     with pytest.raises(LicenseError) as e:
         service.refresh(r.token, mid(2))
     assert e.value.code == "token_invalid"
-    with pytest.raises(LicenseError):
-        service.refresh(r.token[:-2] + "AA", mid(1))
+    # 翻转签名中间一个字节的一位，保证签名一定变了。
+    # 原写法把末两位换成 "AA"：Ed25519 签名最后一个字节（S 的最高字节）只在 0x00..0x10 之间，
+    # 约 1/17 的概率本来就是 0x00，替换后与原签名完全相同，测试会偶发失败。
+    p64, s64 = r.token.split(".")
+    sig = bytearray(b64url_decode(s64))
+    sig[20] ^= 0x01
+    forged = p64 + "." + b64url(bytes(sig))
+    assert forged != r.token
+    with pytest.raises(LicenseError) as e:
+        service.refresh(forged, mid(1))
+    assert e.value.code == "token_invalid"
 
 
 def test_refresh_after_until_expired(service):

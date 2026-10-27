@@ -92,6 +92,30 @@ def cmd_admin(settings: Settings, args) -> None:
             print(f"{a['id']:>3}  {a['username']:<20} {state:<4}  最近登录 {_fmt_ts(a['last_login_at'])}")
 
 
+#: 审计记录最少保留天数：防止误输 --days 1 把排查问题需要的记录全删掉
+MIN_AUDIT_DAYS = 30
+
+
+def prune_audit(db: Database, days: int) -> int:
+    """删除 days 天之前的审计记录，返回删除条数。"""
+    if days < MIN_AUDIT_DAYS:
+        raise LicenseError("bad_request", f"审计记录至少保留 {MIN_AUDIT_DAYS} 天", 422)
+    cutoff = int(time.time()) - days * 86400
+    with db.write() as conn:
+        cur = conn.execute("DELETE FROM audit WHERE at < ?", (cutoff,))
+        removed = cur.rowcount
+    # 删除后回收空间；VACUUM 不能在事务里执行。connect() 返回线程内复用的连接，不能关闭
+    db.connect().execute("VACUUM")
+    return removed
+
+
+def cmd_prune_audit(settings: Settings, args) -> None:
+    db = Database(settings.db_path)
+    db.migrate()
+    removed = prune_audit(db, args.days)
+    print(f"已删除 {args.days} 天之前的审计记录 {removed} 条")
+
+
 def doctor(settings: Settings, host: str = "127.0.0.1") -> list[tuple[bool, str]]:
     """安全自检。返回 (是否通过, 说明) 列表。"""
     out: list[tuple[bool, str]] = []
@@ -169,6 +193,8 @@ def main(argv: list[str] | None = None) -> None:
     asub.add_parser("list")
     p = sub.add_parser("doctor", help="安全自检")
     p.add_argument("--host", default="127.0.0.1")
+    p = sub.add_parser("prune-audit", help=f"删除旧审计记录（至少保留 {MIN_AUDIT_DAYS} 天）")
+    p.add_argument("--days", type=int, default=180, help="保留最近多少天，默认 180")
     p = sub.add_parser("serve", help="启动服务")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8200)
@@ -177,6 +203,7 @@ def main(argv: list[str] | None = None) -> None:
     handlers = {
         "init-db": cmd_init_db, "keygen": cmd_keygen, "pubkey": cmd_pubkey,
         "admin": cmd_admin, "doctor": cmd_doctor, "serve": cmd_serve,
+        "prune-audit": cmd_prune_audit,
     }
     try:
         handlers[args.cmd](load_settings(), args)

@@ -85,8 +85,9 @@ def register_admin(
         return sess
 
     def require_write(request: Request, sess: AdminSession = Depends(require_session)) -> AdminSession:
-        token = request.headers.get("x-csrf-token", "")
-        if not same_origin(request) or not hmac.compare_digest(token, sess.csrf):
+        # 按字节比较：请求头里有非 ASCII 字符时 compare_digest(str, str) 会抛 TypeError（变成 500）
+        token = request.headers.get("x-csrf-token", "").encode("utf-8", "surrogateescape")
+        if not same_origin(request) or not hmac.compare_digest(token, sess.csrf.encode("ascii")):
             raise LicenseError("csrf", "请求来源校验失败，请刷新页面后重试", 403)
         limiter.hit(f"adm:write:{sess.admin_id}", 120, HOUR)
         return sess

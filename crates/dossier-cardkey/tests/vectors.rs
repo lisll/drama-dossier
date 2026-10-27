@@ -6,6 +6,8 @@ use dossier_cardkey::{
 use serde_json::Value;
 
 const VECTORS: &str = include_str!("vectors_v1.json");
+/// 修改 license-server/tests/vectors.py 增删用例后同步这里
+const EXPECTED_CASES: usize = 48;
 
 fn reason_code(v: &Verdict) -> &'static str {
     match v {
@@ -35,7 +37,8 @@ fn every_vector_matches() {
     let keys = parse_key_list(&key_refs).unwrap();
 
     let cases = doc["cases"].as_array().unwrap();
-    assert!(cases.len() >= 30, "向量数量异常：{}", cases.len());
+    // 精确数量：少一条说明生成器漏了用例，多一条说明 Rust 端没跟着更新
+    assert_eq!(cases.len(), EXPECTED_CASES, "向量数量与预期不符");
     let mut seen = std::collections::BTreeSet::new();
     for c in cases {
         let name = c["name"].as_str().unwrap();

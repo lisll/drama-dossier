@@ -53,3 +53,25 @@ def test_doctor_passes_when_hardened(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "geteuid", lambda: 1000)
     failed = [msg for ok, msg in cli.doctor(s) if not ok]
     assert failed == []
+
+
+def test_prune_audit_keeps_recent_and_enforces_minimum(tmp_path):
+    import time
+
+    from dd_license.db import Database, audit
+    from dd_license.errors import LicenseError
+
+    db = Database(tmp_path / "a.sqlite3")
+    db.migrate()
+    now = int(time.time())
+    with db.write() as conn:
+        audit(conn, "t", "keep")
+        conn.execute(
+            "INSERT INTO audit(at, actor, action, ip, detail) VALUES (?,?,?,?,?)",
+            (now - 200 * 86400, "t", "old", "", "{}"),
+        )
+    assert cli.prune_audit(db, 180) == 1
+    actions = [r["action"] for r in db.read().execute("SELECT action FROM audit")]
+    assert actions == ["keep"]
+    with pytest.raises(LicenseError):
+        cli.prune_audit(db, cli.MIN_AUDIT_DAYS - 1)

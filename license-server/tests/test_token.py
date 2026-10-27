@@ -4,7 +4,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from dd_license.keys import b64url, b64url_decode, key_id, public_raw
-from dd_license.token import SIGNING_CONTEXT, Claims, TokenError, canonical_json, sign, verify
+from dd_license.token import SIGNING_CONTEXT, Claims, TokenError, canonical_json, parse_payload, sign, verify
 
 from .conftest import OTHER_SEED, TEST_SEED, mid
 
@@ -109,3 +109,10 @@ def test_tampered_signature(k):
     sig[0] ^= 1
     with pytest.raises(TokenError, match="签名"):
         verify(p + "." + b64url(bytes(sig)), [k.public_key()])
+
+
+@pytest.mark.parametrize("v", [1.0, True, "1", 2])
+def test_version_must_be_integer_one(v):
+    obj = {"exp": 2, "iat": 1, "kid": "0" * 16, "lid": 1, "mid": "a" * 64, "plan": "lifetime", "until": None, "v": v}
+    with pytest.raises(TokenError):
+        parse_payload(canonical_json(obj))

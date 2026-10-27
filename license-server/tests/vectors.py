@@ -72,7 +72,12 @@ def build_vectors() -> dict:
     case("valid_last_second", good, IAT + 7 * DAY - 1, "ok", **ok_kw)
     case("expired_at_exp", good, IAT + 7 * DAY, "expired")
     case("expired_long_after", good, IAT + 100 * DAY, "expired")
-    case("until_before_exp", sign(k, claims(plan="trial", until=IAT + 3 * DAY, exp=IAT + 3 * DAY)), IAT + 3 * DAY, "expired")
+    # 授权到期（until）早于凭证到期（exp）：服务端正常不会签出这种凭证（exp = min(iat+7天, until)），
+    # 但客户端仍必须以较早的 until 为准
+    early = sign(k, claims(plan="month", until=IAT + 2 * DAY, exp=IAT + 7 * DAY))
+    case("until_before_exp_still_valid", early, IAT + 2 * DAY - 1, "ok", plan="month", until=IAT + 2 * DAY, exp=IAT + 7 * DAY)
+    case("until_before_exp", early, IAT + 2 * DAY, "expired")
+    case("until_zero", sign(k, claims(until=0)), IAT, "expired")
     case("trial_valid", sign(k, claims(plan="trial", until=IAT + 3 * DAY, exp=IAT + 3 * DAY)), IAT + DAY, "ok",
          plan="trial", until=IAT + 3 * DAY, exp=IAT + 3 * DAY)
     case("lifetime_valid", sign(k, claims(plan="lifetime", until=None)), IAT + DAY, "ok",
@@ -109,6 +114,24 @@ def build_vectors() -> dict:
     case("padded", p64 + "==." + s64, IAT + 3600, "malformed")
     case("bad_base64_char", p64[:-1] + "*." + s64, IAT + 3600, "malformed")
     case("short_signature", p64 + "." + b64url(b"x" * 63), IAT + 3600, "malformed")
+    case("long_signature", p64 + "." + b64url(b"x" * 65), IAT + 3600, "malformed")
+    # 非规范 base64url：64 字节签名编码成 86 个字符，最后一个字符只有高 2 位有效。
+    # 把低 4 位置 1 后解码结果不变，但不再是唯一编码，两端都必须拒绝。
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    assert len(s64) == 86 and alphabet.index(s64[-1]) & 0x0F == 0
+    noncanon = s64[:-1] + alphabet[alphabet.index(s64[-1]) | 0x0F]
+    case("noncanonical_base64", p64 + "." + noncanon, IAT + 3600, "malformed")
+    case("too_long", "A" * 2049, IAT, "malformed")
+    case("version_float", mutated(v=1.0), IAT + 3600, "bad_payload")
+    case("int_at_2pow53", mutated(lid=2**53), IAT + 3600, "bad_payload")
+    case("int_below_2pow53", mutated(lid=2**53 - 1), IAT + 3600, "ok", **ok_kw)
+    case("payload_is_array", _resign(k, b"[1,2,3]"), IAT + 3600, "bad_payload")
+    case("short_kid", mutated(kid=kid[:15]), IAT + 3600, "bad_payload")
+    case("short_mid", mutated(mid=M1[:63]), IAT + 3600, "bad_payload")
+    # 字段齐全、只是 plan 的值含非 ASCII 字节：两端都必须在解析阶段拒绝
+    non_ascii = canonical_json(good_payload).replace(b'"plan":"month"', b'"plan":"m\xc3\xb6nth"')
+    assert non_ascii != canonical_json(good_payload)
+    case("non_ascii_payload", _resign(k, non_ascii), IAT + 3600, "bad_payload")
 
     return {
         "version": 1,

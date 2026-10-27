@@ -86,7 +86,13 @@ def check_password_strength(password: str, username: str = "") -> None:
 
 
 def _token_digest(token: str) -> str:
+    # 会话令牌由 secrets.token_urlsafe 生成，必为 ASCII；调用方已用 _plausible_token 过滤
     return hashlib.sha256(token.encode("ascii")).hexdigest()
+
+
+def _plausible_token(token: str | None) -> bool:
+    """浏览器发来的 Cookie 可能是任意内容：非 ASCII 或过长的直接当作无会话，不能抛异常变成 500。"""
+    return bool(token) and len(token) <= 128 and token.isascii()
 
 
 @dataclass
@@ -215,7 +221,7 @@ class AdminAuth:
             raise error
         return token, AdminSession(row["id"], username, csrf)
     def session(self, token: str | None, ip: str) -> AdminSession | None:
-        if not token or len(token) > 128:
+        if not _plausible_token(token):
             return None
         at = now()
         dig = _token_digest(token)
@@ -235,7 +241,7 @@ class AdminAuth:
             return AdminSession(row["admin_id"], row["username"], row["csrf"])
 
     def logout(self, token: str | None) -> None:
-        if token:
+        if _plausible_token(token):
             with self.db.write() as conn:
                 conn.execute("DELETE FROM admin_sessions WHERE token_digest = ?", (_token_digest(token),))
 

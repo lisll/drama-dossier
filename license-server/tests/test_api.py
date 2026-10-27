@@ -1,4 +1,7 @@
+import pytest
 from fastapi.testclient import TestClient
+
+from dd_license.errors import LicenseError
 
 from .conftest import mid
 
@@ -71,3 +74,29 @@ def test_unexpected_error_hides_details(app, service, monkeypatch):
     c = TestClient(app, client=("127.0.0.1", 1), raise_server_exceptions=False)
     r = c.post("/v1/refresh", json={"token": "a.b", "machine_id": mid(1)})
     assert r.status_code == 500 and "secret" not in r.text
+
+
+def test_bad_machine_id_rejected_before_rate_limit_key(client, limiter):
+    before = limiter.size()
+    for i in range(20):
+        r = client.post("/v1/refresh", json={"token": "x", "machine_id": f"{i:064d}".replace("0", "g")})
+        assert r.status_code == 422
+    # 只有按 IP 计数的那一条，没有为 20 个乱编的机器码各建一条记录
+    assert limiter.size() - before == 1
+
+
+def test_rate_limiter_gc_respects_each_window():
+    from dd_license.ratelimit import GC_EVERY, RateLimiter
+
+    t = [1000.0]
+    rl = RateLimiter(clock=lambda: t[0])
+    rl.hit("long", 5, 3600)
+    rl.hit("short", 5, 10)
+    t[0] += GC_EVERY + 1
+    rl.hit("trigger", 5, 10)  # 触发一次清理
+    # short 的窗口已过期，被清掉；long 还在自己的 1 小时窗口内，必须保留
+    assert rl.size() == 2
+    for _ in range(4):
+        rl.hit("long", 5, 3600)
+    with pytest.raises(LicenseError):
+        rl.hit("long", 5, 3600)
