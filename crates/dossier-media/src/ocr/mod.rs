@@ -1,15 +1,18 @@
-//! OCR 文字识别（Tesseract）。
+//! OCR 文字识别。
 //!
 //! 补的是一个很具体的缺口：项目此前只有**文本检测**（DBNet 输出「哪里有字」的框），
 //! 没有**文本识别**（「那些字是什么」）。没有识别，就没法做
 //! 「判断这个角标是不是播出平台标识」「核对片头标题有没有被改」这类事。
 //!
 //! 两段式设计（这也是短剧里最实用的形态）：
-//! 1. [`plan_region_frames`]：先用 ffmpeg 把**指定区域 + 指定时间**抽成图片序列——
+//! 1. [`RegionFramePlan`]：先用 ffmpeg 把**指定区域 + 指定时间**抽成图片序列——
 //!    角标/硬字幕只在画面的一小块里，整帧丢给 OCR 既慢又容易被背景干扰；
-//! 2. [`plan_recognize`]：对图片跑 tesseract TSV 输出，得到带**置信度**的文本行。
+//! 2. [`RecognizePlan`]：对图片跑 tesseract TSV 输出，得到带**置信度**的文本行。
 //!
 //! 置信度必须留着：OCR 的错字是常态，下游要靠它决定「自动确认还是转人工」。
+//!
+//! 后端选择（PaddleOCR → 系统 OCR → tesseract 等）见 [`crate::ocr_backend`]，
+//! 各后端的具体调用与运行期降级见 [`engine`]。
 
 use std::path::{Path, PathBuf};
 
@@ -20,6 +23,47 @@ use thiserror::Error;
 use crate::failure_message;
 use crate::render::TimeRange;
 
+pub mod engine;
+pub mod paddle;
+pub mod system;
+
+/// 各 OCR 子模块共用的测试辅助。
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// 一张合法的 2×2 白色灰度 PNG（由 ffmpeg 生成，ffprobe 确认可解码）。
+    /// 用来让「图片必须存在且是真图」的前置检查通过，不需要引入 PNG 编码依赖。
+    pub const TINY_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x00, 0x00, 0x00, 0x00, 0x57,
+        0xdd, 0x52, 0xf8, 0x00, 0x00, 0x00, 0x09, 0x70, 0x48, 0x59, 0x73, 0x00, 0x00, 0x00, 0x01,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x4f, 0x25, 0xc4, 0xd6, 0x00, 0x00, 0x00, 0x0e, 0x49, 0x44,
+        0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8, 0xff, 0x9f, 0xe1, 0xff, 0x7f, 0x00, 0x0b, 0xfa, 0x03,
+        0xfd, 0xe0, 0x25, 0x8a, 0x10, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42,
+        0x60, 0x82,
+    ];
+
+    /// 在系统临时目录下建一个本测试专用的目录（带进程号，避免并行测试互相覆盖）。
+    pub fn unique_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("dossier-ocr-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 在 `dir` 下写一张 [`TINY_PNG`]，返回路径。
+    pub fn write_png(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, TINY_PNG).unwrap();
+        path
+    }
+}
+
+// 平台专属实现：只在对应平台上编译，Linux 构建看不到。
+#[cfg(target_os = "macos")]
+pub(crate) mod system_macos;
+#[cfg(target_os = "windows")]
+pub(crate) mod system_windows;
+
 /// OCR 错误。
 #[derive(Debug, Error)]
 pub enum OcrError {
@@ -27,7 +71,9 @@ pub enum OcrError {
     InputMissing(PathBuf),
     #[error("区域非法：宽高必须大于 0（实际 {width}x{height}）")]
     InvalidRegion { width: u32, height: u32 },
-    #[error("本机没有 tesseract：{0}")]
+    /// 某个 OCR 后端不可用（没装、没语言包、平台不支持）。tesseract、PaddleOCR、
+    /// 系统 OCR 共用这个类型，具体是哪一个写在消息里。
+    #[error("OCR 工具不可用：{0}")]
     ToolMissing(String),
     #[error("识别失败（{command}）：{message}")]
     RunFailed { command: String, message: String },
@@ -224,8 +270,25 @@ pub struct OcrLine {
 
 impl OcrLine {
     /// 可信度是否达标。默认门槛 60：低于它的结果通常是把背景纹理认成了字。
+    ///
+    /// 置信度未知（`-1`）时一律判为不达标；需要「未知就放行」请用 [`OcrLine::passes`]。
     pub fn is_confident(&self, threshold: f64) -> bool {
         self.confidence >= threshold
+    }
+
+    /// 置信度是否未知。Windows 系统 OCR 不给逐行置信度，PaddleOCR 偶尔缺分数，
+    /// 都记为负数。
+    pub fn confidence_unknown(&self) -> bool {
+        self.confidence < 0.0
+    }
+
+    /// 采纳判定：置信度已知就按门槛比，未知就放行。
+    ///
+    /// 为什么未知要放行：不给分数的后端（Windows OCR）不是「认得很差」，而是
+    /// 「没有这个信息」。按 `is_confident` 判会把这一级的结果全部丢掉。
+    /// tesseract 不受影响——它只在空文本行上给 -1，这些行解析时已被跳过。
+    pub fn passes(&self, threshold: f64) -> bool {
+        self.confidence_unknown() || self.is_confident(threshold)
     }
 }
 
@@ -494,6 +557,44 @@ mod tests {
         assert_eq!(lines[1].text, "背景纹理");
         assert!(!lines[1].is_confident(60.0));
         assert!(lines[0].is_confident(60.0));
+    }
+
+    fn line_with(confidence: f64) -> OcrLine {
+        OcrLine {
+            text: "字幕".into(),
+            confidence,
+            left: 0,
+            top: 0,
+            width: 0,
+            height: 0,
+        }
+    }
+
+    /// 回归：Windows OCR 不给置信度（记为 -1），曾被 `is_confident(60.0)` 全部丢掉。
+    #[test]
+    fn unknown_confidence_passes_but_known_low_confidence_does_not() {
+        assert!(line_with(-1.0).passes(60.0), "置信度未知应放行");
+        assert!(line_with(-1.0).confidence_unknown());
+        assert!(
+            !line_with(-1.0).is_confident(60.0),
+            "is_confident 语义保持不变"
+        );
+
+        assert!(line_with(95.0).passes(60.0));
+        assert!(line_with(60.0).passes(60.0), "门槛本身算达标");
+        assert!(!line_with(41.2).passes(60.0), "已知且低于门槛要拒绝");
+        assert!(!line_with(0.0).passes(60.0), "0 分是已知的低分，不是未知");
+    }
+
+    /// tesseract 的 TSV 里只有空文本行是 -1，解析后不会出现未知置信度，
+    /// 所以改用 `passes` 不改变 tesseract 的过滤结果。
+    #[test]
+    fn tesseract_lines_never_carry_unknown_confidence() {
+        let lines = parse_tsv(TSV);
+        assert!(lines.iter().all(|line| !line.confidence_unknown()));
+        let kept: Vec<_> = lines.iter().filter(|line| line.passes(60.0)).collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].text, "龙腾");
     }
 
     #[test]

@@ -527,10 +527,7 @@ fn run(cli: &Cli, runner: &SystemRunner) -> Result<(), String> {
                         .execute(runner, &tesseract)
                         .map_err(|error| error.to_string())?;
                     print_json(&lines, *json)?;
-                    let confident = lines
-                        .iter()
-                        .filter(|line| line.is_confident(*confidence))
-                        .count();
+                    let confident = lines.iter().filter(|line| line.passes(*confidence)).count();
                     println!(
                         "已识别 {} 行（置信度 ≥ {:.0}：{} 行）",
                         lines.len(),

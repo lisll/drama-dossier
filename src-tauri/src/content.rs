@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dossier_core::{save_settings, AppSettings, ProbedEpisode};
 use dossier_media::asr::{AsrPlan, WhisperFlavor};
-use dossier_media::ocr::{RecognizePlan, Region, RegionFramePlan};
+use dossier_media::ocr::{Region, RegionFramePlan};
 use dossier_media::render::TimeRange;
 use dossier_runtime::probe::probe_tool;
 use dossier_runtime::{CommandRunner, CommandSpec, SystemRunner, ToolReport};
@@ -84,6 +84,10 @@ pub struct ModelRuntimeStatus {
     pub asr_engine: AsrEngine,
     pub asr_model: String,
     pub ocr: ToolReport,
+    /// OCR 自检的完整结果：选了哪一级、跳过了哪些、各自原因。
+    /// 提取阶段据此建立识别管线，不必再探测一遍（探测要跑子进程，重复做很浪费）。
+    #[serde(skip)]
+    pub ocr_env: dossier_media::ocr_backend::Environment,
     pub ready: bool,
     pub guidance: String,
 }
@@ -206,14 +210,15 @@ pub(crate) fn model_runtime(
             ocr.detail = "缺少 chi_sim 中文语言包".into();
         }
     }
-    // 按降级链决定 OCR 最终用哪个后端（PaddleOCR → RapidOCR → 系统 OCR → tesseract）。
-    // 目前只有 tesseract 与"系统 OCR 是否存在"能可靠探测，前两级先按"是否配置了入口"判断；
-    // 选中的后端名写进 detail，界面与日志据此说明当前实际在用哪一个。
+    // 按降级链决定 OCR 最终用哪个后端（PaddleOCR → 系统 OCR → tesseract）。
+    // 每一级都要先确认「本机现在真的有它」，再参与选择；探测失败不报错，只跳过。
+    let paddle_program = dossier_media::ocr::paddle::find_program();
     let backend_env = dossier_media::ocr_backend::Environment {
-        // 前两级：设置里给了可执行入口才算装了（安装流程在阶段 3 后续补上）
-        paddle_program: None,
+        paddle_program,
+        // RapidOCR 本轮不做（引擎选型未定），自检恒为「没有」，降级链会跳过这一级。
         rapid_program: None,
-        system_available: system_ocr_available(runner),
+        // 与实际识别用同一个系统接口判断，不需要管理员权限（见 ocr::system::available）。
+        system_available: dossier_media::ocr::system::available(),
         tesseract: if ocr.ok {
             Some((PathBuf::from(ocr.program.clone()), true))
         } else {
@@ -274,43 +279,10 @@ pub(crate) fn model_runtime(
         asr_engine: engine,
         asr_model,
         ocr,
+        ocr_env: backend_env,
         ready,
         guidance,
     }
-}
-
-/// 系统自带 OCR 是否可用。
-///
-/// - Windows：`Windows.Media.Ocr` 只有在系统装了中文 OCR 语言包时才认得出中文，
-///   语言包是从「设置 → 应用 → 可选功能」安装的，并非所有机器都有。这里用
-///   `powershell Get-WindowsCapability` 查询（比直接调 WinRT 简单且不会引入新依赖）；
-///   查询失败一律按"不可用"处理，交给下一级。
-/// - macOS：Vision 框架随系统提供，10.15+ 均可用，直接认为可用。
-/// - 其他平台：不可用。
-#[cfg(target_os = "windows")]
-fn system_ocr_available(runner: &dyn CommandRunner) -> bool {
-    let spec = CommandSpec::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "(Get-WindowsCapability -Online -Name 'Language.OCR*zh-CN*').State",
-        ])
-        .timeout(Duration::from_secs(30));
-    runner
-        .run(&spec)
-        .map(|output| output.success() && output.combined().contains("Installed"))
-        .unwrap_or(false)
-}
-
-#[cfg(target_os = "macos")]
-fn system_ocr_available(_runner: &dyn CommandRunner) -> bool {
-    true
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
-fn system_ocr_available(_runner: &dyn CommandRunner) -> bool {
-    false
 }
 
 /// 把一集视频转成“对白 + 画面文字”证据。
@@ -439,14 +411,23 @@ fn extract_episode(
     let frames = frame_plan
         .execute(&runner, &ffmpeg.display().to_string())
         .map_err(|error| error.to_string())?;
-    let mut ocr_lines = Vec::new();
+
+    // 建立识别管线：按自检结果排好候选链，运行期若某一级跑不通会自动降级。
+    // 没有可用后端时 pipeline 为 None，OCR 证据整段跳过，但整集提取仍然成功。
+    let (selection, _) = dossier_media::ocr_backend::select(&runtime.ocr_env);
+    let mut pipeline = dossier_media::ocr::engine::OcrPipeline::new(selection, &runtime.ocr_env);
     let frame_count = frames.len();
+    // 整批识别：PaddleOCR 一次加载模型处理全部帧，其他后端在内部逐帧跑。
+    // 每帧中间产物用帧名区分（<帧名>.tsv），不再互相覆盖同一个文件。
+    let results = match pipeline.as_mut() {
+        Some(active) => active.recognize_frames(&frames, &episode_dir.join("ocr"), &runner),
+        None => Vec::new(),
+    };
+    let mut ocr_lines = Vec::new();
     let mut ocr_failures = 0usize;
-    for frame in frames {
-        let mut recognize = RecognizePlan::new(&frame, episode_dir.join("ocr"));
-        recognize.language = "chi_sim+eng".into();
-        match recognize.execute(&runner, &runtime.ocr.program) {
-            Ok(lines) => ocr_lines.extend(lines.into_iter().filter(|line| line.is_confident(60.0))),
+    for (frame, result) in frames.iter().zip(results) {
+        match result {
+            Ok(lines) => ocr_lines.extend(lines.into_iter().filter(|line| line.passes(60.0))),
             Err(error) => {
                 ocr_failures += 1;
                 crate::logging::log_event(
@@ -461,6 +442,21 @@ fn extract_episode(
                     ),
                 );
             }
+        }
+    }
+    // 降级一旦发生就要留痕：用户看到的「用的是哪一级」可能与自检结论不同。
+    if let Some(active) = &pipeline {
+        for downgrade in active.downgrades() {
+            crate::logging::log_event(
+                "材料",
+                format!(
+                    "第 {} 集 OCR 从 {} 降级到 {}：{}",
+                    index + 1,
+                    downgrade.from.label(),
+                    downgrade.to.label(),
+                    downgrade.reason
+                ),
+            );
         }
     }
     if ocr_failures > 0 {
