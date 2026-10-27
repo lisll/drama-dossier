@@ -2,11 +2,14 @@
 //!
 //! 与 `install_runtime_blocking`（ffmpeg/ffprobe）同一套交互：后台阻塞执行、
 //! `install-progress` 事件报进度、装完写回设置。安装目标都在应用数据目录，
-//! 不碰系统 PATH：
-//! - ASR：`<app_data>/asr-env` 虚拟环境装 openai-whisper，base 模型下到
-//!   `<app_data>/models/whisper/base.pt`（CLI 用绝对路径加载，不落用户缓存）；
+//! 不碰系统 PATH。国内网络直连 PyPI / GitHub 基本不可用，所有外网下载都配
+//! 了「镜像优先、官方兜底」的多级源：
+//! - ASR：`<app_data>/asr-env` 虚拟环境装 openai-whisper（pip 清华镜像优先），
+//!   base 模型下到 `<app_data>/models/whisper/base.pt`（CLI 用绝对路径加载，
+//!   不落用户缓存）；
 //! - OCR（macOS）：Homebrew 装 `tesseract` + `tesseract-lang`（含 chi_sim）；
-//! - OCR（Windows）：UB-Mannheim 静默安装器装进 `<app_data>/tesseract`，
+//! - OCR（Windows）：UB-Mannheim 静默安装器（ghfast.top 镜像优先）装进
+//!   `<app_data>/tesseract`（安装器忽略 /DIR 时从默认落位搬运回来），
 //!   再补下 chi_sim 语言包（安装器默认组件不含中文）。
 //!
 //! 每个组件独立软失败：一边失败不影响另一边的成果，错误进报告 messages。
@@ -50,8 +53,12 @@ pub(crate) fn cancel_background_downloads() {
 
 /// Windows 用 UB-Mannheim 的 tesseract 安装器（Inno Setup，静默参数官方支持）。
 /// 钉住已知可用版本；升级时换这里的版本号。
+/// 多级下载源：GitHub 直连在国内基本拉不动，ghfast.top 加速代理优先，官方源兜底。
 #[cfg(target_os = "windows")]
-const TESSERACT_SETUP_URL: &str = "https://github.com/UB-Mannheim/tesseract/releases/download/v5.4.0.20240606/tesseract-ocr-w64-setup-5.4.0.20240606.exe";
+const TESSERACT_SETUP_SOURCES: &[&str] = &[
+    "https://ghfast.top/https://github.com/UB-Mannheim/tesseract/releases/download/v5.4.0.20240606/tesseract-ocr-w64-setup-5.4.0.20240606.exe",
+    "https://github.com/UB-Mannheim/tesseract/releases/download/v5.4.0.20240606/tesseract-ocr-w64-setup-5.4.0.20240606.exe",
+];
 
 /// chi_sim 语言包的多级下载源（GitHub raw 主源，CDN 镜像兜底国内直连）。
 /// 仅 Windows 安装器使用；macOS 走 brew 自带的 chi_sim。
@@ -89,6 +96,7 @@ fn installed_torch_variant(python: &Path) -> Option<String> {
         Some(line)
     }
 }
+
 /// base 模型约 140MB，网络慢时可能要几分钟。
 const MODEL_DOWNLOAD_TIMEOUT_SECS: u64 = 1800;
 /// Homebrew 装 tesseract + 全语言包约几十 MB，brew 首次可能更新索引。
@@ -651,7 +659,16 @@ fn install_ocr(app: &AppHandle) -> Result<String, String> {
 
     if !tesseract.is_file() {
         let setup = dir.join("tesseract-setup.exe");
-        crate::toolbox::download_file(app, "ocr", TESSERACT_SETUP_URL, &setup)?;
+        let mut last_error = String::from("（未尝试）");
+        for source in TESSERACT_SETUP_SOURCES {
+            match crate::toolbox::download_file(app, "ocr", source, &setup) {
+                Ok(()) => break,
+                Err(error) => last_error = error,
+            }
+        }
+        if !setup.is_file() {
+            return Err(format!("tesseract 安装器下载失败：{last_error}"));
+        }
         emit_progress(
             app,
             "ocr",
@@ -661,12 +678,14 @@ fn install_ocr(app: &AppHandle) -> Result<String, String> {
             0,
         );
         use std::os::windows::process::CommandExt;
+        // /CURRENTUSER 走每用户安装：不需要管理员授权，UAC 被拒也能装完。
         let mut command = std::process::Command::new(&setup);
         command
             .args([
                 "/VERYSILENT",
                 "/SUPPRESSMSGBOXES",
                 "/NORESTART",
+                "/CURRENTUSER",
                 &format!("/DIR={}", dir.display()),
             ])
             .creation_flags(0x0800_0000);
@@ -674,11 +693,22 @@ fn install_ocr(app: &AppHandle) -> Result<String, String> {
             .status()
             .map_err(|error| format!("启动 tesseract 安装器失败：{error}"))?;
         let _ = std::fs::remove_file(&setup);
-        if !status.success() || !tesseract.is_file() {
+        if !status.success() {
             return Err(format!(
                 "tesseract 静默安装未完成（退出码 {:?}）",
                 status.code()
             ));
+        }
+        // 5.4.0 安装器会忽略 /DIR 落到默认目录：把文件搬回应用目录，
+        // 保持「安装目标都在应用数据目录」的布局（含管理员安装落 Program Files 的情形）。
+        if !tesseract.is_file() {
+            if let Some(root) = locate_installed_tesseract() {
+                copy_dir_contents(&root, &dir)
+                    .map_err(|error| format!("搬运 tesseract 文件失败：{error}"))?;
+            }
+        }
+        if !tesseract.is_file() {
+            return Err("tesseract 静默安装后未找到可执行文件".to_string());
         }
     }
 
@@ -704,6 +734,37 @@ fn install_ocr(app: &AppHandle) -> Result<String, String> {
     })?;
     crate::logging::log_event("环境", "OCR 安装完成（UB-Mannheim tesseract + chi_sim）");
     Ok(tesseract.display().to_string())
+}
+
+/// 安装器忽略 /DIR 时可能落位的目录（每用户默认 / 管理员默认）。
+#[cfg(target_os = "windows")]
+fn locate_installed_tesseract() -> Option<PathBuf> {
+    let local = std::env::var("LOCALAPPDATA").ok()?;
+    [
+        PathBuf::from(local).join("Programs").join("Tesseract-OCR"),
+        PathBuf::from(r"C:\Program Files\Tesseract-OCR"),
+    ]
+    .into_iter()
+    .find(|root| root.join("tesseract.exe").is_file())
+}
+
+/// 递归复制目录内容到目标目录（跳过卸载器文件，源目录本身不复制）。
+#[cfg(target_os = "windows")]
+fn copy_dir_contents(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with("unins") {
+            continue;
+        }
+        let target = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_contents(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]

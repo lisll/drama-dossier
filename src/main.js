@@ -532,6 +532,8 @@ function settingsSnapshot() {
       $("#ocr-executable")?.value.trim() ?? "",
       $("#content-sample-count")?.value.trim() ?? "",
       $("#material-pipeline-enabled")?.checked ? "on" : "off",
+      $("#dedup-recipe-enabled")?.checked ? "on" : "off",
+      $("#ai-badge-enabled")?.checked ? "on" : "off",
     ].join("|"),
   });
 }
@@ -566,6 +568,8 @@ function refreshDirtyBadge() {
       state.settings?.ocrExecutable ?? "",
       state.settings?.contentSampleCount == null ? "" : String(state.settings.contentSampleCount),
       state.settings?.materialPipelineEnabled === false ? "off" : "on",
+      state.settings?.dedupRecipeEnabled === false ? "off" : "on",
+      state.settings?.aiBadgeEnabled === false ? "off" : "on",
     ].join("|"),
   });
   $("#settings-dirty").classList.toggle("hidden", settingsSnapshot() === saved);
@@ -613,6 +617,9 @@ async function loadSettings() {
     $("#content-sample-count").value =
       settings.contentSampleCount == null ? "" : String(settings.contentSampleCount);
     $("#material-pipeline-enabled").checked = settings.materialPipelineEnabled !== false;
+    // 去重配方 / AI 合规角标开关：None / 缺失都视为开启。
+    $("#dedup-recipe-enabled").checked = settings.dedupRecipeEnabled !== false;
+    $("#ai-badge-enabled").checked = settings.aiBadgeEnabled !== false;
     if (state.root) $("#env-workdir").value = state.root;
     renderDefaultHints();
     renderEmptyGuide();
@@ -696,6 +703,8 @@ function buildSettingsFromForm(rules) {
         ? null
         : Number($("#content-sample-count").value.trim()),
     materialPipelineEnabled: $("#material-pipeline-enabled").checked,
+    dedupRecipeEnabled: $("#dedup-recipe-enabled").checked,
+    aiBadgeEnabled: $("#ai-badge-enabled").checked,
   };
 }
 
@@ -763,6 +772,8 @@ async function rememberRoot(root) {
     ocrExecutable: state.settings?.ocrExecutable ?? null,
     contentSampleCount: state.settings?.contentSampleCount ?? null,
     materialPipelineEnabled: state.settings?.materialPipelineEnabled ?? true,
+    dedupRecipeEnabled: state.settings?.dedupRecipeEnabled ?? true,
+    aiBadgeEnabled: state.settings?.aiBadgeEnabled ?? true,
     libraryRoot: root,
   };
   state.settings = settings;
@@ -3179,6 +3190,7 @@ $("#library-root").addEventListener("input", renderEmptyGuide);
   "#rule-prefer-portrait", "#settings-output", "#ffprobe-path",
   "#asr-engine", "#asr-executable", "#asr-model", "#ocr-executable",
   "#content-sample-count", "#material-pipeline-enabled",
+  "#dedup-recipe-enabled", "#ai-badge-enabled",
 ].forEach((selector) => {
   const node = $(selector);
   node.addEventListener("input", refreshDirtyBadge);

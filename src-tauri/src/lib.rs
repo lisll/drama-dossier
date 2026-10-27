@@ -12,6 +12,7 @@ use tauri::{AppHandle, Emitter, Manager};
 mod account;
 mod ai;
 mod content;
+mod dedup;
 mod dossier;
 mod downloads;
 mod erase;
@@ -368,6 +369,11 @@ fn read_recent_logs(limit: Option<usize>) -> Vec<String> {
 }
 
 pub fn run() {
+    // 中文 Windows 下 GUI 进程以管道拉起 Python 子进程时，stdout/stderr 默认用系统
+    // ANSI 代码页（GBK）编码；whisper 这类帮助文本含非 GBK 字符（如 ½、tqdm 进度条）
+    // 的工具会抛 UnicodeEncodeError 并以退出码 1 失败。强制 UTF-8 后所有子进程
+    // （探测/转写/模型安装）自动继承，仅影响 Python 系列。
+    std::env::set_var("PYTHONUTF8", "1");
     tauri::Builder::default()
         .setup(|app| {
             // 测试期日志落盘位置：~/Documents/剧备日志/dossier.log（配置目录仅作兜底）。

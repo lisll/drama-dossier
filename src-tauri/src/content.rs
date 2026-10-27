@@ -1115,11 +1115,16 @@ fn material_pipeline_blocking(
             Ok(identity) => Some(identity),
             Err(error) => {
                 messages.push(format!("AI 文案生成失败，沿用已有内容：{error}"));
+                crate::logging::log_event(
+                    "材料",
+                    format!("LLM 剧名/简介生成失败（跳过，沿用已有内容）：{error}"),
+                );
                 None
             }
         }
     } else {
         messages.push("LLM 未配置，剧名/简介沿用已有内容。".into());
+        crate::logging::log_event("材料", "LLM 未配置，剧名/简介跳过 AI 生成，沿用已有内容");
         None
     };
 
@@ -1188,6 +1193,10 @@ fn material_pipeline_blocking(
                     let _ = std::fs::remove_file(path);
                 }
                 messages.push(format!("海报生成失败（其余材料继续）：{error}"));
+                crate::logging::log_event(
+                    "材料",
+                    format!("海报生成失败（跳过，兜底素材封面）：{error}"),
+                );
                 // 兜底：复制素材目录里的封面（报审素材按规范都带封面）。
                 match crate::toolbox::copy_local_cover(drama_dir, output_dir) {
                     Some(path) => (Some(path), "本地提供（素材封面）".into()),
@@ -1208,6 +1217,7 @@ fn material_pipeline_blocking(
         } else {
             "未提供（本地模式）".into()
         };
+        crate::logging::log_event("材料", format!("海报缺失（{source}），材料流水线继续"));
         (None, source)
     };
 

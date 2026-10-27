@@ -78,6 +78,12 @@ pub struct AppSettings {
     pub content_sample_count: Option<u32>,
     /// 深度处理时是否自动执行“内容提取 + 报审材料生成”编排。
     pub material_pipeline_enabled: Option<bool>,
+    /// 深度处理去重配方开关：`None`/`true` 表示启用（剧名 seed 派生确定性扰动
+    /// + 机型元数据 + 配方存证），`false` 关闭。
+    pub dedup_recipe_enabled: Option<bool>,
+    /// 深度处理 AI 合规角标烧录开关：`None`/`true` 表示把
+    /// 「内容由AI生成·纯属虚构」烧进成片画面，`false` 关闭。
+    pub ai_badge_enabled: Option<bool>,
 }
 
 impl AppSettings {
@@ -102,6 +108,16 @@ impl AppSettings {
     /// 深度处理默认开启材料流水线；如用户显式关闭则不再自动请求模型。
     pub fn effective_material_pipeline_enabled(&self) -> bool {
         self.material_pipeline_enabled.unwrap_or(true)
+    }
+
+    /// 深度处理默认启用去重配方（seed 确定性扰动）；显式关闭后成片只做重组 + 微帧。
+    pub fn effective_dedup_recipe_enabled(&self) -> bool {
+        self.dedup_recipe_enabled.unwrap_or(true)
+    }
+
+    /// 深度处理默认烧录 AI 合规角标；显式关闭后成片画面不带角标。
+    pub fn effective_ai_badge_enabled(&self) -> bool {
+        self.ai_badge_enabled.unwrap_or(true)
     }
 }
 

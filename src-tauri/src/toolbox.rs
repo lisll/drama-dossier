@@ -635,6 +635,9 @@ pub struct TranscodeRunReport {
     /// 深度处理并行材料流水线结果；普通转码为 None。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub materials: Option<crate::content::MaterialPipelineReport>,
+    /// 深度处理去重配方摘要（seed 与存证文件）；其余模式/关闭时为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dedup: Option<crate::dedup::DedupRecipeSummary>,
 }
 
 /// 视频编码参数：软件 libx264 用 CRF 23（质量优先，沿用历史行为）；
@@ -812,6 +815,11 @@ fn seed_for(file_name: &str) -> u64 {
 
 /// 智能微调：每集从开头裁掉 1~3 帧（帧率未知时按 30fps 折算），输出同名新文件。
 /// 各集互不依赖，`lanes` 路并行执行。
+///
+/// `recipe`（深度处理传入）在微帧之外注入去重配方：确定性滤镜链 + 机型元数据；
+/// `badge`（深度处理传入）把 AI 合规角标 PNG 作为第二输入烧进画面。
+/// 独立「智能微调」模式两者都传 None，保持原有轻量行为。
+#[allow(clippy::too_many_arguments)]
 fn transcode_nudge_blocking(
     ffmpeg: &Path,
     lanes: &EncodeLanes,
@@ -820,6 +828,8 @@ fn transcode_nudge_blocking(
     output_dir: &Path,
     emit: &(dyn Fn(u64, u64, &str) + Sync),
     produced: &mut Vec<PathBuf>,
+    recipe: Option<&crate::dedup::DedupRecipePlan>,
+    badge: Option<&Path>,
 ) -> Result<TranscodeRunReport, String> {
     std::fs::create_dir_all(output_dir)
         .map_err(|error| format!("创建输出目录失败（{}）：{error}", output_dir.display()))?;
@@ -837,13 +847,57 @@ fn transcode_nudge_blocking(
             "-i".into(),
             input_str.clone(),
         ];
+        let mut detail = format!("裁掉开头 {frames} 帧（{offset:.4} 秒，{fps:.2} fps）");
+
+        // 去重配方：确定性画面/音频滤镜链（P1）。
+        let mut video_chain = String::new();
+        let mut meta_args: Vec<String> = Vec::new();
+        if let Some(plan) = recipe {
+            let index = episodes
+                .iter()
+                .position(|item| item.file.path == episode.file.path)
+                .unwrap_or_default();
+            if let Some(variant) = plan.variant(index) {
+                video_chain = variant
+                    .compile_video_filters(episode.spec.width.max(2), episode.spec.height.max(2));
+                args.push("-vf".into());
+                args.push(video_chain.clone());
+                if episode.spec.audio_codec.is_some() {
+                    args.push("-af".into());
+                    args.push(variant.compile_audio_filters(crate::dedup::SAMPLE_RATE_HZ));
+                }
+                for (key, value) in plan.metadata_tags(index) {
+                    meta_args.push(format!("{key}={value}"));
+                }
+                detail.push_str(&format!("；去重（{}）：{}", plan.seed, variant.describe()));
+            }
+        }
+        for tag in &meta_args {
+            args.push("-metadata".into());
+            args.push(tag.clone());
+        }
+
+        // AI 合规角标：角标 PNG 作第二输入，视频链并入 filter_complex 后 overlay（P2）。
+        if let Some(path) = badge {
+            args.push("-i".into());
+            args.push(path.display().to_string());
+            args.push("-filter_complex".into());
+            args.push(format!(
+                "[0:v:0]{video_chain}[base];[base][1:v:0]overlay=x={AI_BADGE_MARGIN}:y={AI_BADGE_MARGIN}[vout]"
+            ));
+            args.push("-map".into());
+            args.push("[vout]".into());
+            args.push("-map".into());
+            args.push("0:a?".into());
+            detail.push_str("；已烧录 AI 合规角标");
+        }
+
         args.extend(encode_output_args(&output, &lanes.encoder));
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         run_ffmpeg(ffmpeg, &arg_refs).map_err(|error| {
             let _ = std::fs::remove_file(&output);
             format!("{}：{error}", episode.file.file_name)
         })?;
-        let detail = format!("裁掉开头 {frames} 帧（{offset:.4} 秒，{fps:.2} fps）");
         Ok((
             (output.clone(), detail),
             format!("{}：完成", episode.file.file_name),
@@ -864,6 +918,7 @@ fn transcode_nudge_blocking(
         output_dir: output_dir.display().to_string(),
         items,
         materials: None,
+        dedup: None,
         note: format!(
             "《{drama_name}》每集开头已微调 1~3 帧（{}），输出到新目录，原素材未改动。",
             lanes.describe()
@@ -1030,6 +1085,7 @@ fn transcode_recut_blocking(
         output_dir: output_dir.display().to_string(),
         items,
         materials: None,
+        dedup: None,
         note: format!(
             "已按场景切点重新分成 {produced_count} 集（统一重编码保证切点精确，{}），输出到新目录，原素材未改动。",
             lanes.describe()
@@ -1301,16 +1357,31 @@ fn write_ai_proof(
     output_dir: &Path,
 ) -> Result<PathBuf, String> {
     let version = app.package_info().version.to_string();
+    // 去重配方 / 合规角标的声明与设置一致（证明先于编码产出，这里按开关如实预告）。
+    let dedup_on = read_settings(app)
+        .map(|config| config.effective_dedup_recipe_enabled())
+        .unwrap_or(true);
+    let badge_on = read_settings(app)
+        .map(|config| config.effective_ai_badge_enabled())
+        .unwrap_or(true);
+    let mut processing = format!(
+        "按场景切点重组分集并逐集微帧，成片输出到「视频成片/」子目录，编码 {}。",
+        lanes.describe()
+    );
+    if dedup_on {
+        processing
+            .push_str("成片注入剧名派生的确定性去重配方（逐集参数存证于「去重配方.json」）。");
+    }
+    if badge_on {
+        processing.push_str("成片画面烧录「内容由AI生成·纯属虚构」AI 合规角标。");
+    }
     let payload = serde_json::json!({
         "date": local_date_string(),
         "version": version,
         "dramaName": drama_name,
         "originalEpisodes": episode_count,
         "encoder": lanes.describe(),
-        "processing": format!(
-            "按场景切点重组分集并逐集微帧，成片输出到「视频成片/」子目录，编码 {}。",
-            lanes.describe()
-        ),
+        "processing": processing,
         "evidence": "未提取（本流程未启用材料线程）",
         "title": materials.title,
         "titleSource": materials.title_source,
@@ -1360,10 +1431,10 @@ fn transcode_deep_blocking(
 ) -> Result<TranscodeRunReport, String> {
     std::fs::create_dir_all(output_dir)
         .map_err(|error| format!("创建输出目录失败（{}）：{error}", output_dir.display()))?;
+    let mut settings = read_settings(app)?;
     // 材料阶段（仅本地兜底模式）：流水线未启用/未就绪时在编码前串行产出材料
     //（本地复用 → AI 生成逐级兜底）；流水线模式下材料与编码并行，此处跳过。
     if local_materials {
-        let mut settings = read_settings(app)?;
         let mut materials = MaterialSources::default();
         let llm_label = ai_source_label(&settings.llm_model);
         // 本地简介：设置里已存的优先，其次素材目录里的 简介*.txt（报审素材按规范都带，清单也要求）。
@@ -1610,6 +1681,33 @@ fn transcode_deep_blocking(
     // 阶段二：对每个新集做智能微帧（本地材料模式映射 55~100，流水线模式映射 50~100）。
     // 成片单独放「视频成片/」子目录（Grove-Max 同款结构），材料与视频分层清晰。
     let final_video_dir = output_dir.join("视频成片");
+
+    // 去重配方（P1）：剧名 seed 确定性派生逐集扰动参数，配方全文落盘存证。
+    let recipe_plan = if settings.effective_dedup_recipe_enabled() {
+        let plan = crate::dedup::DedupRecipePlan::build(drama_name, recut_files.len());
+        match plan.save_to(output_dir) {
+            Ok(path) => crate::logging::log_event(
+                "去重",
+                format!(
+                    "配方已签发：seed {}，{} 集，存证 {}",
+                    plan.seed,
+                    plan.variants.len(),
+                    path.display()
+                ),
+            ),
+            Err(error) => crate::logging::log_event(
+                "去重",
+                format!("配方存证写入失败（不影响成片）：{error}"),
+            ),
+        }
+        Some(plan)
+    } else {
+        crate::logging::log_event("去重", "已在设置中关闭，成片只做重组 + 微帧");
+        None
+    };
+    // AI 合规角标（P2）：Pillow 渲染 PNG；环境未就绪时软失败（成片不带角标）。
+    let badge_path = render_ai_badge(app, output_dir, settings.effective_ai_badge_enabled());
+
     let nudge_result = {
         let nudge_base = if local_materials { 55 } else { 50 };
         let step_nudge = |done: u64, total: u64, label: &str| {
@@ -1624,32 +1722,122 @@ fn transcode_deep_blocking(
             &final_video_dir,
             &step_nudge,
             produced,
+            recipe_plan.as_ref(),
+            badge_path.as_deref(),
         )
     };
     let _ = std::fs::remove_dir_all(&staging);
-    let nudge_report = nudge_result?;
+    let nudge_report = match nudge_result {
+        Ok(report) => report,
+        Err(error) => {
+            if let Some(path) = &badge_path {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(error);
+        }
+    };
     let episode_count = nudge_report.items.len();
+    // 角标 PNG 只是烧录中间物，成片完成后即清理。
+    if let Some(path) = &badge_path {
+        let _ = std::fs::remove_file(path);
+    }
 
+    // 汇总报告：去重摘要 + 完成说明。
+    let recipe_file = output_dir.join(crate::dedup::RECIPE_FILE_NAME);
+    let dedup_summary = recipe_plan.map(|plan| crate::dedup::DedupRecipeSummary {
+        seed: plan.seed,
+        episode_count: plan.variants.len(),
+        recipe_file: recipe_file
+            .is_file()
+            .then(|| recipe_file.display().to_string()),
+    });
+    let mut note = format!(
+        "深度处理完成：{}，全剧按场景切点重组后逐集微帧（{}），共 {episode_count} 集，成片在「视频成片/」子目录，原素材未改动。",
+        if local_materials {
+            "材料先行（剧名/简介/海报/过程图/AI 制作证明）"
+        } else {
+            "材料与编码并行处理"
+        },
+        lanes.describe()
+    );
+    if let Some(summary) = &dedup_summary {
+        note.push_str(&format!(
+            " 已注入确定性去重配方（seed {}，逐集参数存证于 去重配方.json）。",
+            summary.seed
+        ));
+    }
+    if badge_path.is_some() {
+        note.push_str(" 成片已烧录「内容由AI生成·纯属虚构」AI 合规角标。");
+    }
     Ok(TranscodeRunReport {
         mode: "deep".into(),
         output_dir: output_dir.display().to_string(),
         items: nudge_report.items,
         materials: None,
-        note: format!(
-            "深度处理完成：{}，全剧按场景切点重组后逐集微帧（{}），共 {episode_count} 集，成片在「视频成片/」子目录，原素材未改动。",
-            if local_materials {
-                "材料先行（剧名/简介/海报/过程图/AI 制作证明）"
-            } else {
-                "材料与编码并行处理"
-            },
-            lanes.describe()
-        ),
+        dedup: dedup_summary,
+        note,
     })
 }
 
 const PROCESS_IMAGE_COUNT: usize = 4;
 // 每图帧数固定为 3（抽帧步长 10%/40%/70% 已按 3 帧写死），暂未引用，注释保留备查。
 // const FRAMES_PER_PROCESS_IMAGE: usize = 3;
+
+/// AI 合规角标：默认文案 / 画面边距（像素）/ 渲染中间物文件名。
+const AI_BADGE_TEXT: &str = "内容由AI生成·纯属虚构";
+const AI_BADGE_MARGIN: i64 = 24;
+const AI_BADGE_FILE: &str = ".ai-badge.png";
+
+/// 渲染 AI 合规角标 PNG（Pillow，与过程图同一套材料排版环境）。
+///
+/// 软失败语义：环境未就绪或渲染失败只记日志并返回 None，成片继续但
+/// 不带角标——角标是合规增强，不应阻塞整个深度处理。
+fn render_ai_badge(app: &AppHandle, output_dir: &Path, enabled: bool) -> Option<PathBuf> {
+    if !enabled {
+        crate::logging::log_event("材料", "AI 合规角标已在设置中关闭，成片不烧角标");
+        return None;
+    }
+    let render = || -> Result<PathBuf, String> {
+        let python = locate_materials_python(app)?;
+        let script = materials_script(app, "make_ai_badge.py")?;
+        let target = output_dir.join(AI_BADGE_FILE);
+        let spec = CommandSpec::new(python.display().to_string())
+            .args([
+                script.display().to_string(),
+                "--output".into(),
+                target.display().to_string(),
+                "--text".into(),
+                AI_BADGE_TEXT.into(),
+            ])
+            // 纯 CPU 排版，1 分钟封顶防挂死。
+            .timeout(Duration::from_secs(60));
+        let output = SystemRunner::new()
+            .run(&spec)
+            .map_err(|error| format!("角标进程启动失败：{error}"))?;
+        if !output.success() {
+            let tail: Vec<&str> = output.stderr.lines().rev().take(3).collect();
+            let tail = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
+            return Err(format!("角标脚本退出码 {}：{tail}", output.code_label()));
+        }
+        if !target.is_file() {
+            return Err("角标脚本执行成功但未产出 PNG".into());
+        }
+        Ok(target)
+    };
+    match render() {
+        Ok(path) => {
+            crate::logging::log_event("材料", format!("AI 合规角标已渲染：{}", path.display()));
+            Some(path)
+        }
+        Err(error) => {
+            crate::logging::log_event(
+                "材料",
+                format!("AI 合规角标渲染失败（成片不带角标）：{error}"),
+            );
+            None
+        }
+    }
+}
 
 /// 生成报审过程图：从原始素材代表集抽帧，交给 Pillow 脚本排版出 4 张竖屏单帧图。
 ///
@@ -1879,6 +2067,9 @@ fn transcode_blocking(
             &output_dir,
             &emit,
             &mut produced,
+            // 独立「智能微调」保持轻量语义：不注入去重配方，也不烧角标。
+            None,
+            None,
         ),
     };
     let materials = material_job
