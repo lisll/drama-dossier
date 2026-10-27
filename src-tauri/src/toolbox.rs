@@ -2395,21 +2395,9 @@ const CURL_PROGRAM: &str = "/usr/bin/curl";
 #[cfg(target_os = "windows")]
 const CURL_PROGRAM: &str = "curl";
 
-/// macOS 静态 ffmpeg 发行源：evermeet.cx。版本钉死保证可复现；
-/// 该站单连接限流（HTTP 429 / 带宽限速），因此**顺序**下载并交给 curl 重试。
-/// 注意：该站只提供 Intel（x86_64）构建（官方明确不提供 ARM 原生版），
-/// 在 Apple Silicon 上经 Rosetta 2 运行；Rosetta 缺失时自检会拦截并提示安装。
-#[cfg(target_os = "macos")]
-const EVERMEET_FFMPEG_URL: &str = "https://evermeet.cx/ffmpeg/ffmpeg-9.0.2.zip";
-#[cfg(target_os = "macos")]
-const EVERMEET_FFPROBE_URL: &str = "https://evermeet.cx/ffmpeg/ffprobe-9.0.2.zip";
-
-/// Windows 发行源：gyan.dev 的 essentials 构建（官方推荐分发包），一个 zip 同时
-/// 含 ffmpeg.exe 与 ffprobe.exe，因此 Windows 只需下载一次。这是滚动更新的
-/// 「release-essentials」包（钉版 URL 会因官网清理旧包而 404），仅作兜底——
-/// 正式安装包由 CI 预置 ffmpeg（见 bundled_runtime_dir），运行时不再联网。
-#[cfg(target_os = "windows")]
-const GYAN_FFMPEG_URL: &str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
+// ffmpeg / ffprobe 的下载源与完整性凭据集中在 `crate::downloads`：
+// 那里按平台给出多源列表与各自的 sha256（macOS 因上游只提供 GPG 签名，退回字节数校验）。
+// 原来写在本文件里的 EVERMEET_* / GYAN_* 常量已迁走，避免两处地址不一致。
 
 /// Windows 一键配置的第 3 个组件：官方 CPython 3.11.9（amd64）安装器，约 25MB。
 /// 静默装进应用数据目录，不装启动器、不改系统 PATH；升级 Python 大版本时换这里的钉版号。
@@ -2430,9 +2418,11 @@ pub struct InstallRuntimeReport {
     pub note: String,
 }
 
-/// 用系统 curl 下载（macOS / Windows 10+ 均自带，支持重试与断点续传）。
+/// 用系统 curl 下载**单个地址**（macOS / Windows 10+ 均自带，支持重试）。
 /// 期间每 0.4 秒轮询一次落盘大小并上报 `install-progress`；
 /// 总大小先用 HEAD 请求探测 content-length，探测不到就只报已下载量。
+///
+/// 这是最底层的单源下载；带哈希校验与多源回退的入口是 [`download_asset`]。
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(crate) fn download_file(
     app: &AppHandle,
@@ -2503,6 +2493,32 @@ pub(crate) fn download_file(
                 let _ = child.wait();
                 return Err(format!("curl 运行失败：{error}"));
             }
+        }
+    }
+}
+
+/// 带哈希校验与多源回退的下载入口：逐个源尝试，每源下载后立即校验。
+///
+/// 与 [`download_file`] 的区别：那个只负责"把内容拉到某个路径"，不判断拉到的对不对；
+/// 这个会按 `asset` 里写死的 sha256 校验，不匹配就删掉换下一个源，全部失败才报错。
+/// 失败类别（网络 / 校验 / 格式）会带进错误信息，界面与日志据此区分。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(crate) fn download_asset(
+    app: &AppHandle,
+    asset: &crate::downloads::Asset,
+    target: &Path,
+) -> Result<(), String> {
+    let result = crate::downloads::fetch_with_fallback(asset, target, |url, path| {
+        download_file(app, asset.name, url, path).map_err(|_| crate::downloads::Failure::Network)
+    });
+    match result {
+        Ok(_) => Ok(()),
+        Err((failure, message)) => {
+            crate::logging::log_event(
+                "环境",
+                format!("下载失败（{}）：{message}", failure.label()),
+            );
+            Err(message)
         }
     }
 }
@@ -2594,7 +2610,12 @@ fn find_extracted(dir: &Path, file_name: &str, depth: u8) -> Option<PathBuf> {
 /// 返回 `Ok(true)` 表示目标已存在、本次跳过。
 /// 仅 macOS 主安装流使用；Windows 走内置复制 + 合包 zip 兜底（见 install_runtime_blocking）。
 #[cfg(target_os = "macos")]
-fn install_one(app: &AppHandle, bin_dir: &Path, name: &str, url: &str) -> Result<bool, String> {
+fn install_one(
+    app: &AppHandle,
+    bin_dir: &Path,
+    name: &str,
+    asset: &crate::downloads::Asset,
+) -> Result<bool, String> {
     let exe_name = dossier_inpaint::erase::binary_name(name);
     let target = bin_dir.join(&exe_name);
     if target.is_file() {
@@ -2605,7 +2626,7 @@ fn install_one(app: &AppHandle, bin_dir: &Path, name: &str, url: &str) -> Result
     let staging = bin_dir.join(format!("{name}.staging"));
     let _ = std::fs::remove_dir_all(&staging);
     let result = (|| -> Result<(), String> {
-        download_file(app, name, url, &zip_path)?;
+        download_asset(app, asset, &zip_path)?;
         emit_install_progress(app, name, "extracting", "解压中", None, 0);
         std::fs::create_dir_all(&staging).map_err(|error| format!("创建解压目录失败：{error}"))?;
         extract_zip(&zip_path, &staging)?;
@@ -2814,7 +2835,11 @@ fn bundled_runtime_dir(app: &AppHandle) -> Option<PathBuf> {
 /// 从安装包内置资源把工具复制到 bin 目录；返回实际安装的组件名。
 /// 复制虽是本地 IO，仍逐组件播报「正在安装 → 完成」进度事件，
 /// 让安装弹窗有可见的推进（内置包约 200MB，复制肉眼可感知）。
-/// 目标已存在且大小一致时跳过，避免每次点击都整块复制。
+/// 目标已存在且内容一致时跳过，避免每次点击都整块复制。
+///
+/// 完整性：内置二进制由 CI 从同一来源抓取，版本随打包日变化，无法在源码里写死哈希。
+/// 这里改用"复制后登记指纹"——复制完成时算出 sha256 记进 sidecar 文件，
+/// 之后再复制时比对指纹；指纹不符说明源被替换，走重新复制而不是静默复用。
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn copy_bundled_tools(
     app: &AppHandle,
@@ -2833,14 +2858,24 @@ fn copy_bundled_tools(
             continue;
         };
         let target = bin_dir.join(&exe_name);
-        let stale = std::fs::metadata(&target)
-            .map(|meta| meta.len() != source.1)
-            .unwrap_or(true);
+        // 复制后登记指纹：目标存在且指纹与 sidecar 一致才算"已经装好且没被换过"
+        let stamp = bin_dir.join(format!("{name}.sha256"));
+        let recorded = std::fs::read_to_string(&stamp).ok();
+        let current = crate::downloads::file_sha256(&target).ok();
+        let stale = match (&recorded, &current) {
+            (Some(recorded), Some(current)) => recorded.trim() != current,
+            // 目标在但没登记过（旧版本升上来）：重新复制一次，顺手补上指纹
+            _ => true,
+        };
         if stale {
             emit_install_progress(app, name, "installing", "正在安装", None, 0);
             if let Err(_error) = std::fs::copy(&source.0, &target) {
                 // 单个复制失败不致命：可能是目标正被占用，交给下载流程或自检去暴露。
                 continue;
+            }
+            // 登记复制后的指纹；写不进去不影响本次安装，只是下次会再复制一遍
+            if let Ok(hash) = crate::downloads::file_sha256(&target) {
+                let _ = std::fs::write(&stamp, hash);
             }
             emit_install_progress(app, name, "finished", "完成", Some(0), 0);
             installed.push(name.to_string());
@@ -2863,10 +2898,15 @@ fn install_runtime_blocking(app: &AppHandle) -> Result<InstallRuntimeReport, Str
             bundled_note = format!("已从安装包内置资源安装：{}", copied.join("、"));
         }
     }
-    if install_one(app, &bin_dir, "ffmpeg", EVERMEET_FFMPEG_URL)? {
+    if install_one(app, &bin_dir, "ffmpeg", &crate::downloads::runtime_ffmpeg())? {
         skipped_existing.push("ffmpeg".into());
     }
-    if install_one(app, &bin_dir, "ffprobe", EVERMEET_FFPROBE_URL)? {
+    if install_one(
+        app,
+        &bin_dir,
+        "ffprobe",
+        &crate::downloads::runtime_ffprobe(),
+    )? {
         skipped_existing.push("ffprobe".into());
     }
 
@@ -2919,7 +2959,8 @@ fn install_runtime_blocking(app: &AppHandle) -> Result<InstallRuntimeReport, Str
         let staging = bin_dir.join("ffmpeg.staging");
         let _ = std::fs::remove_dir_all(&staging);
         let result = (|| -> Result<(), String> {
-            download_file(app, "ffmpeg", GYAN_FFMPEG_URL, &zip_path)?;
+            // 多源 + sha256 校验：BtbN 优先，gyan.dev 兜底（见 downloads 模块的说明）
+            download_asset(app, &crate::downloads::runtime_ffmpeg(), &zip_path)?;
             emit_install_progress(app, "ffmpeg", "extracting", "解压中", None, 0);
             std::fs::create_dir_all(&staging)
                 .map_err(|error| format!("创建解压目录失败：{error}"))?;

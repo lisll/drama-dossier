@@ -13,6 +13,7 @@ mod account;
 mod ai;
 mod content;
 mod dossier;
+mod downloads;
 mod erase;
 mod jianying;
 mod license;
