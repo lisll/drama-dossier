@@ -20,8 +20,9 @@ FastAPI 自带的 `/docs`、`/redoc`、`/openapi.json` 已全部关闭。
 ## 部署（单台 Ubuntu/Debian VPS）
 
 ```bash
-# 0. 以 root 执行：配置防火墙（只开放 22/80/443）、SSH 仅允许密钥登录、fail2ban、自动安全更新，并创建服务账号
-#    执行前务必确认已经能用 SSH 密钥登录，否则会把自己锁在服务器外面
+# 0. 以 root 执行：配置防火墙（只放行 SSH 的实际端口与 80/443）、SSH 仅允许密钥登录、fail2ban、自动安全更新，并创建服务账号
+#    执行前务必确认已经能用 SSH 密钥登录。脚本会检查：至少一个 authorized_keys 里真的有公钥，
+#    并用 sshd -T 读出 SSH 实际端口；任一检查不通过就停止，不会改动防火墙
 bash deploy/setup-firewall.sh
 
 # 1. 安装（依赖按哈希锁定）
@@ -66,6 +67,7 @@ sudo -u ddlicense -E .venv/bin/license-admin doctor
 | 用户换电脑或重装系统 | **不支持迁移**。授权与电脑固定绑定；重装系统或换了硬件、导致机器码变化时，需要重新兑换一张卡 |
 | 忘记密码或被锁定 | 在服务器上执行 `license-admin admin passwd`，或 `license-admin admin unlock` |
 | 备份 | 每天执行一次 `sqlite3 license.sqlite3 ".backup backup.sqlite3"`，再用 `age` 加密后存到异地。私钥 `key.pem` 另外离线保存一份 |
+| 清理审计日志 | 审计表会一直增长。每月执行一次 `sudo -u ddlicense -E .venv/bin/license-admin prune-audit --days 180`，删除 180 天之前的记录并回收空间（最少保留 30 天，填更小的天数会被拒绝）。放进 `/etc/cron.d/dd-license` 时要先加载配置：`0 4 1 * * ddlicense /bin/sh -c 'set -a; . /etc/dd-license/env; exec /opt/dd-license/.venv/bin/license-admin prune-audit --days 180'` |
 
 ## 私钥：最重要的一份文件
 
