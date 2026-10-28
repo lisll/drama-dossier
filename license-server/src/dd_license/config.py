@@ -46,7 +46,8 @@ def parse_networks(raw: str) -> list[ipaddress._BaseNetwork]:
 class Settings:
     db_path: Path
     key_file: Path
-    token_days: int = 7
+    # 离线凭证有效期（天）：也是「停用后一直不联网还能用多久」的上限。客户端每 24 小时续签一次，3 天留出 2 天余量。
+    token_days: int = 3
     admin_allow_ips: list = field(default_factory=list)
     admin_allow_any_ip: bool = False
     trust_proxy: bool = False
@@ -65,7 +66,7 @@ def load_settings() -> Settings:
     return Settings(
         db_path=Path(os.environ.get("DD_LICENSE_DB", str(base / "license.sqlite3"))),
         key_file=Path(os.environ.get("DD_LICENSE_KEY_FILE", str(base / "key.pem"))),
-        token_days=_int_env("DD_LICENSE_TOKEN_DAYS", 7, 1, 30),
+        token_days=_int_env("DD_LICENSE_TOKEN_DAYS", 3, 1, 30),
         admin_allow_ips=parse_networks(os.environ.get("DD_LICENSE_ADMIN_ALLOW_IPS", "")),
         admin_allow_any_ip=_flag("DD_LICENSE_ADMIN_ALLOW_ANY_IP"),
         trust_proxy=_flag("DD_LICENSE_TRUST_PROXY"),

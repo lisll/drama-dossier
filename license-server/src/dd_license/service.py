@@ -52,7 +52,7 @@ class LicenseService:
         self,
         db: Database,
         signing_key: Ed25519PrivateKey,
-        token_days: int = 7,
+        token_days: int = 3,
         extra_trusted: list[Ed25519PublicKey] | None = None,
     ):
         self.db = db

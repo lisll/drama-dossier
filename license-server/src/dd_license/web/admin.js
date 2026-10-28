@@ -419,7 +419,7 @@ $("#m-revoke").addEventListener("click", async () => {
   const m = state.machine;
   const v = await confirmDialog({
     title: `作废电脑 #${m.id}`,
-    text: "该电脑下次联网续签时立即锁定；如果一直不联网，最多还能再用 7 天。",
+    text: "该电脑下次联网续签时立即锁定；如果一直不联网，最多还能再用 3 天（凭证有效期，可用 DD_LICENSE_TOKEN_DAYS 调整）。",
     fields: [{ name: "reason", label: "原因（必填，如：退款、盗刷）", maxLength: 200 }],
     okText: "作废",
   });

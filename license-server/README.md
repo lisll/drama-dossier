@@ -63,7 +63,7 @@ sudo -u ddlicense -E .venv/bin/license-admin doctor
 | 生成卡密 | 后台 →「生成卡密」。明文**只显示这一次**，生成后要立刻下载 CSV 保存 |
 | 查一张卡 | 后台 →「卡密查询」 |
 | 作废未售出的卡 | 后台 →「批次」→ 作废整批；或在「卡密查询」中作废单张 |
-| 退款或盗刷 | 后台 →「已授权电脑」→ 作废。该电脑下次联网时立即锁定，一直离线最多还能使用 7 天 |
+| 退款或盗刷 | 后台 →「已授权电脑」→ 作废。该电脑下次联网时立即锁定，一直离线最多还能使用一个凭证有效期（默认 3 天，`DD_LICENSE_TOKEN_DAYS`） |
 | 用户换电脑或重装系统 | **不支持迁移**。授权与电脑固定绑定；重装系统或换了硬件、导致机器码变化时，需要重新兑换一张卡 |
 | 忘记密码或被锁定 | 在服务器上执行 `license-admin admin passwd`，或 `license-admin admin unlock` |
 | 备份 | 每天执行一次 `sqlite3 license.sqlite3 ".backup backup.sqlite3"`，再用 `age` 加密后存到异地。私钥 `key.pem` 另外离线保存一份 |
@@ -71,7 +71,7 @@ sudo -u ddlicense -E .venv/bin/license-admin doctor
 
 ## 私钥：最重要的一份文件
 
-- 私钥丢失：已经发出的凭证无法再续签，所有用户在 7 天内会被锁定。
+- 私钥丢失：已经发出的凭证无法再续签，所有用户在一个凭证有效期（默认 3 天）内会被锁定。
 - 私钥泄露：别人可以伪造任意授权。
 
 两种情况都要按 [docs/LICENSING.md](../docs/LICENSING.md)「密钥轮换应急」处理。
