@@ -230,6 +230,41 @@ def test_h264_encode_is_absent_when_ffmpeg_is_missing(settings):
     assert "ffmpeg" not in capabilities
 
 
+@pytest.mark.parametrize("bad", ["tmix,rotate", "eq hue", "", "a\tb"])
+def test_probe_builders_reject_joined_or_blank_names(bad):
+    """曾把多个滤镜名用逗号拼成一个参数：整串永远查不到，模块永远不派发且没有报错。"""
+    with pytest.raises(ValueError):
+        caps.requires_filters(bad)
+    with pytest.raises(ValueError):
+        caps.requires_encoders(bad)
+    with pytest.raises(ValueError):
+        caps.requires_filters()
+
+
+def test_dedup_and_overlay_modules_follow_the_real_listing(monkeypatch, settings):
+    """滤镜齐全时去重/角标模块要能被派发；缺了要如实缺席。"""
+    full = FILTER_SAMPLE + "".join(
+        f" ... {name:<17} V->V       sample\n"
+        for name in [
+            "tmix", "rotate", "noise", "unsharp", "eq", "hue",
+            "asetrate", "atempo", "equalizer", "acompressor", "overlay",
+        ]
+    )
+    _patch_listing(monkeypatch, filters=full)
+    from drama_cloud.recipes.registry import ensure_modules_loaded, registered_modules
+
+    ensure_modules_loaded()
+    modules = registered_modules()
+    for name in ["video.dedup", "video.dedup_finish", "audio.dedup", "overlay.badge", "overlay.watermark"]:
+        assert modules[name].capability_probe(settings) is True, name
+    assert modules["metadata.device_pool"].capability_probe(settings) is True
+
+    caps.clear_cache()
+    _patch_listing(monkeypatch, filters=FILTER_SAMPLE)
+    for name in ["video.dedup", "overlay.badge"]:
+        assert modules[name].capability_probe(settings) is False, name
+
+
 def test_capability_probe_names_are_stable_for_diagnostics(settings):
     """探测函数的名字会出现在 Worker 自省输出里，所以它要能说明「缺什么条件」。"""
     probe = caps.requires_all(

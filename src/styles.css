@@ -2135,6 +2135,22 @@ textarea {
   min-width: 1.4em;
 }
 
+/* 剧名输入框 + 「清除已保存」按钮共占一格。 */
+.drama-title-field {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+
+.drama-title-field input {
+  flex: 1;
+  min-width: 0;
+}
+
+.drama-title-field button {
+  white-space: nowrap;
+}
+
 /* 简介 / 海报行没有输入框：中列放一句来源说明（对齐行内文字基线） */
 .ai-config-row .ai-config-desc {
   padding-top: 9px;

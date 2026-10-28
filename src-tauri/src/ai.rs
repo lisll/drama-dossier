@@ -15,13 +15,6 @@ use serde_json::json;
 /// 单次请求超时：生图可能较慢，放宽到 3 分钟。
 const HTTP_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// 文本生成任务种类：剧名 / 简介。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TextKind {
-    Title,
-    Synopsis,
-}
-
 /// 取出必填的非空配置项；未配置时返回带指引的提示。
 fn required_field<'a>(
     value: &'a Option<String>,
@@ -57,27 +50,6 @@ fn img_config(settings: &AppSettings) -> Result<(String, String, String), String
         key.to_string(),
         model.to_string(),
     ))
-}
-
-/// 组装文本生成的 system / user 提示词。
-fn build_text_prompt(kind: TextKind, context: &str) -> (String, String) {
-    let context = context.trim();
-    match kind {
-        TextKind::Title => (
-            "你是短剧报审材料的剧名策划。只输出一个剧名，不要任何解释、引号或标点结尾。".to_string(),
-            format!(
-                "请根据以下剧情素材生成一个 8~12 字的竖屏短剧剧名，要求口语化、有钩子、适合平台报审：\n{context}"
-            ),
-        ),
-        TextKind::Synopsis => (
-            "你是短剧报审材料的简介撰写。只输出一段简介正文，不要标题、不要分点。".to_string(),
-            format!(
-                "请根据以下剧情素材写一段 200 字左右的短剧简介，\
-                 要求交代主角设定与目标、核心冲突如何升级、关键转折与最终结局走向，\
-                 叙事连贯有戏剧张力，不要罗列关键词：\n{context}"
-            ),
-        ),
-    }
 }
 
 /// blocking 客户端（统一超时与 UA 标识）。
@@ -218,33 +190,10 @@ fn save_poster_bytes(output_dir: &Path, bytes: &[u8]) -> Result<PathBuf, String>
     std::fs::create_dir_all(output_dir)
         .map_err(|error| format!("创建输出目录失败（{}）：{error}", output_dir.display()))?;
     let path = output_dir.join("剧目海报.png");
-    std::fs::write(&path, bytes)
+    // 原子覆盖：写到一半失败时旧海报原样保留，不会留下截断的 png。
+    crate::paths::write_atomic(&path, bytes)
         .map_err(|error| format!("写入海报失败（{}）：{error}", path.display()))?;
     Ok(path)
-}
-
-/// 深度处理材料阶段的 blocking 生成入口：按设置生成剧名或简介（须在 spawn_blocking 中调用）。
-pub(crate) fn generate_text_blocking(
-    settings: &AppSettings,
-    kind: TextKind,
-    context: &str,
-) -> Result<String, String> {
-    let (base, key, model) = llm_config(settings)?;
-    let (system, user) = build_text_prompt(kind, context);
-    chat_blocking(&base, &key, &model, &system, &user)
-}
-
-/// 生成竖版海报并落盘（blocking，须在 spawn_blocking 中调用）。
-///
-/// 从命令入口抽出的公共实现：命令（手动按钮）与深度处理材料阶段共用，
-/// 落点都是 `output_dir/剧目海报.png`。返回落盘路径。
-pub(crate) fn generate_poster_blocking(
-    settings: &AppSettings,
-    output_dir: &Path,
-) -> Result<PathBuf, String> {
-    let title = settings.drama_title.clone().unwrap_or_default();
-    let synopsis = settings.drama_synopsis.clone().unwrap_or_default();
-    poster_blocking(settings, output_dir, &title, &synopsis)
 }
 
 /// 按指定的剧名/简介生成竖版海报并落盘。
@@ -303,6 +252,11 @@ pub(crate) fn poster_blocking(
 /// LLM 三项配置是否齐全（供材料阶段判断剧名/简介走 AI 还是沿用已有内容）。
 pub(crate) fn storyboard_llm_ready(settings: &AppSettings) -> bool {
     llm_config(settings).is_ok()
+}
+
+/// 生图三项配置是否齐全（未配置时材料线程不发生图请求，退回素材封面）。
+pub(crate) fn poster_api_ready(settings: &AppSettings) -> bool {
+    img_config(settings).is_ok()
 }
 
 /// 自动材料流水线用的组合文本结果。

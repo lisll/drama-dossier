@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use dossier_core::{save_settings, AppSettings, ProbedEpisode};
+use dossier_core::{AppSettings, ProbedEpisode};
 use dossier_media::asr::{AsrPlan, WhisperFlavor};
 use dossier_media::ocr::{Region, RegionFramePlan};
 use dossier_media::render::TimeRange;
@@ -134,6 +134,15 @@ pub struct MaterialPipelineReport {
     pub synopsis_source: String,
     pub poster_source: String,
     pub storyboard_source: String,
+    /// 沿用的海报配的是旧剧名/简介（处理中不重做，费用由用户在结果区确认后才产生）。
+    pub poster_stale: bool,
+    /// 海报过期且可以按新文案重做（AI 海报开着且生图接口已配置）。
+    pub poster_regenerable: bool,
+    /// 当前这张海报是按哪个剧名 / 简介生成的（AI 生成或重做时写入，沿用时原样带过来）。
+    /// 过期判断拿它和本次文案比，提示会一直持续到重做为止。
+    /// `None` = 依据未知（旧目录没有清单可查），清单里不写这一项，下次退回旧的判断方式。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poster_basis: Option<PosterBasis>,
     /// 海报的 data URL，供转码页直接预览；落盘清单里不包含它。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub poster_data_url: Option<String>,
@@ -154,6 +163,9 @@ impl MaterialPipelineReport {
             synopsis_source: "未生成".into(),
             poster_source: "未生成".into(),
             storyboard_source: "未生成".into(),
+            poster_stale: false,
+            poster_regenerable: false,
+            poster_basis: None,
             poster_data_url: None,
         }
     }
@@ -684,38 +696,258 @@ fn ai_source_label(model: &Option<String>) -> String {
     }
 }
 
-fn existing_poster(settings: &AppSettings, output_dir: &Path) -> Option<PathBuf> {
-    settings
-        .poster_path
-        .as_ref()
-        .filter(|path| path.is_file())
-        .cloned()
-        .or_else(|| {
-            ["png", "jpg", "jpeg", "webp"]
-                .iter()
-                .map(|ext| output_dir.join(format!("剧目海报.{ext}")))
-                .find(|path| path.is_file())
-        })
+/// 本次输出目录里已有的海报（上次深度处理的产物）。只认输出目录内的文件：
+/// 输出目录由归属标记（`.dossier-owner.json`，转码开始前检查）保证只属于本剧，
+/// 所以这里不会拿到别的剧的海报；材料线程只沿用它，只有用户确认的重做海报才会替换它。
+fn existing_poster(output_dir: &Path) -> Option<PathBuf> {
+    ["png", "jpg", "jpeg", "webp"]
+        .iter()
+        .map(|ext| output_dir.join(format!("剧目海报.{ext}")))
+        .find(|path| path.is_file())
 }
 
-/// 保存材料流水线元数据，同时不覆盖用户在材料线程运行期间保存的其他设置。
-fn persist_metadata(
-    app: &AppHandle,
+/// AI 文案这一步的结局，决定「没有现成值时」怎么如实标注来源。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AiText {
+    /// 来源开关关闭（本地模式）。
+    Disabled,
+    /// 开关开着，但 LLM 未配置。
+    NotConfigured,
+    /// 调用了但失败。
+    Failed,
+    /// 本次真的生成了。
+    Generated(String),
+}
+
+/// 一项文字材料的最终取值与来源说明（来源会写进 AI 制作证明，必须如实）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Resolved {
+    value: Option<String>,
+    source: String,
+}
+
+const SOURCE_SAVED: &str = "沿用（本剧已保存）";
+const SOURCE_LOCAL_DIR: &str = "本地提供（素材目录）";
+
+/// 没有现成值时，按 AI 结局给出取值与来源。
+fn from_ai(ai: &AiText, llm_label: &str) -> Resolved {
+    let (value, source) = match ai {
+        AiText::Generated(text) => (Some(text.clone()), llm_label.to_string()),
+        AiText::Disabled => (None, "未填写（本地模式）".to_string()),
+        AiText::NotConfigured => (None, "未填写（未配置 LLM）".to_string()),
+        AiText::Failed => (None, "AI 生成失败，未填写".to_string()),
+    };
+    Resolved { value, source }
+}
+
+/// 剧名：本剧已保存 → AI → 不填。
+fn resolve_title(saved: Option<String>, ai: &AiText, llm_label: &str) -> Resolved {
+    match saved {
+        Some(value) => Resolved {
+            value: Some(value),
+            source: SOURCE_SAVED.into(),
+        },
+        None => from_ai(ai, llm_label),
+    }
+}
+
+/// 简介：素材目录 `简介*.txt` → 本剧已保存 → AI → 不填。
+///
+/// 素材目录的文件排最前：用户放了（或改了）简介文件就一定生效，不会被以前保存的值挡住。
+fn resolve_synopsis(
+    saved: Option<String>,
+    local: Option<String>,
+    ai: &AiText,
+    llm_label: &str,
+) -> Resolved {
+    if let Some(value) = local {
+        return Resolved {
+            value: Some(value),
+            source: SOURCE_LOCAL_DIR.into(),
+        };
+    }
+    if let Some(value) = saved {
+        return Resolved {
+            value: Some(value),
+            source: SOURCE_SAVED.into(),
+        };
+    }
+    from_ai(ai, llm_label)
+}
+
+/// 海报的处理方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PosterAction {
+    /// 调生图接口（失败再退回素材封面）。
+    Generate,
+    /// 沿用本次输出目录里已有的海报。
+    ReuseExisting,
+    /// 复制素材目录里的封面。
+    CopyLocalCover,
+    /// 没有任何来源。
+    Missing,
+}
+
+/// 海报：本次输出目录已有 → 一律沿用（处理中不重做：生图要花钱，文案变了由用户在结果区确认后再重做）；
+/// 没有时 AI（开且已配置）→ 素材封面 → 无。
+fn decide_poster(
+    ai_on: bool,
+    api_ready: bool,
+    has_existing: bool,
+    has_local_cover: bool,
+) -> PosterAction {
+    if has_existing {
+        PosterAction::ReuseExisting
+    } else if ai_on && api_ready {
+        PosterAction::Generate
+    } else if has_local_cover {
+        PosterAction::CopyLocalCover
+    } else {
+        PosterAction::Missing
+    }
+}
+
+const MANIFEST_FILE: &str = "material-manifest.json";
+
+/// 一张海报所依据的文案（清单里的 `posterBasis`）。
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PosterBasis {
+    pub title: Option<String>,
+    pub synopsis: Option<String>,
+}
+
+impl PosterBasis {
+    fn of(title: Option<&str>, synopsis: Option<&str>) -> Self {
+        Self {
+            title: title.map(str::to_string),
+            synopsis: synopsis.map(str::to_string),
+        }
+    }
+}
+
+/// 上一次深度处理的清单里，判断海报是否过期所需的字段。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct PreviousManifest {
+    title: Option<String>,
+    synopsis: Option<String>,
+    poster_source: Option<String>,
+    /// 当时那张海报所依据的文案；旧版本清单没有这一项。
+    poster_basis: Option<PosterBasis>,
+}
+
+impl PreviousManifest {
+    /// 上一张海报所依据的文案：清单记了就用记下的；旧版本清单没记，退回清单里的剧名与简介。
+    fn effective_poster_basis(&self) -> PosterBasis {
+        self.poster_basis
+            .clone()
+            .unwrap_or_else(|| PosterBasis::of(self.title.as_deref(), self.synopsis.as_deref()))
+    }
+}
+
+/// 原子写入清单：写到一半失败时上一份清单原样保留（过期判断与重做海报都依赖它）。
+fn write_manifest(output_dir: &Path, value: &serde_json::Value) -> Result<(), String> {
+    let path = output_dir.join(MANIFEST_FILE);
+    let raw = serde_json::to_vec_pretty(value).map_err(|error| format!("生成清单失败：{error}"))?;
+    crate::paths::write_atomic(&path, &raw)
+        .map_err(|error| format!("写入清单失败（{}）：{error}", path.display()))
+}
+
+/// 读上一次的清单；文件不存在或损坏都按「没有上次清单」处理（只影响是否提示海报过期）。
+fn read_previous_manifest(output_dir: &Path) -> Option<PreviousManifest> {
+    let raw = std::fs::read(output_dir.join(MANIFEST_FILE)).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    let text = |key: &str| value[key].as_str().map(str::to_string);
+    Some(PreviousManifest {
+        title: text("title"),
+        synopsis: text("synopsis"),
+        poster_source: text("posterSource"),
+        poster_basis: value
+            .get("posterBasis")
+            .and_then(|basis| serde_json::from_value(basis.clone()).ok()),
+    })
+}
+
+/// 沿用海报时来源写成「沿用（…；原为 X）」；连续多次沿用时取出最初的来源 X，避免越套越长。
+const REUSE_ORIGIN_MARK: &str = "原为 ";
+
+fn original_poster_source(label: &str) -> &str {
+    match label.rfind(REUSE_ORIGIN_MARK) {
+        // 只去掉「沿用（…）」自己的那一个收尾括号：原来源本身可能也以「）」结尾，如「AI 生成（模型 m）」。
+        Some(at) if label.starts_with("沿用（") => {
+            let rest = &label[at + REUSE_ORIGIN_MARK.len()..];
+            rest.strip_suffix('）').unwrap_or(rest)
+        }
+        _ => label,
+    }
+}
+
+/// 沿用输出目录已有海报时的来源说明：带上它最初的来源，`stale` 时写明配的是旧文案。
+fn reused_poster_source(previous: Option<&str>, stale: bool) -> String {
+    let reason = if stale {
+        "文案已变，海报配的是旧剧名/简介"
+    } else {
+        "本次输出目录已有"
+    };
+    match previous
+        .map(original_poster_source)
+        .filter(|s| !s.is_empty())
+    {
+        Some(origin) => format!("沿用（{reason}；{REUSE_ORIGIN_MARK}{origin}）"),
+        None => format!("沿用（{reason}）"),
+    }
+}
+
+/// 沿用的海报是否配的是旧文案：
+/// - 上次海报是 AI 生成的，且本次最终剧名或简介与海报所依据的文案不同 → 过期；
+/// - 没有上次清单，但本次 AI 新生成了剧名或简介 → 过期（海报一定早于这份文案）；
+/// - 上次海报是素材封面等非 AI 来源 → 不过期（它本来就不随文案变化）。
+fn poster_is_stale(
+    previous: Option<&PreviousManifest>,
     title: Option<&str>,
     synopsis: Option<&str>,
-    poster: Option<&Path>,
+    generated_any: bool,
+) -> bool {
+    match previous {
+        Some(previous) => {
+            let ai_poster = previous
+                .poster_source
+                .as_deref()
+                .is_some_and(|source| original_poster_source(source).starts_with("AI 生成"));
+            // 拿「海报当初所依据的文案」比，而不是上一份清单的文案：后者每跑一次就被改写成新文案，
+            // 过期提示只会出现一次；前者在重做之前一直不变，提示会持续到重做（或文案改回原样）为止。
+            let basis = previous.effective_poster_basis();
+            ai_poster && (basis.title.as_deref() != title || basis.synopsis.as_deref() != synopsis)
+        }
+        None => generated_any,
+    }
+}
+
+/// 把本次 **AI 新生成** 的剧名/简介写回本剧材料；沿用或读自素材目录的值不回写
+/// （素材目录里的简介以文件为准，回写后用户改文件就不再生效）。只动这一部剧。
+fn persist_generated(
+    app: &AppHandle,
+    material_key: &str,
+    title: Option<&str>,
+    synopsis: Option<&str>,
 ) -> Result<(), String> {
+    if title.is_none() && synopsis.is_none() {
+        return Ok(());
+    }
     let path = crate::settings_path(app)?;
-    let mut settings = dossier_core::load_settings(&path).settings;
-    if let Some(title) = title {
-        settings.drama_title = Some(title.to_string());
-    }
-    if let Some(synopsis) = synopsis {
-        settings.drama_synopsis = Some(synopsis.to_string());
-    }
-    // 剧名/简介已更新时必须同步海报：生成失败就清空，避免旧海报配新文案。
-    settings.poster_path = poster.map(Path::to_path_buf);
-    save_settings(&path, &settings).map_err(|error| format!("保存材料元数据失败：{error}"))
+    dossier_core::update_settings(&path, |settings| {
+        let mut materials = settings.materials_for(material_key);
+        if let Some(title) = title {
+            materials.title = Some(title.to_string());
+        }
+        if let Some(synopsis) = synopsis {
+            materials.synopsis = Some(synopsis.to_string());
+        }
+        settings.set_materials_for(material_key, materials);
+        Ok(())
+    })
+    .map(|_| ())
+    .map_err(|error| format!("保存材料元数据失败：{error}"))
 }
 
 fn local_date_string() -> String {
@@ -738,11 +970,11 @@ fn local_date_string() -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+/// AI 制作证明的字段。另存进清单（`proofPayload`），「按新文案重做海报」时据此重渲证明。
 #[allow(clippy::too_many_arguments)]
-fn write_ai_proof(
+fn build_proof_payload(
     app: &AppHandle,
     context: &MaterialProofContext,
-    output_dir: &Path,
     evidence: Option<&ContentEvidence>,
     title: Option<&str>,
     title_source: &str,
@@ -752,9 +984,9 @@ fn write_ai_proof(
     poster_source: &str,
     storyboard_source: &str,
     process_count: usize,
-) -> Result<PathBuf, String> {
+) -> serde_json::Value {
     let version = app.package_info().version.to_string();
-    let payload = json!({
+    json!({
         "date": local_date_string(),
         "version": version,
         "dramaName": context.drama_name,
@@ -782,12 +1014,19 @@ fn write_ai_proof(
             .unwrap_or_default(),
         "processCount": process_count,
         "storyboardSource": storyboard_source,
-    });
-    // 优先出图片证明；排版 Python 不可用时退回文本版，保证证明文件不缺位。
-    if let Ok(path) = write_ai_proof_image(app, output_dir, &payload) {
+    })
+}
+
+/// 渲染 AI 制作证明：优先出图片；排版 Python 不可用时退回文本版，保证证明文件不缺位。
+fn render_ai_proof(
+    app: &AppHandle,
+    output_dir: &Path,
+    payload: &serde_json::Value,
+) -> Result<PathBuf, String> {
+    if let Ok(path) = write_ai_proof_image(app, output_dir, payload) {
         return Ok(path);
     }
-    write_ai_proof_text(output_dir, &payload)
+    write_ai_proof_text(output_dir, payload)
 }
 
 /// 调 Pillow 脚本把证明字段渲染成 `AI制作证明.png`（toolbox 兜底证明复用）。
@@ -902,12 +1141,21 @@ fn poster_preview_data_url(path: &Path) -> Option<String> {
     ))
 }
 
-/// 生成 4 张过程图：直接从原始抽样分集抽帧，不等待深度处理成片。
+/// 过程图画布上的文字与海报：本次最终的剧名、简介与海报（脚本据此排「故事梗概」等区块）。
+struct ProcessImageContext<'a> {
+    title: &'a str,
+    synopsis: Option<&'a str>,
+    poster: Option<&'a Path>,
+}
+
+/// 生成 4 张过程图：直接从原始抽样分集抽帧，不等待深度处理成片；
+/// 由 Pillow 脚本排成「AI 分镜创作画布」整屏截图（剧名 / 简介 / 海报进画布）。
 fn generate_process_images(
     app: &AppHandle,
     ffmpeg: &Path,
     episodes: &[ProbedEpisode],
     output_dir: &Path,
+    canvas: &ProcessImageContext,
 ) -> Result<Vec<PathBuf>, String> {
     let frames_dir = output_dir.join(".material-frames");
     let _ = std::fs::remove_dir_all(&frames_dir);
@@ -981,6 +1229,15 @@ fn generate_process_images(
                 .join(","),
         ])
         .args(["--labels", &labels.join("|")])
+        .args(["--title", canvas.title])
+        .args(["--synopsis", canvas.synopsis.unwrap_or_default()])
+        .args([
+            "--poster",
+            &canvas
+                .poster
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+        ])
         .timeout(Duration::from_secs(120));
     let output = SystemRunner::new().run(&spec).map_err(|error| {
         let _ = std::fs::remove_dir_all(&frames_dir);
@@ -1094,14 +1351,18 @@ fn material_pipeline_blocking(
             synopsis_source: "未启用".into(),
             poster_source: "未启用".into(),
             storyboard_source: "未启用".into(),
+            poster_stale: false,
+            poster_regenerable: false,
+            poster_basis: None,
             poster_data_url: None,
         });
     }
 
     std::fs::create_dir_all(output_dir)
         .map_err(|error| format!("创建输出目录失败（{}）：{error}", output_dir.display()))?;
-    // 清单与证据每次重建；旧海报保留到替换成功或新海报明确失败，避免失效元数据。
-    let _ = std::fs::remove_file(output_dir.join("material-manifest.json"));
+    // 证据每次重建。清单**不预先删除**：只在本轮结束时原子覆盖，中途停止或失败时上一份清单原样保留，
+    // 下次的过期判断与「按新文案重做海报」都还能用。先记下上一份清单里与海报有关的字段。
+    let previous_manifest = read_previous_manifest(output_dir);
     let _ = std::fs::remove_dir_all(output_dir.join(".material-content"));
 
     let evidence = if runtime.ready {
@@ -1149,15 +1410,25 @@ fn material_pipeline_blocking(
         return Err("已停止".into());
     }
 
+    // ── 文字材料：按剧读取已保存值。剧名：本剧已保存 → AI → 不填；
+    //    简介：素材目录 → 本剧已保存 → AI → 不填 ──
+    let material_key = crate::paths::material_key(drama_dir);
+    let saved = settings.materials_for(&material_key);
+    let saved_title = non_empty(&saved.title);
+    let saved_synopsis = non_empty(&saved.synopsis);
+    let local_synopsis = crate::toolbox::read_local_synopsis(drama_dir);
+    let title_ai_on = settings.ai_title_enabled != Some(false);
+    let synopsis_ai_on = settings.ai_synopsis_enabled != Some(false);
+    let llm_label = ai_source_label(&settings.llm_model);
+    // 只有真的缺、且开关开着时才调 LLM：已有剧名和简介就不白花一次调用。
+    let need_title = title_ai_on && saved_title.is_none();
+    let need_synopsis = synopsis_ai_on && saved_synopsis.is_none() && local_synopsis.is_none();
     let llm_ready = ai::storyboard_llm_ready(settings);
-    let _ = app.emit(
-        "material-progress",
-        json!({
-            "stage": "ai",
-            "label": if llm_ready { "材料线程：正在生成剧名与简介" } else { "材料线程：LLM 未配置，整理已有文案" },
-        }),
-    );
-    let identity = if llm_ready {
+    let identity = if (need_title || need_synopsis) && llm_ready {
+        let _ = app.emit(
+            "material-progress",
+            json!({ "stage": "ai", "label": "材料线程：正在生成剧名与简介" }),
+        );
         let context = evidence.as_ref().map(evidence_prompt).unwrap_or_else(|| {
             // ASR/OCR 不可用时至少给出剧目目录名、集数与已有文案，
             // 否则模型拿不到任何剧情线索，只能输出空洞的模板话。
@@ -1165,10 +1436,11 @@ fn material_pipeline_blocking(
                 "剧目目录名：{}；原始素材 {} 集。",
                 proof.drama_name, proof.original_episodes
             );
-            if let Some(title) = non_empty(&settings.drama_title) {
+            if let Some(title) = &saved_title {
                 context.push_str(&format!("已有剧名：{title}。"));
             }
-            if let Some(synopsis) = non_empty(&settings.drama_synopsis) {
+            // 与简介的来源顺序一致：素材目录的简介优先于本剧已保存的。
+            if let Some(synopsis) = local_synopsis.as_ref().or(saved_synopsis.as_ref()) {
                 context.push_str(&format!("已有简介：{synopsis}"));
             }
             context
@@ -1185,65 +1457,98 @@ fn material_pipeline_blocking(
             }
         }
     } else {
-        messages.push("LLM 未配置，剧名/简介沿用已有内容。".into());
-        crate::logging::log_event("材料", "LLM 未配置，剧名/简介跳过 AI 生成，沿用已有内容");
+        if (need_title || need_synopsis) && !llm_ready {
+            messages.push("LLM 未配置，缺失的剧名/简介未生成。".into());
+            crate::logging::log_event("材料", "LLM 未配置，缺失的剧名/简介跳过 AI 生成");
+        }
         None
     };
-
-    let existing_title = non_empty(&settings.drama_title);
-    let existing_synopsis = non_empty(&settings.drama_synopsis);
-    let title_ai_on = settings.ai_title_enabled != Some(false);
-    let synopsis_ai_on = settings.ai_synopsis_enabled != Some(false);
-    let llm_label = ai_source_label(&settings.llm_model);
-
-    let (title, title_source) = if let Some(title) = existing_title.clone() {
-        let source = if title_ai_on {
-            llm_label.clone()
+    let ai_text = |on: bool, needed: bool, generated: Option<&String>| {
+        if !on {
+            AiText::Disabled
+        } else if let Some(text) = generated {
+            AiText::Generated(text.clone())
+        } else if needed && !llm_ready {
+            AiText::NotConfigured
         } else {
-            "本地提供".into()
-        };
-        (Some(title), source)
-    } else if title_ai_on {
-        match identity.as_ref().map(|identity| identity.title.clone()) {
-            Some(title) => (Some(title), llm_label.clone()),
-            None => (None, "AI 生成失败，未填写".into()),
+            AiText::Failed
         }
-    } else {
-        (None, "未填写（本地模式）".into())
     };
-
-    let (synopsis, synopsis_source) = if let Some(synopsis) = existing_synopsis.clone() {
-        let source = if synopsis_ai_on {
-            llm_label.clone()
-        } else {
-            "本地提供".into()
-        };
-        (Some(synopsis), source)
-    } else if synopsis_ai_on {
-        match identity.as_ref().map(|identity| identity.synopsis.clone()) {
-            Some(synopsis) => (Some(synopsis), llm_label.clone()),
-            None => (None, "AI 生成失败，未填写".into()),
-        }
-    } else {
-        (None, "未填写（本地模式）".into())
-    };
+    let title_ai = ai_text(
+        title_ai_on,
+        need_title,
+        identity.as_ref().map(|identity| &identity.title),
+    );
+    let synopsis_ai = ai_text(
+        synopsis_ai_on,
+        need_synopsis,
+        identity.as_ref().map(|identity| &identity.synopsis),
+    );
+    let title_resolved = resolve_title(saved_title.clone(), &title_ai, &llm_label);
+    let synopsis_resolved = resolve_synopsis(
+        saved_synopsis.clone(),
+        local_synopsis.clone(),
+        &synopsis_ai,
+        &llm_label,
+    );
+    // 本次新生成的值（只有它们需要写回本剧材料，也只有它们会让旧海报过期）。
+    let generated_title = (saved_title.is_none())
+        .then(|| match &title_ai {
+            AiText::Generated(text) => Some(text.clone()),
+            _ => None,
+        })
+        .flatten();
+    let generated_synopsis = (saved_synopsis.is_none() && local_synopsis.is_none())
+        .then(|| match &synopsis_ai {
+            AiText::Generated(text) => Some(text.clone()),
+            _ => None,
+        })
+        .flatten();
+    let (title, title_source) = (title_resolved.value, title_resolved.source);
+    let (synopsis, synopsis_source) = (synopsis_resolved.value, synopsis_resolved.source);
 
     // 过程图不再携带分镜概要文字（纯原片帧 + 角标），来源固定为原始素材抽帧。
     let storyboard_source = "原始素材抽帧".to_string();
 
-    let old_poster = existing_poster(settings, output_dir);
-    let text_changed = title != existing_title || synopsis != existing_synopsis;
+    // ── 海报：本次输出目录已有就沿用（处理中不重做）→ AI → 素材封面 → 无 ──
+    let old_poster = existing_poster(output_dir);
     let poster_ai_on = settings.ai_poster_enabled != Some(false);
-    let should_generate_poster = poster_ai_on && (old_poster.is_none() || text_changed);
+    let poster_api_ready = ai::poster_api_ready(settings);
+    let action = decide_poster(
+        poster_ai_on,
+        poster_api_ready,
+        old_poster.is_some(),
+        crate::toolbox::find_local_cover(drama_dir).is_some(),
+    );
+    let poster_stale = action == PosterAction::ReuseExisting
+        && poster_is_stale(
+            previous_manifest.as_ref(),
+            title.as_deref(),
+            synopsis.as_deref(),
+            generated_title.is_some() || generated_synopsis.is_some(),
+        );
+    let poster_regenerable = poster_stale && poster_ai_on && poster_api_ready;
+    if poster_stale {
+        messages.push(if poster_regenerable {
+            "剧名或简介已变化，海报仍是旧文案。可在结果区点「按新文案重做海报」（会调用生图接口，产生费用）。"
+                .to_string()
+        } else {
+            "剧名或简介已变化，海报仍是旧文案。打开 AI 海报并配置生图接口后可按新文案重做。".to_string()
+        });
+    }
     let _ = app.emit(
         "material-progress",
         json!({
             "stage": "poster",
-            "label": if should_generate_poster { "材料线程：正在生成海报" } else { "材料线程：检查已有海报" },
+            "label": if action == PosterAction::Generate { "材料线程：正在生成海报" } else { "材料线程：检查已有海报" },
         }),
     );
-    let (poster, poster_source) = if should_generate_poster {
-        match ai::poster_blocking(
+    let copy_cover = |reason: &str| match crate::toolbox::copy_local_cover(drama_dir, output_dir) {
+        Some(path) => (Some(path), "本地提供（素材封面）".to_string()),
+        None => (None, reason.to_string()),
+    };
+    let (poster, poster_source) = match action {
+        PosterAction::Generate => match ai::poster_blocking(
             settings,
             output_dir,
             title.as_deref().unwrap_or_default(),
@@ -1251,36 +1556,45 @@ fn material_pipeline_blocking(
         ) {
             Ok(path) => (Some(path), ai_source_label(&settings.img_model)),
             Err(error) => {
-                if let Some(path) = old_poster.as_ref() {
-                    let _ = std::fs::remove_file(path);
-                }
+                // 走到这里说明输出目录原本没有海报（有就沿用、不会生图），没有旧文件要处理。
                 messages.push(format!("海报生成失败（其余材料继续）：{error}"));
                 crate::logging::log_event(
                     "材料",
                     format!("海报生成失败（跳过，兜底素材封面）：{error}"),
                 );
-                // 兜底：复制素材目录里的封面（报审素材按规范都带封面）。
-                match crate::toolbox::copy_local_cover(drama_dir, output_dir) {
-                    Some(path) => (Some(path), "本地提供（素材封面）".into()),
-                    None => (None, "AI 生成失败，未生成".into()),
-                }
+                copy_cover("AI 生成失败，未生成")
             }
+        },
+        PosterAction::ReuseExisting => (
+            old_poster,
+            reused_poster_source(
+                previous_manifest
+                    .as_ref()
+                    .and_then(|previous| previous.poster_source.as_deref()),
+                poster_stale,
+            ),
+        ),
+        PosterAction::CopyLocalCover => copy_cover("未提供"),
+        PosterAction::Missing => {
+            let source = if !poster_ai_on {
+                "未提供（本地模式）"
+            } else {
+                "未提供（未配置生图接口，素材目录也没有封面）"
+            };
+            crate::logging::log_event("材料", format!("海报缺失（{source}），材料流水线继续"));
+            (None, source.to_string())
         }
-    } else if let Some(path) = old_poster {
-        let source = if poster_ai_on {
-            "已生成（本次复用）".into()
-        } else {
-            "本地提供".into()
-        };
-        (Some(path), source)
-    } else {
-        let source = if poster_ai_on {
-            "AI 生成失败，未生成".into()
-        } else {
-            "未提供（本地模式）".into()
-        };
-        crate::logging::log_event("材料", format!("海报缺失（{source}），材料流水线继续"));
-        (None, source)
+    };
+    // 这张海报所依据的文案：本次 AI 生成的就是本次文案；沿用的原样带上一张的依据
+    // （旧目录没有清单时依据未知，不写，下次退回旧的判断方式）；素材封面 / 缺失与文案无关。
+    let poster_basis = match action {
+        PosterAction::Generate if poster_source.starts_with("AI 生成") => {
+            Some(PosterBasis::of(title.as_deref(), synopsis.as_deref()))
+        }
+        PosterAction::ReuseExisting => previous_manifest
+            .as_ref()
+            .map(PreviousManifest::effective_poster_basis),
+        _ => Some(PosterBasis::default()),
     };
 
     if crate::toolbox::transcode_cancelled() {
@@ -1293,7 +1607,16 @@ fn material_pipeline_blocking(
             "label": "材料线程：正在生成过程图",
         }),
     );
-    let process_images = match generate_process_images(app, ffmpeg, episodes, output_dir) {
+    // 剧名为空时退回剧目名（与远程 0257ac1 在旧兜底路径里的做法一致），画布标题不留空。
+    let canvas = ProcessImageContext {
+        title: title
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or(&proof.drama_name),
+        synopsis: synopsis.as_deref(),
+        poster: poster.as_deref(),
+    };
+    let process_images = match generate_process_images(app, ffmpeg, episodes, output_dir, &canvas) {
         Ok(paths) => paths,
         Err(error) => {
             messages.push(format!("过程图生成失败：{error}"));
@@ -1310,10 +1633,9 @@ fn material_pipeline_blocking(
             messages.push(format!("简介.txt 写入失败：{error}"));
         }
     }
-    let proof_path = match write_ai_proof(
+    let proof_payload = build_proof_payload(
         app,
         proof,
-        output_dir,
         evidence.as_ref(),
         title.as_deref(),
         &title_source,
@@ -1323,18 +1645,19 @@ fn material_pipeline_blocking(
         &poster_source,
         &storyboard_source,
         process_images.len(),
-    ) {
+    );
+    let proof_path = match render_ai_proof(app, output_dir, &proof_payload) {
         Ok(path) => Some(path),
         Err(error) => {
             messages.push(error);
             None
         }
     };
-    if let Err(error) = persist_metadata(
+    if let Err(error) = persist_generated(
         app,
-        title.as_deref(),
-        synopsis.as_deref(),
-        poster.as_deref(),
+        &material_key,
+        generated_title.as_deref(),
+        generated_synopsis.as_deref(),
     ) {
         messages.push(error);
     }
@@ -1345,7 +1668,7 @@ fn material_pipeline_blocking(
         "partial"
     };
     let poster_data_url = poster.as_deref().and_then(poster_preview_data_url);
-    let report = MaterialPipelineReport {
+    let mut report = MaterialPipelineReport {
         status: status.into(),
         title,
         synopsis,
@@ -1358,16 +1681,192 @@ fn material_pipeline_blocking(
         synopsis_source,
         poster_source,
         storyboard_source,
+        poster_stale,
+        poster_regenerable,
+        poster_basis,
         poster_data_url,
     };
-    let manifest = output_dir.join("material-manifest.json");
-    // data URL 只用于本次界面的预览回包，落盘清单保留路径即可，避免文件膨胀。
+    // data URL 只用于本次界面的预览回包，落盘清单保留路径即可，避免文件膨胀；
+    // 清单另带一份证明字段（proofPayload），「按新文案重做海报」时据此重渲证明。
     let mut manifest_report = report.clone();
     manifest_report.poster_data_url = None;
-    if let Ok(raw) = serde_json::to_vec_pretty(&manifest_report) {
-        let _ = std::fs::write(manifest, raw);
+    let written = serde_json::to_value(&manifest_report)
+        .map_err(|error| format!("生成清单失败：{error}"))
+        .and_then(|mut value| {
+            value["proofPayload"] = proof_payload;
+            write_manifest(output_dir, &value)
+        });
+    if let Err(error) = written {
+        // 清单写不进去：上一份清单原样保留（原子写），但要让用户看到——
+        // 下次的过期判断与重做海报都依赖它。
+        crate::logging::log_event("材料", &error);
+        report.messages.push(format!(
+            "{error}。下次深度处理的海报过期判断可能不准，「按新文案重做海报」也可能不可用。"
+        ));
+        report.status = "partial".into();
     }
     Ok(report)
+}
+
+/// 过期提示消息的特征文本（材料线程写入、重做成功后移除）。
+const STALE_POSTER_MESSAGE_MARK: &str = "海报仍是旧文案";
+
+/// 重做海报成功后改写清单：记下新海报与它所依据的文案，清掉过期标记与过期提示；
+/// 没有别的警告了就把状态改回「已完成」。
+fn apply_regenerated_poster(
+    manifest: &mut serde_json::Value,
+    poster: &Path,
+    poster_source: &str,
+    proof: Option<&Path>,
+    basis: PosterBasis,
+) {
+    manifest["poster"] = json!(poster.display().to_string());
+    manifest["posterSource"] = json!(poster_source);
+    manifest["posterStale"] = json!(false);
+    manifest["posterRegenerable"] = json!(false);
+    manifest["posterBasis"] = json!(basis);
+    if let Some(path) = proof {
+        manifest["proof"] = json!(path.display().to_string());
+    }
+    if let Some(list) = manifest["messages"].as_array_mut() {
+        list.retain(|message| {
+            !message
+                .as_str()
+                .is_some_and(|text| text.contains(STALE_POSTER_MESSAGE_MARK))
+        });
+        if list.is_empty() {
+            manifest["status"] = json!("completed");
+        }
+    }
+}
+
+/// 「按新文案重做海报」的结果。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PosterRegeneration {
+    pub poster: PathBuf,
+    pub poster_source: String,
+    pub proof: Option<PathBuf>,
+    pub messages: Vec<String>,
+}
+
+/// 从上一次深度处理的清单里取重做海报所需的剧名与简介；清单缺失、损坏或没有剧名时报错。
+fn manifest_for_regeneration(output_dir: &Path) -> Result<serde_json::Value, String> {
+    let path = output_dir.join(MANIFEST_FILE);
+    let raw = std::fs::read(&path).map_err(|error| {
+        format!(
+            "输出目录里没有深度处理清单（{}）：{error}。请先完成一次深度处理。",
+            path.display()
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&raw)
+        .map_err(|error| format!("深度处理清单无法识别（{}）：{error}", path.display()))?;
+    if value["title"]
+        .as_str()
+        .is_none_or(|title| title.trim().is_empty())
+    {
+        return Err("清单里没有剧名，无法按新文案重做海报。".into());
+    }
+    Ok(value)
+}
+
+/// 按清单里的最新剧名/简介重做海报（用户在结果区确认后才调用，会产生生图费用）。
+///
+/// 只允许写本剧的输出目录：目录在剧目目录内，或归属标记属于本剧。成功后才替换旧海报，
+/// 并据清单里的 `proofPayload` 重渲 AI 制作证明、改写清单。
+pub(crate) fn regenerate_poster_blocking(
+    app: &AppHandle,
+    drama: &dossier_core::Drama,
+    output_dir: &Path,
+) -> Result<PosterRegeneration, String> {
+    // 顺序：先占用目录（深度处理进行中直接拒绝）→ 清单（没有清单时如实说「先跑一次」，
+    // 而不是误报归属）→ 归属 → 设置（严格读取，损坏时如实报错，不拿默认值说成「未配置」）。
+    let _busy = crate::paths::claim_output_dir(output_dir).map_err(|()| {
+        format!(
+            "《{}》的输出目录正在深度处理，请等处理结束后再重做海报。",
+            drama.name
+        )
+    })?;
+    let mut manifest = manifest_for_regeneration(output_dir)?;
+    let owner_key = crate::paths::material_key(&drama.dir);
+    match crate::toolbox::check_output_owner(output_dir, &drama.dir, &owner_key)? {
+        crate::toolbox::OwnerState::InsideDramaDir | crate::toolbox::OwnerState::Owned => {}
+        _ => {
+            return Err(format!(
+                "输出目录 {} 不属于《{}》，已拒绝重做海报。",
+                output_dir.display(),
+                drama.name
+            ))
+        }
+    }
+    let settings = dossier_core::try_load_settings(&crate::settings_path(app)?)?;
+    if settings.ai_poster_enabled == Some(false) {
+        return Err("AI 海报开关已关闭，无法重做海报。请先在转码页打开海报的 AI 开关。".into());
+    }
+    if !ai::poster_api_ready(&settings) {
+        return Err("生图接口未配置，无法重做海报。请在「设置 → 生成设置」配置后重试。".into());
+    }
+    let title = manifest["title"].as_str().unwrap_or_default().to_string();
+    let synopsis = manifest["synopsis"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let old_poster = existing_poster(output_dir);
+    // poster_blocking 只在下载完成后才写文件：失败时旧海报原样保留。
+    let poster = ai::poster_blocking(&settings, output_dir, &title, &synopsis)?;
+    if let Some(old) = old_poster.filter(|old| *old != poster) {
+        let _ = std::fs::remove_file(old);
+    }
+    let poster_source = ai_source_label(&settings.img_model);
+    let mut messages = Vec::new();
+    let proof = match manifest.get_mut("proofPayload").filter(|v| v.is_object()) {
+        Some(payload) => {
+            payload["date"] = json!(local_date_string());
+            payload["posterName"] = json!(poster
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default());
+            payload["posterSource"] = json!(poster_source);
+            payload["posterPath"] = json!(poster.display().to_string());
+            let payload = payload.clone();
+            match render_ai_proof(app, output_dir, &payload) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    messages.push(format!("海报已重做，但 AI 制作证明重渲失败：{error}"));
+                    None
+                }
+            }
+        }
+        None => {
+            messages.push(
+                "清单缺少证明字段（旧版本生成），AI 制作证明未更新，请重新深度处理一次。".into(),
+            );
+            None
+        }
+    };
+    apply_regenerated_poster(
+        &mut manifest,
+        &poster,
+        &poster_source,
+        proof.as_deref(),
+        // 与材料线程记依据的口径一致：简介为空时记为 None（清单里的 synopsis 同样是 null）。
+        PosterBasis::of(
+            Some(title.as_str()),
+            Some(synopsis.as_str()).filter(|text| !text.is_empty()),
+        ),
+    );
+    write_manifest(output_dir, &manifest)
+        .map_err(|error| format!("海报已重做，但改写清单失败：{error}"))?;
+    crate::logging::log_event(
+        "材料",
+        format!("《{}》按新文案重做海报：{}", drama.name, poster.display()),
+    );
+    Ok(PosterRegeneration {
+        poster,
+        poster_source,
+        proof,
+        messages,
+    })
 }
 
 #[cfg(test)]
@@ -1386,6 +1885,278 @@ torch.load with map_location=torch.device('cpu') to map your storages to the CPU
         assert!(!asr_gpu_failure_worth_cpu_retry(
             "Invalid data found when processing input"
         ));
+    }
+
+    #[test]
+    fn title_and_synopsis_follow_source_order_with_honest_labels() {
+        let label = "AI 生成（模型 m）";
+        let generated = AiText::Generated("AI 文案".into());
+        // 本剧已保存优先，即使 AI 本次也有结果；来源不得冒充模型生成。
+        let resolved = resolve_title(Some("已存剧名".into()), &generated, label);
+        assert_eq!(resolved.value.as_deref(), Some("已存剧名"));
+        assert_eq!(resolved.source, SOURCE_SAVED);
+        // 素材目录有简介、LLM 未配置 → 复用本地。
+        let resolved =
+            resolve_synopsis(None, Some("本地简介".into()), &AiText::NotConfigured, label);
+        assert_eq!(resolved.value.as_deref(), Some("本地简介"));
+        assert_eq!(resolved.source, SOURCE_LOCAL_DIR);
+        // 素材目录的简介排在本剧已保存之前：后补的 简介.txt 一定生效。
+        let resolved = resolve_synopsis(
+            Some("以前保存的 AI 简介".into()),
+            Some("后补的本地简介".into()),
+            &AiText::NotConfigured,
+            label,
+        );
+        assert_eq!(resolved.value.as_deref(), Some("后补的本地简介"));
+        assert_eq!(resolved.source, SOURCE_LOCAL_DIR);
+        // 没有本地简介时沿用本剧已保存的。
+        let resolved = resolve_synopsis(Some("已存简介".into()), None, &generated, label);
+        assert_eq!(resolved.value.as_deref(), Some("已存简介"));
+        assert_eq!(resolved.source, SOURCE_SAVED);
+        // 只有本次真的生成了才标模型名。
+        let resolved = resolve_synopsis(None, None, &generated, label);
+        assert_eq!(resolved.source, label);
+        // 什么都没有：按原因如实标注。
+        for (ai, expected) in [
+            (AiText::Disabled, "未填写（本地模式）"),
+            (AiText::NotConfigured, "未填写（未配置 LLM）"),
+            (AiText::Failed, "AI 生成失败，未填写"),
+        ] {
+            let resolved = resolve_title(None, &ai, label);
+            assert_eq!(resolved.value, None);
+            assert_eq!(resolved.source, expected);
+        }
+    }
+
+    #[test]
+    fn poster_decision_never_regenerates_existing_poster() {
+        use PosterAction::*;
+        // (ai_on, api_ready, has_existing, has_local_cover) → 期望
+        let cases = [
+            ((true, true, false, false), Generate),
+            ((true, true, false, true), Generate),
+            // 已有海报：一律沿用，处理中不重做（重做要用户在结果区确认）。
+            ((true, true, true, true), ReuseExisting),
+            ((false, false, true, false), ReuseExisting),
+            // 关掉 AI：有封面就复用封面。
+            ((false, true, false, true), CopyLocalCover),
+            // 开着 AI 但没配生图接口：不发请求，退回封面。
+            ((true, false, false, true), CopyLocalCover),
+            ((false, false, false, false), Missing),
+        ];
+        for ((ai_on, ready, existing, cover), expected) in cases {
+            assert_eq!(
+                decide_poster(ai_on, ready, existing, cover),
+                expected,
+                "ai_on={ai_on} ready={ready} existing={existing} cover={cover}"
+            );
+        }
+    }
+
+    #[test]
+    fn poster_staleness_follows_previous_manifest() {
+        // 旧版本清单（没有 posterBasis）：退回拿清单里的剧名与简介比。
+        let ai_prev = PreviousManifest {
+            title: Some("旧剧名".into()),
+            synopsis: Some("旧简介".into()),
+            poster_source: Some("AI 生成（模型 m）".into()),
+            poster_basis: None,
+        };
+        // AI 海报 + 简介变了 → 过期；文案没变 → 不过期。
+        assert!(poster_is_stale(
+            Some(&ai_prev),
+            Some("旧剧名"),
+            Some("新简介"),
+            false
+        ));
+        assert!(!poster_is_stale(
+            Some(&ai_prev),
+            Some("旧剧名"),
+            Some("旧简介"),
+            false
+        ));
+        // 上次已是「沿用（…；原为 AI 生成…）」：仍按 AI 海报判断。
+        let reused_prev = PreviousManifest {
+            poster_source: Some(reused_poster_source(Some("AI 生成（模型 m）"), false)),
+            ..ai_prev.clone()
+        };
+        assert!(poster_is_stale(
+            Some(&reused_prev),
+            Some("新剧名"),
+            Some("旧简介"),
+            false
+        ));
+        // 素材封面复制来的海报：文案变了也不算过期。
+        let cover_prev = PreviousManifest {
+            poster_source: Some("本地提供（素材封面）".into()),
+            ..ai_prev.clone()
+        };
+        assert!(!poster_is_stale(
+            Some(&cover_prev),
+            Some("新剧名"),
+            Some("新简介"),
+            true
+        ));
+        // 没有上次清单：本次 AI 新生成了文案才算过期。
+        assert!(poster_is_stale(None, Some("x"), None, true));
+        assert!(!poster_is_stale(None, Some("x"), None, false));
+    }
+
+    #[test]
+    fn poster_staleness_persists_until_regenerated() {
+        // 新版本清单记着海报所依据的文案：上一份清单的文案已是新文案（上一轮沿用时写入），
+        // 只要海报没重做，依据仍是旧文案，每次都判过期——这正是以前只提示一次的漏洞。
+        let basis = PosterBasis::of(Some("剧名"), Some("第一版简介"));
+        let reused_once = PreviousManifest {
+            title: Some("剧名".into()),
+            synopsis: Some("第二版简介".into()),
+            poster_source: Some(reused_poster_source(Some("AI 生成（模型 m）"), true)),
+            poster_basis: Some(basis.clone()),
+        };
+        assert!(poster_is_stale(
+            Some(&reused_once),
+            Some("剧名"),
+            Some("第二版简介"),
+            false
+        ));
+        // 文案改回海报当初用的那一版：不再过期。
+        assert!(!poster_is_stale(
+            Some(&reused_once),
+            Some("剧名"),
+            Some("第一版简介"),
+            false
+        ));
+        // 重做后依据更新为新文案：不再过期。
+        let regenerated = PreviousManifest {
+            poster_source: Some("AI 生成（模型 m）".into()),
+            poster_basis: Some(PosterBasis::of(Some("剧名"), Some("第二版简介"))),
+            ..reused_once.clone()
+        };
+        assert!(!poster_is_stale(
+            Some(&regenerated),
+            Some("剧名"),
+            Some("第二版简介"),
+            false
+        ));
+    }
+
+    #[test]
+    fn regenerated_manifest_clears_stale_state_and_records_basis() {
+        let mut manifest = json!({
+            "status": "partial",
+            "posterStale": true,
+            "posterRegenerable": true,
+            "messages": ["剧名或简介已变化，海报仍是旧文案。可在结果区点「按新文案重做海报」"],
+        });
+        apply_regenerated_poster(
+            &mut manifest,
+            Path::new("/输出/剧目海报.png"),
+            "AI 生成（模型 m）",
+            Some(Path::new("/输出/AI制作证明.png")),
+            PosterBasis::of(Some("剧名"), Some("新简介")),
+        );
+        assert_eq!(manifest["posterStale"], false);
+        assert_eq!(manifest["posterRegenerable"], false);
+        assert_eq!(manifest["messages"].as_array().unwrap().len(), 0);
+        assert_eq!(manifest["status"], "completed", "没有别的警告时改回已完成");
+        assert_eq!(manifest["posterBasis"]["synopsis"], "新简介");
+        assert_eq!(manifest["proof"], "/输出/AI制作证明.png");
+        // 还有别的警告：状态保持 partial。
+        let mut manifest = json!({
+            "status": "partial",
+            "messages": ["海报仍是旧文案", "过程图生成失败：x"],
+        });
+        apply_regenerated_poster(
+            &mut manifest,
+            Path::new("/p.png"),
+            "AI 生成",
+            None,
+            PosterBasis::default(),
+        );
+        assert_eq!(manifest["status"], "partial");
+        assert_eq!(manifest["messages"].as_array().unwrap().len(), 1);
+        // 新清单写出的 posterBasis 能被下一轮读回。
+        let dir = std::env::temp_dir().join(format!("dossier-basis-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_manifest(
+            &dir,
+            &json!({"title": "剧名", "posterBasis": {"title": "剧名", "synopsis": null}}),
+        )
+        .unwrap();
+        let previous = read_previous_manifest(&dir).unwrap();
+        assert_eq!(
+            previous.effective_poster_basis(),
+            PosterBasis::of(Some("剧名"), None)
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reused_poster_source_keeps_original_without_nesting() {
+        let once = reused_poster_source(Some("AI 生成（模型 m）"), false);
+        assert_eq!(once, "沿用（本次输出目录已有；原为 AI 生成（模型 m））");
+        let twice = reused_poster_source(Some(&once), true);
+        assert_eq!(
+            twice,
+            "沿用（文案已变，海报配的是旧剧名/简介；原为 AI 生成（模型 m））"
+        );
+        assert_eq!(original_poster_source(&twice), "AI 生成（模型 m）");
+        assert_eq!(
+            reused_poster_source(None, false),
+            "沿用（本次输出目录已有）"
+        );
+    }
+
+    #[test]
+    fn previous_manifest_and_regeneration_manifest_handle_missing_or_bad_files() {
+        let dir = std::env::temp_dir().join(format!("dossier-manifest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 没有清单：上次清单为空；重做被拒绝。
+        assert_eq!(read_previous_manifest(&dir), None);
+        assert!(manifest_for_regeneration(&dir)
+            .unwrap_err()
+            .contains("没有深度处理清单"));
+        // 损坏：同样按没有处理。
+        std::fs::write(dir.join(MANIFEST_FILE), b"{ broken").unwrap();
+        assert_eq!(read_previous_manifest(&dir), None);
+        assert!(manifest_for_regeneration(&dir).is_err());
+        // 旧格式缺字段：读得出，缺的字段为空；没有剧名时拒绝重做。
+        std::fs::write(dir.join(MANIFEST_FILE), r#"{"synopsis":"简介"}"#).unwrap();
+        assert_eq!(
+            read_previous_manifest(&dir),
+            Some(PreviousManifest {
+                synopsis: Some("简介".into()),
+                ..Default::default()
+            })
+        );
+        assert!(manifest_for_regeneration(&dir)
+            .unwrap_err()
+            .contains("没有剧名"));
+        std::fs::write(
+            dir.join(MANIFEST_FILE),
+            r#"{"title":"剧名","synopsis":"简介"}"#,
+        )
+        .unwrap();
+        assert_eq!(manifest_for_regeneration(&dir).unwrap()["title"], "剧名");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn existing_poster_only_looks_inside_output_dir() {
+        let base = std::env::temp_dir().join(format!("dossier-poster-{}", std::process::id()));
+        let drama_a = base.join("A输出");
+        let drama_b = base.join("B输出");
+        std::fs::create_dir_all(&drama_a).unwrap();
+        std::fs::create_dir_all(&drama_b).unwrap();
+        std::fs::write(drama_a.join("剧目海报.jpg"), b"a").unwrap();
+        assert_eq!(
+            existing_poster(&drama_a),
+            Some(drama_a.join("剧目海报.jpg"))
+        );
+        assert_eq!(existing_poster(&drama_b), None, "不能拿到别的剧的海报");
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

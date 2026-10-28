@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use dossier_core::{save_settings, AppSettings};
+use dossier_core::AppSettings;
 use dossier_runtime::CommandRunner;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
@@ -164,9 +164,12 @@ fn last_stderr(output: &dossier_runtime::CommandOutput) -> String {
 /// 把设置落盘（只改传入的闭包里动的字段）。
 fn persist_settings(app: &AppHandle, update: impl FnOnce(&mut AppSettings)) -> Result<(), String> {
     let path = crate::settings_path(app)?;
-    let mut loaded = dossier_core::load_settings(&path);
-    update(&mut loaded.settings);
-    save_settings(&path, &loaded.settings).map_err(|error| format!("写设置失败：{error}"))
+    dossier_core::update_settings(&path, |settings| {
+        update(settings);
+        Ok(())
+    })
+    .map(|_| ())
+    .map_err(|error| format!("写设置失败：{error}"))
 }
 
 /// 探测一个候选解释器能否执行（--version 秒级返回）。

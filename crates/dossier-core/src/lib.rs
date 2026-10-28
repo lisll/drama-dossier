@@ -73,12 +73,15 @@ pub use scanner::{
     scan_drama_dir, scan_library, validate_drama_dir, validate_drama_name, validate_library_root,
 };
 pub use settings::{
-    load_settings, resolve_product_dir, save_settings, AppSettings, LoadedSettings,
+    load_settings, merge_saved_settings, replace_settings, resolve_product_dir, save_settings,
+    try_load_settings, update_settings, AppSettings, DramaMaterials, LoadedSettings,
+    ReplaceOutcome,
 };
 pub use tools::{
     bitrate_report, episode_target_name, nudge_frames, output_dir_hits_sources,
-    plan_recut_by_duration, plan_recut_segments, plan_rename, same_path, validate_mount_csv,
-    BitrateItem, MountCsvCheck, MountCsvIssue, RenameItem, RenamePlan,
+    plan_recut_by_duration, plan_recut_by_duration_with_speed, plan_recut_segments, plan_rename,
+    same_path, validate_mount_csv, BitrateItem, MountCsvCheck, MountCsvIssue, RecutPlan,
+    RenameItem, RenamePlan,
 };
 pub use transcode::{advise_episode, plan_normalization, NormalizationPlan, TranscodeTarget};
 pub use types::{CheckStatus, Drama, EpisodeFile, EpisodeSpec, ProbedEpisode};

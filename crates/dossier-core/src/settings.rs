@@ -5,11 +5,28 @@
 //! - 写入采用「临时文件 + 替换」，避免中途失败留下半个配置文件；
 //! - 本模块只处理文件读写，不依赖 GUI 或 Tauri。
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::checklist::ChecklistRules;
+
+/// 一部剧的报审文字材料；空字符串视同未填写。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DramaMaterials {
+    pub title: Option<String>,
+    pub synopsis: Option<String>,
+}
+
+impl DramaMaterials {
+    fn is_empty(&self) -> bool {
+        let blank =
+            |value: &Option<String>| value.as_deref().is_none_or(|text| text.trim().is_empty());
+        blank(&self.title) && blank(&self.synopsis)
+    }
+}
 
 /// 用户可配置项。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -36,12 +53,13 @@ pub struct AppSettings {
     pub jianying_dir: Option<PathBuf>,
     /// 剪映草稿目录；`None` 表示使用剪映默认路径。
     pub jianying_draft_dir: Option<PathBuf>,
-    /// 报审材料：剧名（AI 生成或手动填写，转码页回填）。
-    pub drama_title: Option<String>,
-    /// 报审材料：简介（AI 生成或手动填写，转码页回填）。
-    pub drama_synopsis: Option<String>,
-    /// 报审材料：海报图片路径（AI 生成后落盘）。
-    pub poster_path: Option<PathBuf>,
+    /// 报审材料（剧名 / 简介），**按剧存**：键是规范化后的剧目目录绝对路径。
+    ///
+    /// 以前是三个全局字段（`dramaTitle` / `dramaSynopsis` / `posterPath`），哪部剧都读同一份，
+    /// 导致剧与剧之间串用材料。旧字段无法判断属于哪部剧，读取时直接忽略（serde 默认忽略未知字段）。
+    /// 海报不在这里存路径：海报只认本次输出目录里的「剧目海报.*」，天然按剧隔离。
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub drama_materials: BTreeMap<String, DramaMaterials>,
     /// LLM API 基础地址（OpenAI 兼容，如 https://api.deepseek.com/v1）；空表示未配置。
     pub llm_base_url: Option<String>,
     /// LLM API 密钥；仅落本机 settings.json，不打印日志。
@@ -119,6 +137,20 @@ impl AppSettings {
     pub fn effective_ai_badge_enabled(&self) -> bool {
         self.ai_badge_enabled.unwrap_or(true)
     }
+
+    /// 读一部剧的材料；没存过返回空白。`key` 由调用方规范化（桌面层用规范化后的剧目目录）。
+    pub fn materials_for(&self, key: &str) -> DramaMaterials {
+        self.drama_materials.get(key).cloned().unwrap_or_default()
+    }
+
+    /// 写一部剧的材料；全空时删掉该条，不留空壳。只动这一条，不影响其他剧。
+    pub fn set_materials_for(&mut self, key: &str, materials: DramaMaterials) {
+        if materials.is_empty() {
+            self.drama_materials.remove(key);
+        } else {
+            self.drama_materials.insert(key.to_string(), materials);
+        }
+    }
 }
 
 /// 读取结果：即使回退到默认值也保留原因，便于界面提示。
@@ -130,38 +162,82 @@ pub struct LoadedSettings {
     pub warning: Option<String>,
 }
 
-/// 从 `path` 读取设置；文件不存在时静默返回默认值。
-pub fn load_settings(path: &Path) -> LoadedSettings {
-    let fallback = |warning: Option<String>| LoadedSettings {
-        settings: AppSettings::default(),
-        warning,
-    };
+/// 严格读取失败的两种情况：写入方据此决定拒绝写入还是先备份再覆盖。
+#[derive(Debug)]
+enum SettingsReadError {
+    /// 读不出来（权限、被其他程序占用等）：文件内容未知，任何覆盖都可能丢数据。
+    Unreadable(String),
+    /// 读出来了但解析失败（文件损坏）：内容已知，可以先备份再覆盖。
+    Corrupt(String),
+}
 
+/// 严格读取：文件不存在视为默认设置（首次运行），读不出或解析失败都返回错误、不回退。
+fn read_settings_strict(path: &Path) -> Result<AppSettings, SettingsReadError> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return fallback(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AppSettings::default())
+        }
         Err(error) => {
-            return fallback(Some(format!(
-                "读取设置文件失败（{}）：{error}。已使用默认设置。",
+            return Err(SettingsReadError::Unreadable(format!(
+                "读取设置文件失败（{}）：{error}",
                 path.display()
             )))
         }
     };
+    serde_json::from_slice::<AppSettings>(&bytes).map_err(|error| {
+        SettingsReadError::Corrupt(format!("设置文件解析失败（{}）：{error}", path.display()))
+    })
+}
 
-    match serde_json::from_slice::<AppSettings>(&bytes) {
+/// 严格读取失败时给用户的说明：损坏可以到「设置」页保存恢复；读不出来要先查权限或占用。
+fn strict_read_message(error: &SettingsReadError) -> String {
+    match error {
+        SettingsReadError::Corrupt(reason) => format!(
+            "{reason}。为避免覆盖已拒绝本次操作；请到「设置」页点「保存设置」恢复（损坏的旧文件会先备份）。"
+        ),
+        SettingsReadError::Unreadable(reason) => format!(
+            "{reason}。为避免覆盖已拒绝本次操作；请检查设置文件的权限，或是否被其他程序占用。"
+        ),
+    }
+}
+
+/// 严格读取设置：文件不存在视为默认设置；损坏或读不出时返回可展示的错误（不回退默认值）。
+/// 用于结果取决于真实设置、不能拿默认值凑数的场合（例如重做海报前检查生图配置）。
+pub fn try_load_settings(path: &Path) -> Result<AppSettings, String> {
+    read_settings_strict(path).map_err(|error| strict_read_message(&error))
+}
+
+/// 从 `path` 读取设置；文件不存在时静默返回默认值，读取或解析失败时回退默认值并带提示。
+pub fn load_settings(path: &Path) -> LoadedSettings {
+    match read_settings_strict(path) {
         Ok(settings) => LoadedSettings {
             settings,
             warning: None,
         },
-        Err(error) => fallback(Some(format!(
-            "设置文件解析失败（{}）：{error}。已回退到默认设置，保存后会覆盖该文件。",
-            path.display()
-        ))),
+        Err(SettingsReadError::Unreadable(reason)) => LoadedSettings {
+            settings: AppSettings::default(),
+            warning: Some(format!(
+                "{reason}。已暂用默认设置；文件无法读取时不会被覆盖，请检查权限或是否被其他程序占用。"
+            )),
+        },
+        Err(SettingsReadError::Corrupt(reason)) => LoadedSettings {
+            settings: AppSettings::default(),
+            warning: Some(format!(
+                "{reason}。已暂用默认设置；在「设置」页保存时会先把旧文件备份为 settings.json.broken-<时间>，再覆盖。"
+            )),
+        },
     }
 }
 
 /// 写入设置；父目录不存在时自动创建。
+///
+/// 临时文件名带进程号与序号：多个写入方同时落盘时各写各的临时文件，
+/// 不会把别人写了一半的内容 rename 成正式配置。
 pub fn save_settings(path: &Path, settings: &AppSettings) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
@@ -169,9 +245,93 @@ pub fn save_settings(path: &Path, settings: &AppSettings) -> std::io::Result<()>
     }
 
     let data = serde_json::to_vec_pretty(settings).map_err(std::io::Error::other)?;
-    let temp = path.with_extension("json.tmp");
-    std::fs::write(&temp, data)?;
-    std::fs::rename(&temp, path)
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let temp = path.with_extension(format!("json.{}.{seq}.tmp", std::process::id()));
+    std::fs::write(&temp, data).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temp);
+    })?;
+    std::fs::rename(&temp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temp);
+    })
+}
+
+/// 进程内所有设置写入共用的锁：读、改、写在锁内一次完成。
+fn settings_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // 某个写入方 panic 后锁会中毒；锁里没有需要保护的内存状态（数据在磁盘上），继续使用即可。
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// 串行化的「读 → 改 → 写」：进程内所有**局部**设置写入方（材料回写、剧名、工具路径等）都走这里，
+/// 避免并发时互相覆盖更新。
+///
+/// - `update` 拿到的是磁盘上的最新设置；它返回 `Err` 时不写盘、原样返回错误。
+/// - 设置文件读不出或已损坏时**拒绝写入**、文件原样不动：此时手里只有默认值，写回去会把
+///   API 密钥、工具路径和所有剧的材料一起抹掉。恢复路径是到「设置」页保存（见 [`replace_settings`]）。
+/// - 锁只在本进程内有效（应用没有多实例同时写设置的场景）。
+pub fn update_settings(
+    path: &Path,
+    update: impl FnOnce(&mut AppSettings) -> Result<(), String>,
+) -> Result<AppSettings, String> {
+    let _guard = settings_lock();
+    let mut settings = read_settings_strict(path).map_err(|error| strict_read_message(&error))?;
+    update(&mut settings)?;
+    save_settings(path, &settings)
+        .map_err(|error| format!("写入设置失败（{}）：{error}", path.display()))?;
+    Ok(settings)
+}
+
+/// 「设置」页整份保存时的合并规则：用界面传来的设置替换整份，但保留只由后端写入的字段——
+/// 界面从不回传它们，原样覆盖会把它们抹掉：
+/// - `drama_materials`：按剧材料，由材料线程、`save_drama_title`、`clear_drama_materials` 维护；
+/// - `python_path`：一键配置装好 Python 后写入，界面没有对应输入框，也没有清空入口。
+pub fn merge_saved_settings(current: &mut AppSettings, incoming: AppSettings) {
+    let materials = std::mem::take(&mut current.drama_materials);
+    let python_path = current.python_path.take();
+    *current = incoming;
+    current.drama_materials = materials;
+    current.python_path = python_path;
+}
+
+/// [`replace_settings`] 的结果：写入后的设置，以及（文件损坏时）旧文件的备份路径。
+#[derive(Debug)]
+pub struct ReplaceOutcome {
+    pub settings: AppSettings,
+    pub backup: Option<PathBuf>,
+}
+
+/// 「设置」页整份保存专用：与 [`update_settings`] 同一把锁，区别只在文件损坏时——
+/// 先把旧文件复制成 `settings.json.broken-<YYYYMMDD-HHMMSS>`，复制成功才覆盖（`update` 拿到的是默认值）。
+/// 文件读不出来（权限、占用）时复制也会失败，直接拒绝，不覆盖内容未知的文件。
+pub fn replace_settings(
+    path: &Path,
+    update: impl FnOnce(&mut AppSettings) -> Result<(), String>,
+) -> Result<ReplaceOutcome, String> {
+    let _guard = settings_lock();
+    let (mut settings, backup) = match read_settings_strict(path) {
+        Ok(settings) => (settings, None),
+        Err(SettingsReadError::Corrupt(reason)) => {
+            let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+            let backup = path.with_extension(format!("json.broken-{stamp}"));
+            std::fs::copy(path, &backup).map_err(|error| {
+                format!(
+                    "{reason}；备份旧文件到 {} 失败：{error}。为避免丢失已拒绝覆盖。",
+                    backup.display()
+                )
+            })?;
+            (AppSettings::default(), Some(backup))
+        }
+        Err(SettingsReadError::Unreadable(reason)) => {
+            return Err(format!(
+                "{reason}。文件内容无法读取，已拒绝覆盖；请检查权限或是否被其他程序占用。"
+            ))
+        }
+    };
+    update(&mut settings)?;
+    save_settings(path, &settings)
+        .map_err(|error| format!("写入设置失败（{}）：{error}", path.display()))?;
+    Ok(ReplaceOutcome { settings, backup })
 }
 
 /// 产物落点解析：本次覆盖 → 设置里的默认输出目录（产物根目录）→ 剧目目录内。
@@ -274,6 +434,93 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dossier-settings-{tag}-{unique}"));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn legacy_global_material_fields_are_ignored() {
+        // 旧版设置文件里的三个全局字段：读得进来、其余设置不丢，但不再串到任何剧上。
+        let dir = temp_dir("legacy");
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"outputDir":"/产物","dramaTitle":"旧剧名","dramaSynopsis":"旧简介","posterPath":"/x/剧目海报.png"}"#,
+        )
+        .unwrap();
+        let loaded = load_settings(&path);
+        assert!(loaded.warning.is_none(), "{:?}", loaded.warning);
+        assert_eq!(loaded.settings.output_dir, Some(PathBuf::from("/产物")));
+        assert!(loaded.settings.drama_materials.is_empty());
+        // 保存后旧字段消失，不会再被读回。
+        save_settings(&path, &loaded.settings).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("dramaTitle"), "{raw}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn drama_materials_are_isolated_per_drama() {
+        let mut settings = AppSettings::default();
+        settings.set_materials_for(
+            "/素材/剧A",
+            DramaMaterials {
+                title: Some("剧A名".into()),
+                synopsis: Some("剧A简介".into()),
+            },
+        );
+        settings.set_materials_for(
+            "/素材/剧B",
+            DramaMaterials {
+                title: Some("剧B名".into()),
+                synopsis: None,
+            },
+        );
+        assert_eq!(
+            settings.materials_for("/素材/剧A").title.as_deref(),
+            Some("剧A名")
+        );
+        assert_eq!(settings.materials_for("/素材/剧B").synopsis, None);
+        assert_eq!(
+            settings.materials_for("/素材/剧C"),
+            DramaMaterials::default()
+        );
+
+        // 只改剧 B，剧 A 不受影响；写全空则删除该条。
+        settings.set_materials_for("/素材/剧B", DramaMaterials::default());
+        assert!(!settings.drama_materials.contains_key("/素材/剧B"));
+        assert_eq!(
+            settings.materials_for("/素材/剧A").synopsis.as_deref(),
+            Some("剧A简介")
+        );
+        // 只有空白字符也算空。
+        settings.set_materials_for(
+            "/素材/剧A",
+            DramaMaterials {
+                title: Some("  ".into()),
+                synopsis: None,
+            },
+        );
+        assert!(settings.drama_materials.is_empty());
+    }
+
+    #[test]
+    fn drama_materials_round_trip_through_disk() {
+        let dir = temp_dir("materials");
+        let path = dir.join("settings.json");
+        let mut settings = AppSettings::default();
+        settings.set_materials_for(
+            "/素材/剧A",
+            DramaMaterials {
+                title: Some("剧A名".into()),
+                synopsis: None,
+            },
+        );
+        save_settings(&path, &settings).unwrap();
+        let loaded = load_settings(&path).settings;
+        assert_eq!(
+            loaded.materials_for("/素材/剧A").title.as_deref(),
+            Some("剧A名")
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -478,6 +725,223 @@ mod tests {
             loaded.settings.ffprobe_path,
             Some(PathBuf::from("/usr/bin/ffprobe"))
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_updates_do_not_lose_writes_or_leave_temp_files() {
+        let dir = temp_dir("concurrent");
+        let path = dir.join("settings.json");
+        let handles: Vec<_> = (0..8)
+            .map(|worker| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for round in 0..50 {
+                        update_settings(&path, |settings| {
+                            settings.set_materials_for(
+                                &format!("/剧目/{worker}"),
+                                DramaMaterials {
+                                    title: Some(format!("剧{worker}-{round}")),
+                                    synopsis: None,
+                                },
+                            );
+                            Ok(())
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let loaded = load_settings(&path);
+        assert!(loaded.warning.is_none());
+        for worker in 0..8 {
+            assert_eq!(
+                loaded
+                    .settings
+                    .materials_for(&format!("/剧目/{worker}"))
+                    .title,
+                Some(format!("剧{worker}-49"))
+            );
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "残留临时文件：{leftovers:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Windows 上多个线程同时 rename 到同一目标时，目标正被替换或临时文件被杀毒软件占用都可能
+    // 返回 ACCESS_DENIED，测试会偶发失败；那边由加锁版本的并发测试覆盖。
+    #[cfg(unix)]
+    #[test]
+    fn unlocked_concurrent_saves_never_leave_partial_file_or_temp_files() {
+        // 不经过锁、直接并发调 save_settings：验证的是「临时文件名唯一 + rename 替换」本身。
+        let dir = temp_dir("unlocked-save");
+        let path = dir.join("settings.json");
+        let handles: Vec<_> = (0..8)
+            .map(|worker| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for round in 0..50 {
+                        let settings = AppSettings {
+                            recut_min_sec: Some(worker * 100 + round),
+                            ..Default::default()
+                        };
+                        save_settings(&path, &settings).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let loaded = load_settings(&path);
+        assert!(loaded.warning.is_none(), "{:?}", loaded.warning);
+        assert!(loaded.settings.recut_min_sec.is_some());
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn corrupt_file_rejects_partial_updates_and_is_backed_up_on_replace() {
+        let dir = temp_dir("corrupt-write");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, b"{ not json").unwrap();
+        // 局部写入：拒绝，文件字节不变，闭包不被调用。
+        let mut called = false;
+        let error = update_settings(&path, |_| {
+            called = true;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(!called);
+        assert!(error.contains("拒绝"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");
+        // 整份保存：先备份再覆盖。
+        let outcome = replace_settings(&path, |settings| {
+            settings.recut_min_sec = Some(42);
+            Ok(())
+        })
+        .unwrap();
+        let backup = outcome.backup.expect("应有备份");
+        assert!(backup
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("settings.json.broken-"));
+        assert_eq!(std::fs::read(&backup).unwrap(), b"{ not json");
+        let loaded = load_settings(&path);
+        assert!(loaded.warning.is_none());
+        assert_eq!(loaded.settings.recut_min_sec, Some(42));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn merge_keeps_backend_only_fields_from_disk() {
+        let mut current = AppSettings {
+            python_path: Some(PathBuf::from("C:/app/python/python.exe")),
+            recut_min_sec: Some(10),
+            ..Default::default()
+        };
+        current.set_materials_for(
+            "/剧目/甲",
+            DramaMaterials {
+                title: Some("甲".into()),
+                synopsis: None,
+            },
+        );
+        // 界面从不回传 python_path / drama_materials；其他字段以界面为准。
+        let incoming = AppSettings {
+            recut_min_sec: Some(20),
+            ..Default::default()
+        };
+        merge_saved_settings(&mut current, incoming);
+        assert_eq!(current.recut_min_sec, Some(20));
+        assert_eq!(
+            current.python_path,
+            Some(PathBuf::from("C:/app/python/python.exe"))
+        );
+        assert_eq!(
+            current.materials_for("/剧目/甲").title.as_deref(),
+            Some("甲")
+        );
+    }
+
+    #[test]
+    fn strict_load_reports_corruption_instead_of_defaults() {
+        let dir = temp_dir("strict-load");
+        let path = dir.join("settings.json");
+        assert!(try_load_settings(&path).is_ok(), "文件不存在视为默认设置");
+        std::fs::write(&path, b"{ broken").unwrap();
+        let error = try_load_settings(&path).unwrap_err();
+        assert!(
+            error.contains("保存设置"),
+            "损坏时应指向设置页恢复：{error}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_file_is_written_by_both_writers_without_backup() {
+        let dir = temp_dir("missing-write");
+        let path = dir.join("settings.json");
+        update_settings(&path, |settings| {
+            settings.recut_min_sec = Some(7);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(load_settings(&path).settings.recut_min_sec, Some(7));
+        std::fs::remove_file(&path).unwrap();
+        let outcome = replace_settings(&path, |_| Ok(())).unwrap();
+        assert!(outcome.backup.is_none());
+        assert!(path.is_file());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_file_is_never_overwritten() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("unreadable");
+        let path = dir.join("settings.json");
+        save_settings(&path, &AppSettings::default()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // root 不受权限位约束：读得出来就说明本环境测不了这一条，跳过。
+        if std::fs::read(&path).is_ok() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            std::fs::remove_dir_all(&dir).ok();
+            eprintln!("以 root 运行，跳过不可读文件用例");
+            return;
+        }
+        assert!(update_settings(&path, |_| Ok(())).is_err());
+        assert!(replace_settings(&path, |_| Ok(())).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_settings(&path).warning.is_none(), "文件内容应未被改动");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn update_settings_error_leaves_file_untouched() {
+        let dir = temp_dir("update-err");
+        let path = dir.join("settings.json");
+        save_settings(&path, &AppSettings::default()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let result = update_settings(&path, |settings| {
+            settings.recut_min_sec = Some(1);
+            Err("拒绝".into())
+        });
+        assert_eq!(result.unwrap_err(), "拒绝");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -131,8 +131,25 @@ def ffprobe_available(settings: Optional[Settings]) -> bool:
     return settings is not None and present(getattr(settings, "ffprobe", "ffprobe"))
 
 
+def _check_names(kind: str, names: tuple) -> None:
+    """每个参数必须是**单个**滤镜/编码器名。
+
+    曾经出现过 `requires_filters("tmix,rotate,noise,unsharp")`：整串被当成一个名字去查，
+    永远查不到，三个去重模块因此永远不会被派发，且没有任何报错。这里在模块注册时就拒绝。
+    """
+    if not names:
+        raise ValueError(f"requires_{kind} 至少需要一个名字")
+    for name in names:
+        if not isinstance(name, str) or not name or any(ch in name for ch in ", \t"):
+            raise ValueError(
+                f"requires_{kind} 的每个参数必须是单个名字，收到 {name!r}；"
+                f"多个名字请分开传参，例如 requires_{kind}(\"a\", \"b\")"
+            )
+
+
 def requires_filters(*names: str) -> Callable[[Optional[Settings]], bool]:
     """生成一个「这些滤镜都得在」的 `capability_probe`。"""
+    _check_names("filters", names)
 
     def probe(settings: Optional[Settings]) -> bool:
         if not ffmpeg_available(settings):
@@ -146,6 +163,7 @@ def requires_filters(*names: str) -> Callable[[Optional[Settings]], bool]:
 
 def requires_encoders(*names: str) -> Callable[[Optional[Settings]], bool]:
     """生成一个「这些编码器都得在」的 `capability_probe`。"""
+    _check_names("encoders", names)
 
     def probe(settings: Optional[Settings]) -> bool:
         if not ffmpeg_available(settings):

@@ -15,7 +15,7 @@ use dossier_inpaint::erase::{
     build_plan, resolve_tool, run_plan_with_progress, ErasePlan, EraseRequest, EraseRun,
 };
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::paths::normalize;
 
@@ -67,19 +67,37 @@ fn erase_progress_path(output: &Path) -> PathBuf {
 
 /// 开发期仓库根目录（用于在没装到 PATH 时找到 `target/` 里的构建产物）。
 ///
-/// 这是编译期常量，打包后的安装版通常不存在这个目录——那时的正确做法是让使用者在
-/// 界面上指定工具路径，或在 PATH 里安装 `dossier-inpaint`。
+/// 这是编译期常量，打包后的安装版通常不存在这个目录——安装版靠安装包资源里内置的那份。
 fn dev_repo_root() -> Option<PathBuf> {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .map(Path::to_path_buf)
 }
 
-fn locate(tool_path: Option<&str>) -> Result<PathBuf, String> {
+/// 安装包内置的 `dossier-inpaint`（CI 打包时放进 `resources/inpaint/`）。
+///
+/// Tauri v2 的 resources 按「相对 tauri.conf.json 的路径」落盘，与内置 ffmpeg 同一规则；
+/// 兼容再查一层 `<resource_dir>/inpaint`，防打包器行为差异。源码直跑时返回 None。
+fn bundled_tool(app: &AppHandle) -> Option<PathBuf> {
+    let root = app.path().resource_dir().ok()?;
+    let name = dossier_inpaint::erase::binary_name("dossier-inpaint");
+    [root.join("resources").join("inpaint"), root.join("inpaint")]
+        .into_iter()
+        .map(|dir| dir.join(&name))
+        .find(|path| path.is_file())
+}
+
+/// 查找顺序：界面显式指定 → 安装包内置 → PATH → 开发仓库 `target/`。
+fn locate(app: &AppHandle, tool_path: Option<&str>) -> Result<PathBuf, String> {
     let explicit = tool_path
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from);
+    if explicit.is_none() {
+        if let Some(bundled) = bundled_tool(app) {
+            return Ok(bundled);
+        }
+    }
     resolve_tool(explicit.as_deref(), dev_repo_root().as_deref())
 }
 
@@ -99,13 +117,22 @@ pub async fn pick_video() -> Result<Option<String>, String> {
 
 /// 查询擦除工具是否可用。
 #[tauri::command]
-pub fn erase_status(tool_path: Option<String>) -> EraseStatus {
-    match locate(tool_path.as_deref()) {
-        Ok(tool) => EraseStatus {
-            available: true,
-            tool: Some(tool.display().to_string()),
-            message: format!("已找到擦除工具：{}", tool.display()),
-        },
+pub fn erase_status(app: AppHandle, tool_path: Option<String>) -> EraseStatus {
+    match locate(&app, tool_path.as_deref()) {
+        Ok(tool) => {
+            let mut message = format!("已找到擦除工具：{}", tool.display());
+            if bundled_tool(&app).as_deref() == Some(tool.as_path()) {
+                // 安装包只带了 Rust 管线本体，没带 Python 模型 worker 与权重。
+                message.push_str(
+                    "。安装版只支持 fixed + column 基线；worker（DBNet / 时序模型）需要另行配置 Python 与模型权重。",
+                );
+            }
+            EraseStatus {
+                available: true,
+                tool: Some(tool.display().to_string()),
+                message,
+            }
+        }
         Err(message) => EraseStatus {
             available: false,
             tool: None,
@@ -125,10 +152,37 @@ fn ensure_distinct_io(request: &EraseRequest) -> Result<(), String> {
     Ok(())
 }
 
-/// 只拼装命令，不执行——界面据此展示「将要运行什么」。
+/// 预览与执行共用的准备步骤：同一套校验、同一套注入，保证「预览的就是将要执行的」。
 ///
-/// 这里也要挂上 `--progress-json`：预览的意义就是「和真正执行的是同一条命令」，
-/// 少一个参数就不是同一条了。
+/// 不产生任何副作用（不建目录、不跑进程）：输出目录不存在由执行阶段创建。
+fn prepare_request(
+    app: &AppHandle,
+    request: &mut EraseRequest,
+    tool_path: Option<&str>,
+    ffprobe_path: Option<&str>,
+) -> Result<ErasePlan, String> {
+    if !request.input.is_file() {
+        return Err(format!("输入视频不存在：{}", request.input.display()));
+    }
+    ensure_distinct_io(request)?;
+    request.progress_json = Some(erase_progress_path(&request.output));
+    // GUI 子进程的 PATH 里几乎肯定没有 ffprobe，必须把应用解析好的绝对路径显式交给管线。
+    request.ffprobe = Some(
+        crate::toolbox::resolve_ffprobe(app, ffprobe_path)?
+            .display()
+            .to_string(),
+    );
+    // Python 解释器：设置里配过或 PATH 上有就注入，没有则交由 dossier-inpaint 的校验给出提示。
+    if request.worker_program.is_none() {
+        if let Ok(python) = crate::toolbox::resolve_python(app) {
+            request.worker_program = Some(python.display().to_string());
+        }
+    }
+    let tool = locate(app, tool_path)?;
+    build_plan(request, &tool)
+}
+
+/// 只拼装命令，不执行——界面据此展示「将要运行什么」。
 #[tauri::command]
 pub fn plan_erase(
     app: AppHandle,
@@ -137,30 +191,18 @@ pub fn plan_erase(
     ffprobe_path: Option<String>,
 ) -> Result<ErasePlan, String> {
     crate::license::guard()?;
-    ensure_distinct_io(&request)?;
-    request.progress_json = Some(erase_progress_path(&request.output));
-    // 预览里的命令必须和真正执行的同一条：ffprobe 也在这一步解析好填进去。
-    request.ffprobe = Some(
-        crate::toolbox::resolve_ffprobe(&app, ffprobe_path.as_deref())?
-            .display()
-            .to_string(),
-    );
-    // Python 解释器同理：设置里配过（Windows 一键配置装好）或 PATH 上有就注入，
-    // 没有则交由 dossier-inpaint 的校验给出提示（不在这里硬失败）。
-    if request.worker_program.is_none() {
-        if let Ok(python) = crate::toolbox::resolve_python(&app) {
-            request.worker_program = Some(python.display().to_string());
-        }
-    }
-    let tool = locate(tool_path.as_deref())?;
-    build_plan(&request, &tool)
+    prepare_request(
+        &app,
+        &mut request,
+        tool_path.as_deref(),
+        ffprobe_path.as_deref(),
+    )
 }
 
 /// 执行擦除并按确认流退出码回报结论。
 ///
 /// **必须是 async + `spawn_blocking`**：擦除要跑几分钟到几十分钟，而同步命令是在
-/// IPC 处理线程上直接调用的——那样会卡住主线程，进度事件也排到进程结束才送出去，
-/// 进度条就白做了。工具箱的转码走的是同一条路子（`transcode_execute`）。
+/// IPC 处理线程上直接调用的——那样会卡住主线程，进度事件也排到进程结束才送出去。
 #[tauri::command]
 pub async fn run_erase(
     app: AppHandle,
@@ -177,8 +219,8 @@ pub async fn run_erase(
     .map_err(|error| format!("擦除任务失败：{error}"))?
 }
 
-/// 真正干活的那一半：给工具挂上 `--progress-json`，边跑边把进度流里的新事件
-/// 转成 `erase-progress` 推给界面。
+/// 真正干活的那一半：与预览走同一个 `prepare_request`，再创建输出目录、跑进程，
+/// 边跑边把进度流里的新事件转成 `erase-progress` 推给界面。
 fn run_erase_blocking(
     app: &AppHandle,
     mut request: EraseRequest,
@@ -186,33 +228,22 @@ fn run_erase_blocking(
     ffprobe_path: Option<String>,
     timeout_seconds: Option<u64>,
 ) -> Result<EraseRun, String> {
-    if !request.input.is_file() {
-        return Err(format!("输入视频不存在：{}", request.input.display()));
-    }
-    ensure_distinct_io(&request)?;
+    let plan = prepare_request(
+        app,
+        &mut request,
+        tool_path.as_deref(),
+        ffprobe_path.as_deref(),
+    )?;
+    // 输出目录不存在就建（与转码一致），而不是报错让用户自己去建。
+    // 记下本次新建的各层：进程结束后若它们仍是空的（失败、超时、没写出任何东西），就删掉。
+    let mut created_dirs = Vec::new();
     if let Some(parent) = request.output.parent() {
-        if !parent.as_os_str().is_empty() && !parent.is_dir() {
-            return Err(format!("输出目录不存在：{}", parent.display()));
+        if !parent.as_os_str().is_empty() {
+            created_dirs = crate::paths::create_dir_all_tracked(parent)
+                .map_err(|error| format!("创建输出目录失败（{}）：{error}", parent.display()))?;
         }
     }
     let progress_path = erase_progress_path(&request.output);
-    request.progress_json = Some(progress_path.clone());
-    // GUI 子进程的 PATH 里几乎肯定没有 ffprobe（用户环境里的 9.0.2-tessus 也是这么被
-    // 探测到的），所以必须把应用解析好的绝对路径显式交给管线。
-    request.ffprobe = Some(
-        crate::toolbox::resolve_ffprobe(app, ffprobe_path.as_deref())?
-            .display()
-            .to_string(),
-    );
-    // Python 解释器同理：与 plan_erase 保持同一条命令，注入逻辑一致。
-    if request.worker_program.is_none() {
-        if let Ok(python) = crate::toolbox::resolve_python(app) {
-            request.worker_program = Some(python.display().to_string());
-        }
-    }
-
-    let tool = locate(tool_path.as_deref())?;
-    let plan = build_plan(&request, &tool)?;
     let result = run_plan_with_progress(&plan, timeout_seconds.unwrap_or(1800), |event| {
         let _ = app.emit(
             "erase-progress",
@@ -229,5 +260,7 @@ fn run_erase_blocking(
         );
     });
     let _ = std::fs::remove_file(&progress_path);
+    // 只删空目录：成功时目录里有成片或处理日志，这里什么也不会删。
+    crate::paths::remove_created_dirs(&created_dirs);
     result
 }

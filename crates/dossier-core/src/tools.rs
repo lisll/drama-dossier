@@ -163,59 +163,131 @@ pub fn plan_recut_segments(
     segments
 }
 
-/// 按单集时长区间切全局时间线：每段尽量落在 `[min_sec, max_sec]`，
-/// 优先吸附区间内离目标时长（区间中点）最近的场景切点，无切点时硬切在目标点。
-///
-/// 与 `plan_recut_segments` 的差别：那里由「目标集数」反推每段时长，
-/// 这里由「单集目标时长」决定段数——素材总时长 ÷ 区间中点 ≈ 集数。
-/// 结尾剩余不足 `min_sec` 时并入前一段（前一段最长 `max_sec + 剩余`），避免碎尾段。
+/// 按单集时长区间重组的规划结果。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecutPlan {
+    /// 源时间线上的 `(起点秒, 终点秒)`，首尾相接覆盖全长。
+    pub segments: Vec<(f64, f64)>,
+    /// 每集**成片**时长都落在区间内；`false` 表示素材总时长无法在区间内均分，
+    /// 给出的是偏差最小的方案（调用方应提示用户）。
+    pub in_range: bool,
+}
+
+/// 按单集时长区间切全局时间线（不变速）：等价于 [`plan_recut_by_duration_with_speed`]
+/// 传入恒为 1.0 的变速。
 pub fn plan_recut_by_duration(
     boundaries_sec: &[f64],
     total_sec: f64,
     min_sec: f64,
     max_sec: f64,
 ) -> Vec<(f64, f64)> {
+    plan_recut_by_duration_with_speed(boundaries_sec, total_sec, min_sec, max_sec, |_| 1.0).segments
+}
+
+/// 按单集**成片**时长区间切全局时间线，把逐集变速算进去。
+///
+/// `speed_of(i)` 是第 `i` 集成片的播放倍速（去重配方会加速 1.0~1.25 倍），
+/// 第 `i` 段源时长 `d` 对应的成片时长是 `d / speed_of(i)`；`[min_sec, max_sec]`
+/// 约束的是成片时长——用户在设置里填的「单集 60~70 秒」指的就是成片。
+///
+/// 算法：先定集数，再定切点（不再「贪心往前切、尾段太短就并入前一段」，那样会超上限）。
+/// 1. 集数 n：成片等长时每集时长为 `total / Σspeed(0..n)`。选落在区间内且最接近区间
+///    中点的 n；没有任何 n 落在区间内时选偏差最小的 n，并置 `in_range = false`。
+/// 2. 切点：从当前位置出发，第 k 刀的理想位置是把剩余时长按剩余各集倍速等比分配后的
+///    第一份；允许吸附到附近的场景切点，吸附范围同时保证本段成片在区间内、剩下的时长
+///    仍能让后面各集都落在区间内。附近没有切点就用理想位置。
+pub fn plan_recut_by_duration_with_speed(
+    boundaries_sec: &[f64],
+    total_sec: f64,
+    min_sec: f64,
+    max_sec: f64,
+    speed_of: impl Fn(usize) -> f64,
+) -> RecutPlan {
     // 与 plan_recut_segments 相同的 NaN 拒绝语义；区间非法（min ≥ max）同样拒绝。
     let sane = |value: f64| value.partial_cmp(&0.0) == Some(std::cmp::Ordering::Greater);
     if !sane(total_sec)
         || !sane(min_sec)
         || max_sec.partial_cmp(&min_sec) != Some(std::cmp::Ordering::Greater)
     {
-        return vec![];
+        return RecutPlan {
+            segments: vec![],
+            in_range: false,
+        };
     }
-    if total_sec <= max_sec {
-        return vec![(0.0, total_sec)];
-    }
+    let speed = |index: usize| {
+        let value = speed_of(index);
+        if value.is_finite() && value > 0.0 {
+            value
+        } else {
+            1.0
+        }
+    };
+
+    // 1) 定集数。成片每集时长随 n 单调递减，扫到低于下限的那一刻就可以停。
     let target = (min_sec + max_sec) / 2.0;
+    let mut speed_sum = 0.0;
+    let mut best: Option<(usize, bool, f64)> = None; // (n, 在区间内, 评分：越小越好)
+    let max_count = ((total_sec / min_sec).ceil() as usize + 2).clamp(1, 100_000);
+    for n in 1..=max_count {
+        speed_sum += speed(n - 1);
+        let out_len = total_sec / speed_sum;
+        let fits = out_len >= min_sec - 1e-9 && out_len <= max_sec + 1e-9;
+        let score = if fits {
+            (out_len - target).abs()
+        } else if out_len < min_sec {
+            min_sec - out_len
+        } else {
+            out_len - max_sec
+        };
+        let better = match best {
+            None => true,
+            Some((_, best_fits, best_score)) => {
+                (fits && !best_fits) || (fits == best_fits && score < best_score)
+            }
+        };
+        if better {
+            best = Some((n, fits, score));
+        }
+        if out_len < min_sec {
+            break;
+        }
+    }
+    let (count, in_range, _) = best.unwrap_or((1, false, 0.0));
+
+    // 2) 定切点。
     let mut sorted: Vec<f64> = boundaries_sec.to_vec();
     sorted.sort_by(|left, right| left.total_cmp(right));
-    let mut cuts: Vec<f64> = Vec::new();
+    let speeds: Vec<f64> = (0..count).map(speed).collect();
+    let mut cuts: Vec<f64> = Vec::with_capacity(count.saturating_sub(1));
     let mut pos = 0.0;
-    while total_sec - pos > max_sec {
-        let lower = pos + min_sec;
-        let upper = pos + max_sec;
-        let goal = pos + target;
-        let chosen = sorted
-            .iter()
-            .copied()
-            .filter(|value| *value > lower && *value < upper)
-            .min_by(|left, right| (left - goal).abs().total_cmp(&(right - goal).abs()))
-            .unwrap_or(goal);
+    for k in 0..count.saturating_sub(1) {
+        let remaining_speed: f64 = speeds[k..].iter().sum();
+        let later_speed = remaining_speed - speeds[k];
+        let ideal = pos + (total_sec - pos) * speeds[k] / remaining_speed;
+        // 本段成片在区间内，且剩余时长让后面各集都能落在区间内。
+        let lower = (pos + min_sec * speeds[k]).max(total_sec - max_sec * later_speed);
+        let upper = (pos + max_sec * speeds[k]).min(total_sec - min_sec * later_speed);
+        let chosen = if lower <= upper {
+            sorted
+                .iter()
+                .copied()
+                .filter(|value| *value >= lower && *value <= upper)
+                .min_by(|left, right| (left - ideal).abs().total_cmp(&(right - ideal).abs()))
+                .unwrap_or(ideal)
+        } else {
+            ideal
+        };
         cuts.push(chosen);
         pos = chosen;
     }
-    if total_sec - pos < min_sec {
-        // 尾段太碎：去掉最后一刀，把剩余全部并进前一段。
-        cuts.pop();
-    }
-    let mut segments = Vec::with_capacity(cuts.len() + 1);
+    let mut segments = Vec::with_capacity(count);
     let mut start = 0.0;
     for cut in cuts {
         segments.push((start, cut));
         start = cut;
     }
     segments.push((start, total_sec));
-    segments
+    RecutPlan { segments, in_range }
 }
 
 /// 智能微调的帧数：1~3 帧，由种子决定（执行层用文件名+时间做种子实现“每次不同”）。
@@ -543,22 +615,66 @@ mod tests {
         assert!((snapped[0].1 - 67.0).abs() < 1e-9);
     }
 
+    fn lengths(segments: &[(f64, f64)]) -> Vec<f64> {
+        segments.iter().map(|(start, end)| end - start).collect()
+    }
+
     #[test]
-    fn recut_by_duration_merges_tiny_tail_and_handles_short_total() {
-        // 总长不足一个 max → 整剧一段。
-        assert_eq!(
-            plan_recut_by_duration(&[], 50.0, 60.0, 70.0),
-            vec![(0.0, 50.0)]
-        );
-        // 尾段不足 min → 并入前一段（130 秒：切 65 后剩 65 ≥ 60，仍是两段）。
+    fn recut_by_duration_balances_instead_of_overflowing_tail() {
+        // 总长不足一个 min → 整剧一段，并如实报告「不在区间内」。
+        let short = plan_recut_by_duration_with_speed(&[], 50.0, 60.0, 70.0, |_| 1.0);
+        assert_eq!(short.segments, vec![(0.0, 50.0)]);
+        assert!(!short.in_range);
+        // 120 秒：以前贪心切 65 剩 55 再并成一段 120 秒（超上限）；现在均分成 2 × 60。
+        let plan = plan_recut_by_duration_with_speed(&[], 120.0, 60.0, 70.0, |_| 1.0);
+        assert!(plan.in_range);
+        assert_eq!(lengths(&plan.segments), vec![60.0, 60.0]);
+        // 130 秒仍是两段，且都在区间内。
         let two = plan_recut_by_duration(&[], 130.0, 60.0, 70.0);
         assert_eq!(two.len(), 2);
-        // 120 秒：切 65 后剩 55 < 60 → 合并成一段。
-        let merged = plan_recut_by_duration(&[], 120.0, 60.0, 70.0);
-        assert_eq!(merged, vec![(0.0, 120.0)]);
+        assert!(lengths(&two).iter().all(|len| (60.0..=70.0).contains(len)));
+        // 区间太窄、任何集数都落不进去（100 秒，区间 60~65）：给偏差最小的方案并置 false。
+        let tight = plan_recut_by_duration_with_speed(&[], 100.0, 60.0, 65.0, |_| 1.0);
+        assert!(!tight.in_range);
+        assert_eq!(tight.segments.last().unwrap().1, 100.0);
         // 非法区间与坏总长一律拒绝。
         assert!(plan_recut_by_duration(&[], 0.0, 60.0, 70.0).is_empty());
         assert!(plan_recut_by_duration(&[], 650.0, 70.0, 60.0).is_empty());
+        assert!(plan_recut_by_duration(&[], f64::NAN, 60.0, 70.0).is_empty());
+    }
+
+    #[test]
+    fn recut_by_duration_keeps_final_lengths_in_range_after_speedup() {
+        // 逐集加速 1.0~1.25 倍；约束的是成片时长 = 源时长 / 倍速。
+        let speeds = [1.15, 1.13, 1.24, 1.02, 1.2, 1.1, 1.05, 1.18];
+        let speed_of = |index: usize| speeds[index % speeds.len()];
+        for (total, min, max) in [
+            (120.0, 30.0, 50.0),
+            (650.0, 60.0, 70.0),
+            (1800.0, 60.0, 70.0),
+        ] {
+            let plan = plan_recut_by_duration_with_speed(&[], total, min, max, speed_of);
+            assert!(plan.in_range, "total={total}");
+            for (index, len) in lengths(&plan.segments).iter().enumerate() {
+                let out = len / speed_of(index);
+                assert!(
+                    out >= min - 1e-6 && out <= max + 1e-6,
+                    "total={total} 第 {index} 集成片 {out:.2}s 不在 {min}~{max}"
+                );
+            }
+            assert!((plan.segments.last().unwrap().1 - total).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn recut_by_duration_snaps_to_scene_cuts_within_safe_window() {
+        // 理想切点 60；附近 62 处有场景切点，吸附后两段都仍在 55~65 内。
+        let plan = plan_recut_by_duration_with_speed(&[62.0, 100.0], 120.0, 55.0, 65.0, |_| 1.0);
+        assert!(plan.in_range);
+        assert!((plan.segments[0].1 - 62.0).abs() < 1e-9);
+        // 切点太远（吸附会让下一段越界）→ 不吸附，用理想位置。
+        let plan = plan_recut_by_duration_with_speed(&[50.0], 120.0, 55.0, 65.0, |_| 1.0);
+        assert!((plan.segments[0].1 - 60.0).abs() < 1e-9);
     }
 
     #[test]

@@ -23,6 +23,7 @@ from ..base import StrictModel
 from ..errors import ErrorClass, WorkError, bad_param
 from ..recipes.registry import ModuleSpec, register
 from .ffmpeg import MediaContext
+from .ffmpeg_caps import requires_filters
 
 #: 常见中文字体探测顺序（技术验证：探测不到就用 font_path 显式指定）。
 _FONT_CANDIDATES = (
@@ -187,6 +188,8 @@ register(
         produces=frozenset({"overlay_badge"}),
         params_model=OverlayParams,
         implement=implement_badge,
+        # 由 media.encode 统一物化成 ffmpeg overlay，没有这个滤镜的机器不能声明能力。
+        capability_probe=requires_filters("overlay"),
     )
 )
 register(
@@ -198,5 +201,7 @@ register(
         produces=frozenset({"overlay_watermark"}),
         params_model=OverlayParams,
         implement=implement_watermark,
+        # 由 media.encode 统一物化成 ffmpeg overlay，没有这个滤镜的机器不能声明能力。
+        capability_probe=requires_filters("overlay"),
     )
 )

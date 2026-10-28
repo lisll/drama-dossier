@@ -27,7 +27,7 @@ from ..base import StrictModel
 from ..errors import bad_param
 from ..recipes.registry import ModuleSpec, register
 from .ffmpeg import MediaContext
-from .ffmpeg_caps import requires_filters
+from .ffmpeg_caps import ffmpeg_available, requires_filters
 
 WAVE_CLOCK_FRAME = "n"  # 几何类波形随帧号
 WAVE_CLOCK_TIME = "t"  # 色彩类波形随秒
@@ -312,7 +312,7 @@ register(
         produces=frozenset({"dedup_video_filters"}),
         params_model=VideoDedupParams,
         implement=implement_video_dedup,
-        capability_probe=requires_filters("tmix,rotate,noise,unsharp"),
+        capability_probe=requires_filters("tmix", "rotate", "noise", "unsharp"),
     )
 )
 register(
@@ -324,7 +324,7 @@ register(
         produces=frozenset({"dedup_finish_filters"}),
         params_model=VideoDedupParams,
         implement=implement_video_dedup_finish,
-        capability_probe=requires_filters("eq,hue,noise,unsharp"),
+        capability_probe=requires_filters("eq", "hue", "noise", "unsharp"),
     )
 )
 register(
@@ -336,7 +336,7 @@ register(
         produces=frozenset({"dedup_audio_filters"}),
         params_model=VideoDedupParams,
         implement=implement_audio_dedup,
-        capability_probe=requires_filters("asetrate,atempo,equalizer,acompressor"),
+        capability_probe=requires_filters("asetrate", "atempo", "equalizer", "acompressor"),
     )
 )
 register(
@@ -348,5 +348,7 @@ register(
         produces=frozenset({"metadata_policy"}),
         params_model=DevicePoolParams,
         implement=implement_device_pool,
+        # 只写 -metadata，不需要特定滤镜，但没有 ffmpeg 的机器不能声明这项能力。
+        capability_probe=ffmpeg_available,
     )
 )

@@ -184,6 +184,14 @@ const CREATION_EPOCH: i64 = 1_700_000_000;
 
 const PI: f64 = std::f64::consts::PI;
 
+/// 第 `episode_index` 集成片的变速倍数。
+///
+/// 只由 `(剧名 seed, 集序号)` 决定、与总集数无关，所以重组前就能拿来规划切点，
+/// 重组后用同一个剧名签发的 [`DedupRecipePlan`] 给出的是同一个值（单测覆盖）。
+pub fn episode_speed(drama_name: &str, episode_index: usize) -> f64 {
+    derive_variant(seed_for_drama(drama_name), episode_index).speed
+}
+
 /// 从 `(seed, 集序号)` 确定性派生一集参数。同入参必产出同参数（单测覆盖）。
 pub fn derive_variant(seed: u64, episode_index: usize) -> DedupVariant {
     let mut rng = SplitMix64::new(variant_seed(seed, episode_index, 0));
@@ -446,10 +454,19 @@ impl DedupRecipePlan {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DedupRecipeSummary {
+    /// 以字符串发给界面：seed 是 64 位整数，超过 JS 能精确表示的 2^53，按数字传会被舍入。
+    #[serde(serialize_with = "serialize_u64_as_string")]
     pub seed: u64,
     pub episode_count: usize,
     /// 存证文件绝对路径；写入失败时为 None（不阻塞成片）。
     pub recipe_file: Option<String>,
+}
+
+fn serialize_u64_as_string<S: serde::Serializer>(
+    value: &u64,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_str(value)
 }
 
 /// Unix 秒 → `YYYY-MM-DDTHH:MM:SSZ`（确定性伪拍摄时间，不引 chrono 依赖）。
@@ -492,6 +509,28 @@ fn civil_and_time(epoch_secs: u64) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_seed_is_serialized_as_exact_string() {
+        let summary = DedupRecipeSummary {
+            seed: 15_978_750_346_754_301_024,
+            episode_count: 3,
+            recipe_file: None,
+        };
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["seed"], "15978750346754301024");
+    }
+
+    #[test]
+    fn episode_speed_matches_recipe_regardless_of_episode_count() {
+        // 重组前用来规划的倍速，必须与重组后按实际集数签发的配方完全一致。
+        for count in [1_usize, 3, 12] {
+            let plan = DedupRecipePlan::build("测试剧", count);
+            for (index, variant) in plan.variants.iter().enumerate() {
+                assert_eq!(episode_speed("测试剧", index), variant.speed);
+            }
+        }
+    }
 
     #[test]
     fn seed_is_stable_and_timestamp_free() {

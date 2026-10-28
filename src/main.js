@@ -52,6 +52,9 @@ let demoVerifyCode = "";
 let bitrateConfirmReturnFocus = null;
 // 最近一次从配置文件读到的设置：保存时用它带回 ffmpegPath（界面上没有对应输入框）。
 let loadedSettings = null;
+// 剧名输入框当前内容属于哪部剧（剧目目录）。`null` = 还没加载成功，此时不保存剧名。
+// 切换剧目、加载中、加载失败时都是 `null`；加载成功、回填生成结果、清除后才设为对应剧。
+let titleLoadedFor = null;
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
@@ -281,6 +284,7 @@ function beginTask(label) {
   });
   setProgress({ label });
   state.taskTimer = setInterval(renderProgressLabel, 1000);
+  refreshTitleInputState();
   return true;
 }
 
@@ -297,6 +301,7 @@ function endTask() {
   // 所以这里按「当前状态」重算这两个按钮，而不是恢复到任务开始前的值。
   syncRenameApplyState();
   syncBitrateFixState();
+  refreshTitleInputState();
   hideProgress();
 }
 
@@ -602,7 +607,7 @@ async function loadSettings() {
     $("#ai-synopsis-mode").checked = settings.aiSynopsisEnabled !== false;
     $("#ai-poster-mode").checked = settings.aiPosterEnabled !== false;
     applyAiModes();
-    $("#drama-title").value = settings.dramaTitle ?? "";
+    // 剧名按剧保存（后端 dramaMaterials），选中剧目时由 loadDramaTitle() 回填，这里不碰。
     $("#llm-base-url").value = settings.llmBaseUrl ?? "";
     $("#llm-api-key").value = settings.llmApiKey ?? "";
     $("#llm-model").value = settings.llmModel ?? "";
@@ -630,6 +635,15 @@ async function loadSettings() {
   }
 }
 
+/**
+ * 整份保存设置（所有调用方共用），返回后端结果 `{ path, backup }`。
+ * 只有「设置」页的「保存设置」传 `recover: true`：设置文件损坏时后端先备份旧文件再覆盖，
+ * 备份位置由调用方并进成功提示；其他顺带的保存遇到损坏文件会被拒绝（报错照常抛出）。
+ */
+async function saveAppSettings(settings, { recover = false } = {}) {
+  return call("save_app_settings", { settings, recover });
+}
+
 async function saveSettings() {
   let rules;
   try {
@@ -640,13 +654,18 @@ async function saveSettings() {
   }
   try {
     const settings = buildSettingsFromForm(rules);
-    const path = await call("save_app_settings", { settings });
+    const { path, backup } = await saveAppSettings(settings, { recover: true });
     state.settings = settings;
     loadedSettings = settings;
     $("#settings-path").textContent = path;
     renderDefaultHints();
     refreshDirtyBadge();
-    toast("设置已保存到本机配置文件");
+    // 一条提示说完：后面没有别的提示会把备份位置盖掉。
+    toast(
+      backup
+        ? `设置已保存（旧设置文件已损坏，已备份到 ${backup}）`
+        : "设置已保存到本机配置文件",
+    );
     // ffprobe 路径可能变了，重新探一次，头部状态才不会说假话。
     checkRuntime(true);
   } catch (error) {
@@ -680,10 +699,7 @@ function buildSettingsFromForm(rules) {
       $("#recut-max-sec").value.trim() === ""
         ? null
         : Number($("#recut-max-sec").value.trim()),
-    dramaTitle: $("#drama-title").value.trim() || null,
-    // 简介输入框已移除：简介由深度处理自动生成（或复用素材目录），这里原样带回避免丢失。
-    dramaSynopsis: state.settings?.dramaSynopsis ?? null,
-    posterPath: state.settings?.posterPath ?? null,
+    // 剧名 / 简介按剧保存在后端（dramaMaterials），保存设置时后端沿用磁盘上的那份，界面不传。
     // 来源开关（true = AI 生成 / false = 本地手动）。
     aiTitleEnabled: $("#ai-title-mode")?.checked ?? true,
     aiSynopsisEnabled: $("#ai-synopsis-mode")?.checked ?? true,
@@ -708,11 +724,29 @@ function buildSettingsFromForm(rules) {
   };
 }
 
+/** 当前选中的剧（没有素材根目录或没选中时为 `null`）。 */
+function currentDramaOrNull() {
+  return state.root && state.selected != null ? state.dramas[state.selected] ?? null : null;
+}
+
 /**
- * 静默持久化剧名/简介等 AI 元数据：AI 生成海报前调用，
- * 后端从落盘设置读取剧名与简介来拼生图提示词。
+ * 把剧名输入框的内容存到 `drama` 名下；只有输入框里确实是这部剧的剧名时才保存：
+ * 加载还没回来或加载失败时输入框是空的，这时保存会把该剧已保存的剧名清掉。
  */
-async function persistDramaMeta() {
+async function saveDramaTitleFor(drama) {
+  if (!drama || titleLoadedFor !== drama.dir) return;
+  await call("save_drama_title", {
+    root: state.root,
+    name: drama.name,
+    title: $("#drama-title").value.trim() || null,
+  });
+}
+
+/**
+ * 静默持久化来源开关与剧名：深度处理前、切换来源开关时调用。
+ * 剧名按剧保存（后端 save_drama_title），只作用于 `drama`（默认当前选中的那一部剧）。
+ */
+async function persistDramaMeta(drama = currentDramaOrNull()) {
   let rules;
   try {
     rules = readRulesForm(false);
@@ -722,8 +756,75 @@ async function persistDramaMeta() {
   const settings = buildSettingsFromForm(rules);
   state.settings = settings;
   loadedSettings = settings;
-  await call("save_app_settings", { settings });
+  await saveAppSettings(settings);
   refreshDirtyBadge();
+  await saveDramaTitleFor(drama);
+}
+
+/**
+ * 剧名输入框是否可编辑：AI 剧名开着（结果由深度处理回填）、剧名还没加载成功、
+ * 或有长任务进行中，三者任一成立就禁用。所有改变这三个条件的地方都调用它。
+ */
+function refreshTitleInputState() {
+  const input = $("#drama-title");
+  if (!input) return;
+  const drama = currentDramaOrNull();
+  const aiOn = $("#ai-title-mode")?.checked ?? true;
+  const loaded = Boolean(drama) && titleLoadedFor === drama.dir;
+  input.disabled = aiOn || !loaded || Boolean(state.task);
+}
+
+/** 选中剧目后回填该剧已保存的剧名；切换剧目时先清空，避免上一部剧的剧名挂在新剧上。 */
+async function loadDramaTitle() {
+  const input = $("#drama-title");
+  if (!input) return;
+  titleLoadedFor = null;
+  input.value = "";
+  refreshTitleInputState();
+  const drama = currentDramaOrNull();
+  if (!drama) return;
+  try {
+    const materials = await call("load_drama_materials", { root: state.root, name: drama.name });
+    // 等待期间用户可能已切到别的剧：只回填仍然选中的那一部。
+    if (currentDramaOrNull()?.dir === drama.dir) {
+      input.value = materials.title ?? "";
+      titleLoadedFor = drama.dir;
+    }
+  } catch (error) {
+    // 输入框保持锁定：这时手填的内容不会被保存，锁住比让用户白填一次更诚实。
+    toast(`读取《${drama.name}》的剧名失败，剧名输入框已锁定；重新选择该剧可重试。${error}`, true);
+  }
+  refreshTitleInputState();
+}
+
+/** 清除当前剧已保存的剧名与简介：下次深度处理按来源顺序重新取值。 */
+async function clearDramaMaterials() {
+  const drama = currentDramaOrNull();
+  if (!drama) {
+    toast("请先选择一部剧", true);
+    return;
+  }
+  try {
+    await call("clear_drama_materials", { root: state.root, name: drama.name });
+    if (currentDramaOrNull()?.dir === drama.dir) {
+      $("#drama-title").value = "";
+      titleLoadedFor = drama.dir;
+    }
+    refreshTitleInputState();
+    toast(
+      `已清除《${drama.name}》保存的剧名与简介。下次深度处理会按来源顺序重新取值（AI 开着且已配置时重新生成）`,
+    );
+  } catch (error) {
+    reportError(error);
+  }
+}
+
+/** 手填剧名在输入框失去焦点或回车时保存（`change`），失败时提示。 */
+function onDramaTitleChange() {
+  // 必须同步取下：点击剧目列表时 change 先于 selectDrama 触发，晚一步就会存到新选中的剧名下。
+  const drama = currentDramaOrNull();
+  if ($("#ai-title-mode")?.checked ?? true) return;
+  saveDramaTitleFor(drama).catch(reportError);
 }
 
 /**
@@ -731,10 +832,7 @@ async function persistDramaMeta() {
  * AI 关 = 剧名可手动填写。简介 / 海报没有输入框，开关只影响深度处理时的来源。
  */
 function applyAiModes() {
-  const titleInput = $("#drama-title");
-  if (titleInput) {
-    titleInput.disabled = $("#ai-title-mode")?.checked ?? true;
-  }
+  refreshTitleInputState();
 }
 
 /** 记住素材根目录：扫描成功后静默持久化，下次启动直接回填。 */
@@ -754,9 +852,6 @@ async function rememberRoot(root) {
     deepOutputDir: state.settings?.deepOutputDir ?? null,
     recutMinSec: state.settings?.recutMinSec ?? null,
     recutMaxSec: state.settings?.recutMaxSec ?? null,
-    dramaTitle: state.settings?.dramaTitle ?? null,
-    dramaSynopsis: state.settings?.dramaSynopsis ?? null,
-    posterPath: state.settings?.posterPath ?? null,
     llmBaseUrl: state.settings?.llmBaseUrl ?? null,
     llmApiKey: state.settings?.llmApiKey ?? null,
     llmModel: state.settings?.llmModel ?? null,
@@ -778,7 +873,7 @@ async function rememberRoot(root) {
   };
   state.settings = settings;
   try {
-    await call("save_app_settings", { settings });
+    await saveAppSettings(settings);
     renderDefaultHints();
   } catch {
     // 记不住路径不该打断扫描，界面已经拿到了本次结果。
@@ -1011,6 +1106,7 @@ function selectDrama(index) {
   clearResult("#generate-result");
   renderDramas();
   renderContexts();
+  loadDramaTitle();
 }
 
 // ============ 模块导航 ============
@@ -1114,6 +1210,7 @@ async function scan() {
     state.dramas = await call("scan_library", { root });
     state.selected = null;
     state.analysis = null;
+    loadDramaTitle();
     $("#detail-view").classList.add("hidden");
     $("#detail-placeholder").classList.remove("hidden");
     invalidatePlans();
@@ -1937,6 +2034,7 @@ function requestBitrateFix() {
       targets.length > 5 ? ` 等 ${targets.length} 个文件` : ""
     }。<br />
     <strong>原文件会被替换</strong>（视频与音频都会重新编码），<strong>没有备份、不能撤销</strong>。
+    只有重编码后确认达标才会替换；画面过于简单、编不到安全线的分集会保留原文件并列为失败。
     建议先备份，或先在副本上试一集。`;
   // 弹窗关掉后要把焦点还给触发它的按钮，否则键盘用户会被丢回页面开头。
   bitrateConfirmReturnFocus = $("#bitrate-fix");
@@ -2039,11 +2137,17 @@ async function executeTranscode() {
   const mode = $("#exec-mode").value || "deep";
   const outputDir = null;
   const modeLabel = "深度处理（材料生成 + 重组 + 微帧）";
+  // 先取下要处理的剧（在任何 await 之前）：保存设置那几毫秒里用户若点了别的剧，处理的仍是这一部。
+  const drama = currentDramaOrNull();
+  if (!drama) {
+    toast("请先在左侧选择一部剧", true);
+    return;
+  }
   if (!beginTask(`正在执行${modeLabel}（两轮并行编码，可能需要较长时间）`)) return;
   // 材料先行：后端从落盘设置读取剧名/简介/海报与 AI 开关，
   // 执行前先把表单内容静默保存（保存失败不阻塞转码）。
   try {
-    await persistDramaMeta();
+    await persistDramaMeta(drama);
   } catch (error) {
     toast(`设置保存失败（转码继续）：${error}`, true);
   }
@@ -2055,7 +2159,6 @@ async function executeTranscode() {
   // beginTask 未通过时不会走到这里，上一轮结果保持原样。
   clearResult("#exec-result");
   try {
-    const drama = selectedDrama();
     const report = await call("transcode_execute", {
       root: state.root,
       name: drama.name,
@@ -2067,7 +2170,8 @@ async function executeTranscode() {
       },
       ffprobePath: effectiveFfprobe(),
     });
-    applyGeneratedMaterials(report.materials);
+    // 记住发起处理的那部剧：处理期间用户可能已切到别的剧，生成的剧名只回填给原剧。
+    applyGeneratedMaterials(report.materials, drama.dir);
     const rows = report.items
       .map(
         (item) => `<tr>
@@ -2093,10 +2197,19 @@ async function executeTranscode() {
                <p><strong>${esc(materialStatusLabel(report.materials.status))}</strong>
                ${report.materials.title ? ` · 剧名：${esc(report.materials.title)}` : ""}</p>
                ${report.materials.synopsis ? `<p class="hint">${esc(report.materials.synopsis)}</p>` : ""}
-               <p class="hint">剧名来源：${esc(report.materials.titleSource ?? "未生成")}；简介来源：${esc(report.materials.synopsisSource ?? "未生成")}；海报来源：${esc(report.materials.posterSource ?? "未生成")}</p>
+               <p class="hint">剧名来源：${esc(report.materials.titleSource ?? "未生成")}；简介来源：${esc(report.materials.synopsisSource ?? "未生成")}；海报来源：<span data-poster-source>${esc(report.materials.posterSource ?? "未生成")}</span></p>
                ${report.materials.evidence ? `<p class="hint">证据清单：<code>${esc(report.materials.evidence.manifest)}</code></p>` : ""}
-               ${report.materials.poster ? `<p class="hint">海报：<code>${esc(report.materials.poster)}</code></p>` : ""}
-               ${report.materials.proof ? `<p class="hint">AI 制作证明：<code>${esc(report.materials.proof)}</code></p>` : ""}
+               ${report.materials.poster ? `<p class="hint">海报：<code data-poster-path>${esc(report.materials.poster)}</code></p>` : ""}
+               <p class="hint${report.materials.proof ? "" : " hidden"}" data-proof-row>AI 制作证明：<code data-proof-path>${esc(report.materials.proof ?? "")}</code></p>
+               ${
+                 report.materials.posterStale
+                   ? `<p class="hint" data-poster-stale>剧名或简介已变化，海报仍是旧文案。${
+                       report.materials.posterRegenerable
+                         ? ` <button type="button" class="ghost" data-regenerate-poster data-long-task>按新文案重做海报（会调用生图接口，产生费用）</button>`
+                         : "打开海报的 AI 开关并配置生图接口后可重做。"
+                     }</p>`
+                   : ""
+               }
                ${
                  (report.materials.processImages || []).length
                    ? `<p class="hint">过程图：${report.materials.processImages
@@ -2104,7 +2217,12 @@ async function executeTranscode() {
                        .join("、")}</p>`
                    : ""
                }
-               ${(report.materials.messages || []).map((message) => `<p class="hint">${esc(message)}</p>`).join("")}
+               ${(report.materials.messages || [])
+                 .map(
+                   (message) =>
+                     `<p class="hint"${message.includes("海报仍是旧文案") ? " data-stale-message" : ""}>${esc(message)}</p>`,
+                 )
+                 .join("")}
              </details>`
           : ""
       }`,
@@ -2116,6 +2234,12 @@ async function executeTranscode() {
         ],
       ],
     });
+    // 重做按钮在渲染时就绑定这部剧与这次的输出目录，不依赖之后选中的是哪部剧。
+    const regenerateButton = $("#exec-result [data-regenerate-poster]");
+    if (regenerateButton) {
+      const target = { root: state.root, name: drama.name, outputDir: report.outputDir };
+      regenerateButton.addEventListener("click", () => regeneratePoster(target));
+    }
     toast(
       report.materials?.status === "failed"
         ? "转码完成，但自动材料生成失败，详见结果"
@@ -2124,7 +2248,7 @@ async function executeTranscode() {
           : "转码完成",
       ["failed", "partial"].includes(report.materials?.status),
     );
-    // 材料阶段可能由 AI 生成了剧名/简介/海报并写回设置，重新加载回填界面。
+    // 材料阶段可能由 AI 生成了剧名 / 简介并写回本剧材料；重新加载设置，界面与磁盘保持一致。
     await loadSettings();
   } catch (error) {
     const message = String(error);
@@ -2146,6 +2270,44 @@ async function executeTranscode() {
   }
 }
 
+/**
+ * 按新文案重做海报：用户在结果区点按钮才调用（会调用生图接口，产生费用）。
+ * `target` = 渲染结果时记下的 { root, name, outputDir }；后端会再校验目录确实属于这部剧。
+ */
+async function regeneratePoster(target) {
+  if (!beginTask(`正在按新文案重做《${target.name}》的海报`)) return;
+  const result = $("#exec-result");
+  try {
+    const outcome = await call("regenerate_poster", target);
+    const source = result.querySelector("[data-poster-source]");
+    if (source) source.textContent = outcome.posterSource;
+    const poster = result.querySelector("[data-poster-path]");
+    if (poster) poster.textContent = outcome.poster;
+    // 证明行在首次渲染时可能是隐藏的（当时证明没生成出来）：有新路径就显示出来。
+    const proof = result.querySelector("[data-proof-path]");
+    if (proof && outcome.proof) {
+      proof.textContent = outcome.proof;
+      result.querySelector("[data-proof-row]")?.classList.remove("hidden");
+    }
+    const stale = result.querySelector("[data-poster-stale]");
+    if (stale) stale.textContent = `海报已按新文案重做：${outcome.poster}`;
+    // 结果区里那条「海报仍是旧文案」的消息已经不成立，去掉，免得和上面一句自相矛盾。
+    result.querySelectorAll("[data-stale-message]").forEach((node) => node.remove());
+    // 只弹一条提示：有警告时把警告并进去，避免被随后的成功提示盖掉。
+    const warnings = outcome.messages || [];
+    toast(
+      warnings.length
+        ? `《${target.name}》的海报已按新文案重做；${warnings.join("；")}`
+        : `《${target.name}》的海报已按新文案重做`,
+      warnings.length > 0,
+    );
+  } catch (error) {
+    reportError(error);
+  } finally {
+    endTask();
+  }
+}
+
 /** 材料状态是后端 token，界面上只显示中文。 */
 function materialStatusLabel(status) {
   return (
@@ -2155,19 +2317,17 @@ function materialStatusLabel(status) {
   );
 }
 
-/** 深度处理产出的剧名/简介/海报回填到状态，剧名同步到输入框；海报不再做页面预览。 */
-function applyGeneratedMaterials(materials) {
-  if (!materials) return;
-  state.settings = {
-    ...(state.settings ?? {}),
-    dramaTitle: materials.title ?? state.settings?.dramaTitle ?? null,
-    dramaSynopsis: materials.synopsis ?? state.settings?.dramaSynopsis ?? null,
-    // 后端只要生成了新剧名就会同步海报字段：海报失败时状态是空，避免旧海报配新文案。
-    posterPath: materials.title
-      ? (materials.poster ?? null)
-      : (state.settings?.posterPath ?? null),
-  };
-  if (materials.title) $("#drama-title").value = materials.title;
+/**
+ * 深度处理产出的剧名回填到输入框（后端已按剧写回）；海报不再做页面预览。
+ * 只回填给发起处理的那部剧 `dramaDir`：当前选中的已经不是它时不动输入框，
+ * 否则别的剧随后一保存，就会把这部剧的剧名存到别的剧名下。
+ */
+function applyGeneratedMaterials(materials, dramaDir) {
+  if (!materials?.title) return;
+  if (currentDramaOrNull()?.dir !== dramaDir) return;
+  $("#drama-title").value = materials.title;
+  titleLoadedFor = dramaDir;
+  refreshTitleInputState();
 }
 
 // ============ 运行环境（全局横幅 + 头部状态 + 设置-本机环境） ============
@@ -2193,6 +2353,8 @@ function renderRuntimeStatus(status) {
   renderRuntimeList(status);
   renderEnvChip(status);
   renderRuntimeInstallEntry(status);
+  // 「V5 去重验证」依赖开发仓库的 cloud 虚拟环境：安装版没有，隐藏入口而不是留一个必然报错的按钮。
+  $("#tool-dedup-demo")?.classList.toggle("hidden", !status.devTools);
 }
 
 /** 没有「一键配置」的平台（现仅 Linux），按键必然失败，改为给出手动安装指引。 */
@@ -3028,10 +3190,12 @@ $("#env-workdir").addEventListener("keydown", (event) => {
 ].forEach(([selector]) => {
   $(selector).addEventListener("change", () => {
     applyAiModes();
-    persistDramaMeta();
+    persistDramaMeta().catch(reportError);
   });
 });
+$("#drama-title").addEventListener("change", onDramaTitleChange);
 $("#deep-output-pick").addEventListener("click", () => browse("#deep-output-dir"));
+$("#drama-materials-clear").addEventListener("click", clearDramaMaterials);
 // ============ 挂载 ============
 // 挂载与发布卡暂时下架（HTML 已整块注释）：功能函数保留，仅注释事件绑定，恢复时一并取消注释。
 // document.querySelectorAll("#mount-steps .step").forEach((node) => {

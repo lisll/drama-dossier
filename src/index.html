@@ -245,34 +245,47 @@
                 </section>
                 <p class="hint">
                   三项在「深度处理」时自动生成并一起写入输出目录（剧名 / 简介.txt / 剧目海报 / 过程图 / AI 制作证明）；
-                  素材目录已有的简介与封面会优先复用，无需手动填写或上传。API 在
+                  简介以素材目录里文件名含「简介 / intro / synopsis」的 txt、md 为准；海报在输出目录已有时沿用，
+                  文案变了会在结果区提示、由你确认后再按新文案重做（生图会产生费用）。
+                  已保存的剧名与简介可用「清除已保存」清掉，下次深度处理按来源顺序重新取值。API 在
                   <button type="button" class="link" data-goto-sub="rules">设置 → 生成设置</button>
                   配置。
                 </p>
                 <div class="ai-config-rows">
                   <div class="ai-config-row">
                     <span class="ai-config-label">剧名</span>
-                    <input id="drama-title" type="text" placeholder="AI 生成后自动回填；关闭 AI 时可手动填写" />
-                    <label class="ai-mode" title="开启 = 深度处理时 AI 生成；关闭 = 使用手动填写">
-                      <input id="ai-title-mode" type="checkbox" checked />
+                    <div class="drama-title-field">
+                      <input id="drama-title" type="text" placeholder="AI 生成后自动回填；关闭 AI 时可手动填写" />
+                      <button
+                        id="drama-materials-clear"
+                        type="button"
+                        class="ghost"
+                        data-long-task
+                        title="清除这部剧已保存的剧名与简介；下次深度处理按来源顺序重新取值（AI 开着且已配置时重新生成）"
+                      >
+                        清除已保存
+                      </button>
+                    </div>
+                    <label class="ai-mode" title="开启 = 没有已保存的剧名时由 AI 生成；关闭 = 使用手动填写（离开输入框即保存）">
+                      <input id="ai-title-mode" type="checkbox" data-long-task checked />
                       <span class="ai-mode-track"></span>
                       <span class="ai-mode-text">AI</span>
                     </label>
                   </div>
                   <div class="ai-config-row">
                     <span class="ai-config-label">简介</span>
-                    <span class="ai-config-desc">AI 生成，随成片写入输出目录「简介.txt」；素材目录已有简介时直接复用</span>
-                    <label class="ai-mode" title="开启 = 深度处理时 AI 生成；关闭 = 只复用素材目录里的简介">
-                      <input id="ai-synopsis-mode" type="checkbox" checked />
+                    <span class="ai-config-desc">随成片写入输出目录「简介.txt」；素材目录有简介文件（文件名含「简介 / intro / synopsis」的 txt、md）时一律用它，没有时沿用本剧已保存的，再没有才由 AI 生成</span>
+                    <label class="ai-mode" title="开启 = 缺简介时 AI 生成；关闭 = 不调用 AI，只用素材目录或已保存的简介">
+                      <input id="ai-synopsis-mode" type="checkbox" data-long-task checked />
                       <span class="ai-mode-track"></span>
                       <span class="ai-mode-text">AI</span>
                     </label>
                   </div>
                   <div class="ai-config-row">
                     <span class="ai-config-label">海报</span>
-                    <span class="ai-config-desc">AI 生成竖版海报，随成片写入输出目录；素材目录已有封面时直接复用</span>
-                    <label class="ai-mode" title="开启 = 深度处理时 AI 生成；关闭 = 只复用素材目录里的封面">
-                      <input id="ai-poster-mode" type="checkbox" checked />
+                    <span class="ai-config-desc">随成片写入输出目录；输出目录已有海报就沿用，没有时 AI 开着且已配置生图接口就生成竖版海报，否则复用素材目录的封面</span>
+                    <label class="ai-mode" title="开启 = 没有海报时 AI 生图（未配置时复用素材封面）；关闭 = 不调用生图，沿用输出目录已有海报或素材目录的封面">
+                      <input id="ai-poster-mode" type="checkbox" data-long-task checked />
                       <span class="ai-mode-track"></span>
                       <span class="ai-mode-text">AI</span>
                     </label>
@@ -499,7 +512,7 @@
             </section>
 
             <!-- 卡 3：V5 去重验证 -->
-            <section class="panel" id="tool-dedup-demo">
+            <section class="panel hidden" id="tool-dedup-demo">
               <section class="panel-header">
                 <h3>V5 去重验证</h3>
                 <span class="badge">技术验证</span>
@@ -787,7 +800,7 @@
                 <label>单集最长时长（秒）
                   <input id="recut-max-sec" type="number" min="5" max="3600" step="1" placeholder="留空默认 70" />
                 </label>
-                <label>深度处理输出目录
+                <label>深度处理输出根目录（每部剧写到 该目录/剧名/深度处理）
                   <span class="path-row form-field-row">
                     <input id="deep-output-dir" type="text" placeholder="留空时写到 剧目目录/深度处理" />
                     <button id="deep-output-pick" type="button" class="ghost">浏览</button>

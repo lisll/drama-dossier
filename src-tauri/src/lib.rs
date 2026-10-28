@@ -1,10 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use dossier_core::{
-    generate_report_package, load_settings, probe_episode, resolve_product_dir, run_checks,
-    save_settings, scan_drama_dir, validate_drama_dir, validate_drama_name, validate_library_root,
-    AppSettings, ChecklistReport, ChecklistRules, CostSheetForm, Drama, EpisodeSpec, FfprobeConfig,
-    LoadedSettings, PackageOptions, PackageResult, ProbedEpisode,
+    generate_report_package, load_settings, merge_saved_settings, probe_episode, replace_settings,
+    resolve_product_dir, run_checks, scan_drama_dir, update_settings, validate_drama_dir,
+    validate_drama_name, validate_library_root, AppSettings, ChecklistReport, ChecklistRules,
+    CostSheetForm, Drama, DramaMaterials, EpisodeSpec, FfprobeConfig, LoadedSettings,
+    PackageOptions, PackageResult, ProbedEpisode,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
@@ -118,7 +119,11 @@ fn load_app_settings(app: AppHandle) -> Result<SettingsPayload, String> {
 }
 
 #[tauri::command]
-fn save_app_settings(app: AppHandle, settings: AppSettings) -> Result<String, String> {
+fn save_app_settings(
+    app: AppHandle,
+    settings: AppSettings,
+    recover: Option<bool>,
+) -> Result<SaveSettingsOutcome, String> {
     // 测试期关键日志：设置保存直接影响「默认输出目录」「一键安装路径」等链路。
     logging::log_event(
         "设置",
@@ -141,10 +146,111 @@ fn save_app_settings(app: AppHandle, settings: AppSettings) -> Result<String, St
         rules.validate()?;
     }
     let path = settings_path(&app)?;
-    save_settings(&path, &settings)
-        .map_err(|error| format!("保存设置失败（{}）：{error}", path.display()))?;
+    // 只由后端维护的字段（按剧材料、一键配置写入的 Python 路径）一律沿用磁盘上的那份，见
+    // `merge_saved_settings`。读取磁盘与写回在同一把锁里完成，材料线程不会在两者之间插入写入。
+    let merge = move |current: &mut AppSettings| {
+        merge_saved_settings(current, settings);
+        Ok(())
+    };
+    // 设置文件损坏时：只有「设置」页的「保存设置」（recover=true）会先备份旧文件再覆盖；
+    // 扫描、拨开关、开始处理时顺带的保存一律拒绝，原文件不动，避免用户不知情时丢设置。
+    let backup = if recover == Some(true) {
+        replace_settings(&path, merge)
+            .map_err(|error| format!("保存设置失败：{error}"))?
+            .backup
+    } else {
+        update_settings(&path, merge).map_err(|error| format!("保存设置失败：{error}"))?;
+        None
+    };
     logging::log_event("设置", format!("已写入 {}", path.display()));
-    Ok(path.display().to_string())
+    if let Some(backup) = &backup {
+        logging::log_event(
+            "设置",
+            format!("旧设置文件损坏，已备份到 {}", backup.display()),
+        );
+    }
+    Ok(SaveSettingsOutcome {
+        path: path.display().to_string(),
+        backup: backup.map(|backup| backup.display().to_string()),
+    })
+}
+
+/// 保存设置的结果：写入位置，以及旧文件损坏时的备份位置（界面提示用户可以找回）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveSettingsOutcome {
+    path: String,
+    backup: Option<String>,
+}
+
+/// 某部剧已保存的材料（剧名 / 简介）；转码页选中剧目时用来回填剧名输入框。
+#[tauri::command]
+fn load_drama_materials(
+    app: AppHandle,
+    root: String,
+    name: String,
+) -> Result<DramaMaterials, String> {
+    let drama = dossier::load_drama(&root, &name)?;
+    let settings = load_settings(&settings_path(&app)?).settings;
+    Ok(settings.materials_for(&paths::material_key(&drama.dir)))
+}
+
+/// 保存某部剧手动填写的剧名（空 = 清除）；只动这一部剧的剧名，简介与其他剧原样保留。
+#[tauri::command]
+fn save_drama_title(
+    app: AppHandle,
+    root: String,
+    name: String,
+    title: Option<String>,
+) -> Result<DramaMaterials, String> {
+    let drama = dossier::load_drama(&root, &name)?;
+    let path = settings_path(&app)?;
+    let key = paths::material_key(&drama.dir);
+    let title = title
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    let saved = update_settings(&path, |settings| {
+        let mut materials = settings.materials_for(&key);
+        materials.title = title;
+        settings.set_materials_for(&key, materials);
+        Ok(())
+    })
+    .map_err(|error| format!("保存剧名失败：{error}"))?;
+    Ok(saved.materials_for(&key))
+}
+
+/// 按新文案重做海报：用户在深度处理结果区确认后才调用（会调用生图接口，产生费用）。
+/// `output_dir` 是那次深度处理报告里的输出目录；后端会校验它确实属于这部剧。
+#[tauri::command]
+async fn regenerate_poster(
+    app: AppHandle,
+    root: String,
+    name: String,
+    output_dir: String,
+) -> Result<content::PosterRegeneration, String> {
+    license::guard()?;
+    let drama = dossier::load_drama(&root, &name)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        content::regenerate_poster_blocking(&app, &drama, Path::new(&output_dir))
+    })
+    .await
+    .map_err(|error| format!("重做海报任务失败：{error}"))?
+}
+
+/// 清除某部剧已保存的剧名与简介（下次深度处理按来源顺序重新取值，AI 开着时会重新生成）。
+/// 只动这一部剧，其他剧原样保留。
+#[tauri::command]
+fn clear_drama_materials(app: AppHandle, root: String, name: String) -> Result<(), String> {
+    let drama = dossier::load_drama(&root, &name)?;
+    let path = settings_path(&app)?;
+    let key = paths::material_key(&drama.dir);
+    update_settings(&path, |settings| {
+        settings.set_materials_for(&key, DramaMaterials::default());
+        Ok(())
+    })
+    .map_err(|error| format!("清除已保存材料失败：{error}"))?;
+    logging::log_event("材料", format!("已清除《{}》保存的剧名与简介", drama.name));
+    Ok(())
 }
 
 /// 探测并检查的实现体。
@@ -394,6 +500,10 @@ pub fn run() {
             scan_library,
             load_app_settings,
             save_app_settings,
+            load_drama_materials,
+            save_drama_title,
+            clear_drama_materials,
+            regenerate_poster,
             analyze_drama,
             generate_package,
             open_path,

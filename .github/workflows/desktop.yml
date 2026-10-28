@@ -208,6 +208,22 @@ jobs:
             echo "::warning::内置 ffmpeg 在当前 runner 上无法执行（arm64 可能缺 Rosetta 2），已跳过自检"
             file src-tauri/resources/ffmpeg/ffmpeg || true
           fi
+      # 擦除工具：安装版此前完全找不到 dossier-inpaint（只在开发仓库 target/ 里有）。
+      # 与内置 ffmpeg 同一方式放进 resources，运行时 erase::locate 优先查这里。
+      # 只内置 Rust 管线本体，worker 模式依赖的 Python 与模型权重不随包分发。
+      - name: 内置擦除工具（dossier-inpaint）
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release -p dossier-inpaint --target ${{ matrix.target }}
+          mkdir -p src-tauri/resources/inpaint
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/dossier-inpaint.exe" src-tauri/resources/inpaint/
+          else
+            cp "target/${{ matrix.target }}/release/dossier-inpaint" src-tauri/resources/inpaint/
+            chmod +x src-tauri/resources/inpaint/dossier-inpaint
+          fi
+          ls -lh src-tauri/resources/inpaint
       - name: Build desktop bundles
         uses: tauri-apps/tauri-action@v0
         env:
