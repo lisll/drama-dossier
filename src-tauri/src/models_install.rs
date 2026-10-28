@@ -75,9 +75,11 @@ const PIP_INSTALL_TIMEOUT_SECS: u64 = 1800;
 /// PyPI 主源：清华镜像。镜像不可用时 pip 会自动落到官方源，不会因此装不上。
 const PYPI_MIRROR: &str = "https://pypi.tuna.tsinghua.edu.cn/simple";
 /// PyTorch 的 CUDA 轮子源。CUDA 版 torch **不在 PyPI**，必须单独指定；
-/// 选 cu121 是因为它对 NVIDIA 驱动版本的要求最宽松（对应 525+），覆盖面最广。
+/// 选 cu130 是因为内置 Python 是 3.13，老索引（cu121 及更早）没有 3.13 的轮子，
+/// pip 会报「versions: none」。CUDA 13 要求驱动 580+；驱动过旧的机器装完
+/// `torch.cuda.is_available()` 仍为 False，运行时会走 CPU 重试兜底（见 content.rs）。
 /// 升级时同步改这里，并更新 `installed_torch_variant` 的后缀判断依据。
-const PYTORCH_CUDA_INDEX: &str = "https://download.pytorch.org/whl/cu121";
+const PYTORCH_CUDA_INDEX: &str = "https://download.pytorch.org/whl/cu130";
 
 /// 读出当前 venv 里 torch 的版本串（例如 `2.3.1+cu121` 或 `2.3.1`）。
 /// 读不到返回 `None`——调用方按"没有 CUDA"处理，不阻塞安装。
