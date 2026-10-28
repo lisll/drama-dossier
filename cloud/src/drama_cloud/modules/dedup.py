@@ -57,9 +57,22 @@ def format_wave(wave, clock: str) -> str:
     return f"{base}+{amp}*sin(2*PI*{clock}/{period}+{phase})"
 
 
+def _rotation_wave_radians(rotation_wave) -> List[float]:
+    """配方里的旋转波形以**度**为单位（±1.2°、摆动 ≤0.8°），ffmpeg ``rotate`` 的 ``a`` 参数是**弧度**。
+
+    base / amp 换算成弧度，period / phase 与单位无关原样保留。以前直接把度数当弧度传，
+    实际转了约 60° 以上，防黑边裁切只剩不到一半画面。与桌面端 ``dedup.rs`` 的 ``DEG_TO_RAD`` 一致。
+    """
+    base, amp, period, phase = _wave_values(rotation_wave)
+    return [math.radians(float(base)), math.radians(float(amp)), period, phase]
+
+
 def _safe_crop_ratio(width: int, height: int, scale: float, ratio: float, rotation_wave) -> float:
-    """旋转后不露黑边的安全裁切比例（照抄 Grove ``_geometry`` 的投影计算）。"""
-    rotation_wave = _wave_values(rotation_wave)
+    """旋转后不露黑边的安全裁切比例（照抄 Grove ``_geometry`` 的投影计算）。
+
+    ``rotation_wave`` 以度为单位；投影计算用弧度，所以先换算。
+    """
+    rotation_wave = _rotation_wave_radians(rotation_wave)
     scaled_w = max(2, math.floor(width * scale / 2) * 2)
     scaled_h = max(2, math.floor(height * scale / 2) * 2)
     angle = abs(float(f"{rotation_wave[0]:.12f}")) + abs(float(f"{rotation_wave[1]:.12f}"))
@@ -99,7 +112,8 @@ def compile_dedup_video(params: "VideoDedupParams") -> List[str]:
         "setsar=1",
         f"tmix=frames=3:weights='{weights}'",
         f"scale={scaled_w}:{scaled_h}:flags=lanczos",
-        f"rotate=a='{format_wave(variant['rotationWave'], WAVE_CLOCK_FRAME)}':fillcolor=black:ow=iw:oh=ih",
+        f"rotate=a='{format_wave(_rotation_wave_radians(variant['rotationWave']), WAVE_CLOCK_FRAME)}'"
+        ":fillcolor=black:ow=iw:oh=ih",
         f"crop=trunc(iw*{ratio:.12f}/2)*2:trunc(ih*{ratio:.12f}/2)*2:exact=1",
         cover,
         f"crop={width}:{height}",

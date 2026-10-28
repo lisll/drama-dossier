@@ -126,6 +126,30 @@ class TestFilterCompilation:
         rotated = _safe_crop_ratio(720, 1280, 1.0, 1.0, [0.5, 0.5, 600.0, 0.0])
         assert rotated < 1.0
         assert _safe_crop_ratio(720, 1280, 1.0, 1.0, [0.0, 0.0, 600.0, 0.0]) == 1.0
+        # 旋转波形单位是度：最坏 |base|+amp = 2° 也只裁很窄一圈（以前把度数当弧度只剩 0.49）。
+        for width, height in [(1080, 1920), (1920, 1080), (360, 640)]:
+            worst = _safe_crop_ratio(width, height, 1.0, 1.0, [1.2, 0.8, 600.0, 0.0])
+            assert 0.93 <= worst < 1.0, (width, height, worst)
+
+    def test_rotation_converted_to_radians_for_ffmpeg(self):
+        """配方旋转波形是度，交给 ffmpeg rotate 的必须是弧度（ffmpeg -h filter=rotate：in radians）。"""
+        import math
+
+        recipe = _make_recipe()
+        variant = recipe["variants"][0]
+        params = VideoDedupParams(
+            width=recipe["width"], height=recipe["height"],
+            temporalWeights=recipe["temporalWeights"],
+            variant=variant,
+        )
+        rotate = next(part for part in compile_dedup_video(params) if part.startswith("rotate=a='"))
+        expr = rotate[len("rotate=a='"):rotate.index("'", len("rotate=a='"))]
+        base_text, rest = expr.split("+", 1)
+        amp_text = rest.split("*", 1)[0]
+        base_deg, amp_deg = variant["rotationWave"][0], variant["rotationWave"][1]
+        assert math.isclose(float(base_text), math.radians(base_deg), abs_tol=1e-11)
+        assert math.isclose(float(amp_text), math.radians(amp_deg), abs_tol=1e-11)
+        assert abs(float(base_text)) + abs(float(amp_text)) < 0.05
 
 
 class TestAudioBackend:

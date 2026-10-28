@@ -128,6 +128,7 @@ def _variant(rng: random.Random, rate: int) -> Dict:
     return {
         "speed": round(rng.uniform(*SPEED_RANGE), 12),
         "cropRatio": round(rng.uniform(*CROP_RATIO_RANGE), 12),
+        # 单位：度（±1.2°、摆动 ≤0.8° 的微旋转）；编译 ffmpeg rotate 时才换算成弧度。
         "rotationWave": _wave(rng, -1.2, 1.2, 0.8, 360.0, 3600.0),
         "contrastWave": _wave(rng, 1.0, 1.04, 0.02, 60.0, 600.0),
         "brightnessWave": _wave(rng, -0.01, 0.01, 0.008, 60.0, 600.0),

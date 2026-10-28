@@ -106,7 +106,21 @@ impl Wave {
             self.base, self.amp, clock, self.period, self.phase
         )
     }
+
+    /// 幅值换单位后的副本：base 与 amp 乘以 `factor`；period / phase 与单位无关，保持不变。
+    fn scaled(&self, factor: f64) -> Self {
+        Self {
+            base: self.base * factor,
+            amp: self.amp * factor,
+            ..*self
+        }
+    }
 }
+
+/// 度 → 弧度。配方里的旋转波形以**度**为单位（±1.2°、摆动 ≤0.8° 的微旋转），
+/// 而 ffmpeg `rotate` 滤镜的 `a` 参数是**弧度**（`ffmpeg -h filter=rotate`：set angle (in radians)）。
+/// 以前直接把度数当弧度传，实际转了约 60° 以上，防黑边裁切只剩不到一半画面。
+const DEG_TO_RAD: f64 = PI / 180.0;
 
 /// 一段 EQ（`equalizer` 滤镜参数）。
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -254,8 +268,9 @@ pub fn derive_variant(seed: u64, episode_index: usize) -> DedupVariant {
 // ---------------------------------------------------------------------------
 
 /// 旋转后不露黑边的安全裁切比例（照抄原型 `safe_crop_ratio` 的投影计算）。
+/// `rotation` 以度为单位；投影计算用弧度，所以先换算。
 fn safe_crop_ratio(width: u32, height: u32, ratio: f64, rotation: &Wave) -> f64 {
-    let angle = rotation.base.abs() + rotation.amp.abs();
+    let angle = (rotation.base.abs() + rotation.amp.abs()) * DEG_TO_RAD;
     if angle <= 0.0 {
         return ratio;
     }
@@ -285,7 +300,7 @@ impl DedupVariant {
             "setsar=1".into(),
             format!(
                 "rotate=a='{}':fillcolor=black:ow=iw:oh=ih",
-                self.rotation_wave.compile("n")
+                self.rotation_wave.scaled(DEG_TO_RAD).compile("n")
             ),
         ];
         let ratio = safe_crop_ratio(width, height, self.crop_ratio, &self.rotation_wave);
@@ -352,8 +367,8 @@ impl DedupVariant {
 
     /// 给界面/报告的一行可读摘要。
     pub fn describe(&self) -> String {
-        let rotation_deg =
-            (self.rotation_wave.base.abs() + self.rotation_wave.amp.abs()) * 180.0 / PI;
+        // 波形本身就是度数，直接显示（以前又乘了一次 180/π，显示值被放大 57 倍）。
+        let rotation_deg = self.rotation_wave.base.abs() + self.rotation_wave.amp.abs();
         format!(
             "速度 {:.3}x、裁切 {:.1}%、旋转幅度 {:.2}°、调色/混帧已注入、噪点 {}、锐化 {:.2}、音调 {:.3}x",
             self.speed,
@@ -430,7 +445,10 @@ impl DedupRecipePlan {
             })
             .collect();
         serde_json::json!({
-            "schema": "drama-dossier/dedup-recipe@1",
+            // @2：旋转波形明确按「度」解释、编译时换算成弧度。@1 的存证把同一数值直接当弧度
+            // 交给了 ffmpeg，同一 seed 编出的滤镜链与 @2 不同，不能用新版本复算。
+            "schema": "drama-dossier/dedup-recipe@2",
+            "rotationUnit": "degrees",
             "seed": self.seed,
             "dramaName": self.drama_name,
             "episodeCount": self.variants.len(),
@@ -656,7 +674,8 @@ mod tests {
     fn recipe_json_and_save_round_trip() {
         let plan = DedupRecipePlan::build("存证剧", 3);
         let json = plan.to_json();
-        assert_eq!(json["schema"], "drama-dossier/dedup-recipe@1");
+        assert_eq!(json["schema"], "drama-dossier/dedup-recipe@2");
+        assert_eq!(json["rotationUnit"], "degrees");
         assert_eq!(json["episodeCount"], 3);
         assert_eq!(json["variants"].as_array().map(Vec::len), Some(3));
 
@@ -696,5 +715,62 @@ mod tests {
             phase: 0.0,
         };
         assert_eq!(safe_crop_ratio(1080, 1920, 0.95, &still), 0.95);
+        // 最坏情况（|base| + amp = 2°）也只裁掉很窄一圈：以前把度数当弧度时只剩 0.49。
+        let worst = Wave {
+            base: 1.2,
+            amp: 0.8,
+            period: 720.0,
+            phase: 0.0,
+        };
+        for (w, h) in [(1080, 1920), (1920, 1080), (360, 640)] {
+            let ratio = safe_crop_ratio(w, h, 1.0, &worst);
+            assert!((0.93..1.0).contains(&ratio), "{w}x{h}: {ratio}");
+        }
+    }
+
+    /// 从 `rotate=a='<base>+<amp>*sin(...)'` 里取出 base 与 amp。
+    fn rotate_terms(chain: &str) -> (f64, f64) {
+        let start = chain.find("rotate=a='").expect("缺少 rotate") + "rotate=a='".len();
+        let expr = &chain[start..chain[start..].find('\'').unwrap() + start];
+        let (base, rest) = expr.split_once('+').unwrap();
+        let amp = rest.split_once('*').unwrap().0;
+        (base.parse().unwrap(), amp.parse().unwrap())
+    }
+
+    #[test]
+    fn rotation_is_converted_to_radians_for_ffmpeg() {
+        let v = derive_variant(7, 3);
+        let (base, amp) = rotate_terms(&v.compile_video_filters(1080, 1920));
+        // 交给 ffmpeg 的是弧度：等于配方度数 × π/180（12 位小数精度内）。
+        assert!(
+            (base - v.rotation_wave.base * DEG_TO_RAD).abs() < 1e-9,
+            "{base}"
+        );
+        assert!(
+            (amp - v.rotation_wave.amp * DEG_TO_RAD).abs() < 1e-9,
+            "{amp}"
+        );
+        // ±1.2° + 0.8° 换成弧度最多约 0.035；以前把度数当弧度时可达 2.0。
+        assert!(base.abs() + amp.abs() < 0.05, "{base} {amp}");
+    }
+
+    #[test]
+    fn safe_crop_keeps_most_of_the_frame_for_every_seed() {
+        // 防止以后又把单位写错：任何 seed、任何画幅，防黑边裁切都只裁很窄一圈。
+        for seed in 0..200u64 {
+            let v = derive_variant(seed, (seed % 7) as usize);
+            for (w, h) in [(1080, 1920), (1920, 1080)] {
+                let safe = safe_crop_ratio(w, h, v.crop_ratio, &v.rotation_wave);
+                assert!(
+                    safe >= v.crop_ratio.min(0.93),
+                    "seed={seed} {w}x{h}: safe={safe} crop_ratio={}",
+                    v.crop_ratio
+                );
+            }
+            // 说明文字里的旋转幅度是真实度数（不再被放大 57 倍）。
+            let shown = v.rotation_wave.base.abs() + v.rotation_wave.amp.abs();
+            assert!(shown <= 2.0 + 1e-9, "seed={seed}: {shown}°");
+            assert!(v.describe().contains(&format!("旋转幅度 {shown:.2}°")));
+        }
     }
 }
