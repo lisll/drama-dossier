@@ -12,6 +12,12 @@ use std::sync::OnceLock;
 
 /// 日志文件位置；应用启动时 `init` 一次，之后只读。
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
+/// 串行化写日志与轮转：多个线程同时写时不会在轮转瞬间互相覆盖。
+static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// 日志超过这个大小就轮转为 `dossier.log.1`（只保留一份旧日志），避免无限增长。
+const ROTATE_BYTES: u64 = 10 * 1024 * 1024;
+/// 读日志尾部时每次往回读的块大小。
+const TAIL_CHUNK: u64 = 64 * 1024;
 
 /// 应用启动时调用：确定日志文件位置（`~/Documents/剧备日志/`，找不到家目录时
 /// 退回应用配置目录）并记第一条。
@@ -42,12 +48,54 @@ pub fn read_recent_logs(limit: usize) -> Vec<String> {
     let Some(path) = LOG_PATH.get() else {
         return Vec::new();
     };
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let lines: Vec<&str> = content.lines().collect();
-    let start = lines.len().saturating_sub(limit);
-    lines[start..].iter().map(|line| line.to_string()).collect()
+    tail_lines(path, limit).unwrap_or_default()
+}
+
+/// 从文件尾部按块往回读，直到凑够 `limit` 行：不再把整个日志读进内存。
+fn tail_lines(path: &Path, limit: usize) -> std::io::Result<Vec<String>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let mut start = len;
+    let mut buffer: Vec<u8> = Vec::new();
+    // 多读一行：最前面那一行可能是被块边界截断的半行
+    while start > 0 && buffer.iter().filter(|b| **b == b'\n').count() <= limit {
+        let step = TAIL_CHUNK.min(start);
+        start -= step;
+        file.seek(SeekFrom::Start(start))?;
+        let mut chunk = vec![0_u8; step as usize];
+        file.read_exact(&mut chunk)?;
+        chunk.extend_from_slice(&buffer);
+        buffer = chunk;
+    }
+    let text = String::from_utf8_lossy(&buffer);
+    let mut lines: Vec<&str> = text.lines().collect();
+    if start > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let from = lines.len().saturating_sub(limit);
+    Ok(lines[from..].iter().map(|line| line.to_string()).collect())
+}
+
+/// 日志里的邮箱打码成 `a***@example.com`：日志面板未登录也能打开，也常被整份发给维护者。
+pub fn mask_email(email: &str) -> String {
+    match email.trim().split_once('@') {
+        Some((local, domain)) if !local.is_empty() && !domain.is_empty() => {
+            let first: String = local.chars().take(1).collect();
+            format!("{first}***@{domain}")
+        }
+        _ => "***".to_string(),
+    }
+}
+
+/// 写入前检查大小，超过上限就把当前文件改名为 `.1`（覆盖更旧的那份）。
+fn rotate_if_needed(path: &Path) {
+    let too_big = std::fs::metadata(path).is_ok_and(|meta| meta.len() >= ROTATE_BYTES);
+    if too_big {
+        let mut rotated = path.as_os_str().to_owned();
+        rotated.push(".1");
+        let _ = std::fs::rename(path, PathBuf::from(rotated));
+    }
 }
 
 /// 记一条关键日志：`[时间] [操作] 说明`。文件写失败静默（测试辅助，不该影响业务）。
@@ -55,6 +103,8 @@ pub fn log_event(op: &str, message: impl AsRef<str>) {
     let line = format!("[{}] [{}] {}", now_timestamp(), op, message.as_ref());
     eprintln!("{line}");
     if let Some(path) = LOG_PATH.get() {
+        let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        rotate_if_needed(path);
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -89,4 +139,53 @@ pub fn log_err<T>(op: &str, result: Result<T, String>) -> Result<T, String> {
 fn home_documents() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
     Some(Path::new(&home).join("Documents"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_email_keeps_only_first_char_and_domain() {
+        assert_eq!(mask_email("alice@example.com"), "a***@example.com");
+        assert_eq!(mask_email("张三@例子.cn"), "张***@例子.cn");
+        assert_eq!(mask_email("x@y.z"), "x***@y.z");
+        assert_eq!(mask_email("不是邮箱"), "***");
+        assert_eq!(mask_email("@nolocal.com"), "***");
+    }
+
+    #[test]
+    fn tail_matches_full_read_across_chunk_boundaries() {
+        let dir = std::env::temp_dir().join(format!("dossier-logtail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dossier.log");
+        // 足够长、跨过多个 64 KB 块的日志（含中文多字节字符）
+        let content: String = (0..20_000)
+            .map(|i| format!("[时间] [操作] 第 {i} 行日志内容\n"))
+            .collect();
+        std::fs::write(&path, &content).unwrap();
+        let expected: Vec<String> = content.lines().map(str::to_string).collect();
+        for limit in [1, 200, 5_000, 30_000] {
+            let tail = tail_lines(&path, limit).unwrap();
+            let want = &expected[expected.len().saturating_sub(limit)..];
+            assert_eq!(tail, want, "limit={limit}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotation_moves_large_log_aside() {
+        let dir = std::env::temp_dir().join(format!("dossier-logrotate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dossier.log");
+        std::fs::write(&path, vec![b'x'; ROTATE_BYTES as usize]).unwrap();
+        rotate_if_needed(&path);
+        assert!(!path.exists());
+        assert!(dir.join("dossier.log.1").is_file());
+        // 小文件不轮转
+        std::fs::write(&path, b"small").unwrap();
+        rotate_if_needed(&path);
+        assert!(path.is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

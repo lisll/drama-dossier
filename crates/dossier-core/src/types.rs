@@ -34,7 +34,14 @@ pub struct EpisodeSpec {
     pub video_codec: Option<String>,
     pub audio_codec: Option<String>,
     pub fps: Option<f64>,
+    /// 整个文件的码率（`format.bit_rate`，含音频）。
     pub bitrate_bps: Option<u64>,
+    /// 视频轨码率（stream `bit_rate`）；部分封装（如 mkv/webm）不写，读不到为 None。
+    #[serde(default)]
+    pub video_bitrate_bps: Option<u64>,
+    /// 音频码率（全部音轨 stream `bit_rate` 之和；都读不到为 None）。
+    #[serde(default)]
+    pub audio_bitrate_bps: Option<u64>,
 }
 
 /// 探测完成的分集 = 文件信息 + 规格。

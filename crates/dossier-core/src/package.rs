@@ -25,6 +25,10 @@ pub struct PackageOptions {
     pub cost_sheet: Option<CostSheetForm>,
     /// AI 生成内容声明（若剧名/简介/封面由 AI 辅助生成，应如实勾选）。
     pub ai_generated: bool,
+    /// 使用者确认成片画面已按平台要求标注 AI 生成声明（例如深度处理烧录了 AI 合规角标）。
+    /// 只有确认了，权属声明里才写「已按平台要求进行 AI 生成标识」——不替使用者声称没核实过的事。
+    #[serde(default)]
+    pub ai_label_confirmed: bool,
 }
 
 /// 成本配置表单 —— 只承载使用者提供的真实数据。
@@ -48,7 +52,10 @@ pub struct PackageResult {
     pub total_bytes: u64,
 }
 
-/// 生成报审包。
+/// 生成报审包：先写到同级的临时目录，`manifest.json` 写完后整体改名为最终目录。
+///
+/// 中途失败（磁盘满、某个文件读不到）时删除临时目录：不会留下半个包，
+/// 也就不会出现「下一次因为目录已存在而拒绝生成、只能手动删」的情况。
 pub fn generate_report_package(
     drama_name: &str,
     drama_dir: &Path,
@@ -71,7 +78,49 @@ pub fn generate_report_package(
         ));
     }
 
-    std::fs::create_dir_all(&pkg_dir)?;
+    let parent = pkg_dir.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let staging = parent.join(format!(
+        ".{}.part-{}-{}",
+        pkg_dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "报审包".into()),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default()
+    ));
+    let written = write_package_contents(&staging, drama_name, cover, synopsis, episodes, opts)
+        .and_then(|summary| {
+            // 写完才改名：最终目录要么不存在，要么是完整的包。
+            std::fs::rename(&staging, &pkg_dir)?;
+            Ok(summary)
+        });
+    match written {
+        Ok((file_count, total_bytes)) => Ok(PackageResult {
+            package_dir: pkg_dir,
+            file_count,
+            total_bytes,
+        }),
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            Err(error)
+        }
+    }
+}
+
+/// 把报审包的全部内容写进 `pkg_dir`（临时目录），返回 `(文件数, 总字节数)`。
+fn write_package_contents(
+    pkg_dir: &Path,
+    drama_name: &str,
+    cover: Option<&Path>,
+    synopsis: Option<&Path>,
+    episodes: &[ProbedEpisode],
+    opts: &PackageOptions,
+) -> std::io::Result<(u32, u64)> {
+    std::fs::create_dir_all(pkg_dir)?;
 
     let mut manifest_files: Vec<ManifestFile> = Vec::new();
 
@@ -149,7 +198,7 @@ pub fn generate_report_package(
     }
 
     // manifest
-    collect_files(&pkg_dir, &mut manifest_files)?;
+    collect_files(pkg_dir, &mut manifest_files)?;
     let manifest = Manifest {
         schema: "drama-dossier/package@1".into(),
         drama_name: drama_name.into(),
@@ -165,11 +214,7 @@ pub fn generate_report_package(
 
     let file_count = manifest.files.len() as u32;
     let total_bytes = manifest.files.iter().map(|f| f.size_bytes).sum();
-    Ok(PackageResult {
-        package_dir: pkg_dir,
-        file_count,
-        total_bytes,
-    })
+    Ok((file_count, total_bytes))
 }
 
 #[derive(Serialize)]
@@ -255,10 +300,13 @@ fn render_cost_sheet_md(f: &CostSheetForm) -> String {
 }
 
 fn ownership_declaration(drama_name: &str, opts: &PackageOptions) -> String {
-    let ai = if opts.ai_generated {
-        "本剧部分材料（剧名/简介/封面）由 AI 辅助生成，已按平台要求进行标识。"
-    } else {
-        "本剧材料未使用 AI 生成。"
+    // 只陈述使用者勾选确认过的事实：没确认成片已标注，就不写「已按平台要求进行标识」。
+    let ai = match (opts.ai_generated, opts.ai_label_confirmed) {
+        (true, true) => {
+            "本剧部分材料（剧名/简介/封面）由 AI 辅助生成；成片已按平台要求进行 AI 生成标识。"
+        }
+        (true, false) => "本剧部分材料（剧名/简介/封面）由 AI 辅助生成。",
+        (false, _) => "本剧材料未使用 AI 生成。",
     };
     format!(
         "内容权属声明\n\n\
@@ -330,6 +378,7 @@ mod tests {
                     contact: "-".into(),
                 }),
                 ai_generated: true,
+                ai_label_confirmed: false,
             },
         )
         .unwrap();
@@ -370,6 +419,7 @@ mod tests {
                 copy_episodes: false,
                 cost_sheet: None,
                 ai_generated: false,
+                ai_label_confirmed: false,
             },
         )
         .unwrap();
@@ -403,5 +453,69 @@ mod tests {
         assert!(first.get("sizeBytes").is_some());
         assert!(first.get("sha256").is_some());
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    fn base_opts(output: PathBuf) -> PackageOptions {
+        PackageOptions {
+            output_dir: Some(output),
+            copy_episodes: false,
+            cost_sheet: None,
+            ai_generated: true,
+            ai_label_confirmed: false,
+        }
+    }
+
+    /// 中途失败（分集文件读不到，算 sha256 时出错）：最终目录不存在、临时目录也被清掉，
+    /// 下一次可以直接重新生成，不会因为「目录已存在」被拒。
+    #[test]
+    fn failed_generation_leaves_no_partial_package() {
+        let base = std::env::temp_dir().join(format!("dossier-pkg-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let d = base.join("剧A");
+        std::fs::create_dir_all(&d).unwrap();
+        let missing = vec![ProbedEpisode {
+            file: EpisodeFile {
+                path: d.join("不存在的第1集.mp4"),
+                file_name: "不存在的第1集.mp4".into(),
+                size_bytes: 0,
+                episode_number: Some(1),
+            },
+            spec: EpisodeSpec::default(),
+        }];
+        let out = d.join("报审包");
+        assert!(
+            generate_report_package("剧A", &d, None, None, &missing, &base_opts(out.clone()))
+                .is_err()
+        );
+        assert!(!out.exists(), "失败时不能留下半个包");
+        let leftovers: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".part-"))
+            .collect();
+        assert!(leftovers.is_empty(), "临时目录必须清掉");
+        // 修好之后可以直接重新生成
+        assert!(
+            generate_report_package("剧A", &d, None, None, &[], &base_opts(out.clone())).is_ok()
+        );
+        assert!(out.join("manifest.json").is_file());
+        // 目录已存在时仍然拒绝覆盖
+        assert!(generate_report_package("剧A", &d, None, None, &[], &base_opts(out)).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ownership_declaration_only_claims_what_was_confirmed() {
+        let mut opts = base_opts(PathBuf::from("/x"));
+        let unconfirmed = ownership_declaration("剧A", &opts);
+        assert!(unconfirmed.contains("由 AI 辅助生成"));
+        assert!(
+            !unconfirmed.contains("已按平台要求"),
+            "没确认就不能声称已标识"
+        );
+        opts.ai_label_confirmed = true;
+        assert!(ownership_declaration("剧A", &opts).contains("已按平台要求进行 AI 生成标识"));
+        opts.ai_generated = false;
+        assert!(ownership_declaration("剧A", &opts).contains("未使用 AI 生成"));
     }
 }

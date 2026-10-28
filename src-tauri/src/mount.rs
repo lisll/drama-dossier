@@ -148,12 +148,14 @@ fn mount_csv_template_inner(root: &str, drama_name: &str) -> Result<MountCsvChec
                 .unwrap_or_else(|| "0".to_string());
             body.push_str(&format!("{number},\n"));
         }
-        std::fs::write(&csv_path, body)
+        // 带 BOM：Windows 上双击用 Excel 打开时中文不乱码。
+        std::fs::write(&csv_path, dossier_core::csv_text_with_bom(&body))
             .map_err(|error| format!("写入挂载文案模板失败（{}）：{error}", csv_path.display()))?;
     }
 
-    let content =
-        std::fs::read_to_string(&csv_path).map_err(|error| format!("读取挂载文案失败：{error}"))?;
+    // 兼容 Excel 保存后的 UTF-8 BOM / GBK 编码。
+    let content = dossier_core::read_csv_text(&csv_path)
+        .map_err(|error| format!("读取挂载文案失败：{error}"))?;
     let numbers: Vec<u32> = drama
         .episodes
         .iter()
@@ -192,7 +194,7 @@ fn mount_csv_save_inner(
 ) -> Result<MountCsvCheckPayload, String> {
     let drama = load_drama(root, drama_name)?;
     let csv_path = PathBuf::from(&drama.dir).join(MOUNT_CSV_NAME);
-    std::fs::write(&csv_path, content)
+    std::fs::write(&csv_path, dossier_core::csv_text_with_bom(content))
         .map_err(|error| format!("保存挂载文案失败（{}）：{error}", csv_path.display()))?;
     let numbers: Vec<u32> = drama
         .episodes
@@ -227,8 +229,8 @@ fn mount_csv_check_inner(root: &str, drama_name: &str) -> Result<MountCsvCheckPa
             csv_path.display()
         ));
     }
-    let content =
-        std::fs::read_to_string(&csv_path).map_err(|error| format!("读取挂载文案失败：{error}"))?;
+    let content = dossier_core::read_csv_text(&csv_path)
+        .map_err(|error| format!("读取挂载文案失败：{error}"))?;
     let numbers: Vec<u32> = drama
         .episodes
         .iter()

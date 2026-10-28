@@ -138,7 +138,40 @@ pub fn build_mount_copy_rows(drama_name: &str, episodes: &[ProbedEpisode]) -> Ve
         .collect()
 }
 
-/// 写入 UTF-8 CSV。写入采用临时文件替换，避免中途崩溃留下半份文案。
+/// UTF-8 BOM：Windows 上的 Excel 靠它识别 UTF-8，没有 BOM 时按系统代码页（GBK）打开，中文全是乱码。
+pub const UTF8_BOM: &str = "\u{feff}";
+
+/// 把 CSV 文件字节解码成文本：去掉 UTF-8 BOM；不是合法 UTF-8 时按 GBK 解码一次
+/// （中文 Windows 上用 Excel 直接「保存」得到的就是 GBK）。GBK 也解不干净时报错，提示怎么另存。
+pub fn decode_csv_bytes(bytes: &[u8]) -> std::io::Result<String> {
+    let bytes = bytes.strip_prefix(UTF8_BOM.as_bytes()).unwrap_or(bytes);
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return Ok(text.to_string());
+    }
+    let (text, _, had_errors) = encoding_rs::GBK.decode(bytes);
+    if had_errors {
+        return Err(invalid_csv(
+            "CSV 编码无法识别（既不是 UTF-8 也不是 GBK）；请在 Excel 里「另存为 → CSV UTF-8（逗号分隔）」后再导入",
+        ));
+    }
+    Ok(text.into_owned())
+}
+
+/// 读取 CSV 文件并按 [`decode_csv_bytes`] 解码。
+pub fn read_csv_text(path: &Path) -> std::io::Result<String> {
+    decode_csv_bytes(&fs::read(path)?)
+}
+
+/// 写出给 Excel 打开的 CSV 文本：开头补一个 UTF-8 BOM（已有就不重复加）。
+pub fn csv_text_with_bom(text: &str) -> String {
+    if text.starts_with(UTF8_BOM) {
+        text.to_string()
+    } else {
+        format!("{UTF8_BOM}{text}")
+    }
+}
+
+/// 写入 UTF-8（带 BOM）CSV。写入采用临时文件替换，避免中途崩溃留下半份文案。
 pub fn write_mount_copy_csv(
     path: &Path,
     rows: &[MountCopyRow],
@@ -148,7 +181,7 @@ pub fn write_mount_copy_csv(
         fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("csv.tmp");
-    let mut output = String::new();
+    let mut output = String::from(UTF8_BOM);
     output.push_str(MOUNT_COPY_HEADER);
     output.push('\n');
     for row in rows {
@@ -166,7 +199,7 @@ pub fn write_mount_copy_csv(
 
 /// 读取并校验挂载文案 CSV。
 pub fn load_mount_copy_csv(path: &Path) -> std::io::Result<Vec<MountCopyRow>> {
-    let text = fs::read_to_string(path)?;
+    let text = read_csv_text(path)?;
     let mut records = parse_csv(&text)?;
     if records.is_empty() {
         return Ok(Vec::new());
@@ -191,15 +224,16 @@ pub fn load_mount_copy_csv(path: &Path) -> std::io::Result<Vec<MountCopyRow>> {
                     .map_err(|_| invalid_csv("集号必须是非负整数"))?,
             )
         };
+        let field = |index: usize| unguard_formula(&record[index]);
         rows.push(MountCopyRow {
             episode_number,
-            source_file: record[1].clone(),
-            short_title: record[2].clone(),
-            description: record[3].clone(),
-            mount_copy: record[4].clone(),
-            drama_search_name: record[5].clone(),
-            status: record[6].clone(),
-            result_note: record[7].clone(),
+            source_file: field(1),
+            short_title: field(2),
+            description: field(3),
+            mount_copy: field(4),
+            drama_search_name: field(5),
+            status: field(6),
+            result_note: field(7),
         });
     }
     validate_rows(&rows)?;
@@ -323,11 +357,33 @@ fn row_to_csv(row: &MountCopyRow) -> String {
     .join(",")
 }
 
+/// 以这些字符开头的单元格会被 Excel / WPS 当成公式执行（CSV 公式注入）。
+const FORMULA_TRIGGERS: [char; 6] = ['=', '+', '-', '@', '\t', '\r'];
+
+/// 写出前给可能被当成公式的单元格加一个英文单引号（OWASP 推荐做法：Excel 把它当文本前缀，不显示）。
+fn guard_formula(value: &str) -> String {
+    if value.starts_with(FORMULA_TRIGGERS) {
+        format!("'{value}")
+    } else {
+        value.to_string()
+    }
+}
+
+/// 读回时去掉 [`guard_formula`] 加的单引号：只在单引号后面紧跟公式触发字符时才去掉，
+/// 用户自己写的、以单引号开头的普通文本原样保留。
+fn unguard_formula(value: &str) -> String {
+    match value.strip_prefix('\'') {
+        Some(rest) if rest.starts_with(FORMULA_TRIGGERS) => rest.to_string(),
+        _ => value.to_string(),
+    }
+}
+
 fn csv_escape(value: &str) -> String {
+    let value = guard_formula(value);
     if value.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
-        value.to_string()
+        value
     }
 }
 
@@ -415,6 +471,67 @@ mod tests {
         write_mount_copy_csv(&path, &rows).unwrap();
         let loaded = load_mount_copy_csv(&path).unwrap();
         assert_eq!(loaded, rows);
+        // 写出的文件带 BOM：Windows 上双击用 Excel 打开时中文不乱码
+        assert!(fs::read(&path).unwrap().starts_with(UTF8_BOM.as_bytes()));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn decode_csv_handles_bom_gbk_and_garbage() {
+        assert_eq!(
+            decode_csv_bytes("\u{feff}集号,文案\n".as_bytes()).unwrap(),
+            "集号,文案\n"
+        );
+        assert_eq!(
+            decode_csv_bytes("集号,文案\n".as_bytes()).unwrap(),
+            "集号,文案\n"
+        );
+        // 中文 Windows 上 Excel 直接保存得到的 GBK
+        let (gbk, _, _) = encoding_rs::GBK.encode("集号,文案\n1,第一集\n");
+        assert_eq!(decode_csv_bytes(&gbk).unwrap(), "集号,文案\n1,第一集\n");
+        // 既不是 UTF-8 也不是 GBK：报错并告诉用户怎么另存
+        let error = decode_csv_bytes(&[0xff, 0xff, 0xff]).unwrap_err();
+        assert!(error.to_string().contains("CSV UTF-8"), "{error}");
+        assert_eq!(csv_text_with_bom("a"), "\u{feff}a");
+        assert_eq!(csv_text_with_bom("\u{feff}a"), "\u{feff}a", "不重复加 BOM");
+    }
+
+    #[test]
+    fn formula_prefix_is_guarded_and_round_trips() {
+        for text in [
+            "=HYPERLINK(\"http://x\")",
+            "+1",
+            "-2",
+            "@SUM(A1)",
+            "\t制表符开头",
+        ] {
+            let escaped = csv_escape(text);
+            assert!(
+                escaped.trim_start_matches('"').starts_with('\''),
+                "公式前缀没有被转义：{escaped}"
+            );
+            assert_eq!(unguard_formula(&format!("'{text}")), text);
+        }
+        // 用户本来就写的单引号开头文本：读回时不能被误删
+        assert_eq!(unguard_formula("'普通引号"), "'普通引号");
+        assert_eq!(csv_escape("普通文本"), "普通文本");
+
+        let dir = std::env::temp_dir().join(format!("publish-formula-{}", std::process::id()));
+        let path = dir.join("挂载文案.csv");
+        let mut rows = build_mount_copy_rows("测试剧", &[episode(1, "第1集.mp4")]);
+        rows[0].mount_copy = "=1+1 不能被当成公式".into();
+        rows[0].description = "'用户自己的单引号".into();
+        write_mount_copy_csv(&path, &rows).unwrap();
+        let raw = read_csv_text(&path).unwrap();
+        assert!(
+            raw.contains("'=1+1"),
+            "写出的文件里公式前缀没有被转义：{raw}"
+        );
+        assert_eq!(
+            load_mount_copy_csv(&path).unwrap(),
+            rows,
+            "读回内容必须与写入一致"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 

@@ -45,29 +45,27 @@ fn cuda_download_cancelled() -> bool {
     CUDA_DOWNLOAD_CANCEL.load(Ordering::SeqCst)
 }
 
+/// 启动时调用：修复旧版本 GPU 加速包安装缺陷留下的损坏（见 [`heal_corrupted_whisper`]）。
+/// 只在 Windows 上有意义；失败只记日志，不影响启动。
+pub(crate) fn heal_on_startup(app: &AppHandle) {
+    if !cfg!(target_os = "windows") {
+        return;
+    }
+    let Ok(root) = app_data(app) else { return };
+    let bundled = bundled_whisper_dir(app).map(|dir| dir.join("whisper-cli.exe"));
+    if let Err(error) = heal_corrupted_whisper(&root.join("whisper"), bundled.as_deref()) {
+        crate::logging::log_event("环境", format!("修复语音识别程序失败：{error}"));
+    }
+}
+
 /// 退出程序时调用：把后台下载停掉，避免进程退出时留下半成品。
 pub(crate) fn cancel_background_downloads() {
     #[cfg(target_os = "windows")]
     cancel_cuda_download();
 }
 
-/// Windows 用 UB-Mannheim 的 tesseract 安装器（Inno Setup，静默参数官方支持）。
-/// 钉住已知可用版本；升级时换这里的版本号。
-/// 多级下载源：GitHub 直连在国内基本拉不动，ghfast.top 加速代理优先，官方源兜底。
-#[cfg(target_os = "windows")]
-const TESSERACT_SETUP_SOURCES: &[&str] = &[
-    "https://ghfast.top/https://github.com/UB-Mannheim/tesseract/releases/download/v5.4.0.20240606/tesseract-ocr-w64-setup-5.4.0.20240606.exe",
-    "https://github.com/UB-Mannheim/tesseract/releases/download/v5.4.0.20240606/tesseract-ocr-w64-setup-5.4.0.20240606.exe",
-];
-
-/// chi_sim 语言包的多级下载源（GitHub raw 主源，CDN 镜像兜底国内直连）。
-/// 仅 Windows 安装器使用；macOS 走 brew 自带的 chi_sim。
-#[cfg(target_os = "windows")]
-const CHI_SIM_SOURCES: &[&str] = &[
-    "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/main/chi_sim.traineddata",
-    "https://cdn.jsdelivr.net/gh/tesseract-ocr/tessdata_fast@main/chi_sim.traineddata",
-    "https://ghfast.top/https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/main/chi_sim.traineddata",
-];
+// tesseract 安装器与 chi_sim 语言包的下载源与哈希在 `downloads.rs`
+// （`tesseract_installer` / `chi_sim_traineddata`）：镜像与官方源共用同一个哈希。
 
 /// pip 安装要拉 torch（mac 约 60MB / win 约 200MB）再装 whisper 本体，给足超时。
 const PIP_INSTALL_TIMEOUT_SECS: u64 = 1800;
@@ -184,36 +182,137 @@ fn python_works(program: &Path) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Windows：检测到 NVIDIA 显卡时，后台把 CPU 版换成 CUDA 版
+// Windows：检测到 NVIDIA 显卡时，把语音识别切到 CUDA 版
 // ---------------------------------------------------------------------------
 
-/// CUDA 版 whisper 的资源名。版本与 CI 内置的 CPU 版同源（同一份 whisper.cpp 源码），
-/// 但 CUDA 版需要显卡驱动配合，所以走"检测到再下载"而不是内置。
+/// CUDA 版 whisper 的资源名（进度事件里的组件名）。
 #[cfg(target_os = "windows")]
 const WHISPER_CUDA_ASSET: &str = "whisper-cli-cuda";
 
-/// 后台尝试把 CPU 版 whisper-cli 换成 CUDA 版。
+/// CUDA 版安装在独立目录，不覆盖内置 CPU 版：失败时什么都不用回滚，
+/// 设置里的 `asr_executable` 只有在自检通过后才指向这里。
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))] // 只在 Windows 安装流程调用；保留编译以便在各平台跑单测
+const WHISPER_CUDA_DIR: &str = "whisper-cuda";
+/// CUDA 版安装完成的标记（放在 CUDA 目录里，随目录一起存在 / 消失）。
+const CUDA_READY_MARK: &str = "cuda.ready";
+
+/// 在解压目录里找 `whisper-cli.exe`（官方 zip 可能多套一层 `Release/` 目录），
+/// 并确认它真的是 Windows 可执行文件。
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))] // 只在 Windows 安装流程调用；保留编译以便在各平台跑单测
+fn locate_cuda_whisper(staging: &Path) -> Result<PathBuf, String> {
+    let exe = find_file_recursive(staging, "whisper-cli.exe", 3)
+        .ok_or_else(|| "GPU 加速包里没有 whisper-cli.exe".to_string())?;
+    if !crate::downloads::is_pe_header(&crate::downloads::read_header(&exe)) {
+        return Err(format!("{} 不是有效的 Windows 程序", exe.display()));
+    }
+    Ok(exe)
+}
+
+/// 递归（限深）查找文件名完全匹配的文件。
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))] // 只在 Windows 安装流程调用；保留编译以便在各平台跑单测
+fn find_file_recursive(dir: &Path, file_name: &str, depth: u8) -> Option<PathBuf> {
+    let direct = dir.join(file_name);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    if depth == 0 {
+        return None;
+    }
+    let mut subdirs: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    subdirs.sort();
+    subdirs
+        .iter()
+        .find_map(|sub| find_file_recursive(sub, file_name, depth - 1))
+}
+
+/// 修复旧版本留下的损坏：以前下载的 zip 被直接改名成 `whisper-cli.exe`，CPU 版也被删掉，
+/// 于是语音识别永久失败、`cuda.ready` 又阻止重试。这里发现「exe 其实是 zip」时，
+/// 用安装包内置的 CPU 版覆盖回去并删掉旧标记，返回是否做了修复。
 ///
-/// 触发条件：Windows + 装的是内置 CPU 版 + `nvidia-smi` 报有可用显卡。
-/// 行为：下载到临时文件 → 校验 → 原子替换；期间 CPU 版照常可用，失败只记日志。
-/// 取消：用户离开设置页或退出程序时置 `CUDA_DOWNLOAD_CANCEL`，下次轮询退出并删掉半成品。
+/// `bundled_exe` 为 None（本地开发构建没有内置 whisper）时只删除损坏文件，让下次安装重新走流程。
+fn heal_corrupted_whisper(bin_dir: &Path, bundled_exe: Option<&Path>) -> Result<bool, String> {
+    let exe = bin_dir.join("whisper-cli.exe");
+    if !crate::downloads::is_zip_header(&crate::downloads::read_header(&exe)) {
+        return Ok(false);
+    }
+    let _ = std::fs::remove_file(bin_dir.join(CUDA_READY_MARK));
+    let _ = std::fs::remove_file(bin_dir.join("whisper-cli.exe.cpu"));
+    match bundled_exe {
+        Some(source) => {
+            std::fs::copy(source, &exe)
+                .map_err(|error| format!("用内置 CPU 版修复 whisper-cli 失败：{error}"))?;
+        }
+        None => {
+            std::fs::remove_file(&exe)
+                .map_err(|error| format!("删除损坏的 whisper-cli 失败：{error}"))?;
+        }
+    }
+    crate::logging::log_event(
+        "环境",
+        format!(
+            "发现损坏的语音识别程序（{} 实际是 zip 压缩包，旧版本的 GPU 加速包安装缺陷），已{}",
+            exe.display(),
+            if bundled_exe.is_some() {
+                "恢复为内置 CPU 版"
+            } else {
+                "删除，等待重新安装"
+            }
+        ),
+    );
+    Ok(true)
+}
+
+/// 检测到 NVIDIA 显卡时安装 CUDA 版 whisper，返回 CUDA 版可执行文件路径（未切换时为 None）。
+///
+/// 流程：下载（sha256 校验）→ 解压到中转目录 → 在中转目录里实跑 `--help` 自检 →
+/// 自检通过才把中转目录改名为 `whisper-cuda/`，并把设置里的 ASR 程序指向它。
+/// 任何一步失败都保留 CPU 版不动，原因写进 `messages`；已校验的压缩包保留，下次重试不用重新下载。
+/// 用户在设置页再点一次「一键安装内容模型」就会重试。
 #[cfg(target_os = "windows")]
-fn upgrade_whisper_to_cuda(app: &AppHandle) {
+fn upgrade_whisper_to_cuda(app: &AppHandle, messages: &mut Vec<String>) -> Option<PathBuf> {
     if !crate::toolbox::nvidia_gpu_present() {
-        return;
+        return None;
     }
-    let Ok(root) = app_data(app) else { return };
-    let bin_dir = root.join("whisper");
-    let target = bin_dir.join("whisper-cli.exe");
-    if !target.is_file() {
-        return;
+    let root = app_data(app).ok()?;
+    let cuda_dir = root.join(WHISPER_CUDA_DIR);
+    let cuda_exe = cuda_dir.join("whisper-cli.exe");
+    // 已经装好：只需把设置指回去（重新安装内容模型会先把设置写成 CPU 版）。
+    if cuda_dir.join(CUDA_READY_MARK).is_file()
+        && crate::downloads::is_pe_header(&crate::downloads::read_header(&cuda_exe))
+    {
+        return Some(cuda_exe);
     }
-    // 已经换过就不再重复下载：用同目录的标记文件判断
-    let stamp = bin_dir.join("cuda.ready");
-    if stamp.is_file() {
-        return;
+    match install_cuda_whisper(app, &root, &cuda_dir) {
+        Ok(exe) => {
+            crate::logging::log_event(
+                "环境",
+                format!("ASR 已切换为 CUDA 版（GPU 加速）：{}", exe.display()),
+            );
+            emit_progress(app, "asr", "finished", "GPU 加速包已安装", Some(0), 0);
+            Some(exe)
+        }
+        Err(reason) => {
+            crate::logging::log_event(
+                "环境",
+                format!("GPU 加速包未启用（继续使用 CPU 版）：{reason}"),
+            );
+            messages.push(format!(
+                "GPU 加速包未启用，语音识别继续使用 CPU：{reason}。可在设置页再点一次「一键安装内容模型」重试。"
+            ));
+            None
+        }
     }
-    let tmp = bin_dir.join("whisper-cli.exe.cuda-tmp");
+}
+
+#[cfg(target_os = "windows")]
+fn install_cuda_whisper(app: &AppHandle, root: &Path, cuda_dir: &Path) -> Result<PathBuf, String> {
+    let zip = root.join(".whisper-cuda-download.zip");
+    let staging = root.join(".whisper-cuda-staging");
     CUDA_DOWNLOAD_CANCEL.store(false, Ordering::SeqCst);
     emit_progress(
         app,
@@ -224,50 +323,93 @@ fn upgrade_whisper_to_cuda(app: &AppHandle) {
         0,
     );
     let asset = crate::downloads::whisper_cuda();
-    let result = crate::downloads::fetch_with_fallback(&asset, &tmp, |url, path| {
+    crate::downloads::fetch_with_fallback(&asset, &zip, |url, path| {
         if cuda_download_cancelled() {
             return Err(crate::downloads::Failure::Network);
         }
         crate::toolbox::download_file(app, WHISPER_CUDA_ASSET, url, path)
             .map_err(|_| crate::downloads::Failure::Network)
-    });
-    match result {
-        Ok(_) if !cuda_download_cancelled() => {
-            // 原子替换：先备份 CPU 版，替换失败能回滚
-            let backup = bin_dir.join("whisper-cli.exe.cpu");
-            let _ = std::fs::rename(&target, &backup);
-            match std::fs::rename(&tmp, &target) {
-                Ok(()) => {
-                    let _ = std::fs::write(&stamp, "1");
-                    let _ = std::fs::remove_file(&backup);
-                    crate::logging::log_event("环境", "ASR 已升级为 CUDA 版（GPU 加速）");
-                    emit_progress(app, "asr", "finished", "GPU 加速包已安装", Some(0), 0);
-                }
-                Err(error) => {
-                    let _ = std::fs::rename(&backup, &target);
-                    crate::logging::log_event(
-                        "环境",
-                        format!("替换 CUDA 版失败（已保留 CPU 版）：{error}"),
-                    );
-                }
-            }
+    })
+    .map_err(|(_, message)| message)?;
+    if cuda_download_cancelled() {
+        return Err("下载已取消".into());
+    }
+
+    emit_progress(
+        app,
+        "asr",
+        "extracting",
+        "正在解压并自检 GPU 加速包",
+        None,
+        0,
+    );
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).map_err(|error| format!("创建中转目录失败：{error}"))?;
+    let cleanup = || {
+        let _ = std::fs::remove_dir_all(&staging);
+    };
+    crate::toolbox::extract_zip(&zip, &staging).inspect_err(|_| cleanup())?;
+    let exe = locate_cuda_whisper(&staging).inspect_err(|_| cleanup())?;
+    // 自检：确认解压出来的程序能在这台机器上启动（缺 CUDA 运行库 DLL、文件损坏时会在这里失败）。
+    // `--help` 在初始化 GPU 之前就退出，驱动版本过旧这类问题测不出来，要到第一次真实识别时才会暴露。
+    let spec = dossier_runtime::CommandSpec::new(exe.display().to_string())
+        .arg("--help")
+        .timeout(Duration::from_secs(30));
+    let output = dossier_runtime::SystemRunner::new()
+        .run(&spec)
+        .map_err(|error| format!("自检启动失败：{error}"))
+        .inspect_err(|_| cleanup())?;
+    if !output.success() {
+        cleanup();
+        return Err(format!(
+            "自检失败（退出码 {}）：{}",
+            output.code_label(),
+            last_stderr(&output)
+        ));
+    }
+    // exe 所在目录（含 cublas 等 DLL）整体就位：先挪走旧目录，改名失败再挪回来。
+    let exe_dir = exe
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| staging.clone());
+    std::fs::write(exe_dir.join(CUDA_READY_MARK), "1")
+        .map_err(|error| format!("写安装标记失败：{error}"))
+        .inspect_err(|_| cleanup())?;
+    let old = root.join(".whisper-cuda-old");
+    let _ = std::fs::remove_dir_all(&old);
+    let had_old = cuda_dir.exists() && rename_with_retry(cuda_dir, &old).is_ok();
+    if let Err(error) = rename_with_retry(&exe_dir, cuda_dir) {
+        if had_old {
+            let _ = rename_with_retry(&old, cuda_dir);
         }
-        _ => {
-            let _ = std::fs::remove_file(&tmp);
-            crate::logging::log_event(
-                "环境",
-                if cuda_download_cancelled() {
-                    "GPU 加速包下载已取消（继续使用 CPU 版）".into()
-                } else {
-                    "GPU 加速包下载失败（继续使用 CPU 版）".to_string()
-                },
-            );
+        cleanup();
+        return Err(format!("GPU 加速包就位失败：{error}"));
+    }
+    let _ = std::fs::remove_dir_all(&old);
+    cleanup();
+    let _ = std::fs::remove_file(&zip);
+    Ok(cuda_dir.join("whisper-cli.exe"))
+}
+
+/// 目录改名，失败时短暂重试：刚跑完自检的 exe 可能还被杀毒软件扫描着，Windows 会暂时拒绝访问。
+#[cfg(target_os = "windows")]
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut attempt = 0;
+    loop {
+        match std::fs::rename(from, to) {
+            Err(error) if attempt < 4 && error.kind() == std::io::ErrorKind::PermissionDenied => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            result => return result,
         }
     }
 }
 
 #[cfg(not(target_os = "windows"))]
-fn upgrade_whisper_to_cuda(_app: &AppHandle) {}
+fn upgrade_whisper_to_cuda(_app: &AppHandle, _messages: &mut Vec<String>) -> Option<PathBuf> {
+    None
+}
 
 // ---------------------------------------------------------------------------
 // 内置 whisper.cpp：零下载、无 Python
@@ -325,6 +467,10 @@ fn install_bundled_whisper(app: &AppHandle, models_dir: &Path) -> Result<Option<
     let root = app_data(app)?;
     let bin_dir = root.join("whisper");
     std::fs::create_dir_all(&bin_dir).map_err(|error| format!("创建目录失败：{error}"))?;
+    // 旧版本可能把 zip 当成 exe 放在这里，并留下阻止重试的 cuda.ready：先清理再复制。
+    if cfg!(target_os = "windows") {
+        heal_corrupted_whisper(&bin_dir, Some(&bin_src))?;
+    }
     let bin = bin_dir.join(exe);
     let model = models_dir.join("ggml-base.bin");
 
@@ -372,9 +518,6 @@ fn install_bundled_whisper(app: &AppHandle, models_dir: &Path) -> Result<Option<
         "环境",
         format!("ASR 安装完成（内置 whisper.cpp）：{}", bin.display()),
     );
-    // Windows 上如果检测到 NVIDIA 显卡，接着把 CPU 版换成 CUDA 版：
-    // 先保证有可用结果，再后台提升；失败或取消都不影响已经能用的 CPU 版。
-    upgrade_whisper_to_cuda(app);
     Ok(Some(bin.display().to_string()))
 }
 
@@ -664,16 +807,16 @@ fn install_ocr(app: &AppHandle) -> Result<String, String> {
 
     if !tesseract.is_file() {
         let setup = dir.join("tesseract-setup.exe");
-        let mut last_error = String::from("（未尝试）");
-        for source in TESSERACT_SETUP_SOURCES {
-            match crate::toolbox::download_file(app, "ocr", source, &setup) {
-                Ok(()) => break,
-                Err(error) => last_error = error,
-            }
-        }
-        if !setup.is_file() {
-            return Err(format!("tesseract 安装器下载失败：{last_error}"));
-        }
+        // 安装器下载后会被静默执行：必须通过 sha256 校验，镜像被篡改时宁可装不上。
+        crate::downloads::fetch_with_fallback(
+            &crate::downloads::tesseract_installer(),
+            &setup,
+            |url, path| {
+                crate::toolbox::download_file(app, "ocr", url, path)
+                    .map_err(|_| crate::downloads::Failure::Network)
+            },
+        )
+        .map_err(|(_, message)| format!("tesseract 安装器下载失败：{message}"))?;
         emit_progress(
             app,
             "ocr",
@@ -721,18 +864,16 @@ fn install_ocr(app: &AppHandle) -> Result<String, String> {
     let tessdata = dir.join("tessdata");
     std::fs::create_dir_all(&tessdata).map_err(|error| format!("创建语言包目录失败：{error}"))?;
     let chi_sim = tessdata.join("chi_sim.traineddata");
-    if !chi_sim.is_file() {
-        let mut last_error = String::from("（未尝试）");
-        for source in CHI_SIM_SOURCES {
-            match crate::toolbox::download_file(app, "ocr", source, &chi_sim) {
-                Ok(()) => break,
-                Err(error) => last_error = error,
-            }
-        }
-        if !chi_sim.is_file() {
-            return Err(format!("chi_sim 语言包下载失败：{last_error}"));
-        }
-    }
+    // 已存在但哈希不对（下载中断留下的半截文件、旧版本跟随 main 下的不同内容）会被删掉重下。
+    crate::downloads::fetch_with_fallback(
+        &crate::downloads::chi_sim_traineddata(),
+        &chi_sim,
+        |url, path| {
+            crate::toolbox::download_file(app, "ocr", url, path)
+                .map_err(|_| crate::downloads::Failure::Network)
+        },
+    )
+    .map_err(|(_, message)| format!("chi_sim 语言包下载失败：{message}"))?;
 
     persist_settings(app, |settings| {
         settings.ocr_executable = Some(tesseract.clone());
@@ -798,7 +939,25 @@ fn install_content_models_blocking(app: &AppHandle) -> Result<ContentModelsRepor
         0,
     );
     match install_asr(app) {
-        Ok(path) => report.asr_path = Some(path),
+        Ok(path) => {
+            report.asr_path = Some(path);
+            // Windows 上检测到 NVIDIA 显卡时切到 CUDA 版：CPU 版已经可用，这一步失败不影响它。
+            let engine = read_settings(app)
+                .ok()
+                .and_then(|settings| settings.asr_engine);
+            if engine.as_deref() == Some("whisper_cpp") {
+                if let Some(cuda_exe) = upgrade_whisper_to_cuda(app, &mut report.messages) {
+                    match persist_settings(app, |settings| {
+                        settings.asr_executable = Some(cuda_exe.clone());
+                    }) {
+                        Ok(()) => report.asr_path = Some(cuda_exe.display().to_string()),
+                        Err(error) => report.messages.push(format!(
+                            "GPU 加速包已安装，但写入设置失败（继续使用 CPU 版）：{error}"
+                        )),
+                    }
+                }
+            }
+        }
         Err(error) => {
             crate::logging::log_event("环境", format!("ASR 一键安装失败：{error}"));
             report.messages.push(format!("ASR 安装失败：{error}"));
@@ -847,4 +1006,77 @@ pub async fn install_content_models(app: AppHandle) -> Result<ContentModelsRepor
         }),
     );
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let dir =
+            std::env::temp_dir().join(format!("dossier-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 旧版本把 zip 当成 exe 放进去、删了 CPU 版、还写了 cuda.ready：必须恢复成内置 CPU 版。
+    #[test]
+    fn heal_restores_cpu_whisper_when_exe_is_a_zip() {
+        let dir = unique_dir("heal");
+        let bin_dir = dir.join("whisper");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("whisper-cli.exe"), b"PK\x03\x04zip-content").unwrap();
+        std::fs::write(bin_dir.join(CUDA_READY_MARK), "1").unwrap();
+        let bundled = dir.join("bundled-whisper-cli.exe");
+        std::fs::write(&bundled, b"MZcpu-build").unwrap();
+
+        assert!(heal_corrupted_whisper(&bin_dir, Some(&bundled)).unwrap());
+        assert_eq!(
+            std::fs::read(bin_dir.join("whisper-cli.exe")).unwrap(),
+            b"MZcpu-build"
+        );
+        assert!(
+            !bin_dir.join(CUDA_READY_MARK).exists(),
+            "阻止重试的旧标记必须删掉"
+        );
+
+        // 已经是正常的 exe：什么都不动
+        assert!(!heal_corrupted_whisper(&bin_dir, Some(&bundled)).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn heal_without_bundled_copy_removes_the_broken_file() {
+        let dir = unique_dir("heal-nobundle");
+        std::fs::write(dir.join("whisper-cli.exe"), b"PK\x03\x04").unwrap();
+        assert!(heal_corrupted_whisper(&dir, None).unwrap());
+        assert!(!dir.join("whisper-cli.exe").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn locate_cuda_whisper_finds_nested_pe_and_rejects_others() {
+        let dir = unique_dir("locate");
+        let nested = dir.join("Release");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("whisper-cli.exe"), b"MZ\x90\x00").unwrap();
+        assert_eq!(
+            locate_cuda_whisper(&dir).unwrap(),
+            nested.join("whisper-cli.exe")
+        );
+
+        std::fs::write(nested.join("whisper-cli.exe"), b"PK\x03\x04").unwrap();
+        assert!(
+            locate_cuda_whisper(&dir).is_err(),
+            "不是 exe 的文件不能被当成可执行程序"
+        );
+        let empty = unique_dir("locate-empty");
+        assert!(locate_cuda_whisper(&empty).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
 }

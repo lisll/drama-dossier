@@ -7,7 +7,9 @@
 //! - 每次判断都从磁盘重读授权文件并完整验签，不信任上一次的结论；
 //! - 只有「程序被篡改」（金丝雀自检失败）会在整次运行内保持锁定；
 //! - 「被服务器停用」写进授权文件，重启、刷新都无效，只有拿到新凭证才清除；
-//! - 授权文件的 `last_seen`、`revoked` 受校验码保护，手改即判为无效。
+//! - 授权文件的 `last_seen`、`revoked` 受校验码保护，手改即判为无效；
+//! - 同样两项再存一份到系统凭据库（[`crate::license_anchor`]），判定取两边更严的那份：
+//!   恢复一份旧的授权文件只能回滚其中一处。凭据库不可用时退回只看授权文件。
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -17,6 +19,9 @@ use dossier_cardkey::{
     check_seal, decide, next_last_seen, seal, KeyError, LockReason, TrustedKey, Verdict,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::license_anchor::Anchor;
 
 /// 连续这么久写不进授权文件就锁定（文件被设成只读、磁盘满等）。
 pub const MAX_UNPERSISTED_SECS: u64 = 3600;
@@ -64,6 +69,60 @@ pub enum ReadOutcome {
     Unreadable(String),
 }
 
+/// 凭据库里的第二份存档：见过的最晚时间 + 被停用的凭证（存 sha256，不存凭证原文）。
+///
+/// 和授权文件一样用校验码绑定本机机器码：手改或从别的电脑拷来的记录一律视为不存在
+/// （不锁定，只是不再提供额外保护）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnchorRecord {
+    last_seen: u64,
+    revoked_token_sha256: Option<String>,
+    mac: String,
+}
+
+impl AnchorRecord {
+    /// 校验码复用授权文件的 HMAC：把停用凭证的哈希放在「凭证」位置，区分出这是锚点记录。
+    fn sealed(machine_id: &str, last_seen: u64, revoked_token_sha256: Option<String>) -> Self {
+        let mac = seal(
+            machine_id,
+            &Self::payload(revoked_token_sha256.as_deref()),
+            last_seen,
+            false,
+        );
+        Self {
+            last_seen,
+            revoked_token_sha256,
+            mac,
+        }
+    }
+
+    fn payload(revoked: Option<&str>) -> String {
+        format!("anchor:{}", revoked.unwrap_or("-"))
+    }
+
+    fn parse(text: &str, machine_id: &str) -> Option<Self> {
+        let record: Self = serde_json::from_str(text).ok()?;
+        check_seal(
+            machine_id,
+            &Self::payload(record.revoked_token_sha256.as_deref()),
+            record.last_seen,
+            false,
+            &record.mac,
+        )
+        .then_some(record)
+    }
+}
+
+fn token_sha256(token: &str) -> String {
+    format!("{:x}", Sha256::digest(token.as_bytes()))
+}
+
+/// 同一次判定里的多条说明合成一条日志；没有说明时为 None。
+fn join_notes(notes: Vec<String>) -> Option<String> {
+    (!notes.is_empty()).then(|| notes.join("；"))
+}
+
 pub struct State {
     path: PathBuf,
     machine_id: Result<String, String>,
@@ -78,10 +137,67 @@ pub struct State {
     /// 本次运行内被服务器停用的凭证（停用标记写盘失败时仍要锁住）
     revoked_token: Mutex<Option<String>>,
     io: Mutex<()>,
+    /// 系统凭据库里的第二份存档；只在第一次用到时读一次，之后以内存为准、变化时写回。
+    anchor: Box<dyn Anchor>,
+    anchor_slot: Mutex<AnchorSlot>,
+}
+
+/// 第二份存档在本次运行里的状态。
+#[derive(Debug)]
+enum AnchorSlot {
+    /// 还没读过凭据库
+    Unloaded,
+    /// 已读（`None` = 确实没有记录，或记录被改过 / 来自别的电脑），之后以内存为准
+    Ready(Option<AnchorRecord>),
+    /// 本次运行不再碰凭据库：读失败（写入会覆盖掉读不到的原有记录）或写失败
+    /// （macOS 上反复访问会反复弹授权框）。已经读到的记录仍留在内存里参与判定。
+    Disabled(Option<AnchorRecord>),
+}
+
+/// 对第二份存档的一次更新，与已有记录合并后写回。
+enum AnchorUpdate {
+    /// 判定通过：见过的最晚时间往后推（只増不减），停用记录原样保留
+    Seen(u64),
+    /// 服务器停用了这份凭证（sha256）；时间同样只増不减
+    Revoke {
+        last_seen: u64,
+        token_sha256: String,
+    },
+    /// 激活了新凭证：时钟下限重置为现在（用户校正时钟后续签必须能用）；
+    /// 旧凭证的停用记录保留——恢复旧凭证的备份文件仍然拦得住，除非新凭证就是它。
+    Accept { now: u64, token_sha256: String },
+}
+
+impl AnchorUpdate {
+    fn merge(self, previous: Option<&AnchorRecord>) -> (u64, Option<String>) {
+        let previous_seen = previous.map_or(0, |record| record.last_seen);
+        let previous_revoked = previous.and_then(|record| record.revoked_token_sha256.clone());
+        match self {
+            Self::Seen(now) => (now.max(previous_seen), previous_revoked),
+            Self::Revoke {
+                last_seen,
+                token_sha256,
+            } => (last_seen.max(previous_seen), Some(token_sha256)),
+            Self::Accept { now, token_sha256 } => (
+                now,
+                previous_revoked.filter(|revoked| *revoked != token_sha256),
+            ),
+        }
+    }
 }
 
 impl State {
+    /// 不带第二份存档：单测模拟「只有授权文件」的旧行为用。
+    #[cfg(test)]
     pub fn new(path: PathBuf, machine_id: Result<String, String>) -> Self {
+        Self::with_anchor(path, machine_id, Box::new(crate::license_anchor::NoAnchor))
+    }
+
+    pub fn with_anchor(
+        path: PathBuf,
+        machine_id: Result<String, String>,
+        anchor: Box<dyn Anchor>,
+    ) -> Self {
         Self {
             path,
             machine_id,
@@ -91,7 +207,68 @@ impl State {
             active_until: AtomicU64::new(0),
             revoked_token: Mutex::new(None),
             io: Mutex::new(()),
+            anchor,
+            anchor_slot: Mutex::new(AnchorSlot::Unloaded),
         }
+    }
+
+    fn lock_anchor(&self) -> std::sync::MutexGuard<'_, AnchorSlot> {
+        self.anchor_slot.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 读第二份存档（每次运行只真正读一次凭据库）。返回记录与需要记日志的说明：
+    /// 没有记录、校验码不对都算没有记录；读失败则本次运行停用存档（只报告这一次）。
+    fn anchor_record(&self, machine_id: &str) -> (Option<AnchorRecord>, Option<String>) {
+        let mut slot = self.lock_anchor();
+        let mut note = None;
+        if matches!(*slot, AnchorSlot::Unloaded) {
+            *slot = match self.anchor.load() {
+                Ok(text) => {
+                    AnchorSlot::Ready(text.and_then(|text| AnchorRecord::parse(&text, machine_id)))
+                }
+                Err(error) => {
+                    note = Some(format!(
+                        "授权状态的第二份存档读取失败，本次运行不再使用（不影响使用）：{error}"
+                    ));
+                    AnchorSlot::Disabled(None)
+                }
+            };
+        }
+        let record = match &*slot {
+            AnchorSlot::Ready(record) | AnchorSlot::Disabled(record) => record.clone(),
+            AnchorSlot::Unloaded => None,
+        };
+        (record, note)
+    }
+
+    /// 把一次更新合并进第二份存档并写回凭据库。写失败只返回说明，由调用方记日志——绝不因此锁定；
+    /// 失败一次后本次运行不再尝试写入（只更新内存）。
+    fn write_anchor(&self, machine_id: &str, update: AnchorUpdate) -> Option<String> {
+        let (_, mut note) = self.anchor_record(machine_id);
+        let mut slot = self.lock_anchor();
+        let previous = match &*slot {
+            AnchorSlot::Ready(record) | AnchorSlot::Disabled(record) => record.clone(),
+            AnchorSlot::Unloaded => None,
+        };
+        let (last_seen, revoked) = update.merge(previous.as_ref());
+        let record = AnchorRecord::sealed(machine_id, last_seen, revoked);
+        if matches!(*slot, AnchorSlot::Disabled(_)) {
+            *slot = AnchorSlot::Disabled(Some(record));
+            return note;
+        }
+        let result = serde_json::to_string(&record)
+            .map_err(|error| error.to_string())
+            .and_then(|text| self.anchor.store(&text));
+        *slot = match result {
+            Ok(()) => AnchorSlot::Ready(Some(record)),
+            Err(error) => {
+                note = Some(format!(
+                    "授权状态的第二份存档未更新（不影响使用，本次运行不再重试）：{error}"
+                ));
+                AnchorSlot::Disabled(Some(record))
+            }
+        };
+        note
     }
 
     pub fn machine_id(&self) -> Result<&str, &str> {
@@ -192,18 +369,30 @@ impl State {
             .unwrap_or_else(|e| e.into_inner())
             .as_deref()
             == Some(stored.token.as_str());
-        if stored.revoked || revoked_in_memory {
-            return self.finish(Verdict::Locked(LockReason::Revoked), None);
+        let (anchor, anchor_note) = self.anchor_record(mid);
+        let mut notes: Vec<String> = anchor_note.into_iter().collect();
+        // 第二份存档记录了「这份凭证已被停用」：授权文件被换成停用前的备份也照样锁定。
+        let revoked_in_anchor = anchor
+            .as_ref()
+            .and_then(|record| record.revoked_token_sha256.as_deref())
+            == Some(token_sha256(&stored.token).as_str());
+        if stored.revoked || revoked_in_memory || revoked_in_anchor {
+            return self.finish(Verdict::Locked(LockReason::Revoked), join_notes(notes));
         }
+        // 时钟下限取三处最晚：授权文件、本次运行内存、第二份存档。恢复旧文件只能回滚其中一处。
+        let anchor_seen = anchor.as_ref().map_or(0, |record| record.last_seen);
         let floor = stored
             .last_seen
-            .max(self.mem_last_seen.load(Ordering::SeqCst));
+            .max(self.mem_last_seen.load(Ordering::SeqCst))
+            .max(anchor_seen);
         let v = decide(&stored.token, mid, now, floor, keys);
         if !v.is_active() {
-            return self.finish(v, None);
+            return self.finish(v, join_notes(notes));
         }
         self.mem_last_seen.fetch_max(now, Ordering::SeqCst);
-        let mut note = None;
+        if next_last_seen(now, anchor_seen).is_some() {
+            notes.extend(self.write_anchor(mid, AnchorUpdate::Seen(now)));
+        }
         if let Some(next) = next_last_seen(now, stored.last_seen) {
             let fresh = Stored::new(mid, stored.token, next, false);
             match self.write_locked(&fresh) {
@@ -219,16 +408,15 @@ impl State {
                         Err(prev) => prev,
                     };
                     if now.saturating_sub(since) >= MAX_UNPERSISTED_SECS {
-                        return self.finish(
-                            Verdict::Locked(LockReason::Unpersisted),
-                            Some(format!("授权状态连续 1 小时无法保存，已锁定：{e}")),
-                        );
+                        notes.push(format!("授权状态连续 1 小时无法保存，已锁定：{e}"));
+                        return self
+                            .finish(Verdict::Locked(LockReason::Unpersisted), join_notes(notes));
                     }
-                    note = Some(format!("授权状态暂时无法保存（{e}），1 小时内恢复即可"));
+                    notes.push(format!("授权状态暂时无法保存（{e}），1 小时内恢复即可"));
                 }
             }
         }
-        (self.finish(v, None).0, note)
+        (self.finish(v, None).0, join_notes(notes))
     }
 
     fn finish(&self, v: Verdict, note: Option<String>) -> (Verdict, Option<String>) {
@@ -266,11 +454,21 @@ impl State {
             return Err(r);
         }
         let _g = self.lock_io();
+        let accepted_sha256 = token_sha256(&token);
         self.write_locked(&Stored::new(mid, token, now, false))
             .map_err(|_| LockReason::Unpersisted)?;
         self.mem_last_seen.store(now, Ordering::SeqCst);
         self.unpersisted_since.store(0, Ordering::SeqCst);
         *self.revoked_token.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // 新凭证由服务器签发、刚通过验签：第二份存档的时钟下限重置为现在；
+        // 旧凭证的停用记录保留（恢复旧凭证的备份仍然锁定）。写失败不影响激活结果。
+        let accepted = AnchorUpdate::Accept {
+            now,
+            token_sha256: accepted_sha256,
+        };
+        if let Some(note) = self.write_anchor(mid, accepted) {
+            crate::logging::log_event("授权", note);
+        }
         Ok(self.finish(v, None).0)
     }
 
@@ -293,6 +491,14 @@ impl State {
         let last = current
             .last_seen
             .max(self.mem_last_seen.load(Ordering::SeqCst));
+        // 先写第二份存档：即使授权文件之后被换回停用前的备份，这份凭证仍然锁定。
+        let revoke = AnchorUpdate::Revoke {
+            last_seen: last,
+            token_sha256: token_sha256(&current.token),
+        };
+        if let Some(note) = self.write_anchor(mid, revoke) {
+            crate::logging::log_event("授权", note);
+        }
         self.write_locked(&Stored::new(mid, current.token, last, true))
     }
 }
@@ -485,6 +691,190 @@ mod tests {
         );
         // 校正回来就恢复，不会被一次失败锁死
         assert!(fx.eval(&s, T0 + 3 * DAY + 10).is_active());
+    }
+
+    use crate::license_anchor::MemoryAnchor;
+
+    /// 带第二份存档启动：`store` 跨「重启」共享，模拟系统凭据库。
+    fn boot_with(fx: &Fx, store: &std::sync::Arc<std::sync::Mutex<Option<String>>>) -> State {
+        State::with_anchor(
+            fx.dir.file(),
+            Ok(MID.to_string()),
+            Box::new(MemoryAnchor {
+                value: store.clone(),
+                ..Default::default()
+            }),
+        )
+    }
+
+    /// 回滚攻击：备份旧授权文件 → 用到很晚 → 恢复备份、重启、把时间拨回去。
+    /// 没有第二份存档时能用（旧行为）；有了它，凭据库里更晚的时间仍然拦住回拨。
+    #[test]
+    fn restored_old_license_file_cannot_roll_back_clock() {
+        let fx = Fx::new("anchor-rollback");
+        let (_, store) = MemoryAnchor::shared();
+        let s = boot_with(&fx, &store);
+        fx.accept(&s, T0);
+        let backup = std::fs::read(fx.dir.file()).unwrap();
+        assert!(fx.eval(&s, T0 + 5 * DAY).is_active());
+
+        std::fs::write(fx.dir.file(), &backup).unwrap();
+        let rebooted = boot_with(&fx, &store);
+        assert_eq!(
+            locked(&fx.eval(&rebooted, T0 + DAY)),
+            Some(LockReason::ClockRollback),
+            "凭据库记得见过 T0+5 天，拨回 T0+1 天必须被拦住"
+        );
+
+        // 对照：没有第二份存档（旧行为）时同样的操作能用，说明测试确实打在了漏洞上。
+        std::fs::write(fx.dir.file(), &backup).unwrap();
+        assert!(fx.eval(&fx.boot(), T0 + DAY).is_active());
+    }
+
+    /// 被停用后恢复停用前的授权文件：凭据库里有停用记录，仍然锁定。
+    #[test]
+    fn restored_pre_revocation_file_stays_revoked() {
+        let fx = Fx::new("anchor-revoked");
+        let (_, store) = MemoryAnchor::shared();
+        let s = boot_with(&fx, &store);
+        fx.accept(&s, T0);
+        let backup = std::fs::read(fx.dir.file()).unwrap();
+        let tok = fx.read().token;
+        s.mark_revoked(&tok).unwrap();
+
+        std::fs::write(fx.dir.file(), &backup).unwrap();
+        assert!(!fx.read().revoked, "备份里没有停用标记");
+        let rebooted = boot_with(&fx, &store);
+        assert_eq!(
+            locked(&fx.eval(&rebooted, T0 + 10)),
+            Some(LockReason::Revoked)
+        );
+
+        // 拿到新凭证后解除：新凭证不受旧停用记录影响
+        assert!(fx.accept(&rebooted, T0 + 20).is_active());
+        assert!(fx.eval(&boot_with(&fx, &store), T0 + 30).is_active());
+    }
+
+    /// 凭据库里的记录被手改或来自别的电脑：视为不存在（不锁定，只是不再提供额外保护）。
+    #[test]
+    fn tampered_anchor_record_is_ignored_not_fatal() {
+        let fx = Fx::new("anchor-tampered");
+        let (_, store) = MemoryAnchor::shared();
+        let s = boot_with(&fx, &store);
+        fx.accept(&s, T0);
+        // 把凭据库里的时间改成很晚（想把用户锁死）——校验码对不上，必须被忽略
+        let mut record: AnchorRecord =
+            serde_json::from_str(store.lock().unwrap().as_deref().unwrap()).unwrap();
+        record.last_seen = T0 + 100 * DAY;
+        *store.lock().unwrap() = Some(serde_json::to_string(&record).unwrap());
+        assert!(fx.eval(&boot_with(&fx, &store), T0 + 60).is_active());
+
+        // 别的电脑的记录（机器码不同）同样无效
+        let foreign = AnchorRecord::sealed(OTHER_MID, T0 + 100 * DAY, None);
+        *store.lock().unwrap() = Some(serde_json::to_string(&foreign).unwrap());
+        assert!(fx.eval(&boot_with(&fx, &store), T0 + 120).is_active());
+    }
+
+    /// 凭据库不可用（拒绝钥匙串访问等）：行为与没有第二份存档完全一致，不锁死用户。
+    #[test]
+    fn unavailable_anchor_falls_back_to_file_only() {
+        let fx = Fx::new("anchor-unavailable");
+        // 先用没有存档的实例激活，再换成「凭据库写不进去」的实例判定
+        fx.accept(&fx.boot(), T0);
+        let s = State::with_anchor(
+            fx.dir.file(),
+            Ok(MID.to_string()),
+            Box::new(MemoryAnchor {
+                fail_writes: true,
+                ..Default::default()
+            }),
+        );
+        let (verdict, note) = s.evaluate(T0 + DAY, Ok(&fx.keys), true);
+        assert!(verdict.is_active());
+        assert!(
+            note.is_some_and(|n| n.contains("不影响使用")),
+            "第一次失败要报告"
+        );
+        let (verdict, note) = s.evaluate(T0 + DAY + 120, Ok(&fx.keys), true);
+        assert!(verdict.is_active());
+        assert!(note.is_none(), "同一次运行内不重复报告");
+    }
+
+    /// 凭据库一时读不到（钥匙串锁定、拒绝访问）：不能当成「没有记录」再写一份新的，
+    /// 否则原有的停用记录被覆盖；本次运行改为只读授权文件，凭据库原样不动。
+    #[test]
+    fn unreadable_anchor_is_never_overwritten() {
+        let fx = Fx::new("anchor-unreadable");
+        let (_, store) = MemoryAnchor::shared();
+        let s = boot_with(&fx, &store);
+        fx.accept(&s, T0);
+        let tok = fx.read().token;
+        s.mark_revoked(&tok).unwrap();
+        let before = store.lock().unwrap().clone();
+        assert!(before.is_some());
+
+        // 换一份凭证激活（新实例、凭据库读失败），然后判定几次
+        let flaky = State::with_anchor(
+            fx.dir.file(),
+            Ok(MID.to_string()),
+            Box::new(MemoryAnchor {
+                value: store.clone(),
+                fail_reads: true,
+                ..Default::default()
+            }),
+        );
+        let (verdict, note) = flaky.evaluate(T0 + 10, Ok(&fx.keys), true);
+        assert_eq!(
+            verdict,
+            Verdict::Locked(LockReason::Revoked),
+            "授权文件里的停用标记照常生效"
+        );
+        assert!(
+            note.is_some_and(|n| n.contains("读取失败")),
+            "第一次读失败要报告"
+        );
+        assert!(fx.accept(&flaky, T0 + 20).is_active());
+        let (verdict, note) = flaky.evaluate(T0 + DAY, Ok(&fx.keys), true);
+        assert!(verdict.is_active(), "读不到凭据库不能锁死用户");
+        assert!(note.is_none(), "读失败只报告一次");
+        assert_eq!(*store.lock().unwrap(), before, "凭据库里的记录必须原样保留");
+    }
+
+    /// 激活新凭证后恢复「已停用的旧凭证」的备份：停用记录不能随新凭证激活被清掉。
+    #[test]
+    fn revoked_token_stays_blocked_after_new_activation() {
+        let fx = Fx::new("anchor-keep-revoked");
+        let (_, store) = MemoryAnchor::shared();
+        let s = boot_with(&fx, &store);
+        fx.accept(&s, T0);
+        let old_backup = std::fs::read(fx.dir.file()).unwrap();
+        let old = fx.read().token;
+        s.mark_revoked(&old).unwrap();
+
+        assert!(fx.accept(&s, T0 + 20).is_active(), "新凭证正常激活");
+        assert!(fx.eval(&s, T0 + 30).is_active());
+
+        std::fs::write(fx.dir.file(), &old_backup).unwrap();
+        assert_eq!(
+            locked(&fx.eval(&boot_with(&fx, &store), T0 + 40)),
+            Some(LockReason::Revoked)
+        );
+    }
+
+    /// 停用时写入的时间不能低于凭据库里已有的更晚时间（只增不减）。
+    #[test]
+    fn revocation_never_lowers_anchor_clock() {
+        let fx = Fx::new("anchor-revoke-clock");
+        let (_, store) = MemoryAnchor::shared();
+        fx.accept(&boot_with(&fx, &store), T0);
+        assert!(fx.eval(&boot_with(&fx, &store), T0 + 5 * DAY).is_active());
+        // 恢复早期文件后重启（内存里没有更晚时间），这时被停用
+        let early = Stored::new(MID, fx.read().token, T0, false);
+        fx.write_raw(&early);
+        let s = boot_with(&fx, &store);
+        s.mark_revoked(&early.token).unwrap();
+        let record = AnchorRecord::parse(store.lock().unwrap().as_deref().unwrap(), MID).unwrap();
+        assert_eq!(record.last_seen, T0 + 5 * DAY);
     }
 
     #[test]

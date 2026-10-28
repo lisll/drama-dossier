@@ -42,6 +42,8 @@ const ALLOWED_WITHOUT_LICENSE: &[&str] = &[
     "open_log_dir",
     "read_recent_logs",
     "transcode_stop",
+    "bitrate_stop",
+    "dedup_demo_stop",
     "erase_status",
 ];
 /// 服务器明确表示「这台电脑不能再用这份授权」的错误码。只有这几种才锁定，
@@ -120,6 +122,17 @@ fn ctx() -> Option<&'static Ctx> {
 const _: () = assert!(
     dossier_cardkey::PRODUCTION_KEYS.is_empty(),
     "已填入正式公钥：请先按 docs/LICENSING.md「删除测试版」删除 license-test-mode，再发布正式版"
+);
+
+// 正式发布包与测试版互斥：两者同开说明构建命令写错了，宁可编译失败也不出一个身份不明的包。
+#[cfg(all(feature = "official-release", feature = "license-test-mode"))]
+compile_error!("official-release 与 license-test-mode 不能同时开启：正式包不得包含测试授权");
+
+// 正式发布包必须带正式公钥：没填公钥时出的包谁都激活不了，不该被发布出去。
+#[cfg(feature = "official-release")]
+const _: () = assert!(
+    !dossier_cardkey::PRODUCTION_KEYS.is_empty(),
+    "official-release 需要正式公钥：请先在 crates/dossier-cardkey/src/keys.rs 的 PRODUCTION_KEYS 中填入正式公钥"
 );
 
 /// 调试构建默认跳过授权检查，本地开发不必激活；想在调试构建里测授权，设置
@@ -538,7 +551,8 @@ pub fn init(app: &AppHandle) {
         e.to_string()
     });
     let _ = CTX.set(Ctx {
-        state: State::new(path, machine_id),
+        // 第二份存档放系统凭据库（Windows 凭据管理器 / macOS 钥匙串），见 license_anchor.rs。
+        state: State::with_anchor(path, machine_id, crate::license_anchor::platform_anchor()),
         app_version: app.package_info().version.to_string(),
     });
     let _ = APP.set(app.clone());
@@ -642,10 +656,7 @@ pub async fn license_activate(card: String) -> Result<LicenseStatus, String> {
         {
             if !crate::license_test_mode::is_test_card(&code) {
                 log_event("授权", "测试版收到非测试卡密，已拒绝");
-                return Err(format!(
-                    "测试版只接受测试卡密 {}",
-                    crate::license_test_mode::TEST_CARD
-                ));
+                return Err("测试版只接受内部测试卡密，请联系发放人".into());
             }
             log_event("授权", "使用测试卡密离线激活");
             let token = crate::license_test_mode::issue(&mid, now_secs());

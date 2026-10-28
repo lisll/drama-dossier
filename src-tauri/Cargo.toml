@@ -10,10 +10,13 @@ edition = "2021"
 tauri-build = { version = "2", features = [] }
 
 [features]
-default = ["license-test-mode"]
-# TEST-MODE：离线测试版授权（固定测试卡密，不联网）。测试通过后连同 license_test_mode.rs 一起删除，
-# 见 docs/LICENSING.md「删除测试版」。填入正式公钥后仍开着这个开关会直接编译失败。
+# 授权构建形态必须显式选择，默认两者都不开：此时没有任何可信公钥，授权恒为「未激活」（fail-closed）。
+default = []
+# TEST-MODE：离线测试版授权（固定测试卡密，不联网），只用于内部测试包（`--features license-test-mode`）。
+# 测试通过后连同 license_test_mode.rs 一起删除，见 docs/LICENSING.md「删除测试版」。
 license-test-mode = ["dossier-cardkey/test-issuer"]
+# 正式发布包（`--features official-release`）：编译期要求已填正式公钥，且不能与测试模式同时开启。
+official-release = []
 
 [dependencies]
 dossier-core = { path = "../crates/dossier-core" }
@@ -30,6 +33,11 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 base64 = "0.22"
 tauri = { version = "2", features = [] }
 rfd = "0.15"
+
+# 授权状态的第二份存档（防恢复旧授权文件绕过停用 / 时钟回拨）：系统凭据库，只在有原生后端的平台引入。
+# Linux 没有后端，退回只看授权文件的旧逻辑（见 license_anchor.rs）。精确锁版本。
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+keyring = { version = "=3.6.3", features = ["apple-native", "windows-native"] }
 
 [dev-dependencies]
 # 单元测试要在本机签发凭证来驱动授权状态机

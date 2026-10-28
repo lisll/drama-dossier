@@ -1478,6 +1478,12 @@ code {
   font-size: 12px;
 }
 
+.field-hint {
+  margin: 4px 0 0;
+  color: var(--warn-text);
+  font-size: 12px;
+}
+
 input[aria-invalid="true"] {
   border-color: var(--err-fill);
 }

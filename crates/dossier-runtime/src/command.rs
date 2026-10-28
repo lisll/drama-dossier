@@ -225,6 +225,13 @@ impl CommandRunner for SystemRunner {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x0800_0000);
         }
+        #[cfg(unix)]
+        {
+            // 子进程自成一个进程组：停止 / 超时时整组终止，它再拉起的孙进程（如 python 调的 ffmpeg）一并结束。
+            // 同时让子进程脱离终端的前台进程组，Ctrl-C 不会直接打到它们。
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         if let Some(cwd) = &spec.cwd {
             command.current_dir(cwd);
         }
@@ -262,8 +269,7 @@ impl CommandRunner for SystemRunner {
         let status = loop {
             // 用户点「停止」时立刻终止子进程，不等它自然跑完。
             if cancelled() {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_tree(&mut child);
                 return Err(CommandError::Cancelled {
                     program: spec.program.clone(),
                 });
@@ -272,8 +278,7 @@ impl CommandRunner for SystemRunner {
                 Ok(Some(status)) => break status,
                 Ok(None) => {}
                 Err(source) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_tree(&mut child);
                     return Err(CommandError::Spawn {
                         program: spec.program.clone(),
                         message: source.to_string(),
@@ -282,8 +287,7 @@ impl CommandRunner for SystemRunner {
             }
             if let Some(deadline) = deadline {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_tree(&mut child);
                     return Err(CommandError::Timeout {
                         program: spec.program.clone(),
                         after: spec.timeout.unwrap_or_default(),
@@ -302,6 +306,40 @@ impl CommandRunner for SystemRunner {
             stdout_raw: stdout,
         })
     }
+}
+
+/// 终止子进程及其全部后代，然后回收子进程。
+///
+/// 只 `kill` 直接子进程不够：python 脚本、批处理拉起的 ffmpeg 会变成孤儿继续占 CPU、写文件，
+/// 还会一直持有 stdout/stderr 管道，导致排空线程等不到 EOF。
+/// - Unix：子进程启动时已用 `process_group(0)` 自成一组，这里向整组发 SIGKILL。
+/// - Windows：`taskkill /T /F` 按父子关系终止整棵进程树。
+///
+/// 两种方式失败时都退回 `child.kill()`，至少保证直接子进程结束。
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+            // SAFETY：kill(2) 只读参数、不涉及内存；负 pid 表示「向进程组 |pid| 发信号」，
+            // 进程组号等于子进程 pid（spawn 时 process_group(0)）。组已不存在时返回 ESRCH，忽略即可。
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x0800_0000)
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn spawn_drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
@@ -476,6 +514,68 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, CommandError::Timeout { .. }));
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// 停止时连孙进程一起终止：sh 后台拉起的 sleep 不能变成孤儿。
+    #[cfg(unix)]
+    #[test]
+    fn cancel_kills_grandchildren() {
+        let dir = std::env::temp_dir().join(format!(
+            "dossier-killtree-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("grandchild.pid");
+        let script = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
+        let started = Instant::now();
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        let err = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                // 等孙进程 pid 落盘后再发停止，确保真的存在一个孙进程
+                while !pid_file.is_file() && started.elapsed() < Duration::from_secs(10) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            SystemRunner::new()
+                .run_cancellable(
+                    &CommandSpec::new("sh")
+                        .args(["-c", &script])
+                        .timeout(Duration::from_secs(20)),
+                    &|| flag.load(std::sync::atomic::Ordering::SeqCst),
+                )
+                .unwrap_err()
+        });
+        assert!(matches!(err, CommandError::Cancelled { .. }));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "停止后应立即返回"
+        );
+        let grandchild: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // 孙进程被 SIGKILL 后由 init 回收，可能有极短延迟；最多等 2 秒。
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let alive = loop {
+            // SAFETY：信号 0 只做存在性检查，不会真的发信号。
+            let alive = unsafe { libc::kill(grandchild, 0) } == 0;
+            if !alive || Instant::now() >= deadline {
+                break alive;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !alive,
+            "孙进程 {grandchild} 仍在运行，停止没有覆盖整个进程组"
+        );
     }
 
     #[test]

@@ -48,8 +48,9 @@
     // TEST-MODE：测试版明确标出来，避免和正式版混淆
     badge.hidden = !status.testMode;
     if (status.testMode) {
-      sub.textContent = "这是内部测试版，请输入测试卡密。激活后离线可用 30 天，到期后再输入一次即可续用。";
-      input.placeholder = "DDK-TEST-CARD-2345-6789";
+      sub.textContent =
+        "这是内部测试版，请输入发放人提供的内部测试卡密。激活后离线可用 30 天，到期后再输入一次即可续用。";
+      input.placeholder = "DDK-XXXX-XXXX-XXXX-XXXX";
     }
     if (!canActivate) setMsg(msg, "授权服务器未配置，请联系客服获取正式版本。");
   }

@@ -143,7 +143,28 @@ function setFieldError(selector, message) {
 
 /** 清掉某一组字段的错误提示。 */
 function clearFieldErrors(selectors) {
-  selectors.forEach((selector) => setFieldError(selector, null));
+  selectors.forEach((selector) => {
+    setFieldError(selector, null);
+    setFieldHint(selector, null);
+  });
+}
+
+/** 字段旁的黄色提示：只提醒、不阻止提交（与 setFieldError 的红色错误区分）。 */
+function setFieldHint(selector, message) {
+  const field = $(selector);
+  const holder = field?.closest("label") ?? field?.parentElement;
+  if (!holder) return;
+  let node = holder.querySelector(".field-hint");
+  if (!message) {
+    if (node) node.remove();
+    return;
+  }
+  if (!node) {
+    node = document.createElement("p");
+    node.className = "field-hint";
+    holder.appendChild(node);
+  }
+  node.textContent = message;
 }
 
 // ============ 结果区：语义色与路径操作 ============
@@ -303,6 +324,38 @@ function endTask() {
   syncBitrateFixState();
   refreshTitleInputState();
   hideProgress();
+}
+
+/**
+ * 长任务的停止按钮：任务开始时显示、结束时隐藏并复位文案。
+ * 每类任务有自己的停止命令（后端按任务类别取消），互不干扰。
+ */
+function showStopButton(selector, label) {
+  const button = $(selector);
+  button.classList.remove("hidden");
+  button.disabled = false;
+  button.textContent = label;
+  return () => {
+    button.classList.add("hidden");
+    button.disabled = false;
+    button.textContent = label;
+  };
+}
+
+function bindStopButton(selector, command, label, sentMessage) {
+  $(selector).addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    button.textContent = "正在停止…";
+    try {
+      await invoke(command);
+      toast(sentMessage);
+    } catch (error) {
+      toast(error, true);
+      button.disabled = false;
+      button.textContent = label;
+    }
+  });
 }
 
 /** 处理后端推来的逐集探测进度（`probe-progress`）。 */
@@ -539,6 +592,8 @@ function settingsSnapshot() {
       $("#material-pipeline-enabled")?.checked ? "on" : "off",
       $("#dedup-recipe-enabled")?.checked ? "on" : "off",
       $("#ai-badge-enabled")?.checked ? "on" : "off",
+      $("#ai-badge-text")?.value.trim() ?? "",
+      $("#ai-badge-font-size")?.value.trim() ?? "",
     ].join("|"),
   });
 }
@@ -575,6 +630,8 @@ function refreshDirtyBadge() {
       state.settings?.materialPipelineEnabled === false ? "off" : "on",
       state.settings?.dedupRecipeEnabled === false ? "off" : "on",
       state.settings?.aiBadgeEnabled === false ? "off" : "on",
+      state.settings?.aiBadgeText ?? "",
+      state.settings?.aiBadgeFontSize == null ? "" : String(state.settings.aiBadgeFontSize),
     ].join("|"),
   });
   $("#settings-dirty").classList.toggle("hidden", settingsSnapshot() === saved);
@@ -625,6 +682,9 @@ async function loadSettings() {
     // 去重配方 / AI 合规角标开关：None / 缺失都视为开启。
     $("#dedup-recipe-enabled").checked = settings.dedupRecipeEnabled !== false;
     $("#ai-badge-enabled").checked = settings.aiBadgeEnabled !== false;
+    $("#ai-badge-text").value = settings.aiBadgeText ?? "";
+    $("#ai-badge-font-size").value =
+      settings.aiBadgeFontSize == null ? "" : String(settings.aiBadgeFontSize);
     if (state.root) $("#env-workdir").value = state.root;
     renderDefaultHints();
     renderEmptyGuide();
@@ -651,6 +711,15 @@ async function saveSettings() {
   } catch (error) {
     reportError(error);
     return;
+  }
+  // 字号是整数：填 12.5 时后端反序列化报的是 serde 原文，用户看不懂，先在这里拦下。
+  const badgeFontSize = $("#ai-badge-font-size").value.trim();
+  if (badgeFontSize !== "") {
+    const size = Number(badgeFontSize);
+    if (!Number.isInteger(size) || size < 10 || size > 24) {
+      reportError("AI 角标字号需填 10 到 24 之间的整数（留空用默认 12）。");
+      return;
+    }
   }
   try {
     const settings = buildSettingsFromForm(rules);
@@ -721,6 +790,12 @@ function buildSettingsFromForm(rules) {
     materialPipelineEnabled: $("#material-pipeline-enabled").checked,
     dedupRecipeEnabled: $("#dedup-recipe-enabled").checked,
     aiBadgeEnabled: $("#ai-badge-enabled").checked,
+    // 留空 = 用默认文案 / 默认字号（后端校验：文案 ≤40 字符、字号 10–24）。
+    aiBadgeText: $("#ai-badge-text").value.trim() || null,
+    aiBadgeFontSize:
+      $("#ai-badge-font-size").value.trim() === ""
+        ? null
+        : Number($("#ai-badge-font-size").value.trim()),
   };
 }
 
@@ -869,6 +944,8 @@ async function rememberRoot(root) {
     materialPipelineEnabled: state.settings?.materialPipelineEnabled ?? true,
     dedupRecipeEnabled: state.settings?.dedupRecipeEnabled ?? true,
     aiBadgeEnabled: state.settings?.aiBadgeEnabled ?? true,
+    aiBadgeText: state.settings?.aiBadgeText ?? null,
+    aiBadgeFontSize: state.settings?.aiBadgeFontSize ?? null,
     libraryRoot: root,
   };
   state.settings = settings;
@@ -1284,6 +1361,14 @@ function validateCostForm() {
     problems.push(["#actor-ratio", "演员成本占比必须在 0–100 之间。"]);
   }
   problems.forEach(([selector, message]) => setFieldError(selector, message));
+  // 常见报审分级区间（投资额 0–100 万元、演员片酬占比 < 40%）之外只提示、不拦截：
+  // 超出区间不代表数据错误，真实数据如实填写即可。
+  if (investment !== null && investment >= 0 && !(investment > 0 && investment < 100)) {
+    setFieldHint("#total-investment", "超出常见报审分级区间（0–100 万元），请确认数据无误。");
+  }
+  if (ratio !== null && ratio >= 40 && ratio <= 100) {
+    setFieldHint("#actor-ratio", "超出常见报审分级区间（演员片酬占比低于 40%），请确认数据无误。");
+  }
   return problems.length ? null : { investment, ratio };
 }
 
@@ -1304,6 +1389,8 @@ async function generate() {
       outputRoot: state.settings?.outputDir ?? null,
       copyEpisodes: $("#copy-episodes").checked,
       aiGenerated: $("#ai-generated").checked,
+      // 只有使用者确认成片已标注 AI 声明，权属声明里才写「已按平台要求进行标识」。
+      aiLabelConfirmed: $("#ai-label-confirmed")?.checked ?? false,
       ffprobePath: effectiveFfprobe(),
       rules: effectiveRules(),
       costSheet: {
@@ -1586,6 +1673,7 @@ async function runDedupDemo() {
     return;
   }
   if (!beginTask("正在执行 V5 去重验证（两轮编码）")) return;
+  const hideStop = showStopButton("#dedup-demo-stop", "停止验证");
   try {
     const result = await call("dedup_demo_execute", {
       input,
@@ -1613,11 +1701,16 @@ async function runDedupDemo() {
   } catch (error) {
     reportError(error);
   } finally {
+    hideStop();
     endTask();
   }
 }
 
-async function generatePublishCopy() {
+/**
+ * 生成挂载文案 CSV。目标文件已存在时后端拒绝覆盖；这里给出「覆盖」操作，
+ * 用户点了才带 overwrite: true 重新生成（不会在用户不知情时覆盖已编辑过的文案）。
+ */
+async function generatePublishCopy(overwrite = false) {
   try {
     const path = $("#publish-copy-path").value.trim();
     if (!path) throw new Error("请填写挂载文案 CSV 输出路径。");
@@ -1627,12 +1720,21 @@ async function generatePublishCopy() {
       name: drama.name,
       outputPath: path,
       ffprobePath: $("#ffprobe-path").value.trim() || null,
+      overwrite,
     });
     $("#publish-copy-path").value = result.path;
     state.publishRows = await call("load_mount_copy", { path: result.path });
     renderPublishCopy(`<strong>模板已生成</strong><br />行数：${result.rowCount} · SHA-256：<code>${esc(result.sha256)}</code>`);
   } catch (error) {
-    toast(String(error), true);
+    const message = String(error);
+    if (!overwrite && message.includes("文件已存在")) {
+      toast(`${message} 覆盖会丢掉文件里已编辑的文案。`, true, {
+        label: "覆盖并重新生成",
+        run: () => generatePublishCopy(true),
+      });
+      return;
+    }
+    toast(message, true);
   }
 }
 
@@ -1959,26 +2061,40 @@ async function applyRename() {
 
 // ============ 工具箱：码率修复 ============
 
-/** 码率修复按钮的可点状态：有低于安全线的分集、且当前没有别的任务在跑。 */
+/** 码率修复按钮的可点状态：有超出区间的分集、且当前没有别的任务在跑。 */
 function syncBitrateFixState() {
   const fixable = (bitrateItems ?? []).filter((item) => item.needsFix).length;
   $("#bitrate-fix").disabled = !fixable || Boolean(state.task);
 }
 
-function bitrateMinBps() {
-  const value = Number($("#bitrate-min").value);
-  if (!(value > 0)) {
-    setFieldError("#bitrate-min", "码率安全线必须是大于 0 的数字。");
-    throw new Error("码率安全线必须是大于 0 的数字。");
-  }
+/** 码率安全区间（kbps）：下限 > 0 且小于上限，否则在字段旁标红并抛错。 */
+function bitrateRangeKbps() {
+  const min = Number($("#bitrate-min").value);
+  const max = Number($("#bitrate-max").value);
   setFieldError("#bitrate-min", null);
-  return Math.round(value * 1e6);
+  setFieldError("#bitrate-max", null);
+  if (!(min > 0)) {
+    setFieldError("#bitrate-min", "码率下限必须是大于 0 的数字。");
+    throw new Error("码率下限必须是大于 0 的数字。");
+  }
+  if (!(max > min)) {
+    setFieldError("#bitrate-max", "码率上限必须大于下限。");
+    throw new Error("码率上限必须大于下限。");
+  }
+  return { minKbps: Math.round(min * 1000), maxKbps: Math.round(max * 1000) };
+}
+
+function bitrateStatusText(item) {
+  if (item.bitrateBps == null) return "探测不到码率";
+  if (item.direction === "low") return "低于下限";
+  if (item.direction === "high") return "高于上限";
+  return "在区间内";
 }
 
 async function probeBitrate() {
-  let minKbps;
+  let range;
   try {
-    minKbps = Math.round(bitrateMinBps() / 1000);
+    range = bitrateRangeKbps();
   } catch (error) {
     reportError(error);
     return;
@@ -1989,7 +2105,8 @@ async function probeBitrate() {
     bitrateItems = await call("probe_bitrate", {
       root: state.root,
       name: drama.name,
-      minKbps,
+      minKbps: range.minKbps,
+      maxKbps: range.maxKbps,
       ffprobePath: effectiveFfprobe(),
     });
     const rows = bitrateItems
@@ -1998,10 +2115,8 @@ async function probeBitrate() {
         const status = kbps == null ? "unknown" : item.needsFix ? "fail" : "pass";
         return `<tr>
           <td>${esc(item.fileName)}</td>
-          <td>${kbps == null ? "未知" : `${(kbps / 1000).toFixed(0)} kbps`}</td>
-          <td class="status-${status}">${
-            kbps == null ? "探测不到码率" : item.needsFix ? "低于安全线" : "达标"
-          }</td>
+          <td>${kbps == null ? "未知" : `${(kbps / 1000).toFixed(0)} kbps${item.estimated ? "（估算）" : ""}`}</td>
+          <td class="status-${status}">${bitrateStatusText(item)}</td>
         </tr>`;
       })
       .join("");
@@ -2009,8 +2124,13 @@ async function probeBitrate() {
     renderResult("#bitrate-result", {
       tone: fixable ? "warn" : "ok",
       html: `
-      <strong>共 ${bitrateItems.length} 集：${fixable} 集低于安全线</strong>
-      <table><thead><tr><th>文件</th><th>码率</th><th>状态</th></tr></thead><tbody>${rows}</tbody></table>
+      <strong>共 ${bitrateItems.length} 集：${fixable} 集超出 ${range.minKbps / 1000}–${range.maxKbps / 1000} Mbps</strong>
+      <table><thead><tr><th>文件</th><th>视频轨码率</th><th>状态</th></tr></thead><tbody>${rows}</tbody></table>
+      ${
+        bitrateItems.some((item) => item.estimated)
+          ? "<p class=\"hint\">标「估算」的分集读不到视频轨码率，按「文件码率 − 音频码率」估算。</p>"
+          : ""
+      }
       ${fixable ? "<p>下一步会重编码这些分集并替换原文件，点按钮后会再确认一次。</p>" : ""}`,
     });
   } catch (error) {
@@ -2033,8 +2153,9 @@ function requestBitrateFix() {
     ${esc(targets.slice(0, 5).map((item) => item.fileName).join("、"))}${
       targets.length > 5 ? ` 等 ${targets.length} 个文件` : ""
     }。<br />
-    <strong>原文件会被替换</strong>（视频与音频都会重新编码），<strong>没有备份、不能撤销</strong>。
-    只有重编码后确认达标才会替换；画面过于简单、编不到安全线的分集会保留原文件并列为失败。
+    <strong>原文件会被替换</strong>（只重新编码视频轨，音轨与字幕轨尽量原样保留），<strong>没有备份、不能撤销</strong>。
+    偏低的修到下限 + 0.5 Mbps、偏高的压到上限；只有重编码后码率落在区间内、且时长与原片一致才会替换，
+    否则保留原文件并列为失败。
     建议先备份，或先在副本上试一集。`;
   // 弹窗关掉后要把焦点还给触发它的按钮，否则键盘用户会被丢回页面开头。
   bitrateConfirmReturnFocus = $("#bitrate-fix");
@@ -2059,12 +2180,13 @@ async function applyBitrateFix() {
   bitrateConfirmReturnFocus = null;
   cancelBitrateFix();
   if (!beginTask(`正在重编码 ${bitratePending.length} 集（原文件会被替换）`)) return;
+  const hideStop = showStopButton("#bitrate-stop", "停止码率修复");
   try {
     const drama = selectedDrama();
     const report = await call("fix_bitrate", {
       root: state.root,
       name: drama.name,
-      minKbps: Math.round(bitrateMinBps() / 1000),
+      ...bitrateRangeKbps(),
       ffprobePath: effectiveFfprobe(),
     });
     const fixedRows = report.fixed
@@ -2072,7 +2194,7 @@ async function applyBitrateFix() {
         (item) =>
           `<tr><td>${esc(item.fileName)}</td><td>${item.fromKbps} → ${
             item.toKbps ?? "?"
-          } kbps</td></tr>`,
+          } kbps${item.note ? `<br /><span class="hint">${esc(item.note)}</span>` : ""}</td></tr>`,
       )
       .join("");
     const failedRows = report.failed
@@ -2090,8 +2212,16 @@ async function applyBitrateFix() {
     // 结果已变，旧的分级数据不再可信，要求重新检测。
     bitrateItems = null;
   } catch (error) {
-    reportError(error);
+    // 停止后已替换的分集保留、其余未动；结果已变，同样要求重新检测。
+    if (String(error).includes("已停止")) {
+      bitrateItems = null;
+      renderResult("#bitrate-result", { tone: "warn", html: `<strong>已停止</strong><br />${esc(error)}` });
+      toast("码率修复已停止");
+    } else {
+      reportError(error);
+    }
   } finally {
+    hideStop();
     endTask();
     syncBitrateFixState();
   }
@@ -3245,6 +3375,13 @@ function handleConfirmKeys(event) {
 
 document.addEventListener("keydown", handleConfirmKeys);
 $("#exec-run").addEventListener("click", executeTranscode);
+bindStopButton(
+  "#bitrate-stop",
+  "bitrate_stop",
+  "停止码率修复",
+  "已发送停止指令：当前这一集立即终止，已替换的分集保留",
+);
+bindStopButton("#dedup-demo-stop", "dedup_demo_stop", "停止验证", "已发送停止指令，正在终止验证进程");
 // 停止转码：后端杀掉正在跑的 ffmpeg、清理本次输出目录，执行中的 transcode_execute 会随之返回。
 $("#exec-stop").addEventListener("click", async (event) => {
   const button = event.currentTarget;
@@ -3328,7 +3465,8 @@ $("#draft-export").addEventListener("click", exportDraft);
 $("#draft-import").addEventListener("click", importDraft);
 $("#dedup-demo-pick").addEventListener("click", () => browse("#dedup-demo-input", "file"));
 $("#dedup-demo-run").addEventListener("click", runDedupDemo);
-$("#publish-copy-generate").addEventListener("click", generatePublishCopy);
+// 包一层：直接传函数时 click 事件对象会被当成 overwrite（真值），等于不确认就覆盖。
+$("#publish-copy-generate").addEventListener("click", () => generatePublishCopy(false));
 $("#publish-copy-load").addEventListener("click", loadPublishCopy);
 $("#publish-copy-preview").addEventListener("click", previewPublishCopy);
 // 报审包入口（暂时隐藏）：卡片注释后以下绑定一并停用；恢复时取消注释即可。
@@ -3354,7 +3492,7 @@ $("#library-root").addEventListener("input", renderEmptyGuide);
   "#rule-prefer-portrait", "#settings-output", "#ffprobe-path",
   "#asr-engine", "#asr-executable", "#asr-model", "#ocr-executable",
   "#content-sample-count", "#material-pipeline-enabled",
-  "#dedup-recipe-enabled", "#ai-badge-enabled",
+  "#dedup-recipe-enabled", "#ai-badge-enabled", "#ai-badge-text", "#ai-badge-font-size",
 ].forEach((selector) => {
   const node = $(selector);
   node.addEventListener("input", refreshDirtyBadge);

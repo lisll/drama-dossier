@@ -422,6 +422,7 @@ mod tests {
                     audio_codec: Some("aac".into()),
                     fps: Some(30.0),
                     bitrate_bps: Some(4_000_000),
+                    ..Default::default()
                 },
             })
             .collect()

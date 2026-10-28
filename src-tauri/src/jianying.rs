@@ -26,6 +26,25 @@ const DEFAULT_APP: &str = "/Applications/JianyingPro.app";
 /// 剪映默认草稿目录（国内版剪映的标准位置）。
 const DEFAULT_DRAFT_DIR: &str = "Movies/JianyingPro/User Data/Projects/com.lveditor.draft";
 
+/// Windows 上剪映的可执行文件名。
+const WINDOWS_EXE: &str = "JianyingPro.exe";
+/// Windows 上剪映的候选安装目录（相对 `%LOCALAPPDATA%`），按顺序查找。
+///
+/// **待真机确认**：这几处是常见的默认安装位置，还没在装了剪映的 Windows 电脑上逐一核实；
+/// 确认后应在这里写明核对日期与剪映版本。找不到时界面如实显示「未检测到」，
+/// 用户可以在设置里手动指定安装目录与草稿目录（手动值优先）。
+const WINDOWS_INSTALL_CANDIDATES: &[&str] = &["JianyingPro", "JianyingPro\\Apps"];
+/// Windows 上剪映的默认草稿目录（相对 `%LOCALAPPDATA%`；**待真机确认**，同上）。
+const WINDOWS_DRAFT_DIR: &str = "JianyingPro\\User Data\\Projects\\com.lveditor.draft";
+
+/// 在候选目录里找剪映可执行文件（纯函数，按传入顺序检查 `目录/JianyingPro.exe`）。
+fn find_windows_exe(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .map(|dir| dir.join(WINDOWS_EXE))
+        .find(|exe| exe.is_file())
+}
+
 /// 从 Info.plist 文本中提取 `CFBundleShortVersionString` 的值（std only，不引 plist 库）。
 ///
 /// 形如 `<key>CFBundleShortVersionString</key>\n<string>5.9.0</string>`：
@@ -73,6 +92,9 @@ pub fn jianying_detect(app: AppHandle, dir: Option<String>) -> Result<JianyingDe
 }
 
 fn jianying_detect_inner(app: &AppHandle, dir: Option<String>) -> Result<JianyingDetect, String> {
+    if cfg!(target_os = "windows") {
+        return jianying_detect_windows(app, dir);
+    }
     let settings = read_settings(app)?;
     // 优先级：界面本次传入 > 设置保存 > 默认路径。
     let configured = dir
@@ -111,6 +133,59 @@ fn jianying_detect_inner(app: &AppHandle, dir: Option<String>) -> Result<Jianyin
     })
 }
 
+/// Windows：以前只认 macOS 的 `.app` 路径，在 Windows 上永远显示「未安装」。
+/// 优先级与 macOS 相同：界面本次传入 > 设置保存 > 默认候选目录。版本号暂不读取（显示为空）。
+fn jianying_detect_windows(app: &AppHandle, dir: Option<String>) -> Result<JianyingDetect, String> {
+    let settings = read_settings(app)?;
+    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    let configured = dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or(settings.jianying_dir);
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = &configured {
+        // 用户可能填安装根目录、exe 所在的 Apps 子目录，也可能直接选中 JianyingPro.exe 本身
+        if dir.is_file() {
+            if let Some(parent) = dir.parent() {
+                candidates.push(parent.to_path_buf());
+            }
+        }
+        candidates.push(dir.clone());
+        candidates.push(dir.join("Apps"));
+    }
+    if let Some(local) = &local {
+        candidates.extend(WINDOWS_INSTALL_CANDIDATES.iter().map(|rel| local.join(rel)));
+    }
+    let exe = find_windows_exe(&candidates);
+    let install_dir = exe
+        .as_deref()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .or(configured)
+        .or_else(|| {
+            local
+                .as_ref()
+                .map(|local| local.join(WINDOWS_INSTALL_CANDIDATES[0]))
+        })
+        .unwrap_or_default();
+    let draft_dir = settings.jianying_draft_dir.unwrap_or_else(|| {
+        local
+            .as_ref()
+            .map(|local| local.join(WINDOWS_DRAFT_DIR))
+            .unwrap_or_default()
+    });
+    let draft_dir_exists = draft_dir.is_dir();
+    Ok(JianyingDetect {
+        installed: exe.is_some(),
+        install_dir: install_dir.display().to_string(),
+        version: None,
+        draft_dir: draft_dir.display().to_string(),
+        draft_dir_exists,
+    })
+}
+
 /// 把用户填的路径归一到 `.app` 包根目录。
 ///
 /// 从深到浅找第一个「以 .app 结尾且含 Contents/Info.plist」的祖先——
@@ -137,8 +212,30 @@ fn default_draft_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_app_dir, version_from_plist};
+    use super::{find_windows_exe, normalize_app_dir, version_from_plist, WINDOWS_EXE};
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn finds_windows_exe_in_candidate_order() {
+        let base = std::env::temp_dir().join(format!("dossier-jianying-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("JianyingPro");
+        let apps = root.join("Apps");
+        std::fs::create_dir_all(&apps).unwrap();
+        assert_eq!(find_windows_exe(&[root.clone(), apps.clone()]), None);
+        std::fs::write(apps.join(WINDOWS_EXE), b"MZ").unwrap();
+        assert_eq!(
+            find_windows_exe(&[root.clone(), apps.clone()]),
+            Some(apps.join(WINDOWS_EXE)),
+            "根目录没有 exe 时找到 Apps 子目录里的"
+        );
+        std::fs::write(root.join(WINDOWS_EXE), b"MZ").unwrap();
+        assert_eq!(
+            find_windows_exe(&[root.clone(), apps]),
+            Some(root.join(WINDOWS_EXE))
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn extracts_short_version_from_plist_text() {

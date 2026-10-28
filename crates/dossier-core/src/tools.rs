@@ -70,31 +70,93 @@ pub fn plan_rename(drama: &Drama) -> RenamePlan {
     RenamePlan { items, skipped }
 }
 
-/// 一条码率分级结果；`needs_fix` 表示低于安全线需要重编码。
+/// 码率偏离安全区间的方向。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BitrateDirection {
+    /// 低于下限：重编码拉到 `下限 + 0.5 Mbps`（不超过上限）
+    Low,
+    /// 高于上限：重编码压到上限
+    High,
+}
+
+/// 一条码率分级结果；`needs_fix` 表示码率超出 `[下限, 上限]`、需要重编码。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BitrateItem {
     pub file_name: String,
     pub path: String,
-    /// `None` 表示探测不到码率（按不处理处理，但要在界面标出）。
+    /// 用于判定的视频轨码率；`None` 表示探测不到（不处理，但要在界面标出）。
     pub bitrate_bps: Option<u64>,
+    /// `bitrate_bps` 不是直接读到的视频轨码率，而是由文件码率估算出来的。
+    pub estimated: bool,
     pub needs_fix: bool,
+    pub direction: Option<BitrateDirection>,
 }
 
-/// 码率分级：只做比较，不执行转码。
-pub fn bitrate_report(episodes: &[ProbedEpisode], min_bitrate_bps: u64) -> Vec<BitrateItem> {
+/// 判定用的视频轨码率：视频轨 stream 码率 → 文件码率减音频码率 → 文件码率。
+/// 返回 `(码率, 是否为估算)`。
+///
+/// 只看文件码率会把音频也算进去：音频码率高的文件，视频轨实际不足下限也会被判「达标」。
+pub fn video_bitrate(spec: &crate::types::EpisodeSpec) -> (Option<u64>, bool) {
+    if let Some(video) = spec.video_bitrate_bps.filter(|bps| *bps > 0) {
+        return (Some(video), false);
+    }
+    match (spec.bitrate_bps, spec.audio_bitrate_bps) {
+        (Some(total), Some(audio)) if total > audio => (Some(total - audio), true),
+        (Some(total), _) => (Some(total), true),
+        (None, _) => (None, false),
+    }
+}
+
+/// 码率分级：只做比较，不执行转码。`[min, max]` 内的不处理。
+pub fn bitrate_report(
+    episodes: &[ProbedEpisode],
+    min_bitrate_bps: u64,
+    max_bitrate_bps: u64,
+) -> Vec<BitrateItem> {
     episodes
         .iter()
         .map(|episode| {
-            let bitrate = episode.spec.bitrate_bps;
+            let (bitrate, estimated) = video_bitrate(&episode.spec);
+            let direction = bitrate.and_then(|bps| {
+                if bps < min_bitrate_bps {
+                    Some(BitrateDirection::Low)
+                } else if bps > max_bitrate_bps {
+                    Some(BitrateDirection::High)
+                } else {
+                    None
+                }
+            });
             BitrateItem {
                 file_name: episode.file.file_name.clone(),
                 path: episode.file.path.display().to_string(),
                 bitrate_bps: bitrate,
-                needs_fix: bitrate.is_some_and(|bps| bps < min_bitrate_bps),
+                estimated,
+                needs_fix: direction.is_some(),
+                direction,
             }
         })
         .collect()
+}
+
+/// 修复目标码率：偏低时拉到 `min + 0.5 Mbps`（不超过上限），偏高时压到上限。
+///
+/// 偏低时不直接用下限做目标：编码器的实际平均码率会在目标上下浮动，贴着下限编常常差一点不达标。
+pub fn bitrate_fix_target(direction: BitrateDirection, min_bps: u64, max_bps: u64) -> u64 {
+    match direction {
+        BitrateDirection::Low => min_bps.saturating_add(500_000).min(max_bps),
+        BitrateDirection::High => max_bps,
+    }
+}
+
+/// 重编码结果的时长是否与原片一致：误差不超过 `max(0.5 秒, 原时长 × 1%)`。
+/// 原片时长读不到（0 / 非有限）时无法核对，按不一致处理——宁可不替换也不冒险覆盖原文件。
+pub fn durations_match(original_sec: f64, encoded_sec: f64) -> bool {
+    if !(original_sec.is_finite() && original_sec > 0.0 && encoded_sec.is_finite()) {
+        return false;
+    }
+    (encoded_sec - original_sec).abs() <= (original_sec * 0.01).max(0.5)
 }
 
 /// 把全局时间线切成 `target_count` 段：优先落在场景切点上，等分点兜底。
@@ -556,19 +618,69 @@ mod tests {
     }
 
     #[test]
-    fn bitrate_report_flags_only_below_threshold() {
+    fn bitrate_report_flags_outside_range_both_ways() {
         let mut low = episode_for_test("低.mp4");
         low.spec.bitrate_bps = Some(2_000_000);
+        let mut ok = episode_for_test("正常.mp4");
+        ok.spec.bitrate_bps = Some(6_000_000);
         let mut high = episode_for_test("高.mp4");
-        high.spec.bitrate_bps = Some(6_000_000);
+        high.spec.bitrate_bps = Some(12_000_000);
         let mut unknown = episode_for_test("未知.mp4");
         unknown.spec.bitrate_bps = None;
 
-        let report = bitrate_report(&[low, high, unknown], 4_000_000);
+        let report = bitrate_report(&[low, ok, high, unknown], 4_000_000, 8_000_000);
+        assert_eq!(report[0].direction, Some(BitrateDirection::Low));
         assert!(report[0].needs_fix);
         assert!(!report[1].needs_fix);
-        assert!(!report[2].needs_fix);
-        assert!(report[2].bitrate_bps.is_none());
+        assert_eq!(report[2].direction, Some(BitrateDirection::High));
+        assert!(report[2].needs_fix);
+        assert!(!report[3].needs_fix, "读不到码率不处理");
+        assert!(report[3].bitrate_bps.is_none());
+    }
+
+    #[test]
+    fn video_bitrate_prefers_stream_then_estimates() {
+        let mut spec = crate::types::EpisodeSpec {
+            bitrate_bps: Some(5_000_000),
+            ..Default::default()
+        };
+        // 只有文件码率：原样使用，标为估算
+        assert_eq!(video_bitrate(&spec), (Some(5_000_000), true));
+        // 有音频码率：减掉音频
+        spec.audio_bitrate_bps = Some(1_500_000);
+        assert_eq!(video_bitrate(&spec), (Some(3_500_000), true));
+        // 有视频轨码率：直接用，不是估算
+        spec.video_bitrate_bps = Some(3_200_000);
+        assert_eq!(video_bitrate(&spec), (Some(3_200_000), false));
+        // 音频高 → 文件码率 5 Mbps 看似达标，视频轨其实只有 3.2 Mbps
+        let mut episode = episode_for_test("高音频.mp4");
+        episode.spec = spec;
+        let report = bitrate_report(&[episode], 4_000_000, 8_000_000);
+        assert_eq!(report[0].direction, Some(BitrateDirection::Low));
+    }
+
+    #[test]
+    fn bitrate_fix_target_and_duration_check() {
+        assert_eq!(
+            bitrate_fix_target(BitrateDirection::Low, 4_000_000, 8_000_000),
+            4_500_000
+        );
+        assert_eq!(
+            bitrate_fix_target(BitrateDirection::High, 4_000_000, 8_000_000),
+            8_000_000
+        );
+        // 区间很窄时，偏低的目标不能超过上限
+        assert_eq!(
+            bitrate_fix_target(BitrateDirection::Low, 4_000_000, 4_200_000),
+            4_200_000
+        );
+
+        assert!(durations_match(60.0, 60.3));
+        assert!(!durations_match(60.0, 59.0));
+        assert!(durations_match(600.0, 605.0), "长片按 1% 容差");
+        assert!(!durations_match(600.0, 590.0));
+        assert!(!durations_match(0.0, 0.0), "原片时长未知时不替换");
+        assert!(!durations_match(60.0, f64::NAN));
     }
 
     #[test]
@@ -741,6 +853,7 @@ mod tests {
                 audio_codec: Some("aac".into()),
                 fps: Some(30.0),
                 bitrate_bps: Some(4_000_000),
+                ..Default::default()
             },
         }
     }

@@ -115,6 +115,15 @@ pub fn parse_ffprobe_json(raw: &[u8]) -> Result<EpisodeSpec, serde_json::Error> 
         avg_frame_rate: Option<String>,
         #[serde(default)]
         r_frame_rate: Option<String>,
+        #[serde(default)]
+        bit_rate: Option<String>,
+        #[serde(default)]
+        disposition: Option<Disposition>,
+    }
+    #[derive(Deserialize)]
+    struct Disposition {
+        #[serde(default)]
+        attached_pic: u8,
     }
 
     let root: Root = serde_json::from_slice(raw)?;
@@ -127,19 +136,38 @@ pub fn parse_ffprobe_json(raw: &[u8]) -> Result<EpisodeSpec, serde_json::Error> 
             .unwrap_or(0.0);
         spec.bitrate_bps = f.bit_rate.as_deref().and_then(|s| s.parse().ok());
     }
+    let mut video_seen = false;
     for st in &root.streams {
+        let bit_rate = st.bit_rate.as_deref().and_then(|s| s.parse::<u64>().ok());
         match st.codec_type.as_deref() {
-            Some("video") => {
+            // 只取第一条真正的视频流：mp4/m4v 的封面图（attached_pic）在 ffprobe 里也是 video 流，
+            // 排在后面时会把宽高、编码、码率全换成那张图的。
+            Some("video")
+                if !video_seen && st.disposition.as_ref().is_none_or(|d| d.attached_pic == 0) =>
+            {
+                video_seen = true;
                 spec.width = st.width.unwrap_or(0);
                 spec.height = st.height.unwrap_or(0);
                 spec.video_codec = st.codec_name.clone();
+                spec.video_bitrate_bps = bit_rate;
+                // 两个字段分别解析、取第一个有效值：`avg_frame_rate` 为 "0/0" 时它仍是 Some，
+                // 写成 `.or(r_frame_rate)` 永远不会回退，结果按 30 fps 处理、微帧位移算偏。
                 spec.fps = st
                     .avg_frame_rate
                     .as_deref()
-                    .or(st.r_frame_rate.as_deref())
-                    .and_then(parse_frame_rate);
+                    .and_then(parse_frame_rate)
+                    .or_else(|| st.r_frame_rate.as_deref().and_then(parse_frame_rate));
             }
-            Some("audio") => spec.audio_codec = st.codec_name.clone(),
+            Some("audio") => {
+                // 编码名取第一条（主音轨）；码率累加全部音轨：估算视频码率时要把音频整体扣掉，
+                // 只扣第一条会把多音轨文件的视频码率估高。
+                if spec.audio_codec.is_none() {
+                    spec.audio_codec = st.codec_name.clone();
+                }
+                if let Some(bps) = bit_rate {
+                    spec.audio_bitrate_bps = Some(spec.audio_bitrate_bps.unwrap_or(0) + bps);
+                }
+            }
             _ => {}
         }
     }
@@ -161,6 +189,44 @@ fn parse_frame_rate(s: &str) -> Option<f64> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn frame_rate_falls_back_when_avg_is_zero_over_zero() {
+        let raw = br#"{"format":{"duration":"10"},"streams":[
+            {"codec_type":"video","codec_name":"h264","width":720,"height":1280,
+             "avg_frame_rate":"0/0","r_frame_rate":"25/1","bit_rate":"3000000"},
+            {"codec_type":"audio","codec_name":"aac","bit_rate":"128000"},
+            {"codec_type":"audio","codec_name":"ac3","bit_rate":"384000"}]}"#;
+        let spec = parse_ffprobe_json(raw).unwrap();
+        assert_eq!(
+            spec.fps,
+            Some(25.0),
+            "avg_frame_rate 为 0/0 时应改读 r_frame_rate"
+        );
+        assert_eq!(spec.video_bitrate_bps, Some(3_000_000));
+        // 多音轨时编码名记第一条（主音轨），码率累加全部音轨
+        assert_eq!(spec.audio_codec.as_deref(), Some("aac"));
+        assert_eq!(
+            spec.audio_bitrate_bps,
+            Some(512_000),
+            "音频码率累加全部音轨"
+        );
+    }
+
+    #[test]
+    fn cover_art_stream_does_not_override_main_video() {
+        let raw = br#"{"format":{"duration":"10","bit_rate":"3200000"},"streams":[
+            {"codec_type":"video","codec_name":"h264","width":1080,"height":1920,
+             "avg_frame_rate":"30/1","bit_rate":"3000000","disposition":{"attached_pic":0}},
+            {"codec_type":"audio","codec_name":"aac","bit_rate":"128000"},
+            {"codec_type":"video","codec_name":"mjpeg","width":600,"height":600,
+             "avg_frame_rate":"0/0","disposition":{"attached_pic":1}}]}"#;
+        let spec = parse_ffprobe_json(raw).unwrap();
+        assert_eq!((spec.width, spec.height), (1080, 1920));
+        assert_eq!(spec.video_codec.as_deref(), Some("h264"));
+        assert_eq!(spec.video_bitrate_bps, Some(3_000_000));
+        assert_eq!(spec.fps, Some(30.0));
+    }
 
     #[test]
     fn parses_ffprobe_fixture() {

@@ -55,7 +55,7 @@ def hex_to_rgb(color):
 def main():
     parser = argparse.ArgumentParser(description="渲染 AI 合规角标 PNG")
     parser.add_argument("--output", required=True, help="输出 PNG 路径")
-    parser.add_argument("--text", default="内容由AI生成·纯属虚构", help="角标文案")
+    parser.add_argument("--text", default="内容由AI生成·纯属虚构·请勿代入现实", help="角标文案")
     parser.add_argument("--font-size", type=int, default=40, help="字号（像素）")
     parser.add_argument("--opacity", type=float, default=0.8, help="整体不透明度 0~1")
     parser.add_argument("--padding", type=int, default=14, help="文字四周留白（像素）")

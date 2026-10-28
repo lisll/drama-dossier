@@ -19,6 +19,7 @@ mod downloads;
 mod erase;
 mod jianying;
 mod license;
+mod license_anchor;
 mod license_state;
 #[cfg(feature = "license-test-mode")] // TEST-MODE
 mod license_test_mode;
@@ -26,6 +27,7 @@ mod logging;
 mod models_install;
 mod mount;
 mod paths;
+mod tasks;
 mod toolbox;
 
 #[derive(Debug, Serialize)]
@@ -145,6 +147,10 @@ fn save_app_settings(
     if let Some(rules) = &settings.rules {
         rules.validate()?;
     }
+    dossier_core::validate_ai_badge(
+        settings.ai_badge_text.as_deref(),
+        settings.ai_badge_font_size,
+    )?;
     let path = settings_path(&app)?;
     // 只由后端维护的字段（按剧材料、一键配置写入的 Python 路径）一律沿用磁盘上的那份，见
     // `merge_saved_settings`。读取磁盘与写回在同一把锁里完成，材料线程不会在两者之间插入写入。
@@ -362,6 +368,7 @@ fn generate_package(
     output_root: Option<String>,
     copy_episodes: bool,
     ai_generated: bool,
+    ai_label_confirmed: Option<bool>,
     cost_sheet: Option<CostSheetForm>,
     ffprobe_path: Option<String>,
     rules: Option<ChecklistRules>,
@@ -392,13 +399,10 @@ fn generate_package(
         ),
     )?;
     let drama = analysis.drama;
-    let episodes: Vec<ProbedEpisode> = drama
-        .episodes
-        .iter()
-        .cloned()
-        .zip(analysis.probes)
-        .filter_map(|(file, probe)| probe.spec.map(|spec| ProbedEpisode { file, spec }))
-        .collect();
+    let episodes = logging::log_err(
+        "生成",
+        probed_episodes_or_reject(&drama.episodes, analysis.probes),
+    )?;
 
     // 落点三层：本次覆盖 → 设置里的「默认输出目录」（产物根目录）→ 剧目目录内。
     // 规则与单测都在 `dossier_core::resolve_product_dir`，这一层只做字符串到路径的转换。
@@ -407,7 +411,7 @@ fn generate_package(
         output_root.as_deref().map(Path::new),
         &drama.dir,
         &drama.name,
-        "报审包",
+        dossier_core::PACKAGE_OUTPUT_DIR,
     );
 
     let opts = PackageOptions {
@@ -415,6 +419,7 @@ fn generate_package(
         copy_episodes,
         cost_sheet,
         ai_generated,
+        ai_label_confirmed: ai_label_confirmed == Some(true),
     };
 
     let result = logging::log_err(
@@ -447,6 +452,35 @@ fn generate_package(
         ),
     );
     Ok(result)
+}
+
+/// 报审包只接受「每一集都探测成功」：以前探测失败的分集被静默丢掉，分集清单少了几集
+/// 也照样报「生成成功」——报审包缺集比生成失败更难发现。现在列出失败的文件，一个文件都不写。
+fn probed_episodes_or_reject(
+    files: &[dossier_core::EpisodeFile],
+    probes: Vec<ProbeOutcome>,
+) -> Result<Vec<ProbedEpisode>, String> {
+    let mut episodes = Vec::with_capacity(files.len());
+    let mut failed = Vec::new();
+    for (file, probe) in files.iter().cloned().zip(probes) {
+        match probe.spec {
+            Some(spec) => episodes.push(ProbedEpisode { file, spec }),
+            None => failed.push(format!(
+                "{}（{}）",
+                file.file_name,
+                probe.error.as_deref().unwrap_or("探测失败")
+            )),
+        }
+    }
+    if failed.is_empty() {
+        Ok(episodes)
+    } else {
+        Err(format!(
+            "有 {} 集探测失败，报审包未生成（避免缺集）：{}。请修复或移走这些文件后重试。",
+            failed.len(),
+            failed.join("；")
+        ))
+    }
 }
 
 /// 在系统文件管理器里打开目录（或文件所在目录），供界面「打开目录」按钮调用。
@@ -489,6 +523,8 @@ pub fn run() {
                 .unwrap_or_else(|_| std::env::temp_dir().join("drama-dossier"));
             logging::init(fallback);
             license::init(app.handle());
+            // 旧版本 GPU 加速包安装缺陷会把语音识别弄坏（zip 被当成 exe）：启动时发现就修复。
+            models_install::heal_on_startup(app.handle());
             Ok(())
         })
         .invoke_handler(license::gate(tauri::generate_handler![
@@ -539,6 +575,8 @@ pub fn run() {
             toolbox::fix_bitrate,
             toolbox::transcode_execute,
             toolbox::transcode_stop,
+            toolbox::bitrate_stop,
+            toolbox::dedup_demo_stop,
             toolbox::dedup_demo_execute,
             toolbox::install_runtime,
             models_install::install_content_models,
@@ -556,4 +594,49 @@ pub fn run() {
                 models_install::cancel_background_downloads();
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(name: &str) -> dossier_core::EpisodeFile {
+        dossier_core::EpisodeFile {
+            path: PathBuf::from(name),
+            file_name: name.into(),
+            size_bytes: 1,
+            episode_number: None,
+        }
+    }
+
+    fn probe(name: &str, ok: bool) -> ProbeOutcome {
+        ProbeOutcome {
+            file_name: name.into(),
+            episode_number: None,
+            spec: ok.then(EpisodeSpec::default),
+            error: (!ok).then(|| "moov atom not found".to_string()),
+        }
+    }
+
+    #[test]
+    fn package_refuses_when_any_episode_failed_to_probe() {
+        let files = vec![file("第1集.mp4"), file("第2集.mp4"), file("第3集.mp4")];
+        let error = probed_episodes_or_reject(
+            &files,
+            vec![
+                probe("第1集.mp4", true),
+                probe("第2集.mp4", false),
+                probe("第3集.mp4", true),
+            ],
+        )
+        .unwrap_err();
+        assert!(error.contains("1 集探测失败"), "{error}");
+        assert!(
+            error.contains("第2集.mp4（moov atom not found）"),
+            "{error}"
+        );
+
+        let ok = probed_episodes_or_reject(&files[..1], vec![probe("第1集.mp4", true)]).unwrap();
+        assert_eq!(ok.len(), 1);
+    }
 }

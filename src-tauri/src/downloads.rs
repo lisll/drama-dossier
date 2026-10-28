@@ -213,27 +213,21 @@ where
 
 /// 运行环境（ffmpeg / ffprobe）的下载源表，顺序即优先级。
 ///
-/// 取舍依据（2026-10-27 核对）：
-/// - **Windows 首选 BtbN 的 lgpl 静态包**：每日构建，release 自带官方 `checksums.sha256`，
-///   来源是 GitHub，国内比单站点快，而且是 LGPL（gyan.dev 的 essentials 是 GPLv3）。
-/// - **Windows 次选 gyan.dev essentials**：`ffmpeg-release-essentials.zip` 是滚动包
-///   （会 303 到版本化文件名），内容随发布变化，所以这里钉**版本化的包名**，
-///   哈希取自它自己的 `.sha256` 接口 `/packages/<包名>.sha256`。
-///   注意这个哈希随发布变化，升级版本时必须同步改这里。
+/// 取舍依据（2026-10-28 核对）：
+/// - **Windows 只用 gyan.dev essentials（单一来源）**：钉**版本化的包名**，哈希取自它自己的
+///   `.sha256` 接口 `/packages/<包名>.sha256`。升级版本时必须同步改这里。
+///   以前排在它前面的 BtbN 用的是滚动的 `latest` 地址却钉了固定哈希：上游每次重建（几乎每天）
+///   校验就必然失败，实际每次都退回 gyan.dev，只是白白多下一遍 —— 已移除。
+///   正常安装路径用的是安装包内置的 ffmpeg，这里只是兜底。
 /// - **macOS 只有 evermeet.cx** 提供 ffmpeg/ffprobe 单文件包，而它**只提供 GPG 签名**
 ///   （`.zip.sig`），项目里没有 GPG 验签能力，所以退回"字节数"校验
-///   （数值取自其 `info/*/release` 接口）。这类源挡不住同尺寸替换，只作兜底；
-///   根治办法是阶段 4 的"安装包内置 ffmpeg"。
+///   （数值取自同一台服务器的 `info/*/release` 接口）。**它只防截断，不防篡改**：
+///   服务器或链路被篡改时字节数也可以一起改。所以 macOS 优先用安装包内置的 ffmpeg，这里只作兜底。
 #[cfg(target_os = "windows")]
 pub fn runtime_ffmpeg() -> Asset {
     Asset::new(
         "ffmpeg",
         vec![
-            // BtbN：win64 lgpl 静态包，哈希来自其 release 的 checksums.sha256
-            Source::sha256(
-                "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl.zip",
-                "6b5d1f4164837f287391eedd86821a6f585740e904036d4131c3c3c4b56b1124",
-            ),
             // gyan.dev：essentials（GPLv3），哈希来自其 .sha256 接口
             Source::sha256(
                 "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-essentials_build.zip",
@@ -330,24 +324,100 @@ fn extract_json_u64(body: &str, key: &str) -> Option<u64> {
 
 /// Windows 的 CUDA 版 whisper-cli（安装包只带 CPU 版，检测到显卡后再下这个）。
 ///
-/// 为什么不内置：官方 CUDA 预编译包是 285 MB（cu11.8）到 685 MB（cu12.4），
-/// 比整个应用还大。
+/// 为什么不内置：官方 CUDA 预编译包是 285 MB（cu11.8）到 685 MB（cu12.4），比整个应用还大。
+/// 选 CUDA 11.8：包小一半以上，对显卡驱动版本要求更低，覆盖更多老机器。
 ///
-/// 完整性：这里**没有可用的固定 sha256**——whisper.cpp 的预编译资产只出现在
-/// nightly 预发布里，每次构建哈希都变；官方稳定版则完全不提供二进制。
-/// 所以用 `Integrity::None`，只能靠 HTTPS 与"装完能跑起来"的自检把关。
-/// 这与 ffmpeg 的两个源（都有官方哈希）处理方式不同，是明确的取舍。
-/// 若上游开始发布带固定版本的资产，应立刻补上 sha256。
-#[cfg(target_os = "windows")]
+/// 完整性：`b5454` 是固定标签，GitHub 为发布里的每个文件提供 sha256 摘要（2026-10-28 用
+/// releases API 的 `digest` 字段核对）。以前这里的地址是 `whisper-bin-x64.zip`（8.9 MB 的 **CPU 版**），
+/// 还被直接改名成 exe 使用，已一并修正：现在下载的是 zip，由调用方解压、自检后再整目录替换。
 pub fn whisper_cuda() -> Asset {
     Asset::new(
         "whisper-cuda",
-        vec![Source {
-            url: "https://github.com/ggml-org/whisper.cpp/releases/download/b5454/whisper-bin-x64.zip"
-                .to_string(),
-            integrity: Integrity::None,
-        }],
+        vec![Source::sha256(
+            "https://github.com/ggml-org/whisper.cpp/releases/download/b5454/whisper-bin-win-cuda-11.8.0-x64.zip",
+            "e81c86c542be6e3d7b7245392d4e1c52ab6e5c61dbe38721754bc0ab59d4d027",
+        )],
     )
+}
+
+/// Windows 一键配置的 Python 安装器：官方 CPython 3.11.9（amd64），下载后会被**静默执行**。
+///
+/// 哈希 2026-10-28 从 python.org 下载后计算，并与官方发布页的 MD5（`e8dcd502e34932eebcaf1be056d5cbcd`）
+/// 和 `.sigstore` 包里的 SHA2_256 摘要交叉核对一致。地址以前多了一段 `amd64/`（该路径 404），已修正。
+pub fn python_installer() -> Asset {
+    Asset::new(
+        "python",
+        vec![Source::sha256(
+            "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe",
+            "5ee42c4eee1e6b4464bb23722f90b45303f79442df63083f05322f1785f5fdde",
+        )],
+    )
+}
+
+/// Windows 的 tesseract 安装器（UB-Mannheim 打包，Inno Setup），下载后会被**静默执行**。
+///
+/// 多级下载源：GitHub 直连在国内基本拉不动，`ghfast.top` 加速代理优先，官方源兜底。
+/// 两个源共用**同一个哈希**（2026-10-28 从官方 GitHub 源下载后计算）：代理即使返回了被篡改的文件，
+/// 也过不了校验，不会被执行。
+pub fn tesseract_installer() -> Asset {
+    const SHA256: &str = "c885fff6998e0608ba4bb8ab51436e1c6775c2bafc2559a19b423e18678b60c9";
+    const PATH: &str =
+        "UB-Mannheim/tesseract/releases/download/v5.4.0.20240606/tesseract-ocr-w64-setup-5.4.0.20240606.exe";
+    Asset::new(
+        "tesseract",
+        vec![
+            Source::sha256(
+                format!("https://ghfast.top/https://github.com/{PATH}"),
+                SHA256,
+            ),
+            Source::sha256(format!("https://github.com/{PATH}"), SHA256),
+        ],
+    )
+}
+
+/// tesseract 简体中文语言包（tessdata_fast）。钉到固定 commit，三个源共用同一个哈希。
+///
+/// 以前跟随 `main` 分支、不校验：内容会随上游变，下载中断留下的半截文件也会被当成「已安装」。
+/// 哈希 2026-10-28 计算，内容与 GitHub 该 commit 下的 git blob `388bac27…7dab` 一致。
+pub fn chi_sim_traineddata() -> Asset {
+    const COMMIT: &str = "87416418657359cb625c412a48b6e1d6d41c29bd";
+    const SHA256: &str = "a5fcb6f0db1e1d6d8522f39db4e848f05984669172e584e8d76b6b3141e1f730";
+    Asset::new(
+        "chi_sim",
+        vec![
+            Source::sha256(
+                format!("https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/{COMMIT}/chi_sim.traineddata"),
+                SHA256,
+            ),
+            Source::sha256(
+                format!("https://cdn.jsdelivr.net/gh/tesseract-ocr/tessdata_fast@{COMMIT}/chi_sim.traineddata"),
+                SHA256,
+            ),
+            Source::sha256(
+                format!("https://ghfast.top/https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/{COMMIT}/chi_sim.traineddata"),
+                SHA256,
+            ),
+        ],
+    )
+}
+
+/// 文件头是不是 Windows 可执行文件（PE，以 `MZ` 开头）。
+pub fn is_pe_header(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"MZ")
+}
+
+/// 文件头是不是 zip（`PK\x03\x04`）。用于发现「zip 被当成 exe」这类损坏。
+pub fn is_zip_header(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"PK\x03\x04")
+}
+
+/// 读文件开头几个字节（读不到返回空）。
+pub fn read_header(path: &Path) -> Vec<u8> {
+    use std::io::Read;
+    let mut buffer = [0_u8; 4];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read(&mut buffer).map(|n| buffer[..n].to_vec()))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -508,6 +578,59 @@ mod tests {
         assert_eq!(err.0, Failure::Network);
         assert!(err.1.contains("没有配置可用的下载源"));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 下载后会被执行（或解压后执行）的资源，每个源都必须钉 sha256：
+    /// 代理 / 镜像 / 链路被篡改时宁可装不上，也不能执行来历不明的程序。
+    #[test]
+    fn executable_assets_are_all_pinned_by_sha256() {
+        for asset in [
+            python_installer(),
+            tesseract_installer(),
+            whisper_cuda(),
+            chi_sim_traineddata(),
+        ] {
+            assert!(!asset.sources.is_empty(), "{} 没有下载源", asset.name);
+            let hashes: Vec<&str> = asset
+                .sources
+                .iter()
+                .map(|source| match source.integrity {
+                    Integrity::Sha256(hash) => hash,
+                    ref other => {
+                        panic!("{} 的源 {} 没有 sha256：{other:?}", asset.name, source.url)
+                    }
+                })
+                .collect();
+            for hash in &hashes {
+                assert_eq!(hash.len(), 64, "{} 的哈希长度不对", asset.name);
+                assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+            }
+            // 镜像与官方源必须是同一个文件：共用同一个哈希
+            assert!(
+                hashes.windows(2).all(|pair| pair[0] == pair[1]),
+                "{} 的多个源哈希不一致",
+                asset.name
+            );
+            assert!(
+                asset
+                    .sources
+                    .iter()
+                    .all(|source| source.url.starts_with("https://")),
+                "{} 有非 HTTPS 的源",
+                asset.name
+            );
+        }
+        // CUDA 包必须真的是 CUDA 版（以前误用了 8.9 MB 的 CPU 版 whisper-bin-x64.zip）
+        assert!(whisper_cuda().sources[0].url.contains("cuda-11.8"));
+    }
+
+    #[test]
+    fn header_sniffing() {
+        assert!(is_pe_header(b"MZ\x90\x00"));
+        assert!(!is_pe_header(b"PK\x03\x04"));
+        assert!(is_zip_header(b"PK\x03\x04rest"));
+        assert!(!is_zip_header(b"MZ"));
+        assert!(read_header(std::path::Path::new("/不存在/的文件")).is_empty());
     }
 
     /// 解析 evermeet `info/*/release` 的真实响应片段。

@@ -13,6 +13,10 @@ serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 
+# 停止 / 超时时按进程组整组终止（kill(-pgid)），避免 python 拉起的 ffmpeg 变成孤儿；版本与 Cargo.lock 已锁定的一致。
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.190"
+
 [[bin]]
 name = "dossier-runtime"
 path = "src/main.rs"

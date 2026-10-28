@@ -99,9 +99,44 @@ pub struct AppSettings {
     /// 深度处理去重配方开关：`None`/`true` 表示启用（剧名 seed 派生确定性扰动
     /// + 机型元数据 + 配方存证），`false` 关闭。
     pub dedup_recipe_enabled: Option<bool>,
-    /// 深度处理 AI 合规角标烧录开关：`None`/`true` 表示把
-    /// 「内容由AI生成·纯属虚构」烧进成片画面，`false` 关闭。
+    /// 深度处理 AI 合规角标烧录开关：`None`/`true` 表示把角标烧进成片画面，`false` 关闭。
     pub ai_badge_enabled: Option<bool>,
+    /// AI 合规角标文案：留空用默认 [`DEFAULT_AI_BADGE_TEXT`]；最多 40 个字符、不能换行。
+    #[serde(default)]
+    pub ai_badge_text: Option<String>,
+    /// AI 合规角标字号（10–24，默认 12）。界面上的「字号」，渲染时换算成像素。
+    #[serde(default)]
+    pub ai_badge_font_size: Option<u32>,
+}
+
+/// AI 合规角标默认文案。
+pub const DEFAULT_AI_BADGE_TEXT: &str = "内容由AI生成·纯属虚构·请勿代入现实";
+/// AI 合规角标文案的长度上限（字符数）。
+pub const MAX_AI_BADGE_CHARS: usize = 40;
+/// AI 合规角标字号范围与默认值。
+pub const AI_BADGE_FONT_SIZE_RANGE: (u32, u32) = (10, 24);
+pub const DEFAULT_AI_BADGE_FONT_SIZE: u32 = 12;
+
+/// 校验 AI 合规角标设置（保存设置时调用）：文案最多 40 个字符、不能含换行，字号 10–24。
+pub fn validate_ai_badge(text: Option<&str>, font_size: Option<u32>) -> Result<(), String> {
+    if let Some(text) = text.map(str::trim).filter(|text| !text.is_empty()) {
+        if text.contains(['\n', '\r']) {
+            return Err("AI 角标文案不能换行。".into());
+        }
+        let chars = text.chars().count();
+        if chars > MAX_AI_BADGE_CHARS {
+            return Err(format!(
+                "AI 角标文案最多 {MAX_AI_BADGE_CHARS} 个字符，当前 {chars} 个。"
+            ));
+        }
+    }
+    let (low, high) = AI_BADGE_FONT_SIZE_RANGE;
+    if let Some(size) = font_size.filter(|size| !(low..=high).contains(size)) {
+        return Err(format!(
+            "AI 角标字号必须在 {low}–{high} 之间，当前 {size}。"
+        ));
+    }
+    Ok(())
 }
 
 impl AppSettings {
@@ -136,6 +171,29 @@ impl AppSettings {
     /// 深度处理默认烧录 AI 合规角标；显式关闭后成片画面不带角标。
     pub fn effective_ai_badge_enabled(&self) -> bool {
         self.ai_badge_enabled.unwrap_or(true)
+    }
+
+    /// 生效的 AI 角标文案：留空用默认文案。超长或含换行时（手改设置文件）也退回默认，
+    /// 不把不合规的文字烧进成片。
+    pub fn effective_ai_badge_text(&self) -> String {
+        self.ai_badge_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| {
+                !text.is_empty()
+                    && !text.contains(['\n', '\r'])
+                    && text.chars().count() <= MAX_AI_BADGE_CHARS
+            })
+            .unwrap_or(DEFAULT_AI_BADGE_TEXT)
+            .to_string()
+    }
+
+    /// 生效的 AI 角标字号：钳制到 10–24，默认 12。
+    pub fn effective_ai_badge_font_size(&self) -> u32 {
+        let (low, high) = AI_BADGE_FONT_SIZE_RANGE;
+        self.ai_badge_font_size
+            .unwrap_or(DEFAULT_AI_BADGE_FONT_SIZE)
+            .clamp(low, high)
     }
 
     /// 读一部剧的材料；没存过返回空白。`key` 由调用方规范化（桌面层用规范化后的剧目目录）。
@@ -424,6 +482,36 @@ fn safe_path_component(name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ai_badge_settings_default_validate_and_clamp() {
+        let mut settings = AppSettings::default();
+        assert_eq!(settings.effective_ai_badge_text(), DEFAULT_AI_BADGE_TEXT);
+        assert_eq!(settings.effective_ai_badge_font_size(), 12);
+
+        settings.ai_badge_text = Some("  本片由 AI 生成  ".into());
+        settings.ai_badge_font_size = Some(30);
+        assert_eq!(settings.effective_ai_badge_text(), "本片由 AI 生成");
+        assert_eq!(
+            settings.effective_ai_badge_font_size(),
+            24,
+            "超出范围钳到上限"
+        );
+
+        // 手改设置文件写入了不合规文案：烧录时退回默认，不把它烧进成片
+        settings.ai_badge_text = Some("字".repeat(41));
+        assert_eq!(settings.effective_ai_badge_text(), DEFAULT_AI_BADGE_TEXT);
+
+        assert!(validate_ai_badge(Some(&"字".repeat(40)), Some(10)).is_ok());
+        assert!(validate_ai_badge(Some(&"字".repeat(41)), None).is_err());
+        assert!(validate_ai_badge(Some("两行\n文案"), None).is_err());
+        assert!(validate_ai_badge(None, Some(9)).is_err());
+        assert!(validate_ai_badge(None, Some(25)).is_err());
+        assert!(
+            validate_ai_badge(Some(""), None).is_ok(),
+            "留空 = 用默认文案"
+        );
+    }
+
     use super::*;
 
     fn temp_dir(tag: &str) -> PathBuf {

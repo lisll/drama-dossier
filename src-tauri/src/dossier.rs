@@ -135,22 +135,45 @@ pub fn import_draft(draft_dir: String) -> Result<CapcutDraft, String> {
     import_capcut_draft(&PathBuf::from(draft_dir)).map_err(|error| error.to_string())
 }
 
+/// 挂载文案 CSV 的输出路径校验：只允许 `.csv` 扩展名，防止填错路径（或前端被攻破）时
+/// 覆盖 `.exe`、配置文件等任意文件。`overwrite` 为 false 时已存在的文件一律拒绝。
+fn csv_output_path(path: &str, overwrite: bool) -> Result<PathBuf, String> {
+    let path = PathBuf::from(path.trim());
+    let is_csv = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("csv"));
+    if !is_csv {
+        return Err(format!("挂载文案只能保存为 .csv 文件：{}", path.display()));
+    }
+    if !overwrite && path.exists() {
+        return Err(format!(
+            "文件已存在：{}。确认覆盖后再生成。",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
 /// 生成可编辑的「挂载文案.csv」。这里只生成本地元数据，不连接第三方平台。
+/// 目标文件已存在时需要前端显式传 `overwrite: true`（用户确认后）才覆盖。
 #[tauri::command]
 pub fn generate_mount_copy_csv(
     root: String,
     name: String,
     output_path: String,
     ffprobe_path: Option<String>,
+    overwrite: Option<bool>,
 ) -> Result<MountCopyWriteResult, String> {
     crate::license::guard()?;
+    let output_path = csv_output_path(&output_path, overwrite == Some(true))?;
     let drama = load_drama(&root, &name)?;
     let episodes = probe_all(&drama, ffprobe_path);
     if episodes.is_empty() {
         return Err("没有任何成功探测规格的分集，无法生成挂载文案。".into());
     }
     let rows = build_mount_copy_rows(&drama.name, &episodes);
-    write_mount_copy_csv(&PathBuf::from(output_path), &rows).map_err(|error| error.to_string())
+    write_mount_copy_csv(&output_path, &rows).map_err(|error| error.to_string())
 }
 
 /// 读回挂载文案 CSV，供人工修改后的结果复核。
@@ -165,7 +188,8 @@ pub fn save_mount_copy(
     path: String,
     rows: Vec<MountCopyRow>,
 ) -> Result<MountCopyWriteResult, String> {
-    let path = PathBuf::from(path);
+    // 保存就是覆盖同一份文案；只拦扩展名，避免把文案写进任意文件。
+    let path = csv_output_path(&path, true)?;
     if path.exists() {
         let previous = load_mount_copy_csv(&path).map_err(|error| error.to_string())?;
         if previous.len() != rows.len() {
@@ -203,4 +227,26 @@ pub fn transition_mount_copy_row(
     transition_publish_row(&mut row, &next_status, result_note)
         .map_err(|error| error.to_string())?;
     Ok(row)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csv_output_path_requires_csv_extension_and_confirmation() {
+        assert!(csv_output_path("/tmp/挂载文案.exe", true).is_err());
+        assert!(csv_output_path("/tmp/没有扩展名", true).is_err());
+        assert!(csv_output_path("/tmp/挂载文案.CSV", true).is_ok());
+
+        let dir = std::env::temp_dir().join(format!("dossier-csvpath-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let existing = dir.join("已有.csv");
+        std::fs::write(&existing, "x").unwrap();
+        let path = existing.display().to_string();
+        let error = csv_output_path(&path, false).unwrap_err();
+        assert!(error.contains("已存在"), "{error}");
+        assert!(csv_output_path(&path, true).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

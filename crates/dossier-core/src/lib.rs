@@ -65,23 +65,25 @@ pub use progress::{
     ProgressLog, ProgressRecorder, TaskProgress,
 };
 pub use publish::{
-    build_mount_copy_rows, load_mount_copy_csv, make_publish_batch, preview_publish_batch,
-    transition_publish_row, validate_publish_update, write_mount_copy_csv, MountCopyRow,
-    MountCopyWriteResult, PublishBatch, PublishPreview, PublishPreviewRow,
+    build_mount_copy_rows, csv_text_with_bom, decode_csv_bytes, load_mount_copy_csv,
+    make_publish_batch, preview_publish_batch, read_csv_text, transition_publish_row,
+    validate_publish_update, write_mount_copy_csv, MountCopyRow, MountCopyWriteResult,
+    PublishBatch, PublishPreview, PublishPreviewRow,
 };
 pub use scanner::{
     scan_drama_dir, scan_library, validate_drama_dir, validate_drama_name, validate_library_root,
+    DEEP_OUTPUT_DIR, NUDGE_OUTPUT_DIR, PACKAGE_OUTPUT_DIR, RECUT_OUTPUT_DIR,
 };
 pub use settings::{
     load_settings, merge_saved_settings, replace_settings, resolve_product_dir, save_settings,
-    try_load_settings, update_settings, AppSettings, DramaMaterials, LoadedSettings,
-    ReplaceOutcome,
+    try_load_settings, update_settings, validate_ai_badge, AppSettings, DramaMaterials,
+    LoadedSettings, ReplaceOutcome, DEFAULT_AI_BADGE_TEXT,
 };
 pub use tools::{
-    bitrate_report, episode_target_name, nudge_frames, output_dir_hits_sources,
-    plan_recut_by_duration, plan_recut_by_duration_with_speed, plan_recut_segments, plan_rename,
-    same_path, validate_mount_csv, BitrateItem, MountCsvCheck, MountCsvIssue, RecutPlan,
-    RenameItem, RenamePlan,
+    bitrate_fix_target, bitrate_report, durations_match, episode_target_name, nudge_frames,
+    output_dir_hits_sources, plan_recut_by_duration, plan_recut_by_duration_with_speed,
+    plan_recut_segments, plan_rename, same_path, validate_mount_csv, video_bitrate,
+    BitrateDirection, BitrateItem, MountCsvCheck, MountCsvIssue, RecutPlan, RenameItem, RenamePlan,
 };
 pub use transcode::{advise_episode, plan_normalization, NormalizationPlan, TranscodeTarget};
 pub use types::{CheckStatus, Drama, EpisodeFile, EpisodeSpec, ProbedEpisode};

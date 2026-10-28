@@ -8,11 +8,26 @@ const VIDEO_EXTS: &[&str] = &["mp4", "mov", "mkv", "flv", "ts", "m4v", "webm"];
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp"];
 const TEXT_EXTS: &[&str] = &["txt", "md"];
 
+/// 报审包的默认落点子目录（`package.rs`）。
+pub const PACKAGE_OUTPUT_DIR: &str = "报审包";
+/// 桌面端「智能微调」的默认落点子目录。
+pub const NUDGE_OUTPUT_DIR: &str = "微调输出";
+/// 桌面端「分集重组」的默认落点子目录。
+pub const RECUT_OUTPUT_DIR: &str = "重组输出";
+/// 桌面端「深度处理」的默认落点子目录（成片在其下的「视频成片/」，材料在目录本层）。
+pub const DEEP_OUTPUT_DIR: &str = "深度处理";
+
 /// 应用自己会在剧目录里生成的产物子目录，扫描分集时必须跳过：
 /// 否则转码输出（同名文件）会被当成新一集，转码一次集数就翻倍，
-/// 下次转码还会把旧产物当素材重新处理。
-/// 「报审包」对应 `package.rs`，「微调输出 / 重组输出」对应桌面端转码落点。
-const PRODUCT_SUBDIRS: &[&str] = &["报审包", "微调输出", "重组输出"];
+/// 下次转码还会把旧产物当素材重新处理。深度处理目录本层还有 AI 生成的 `简介.txt`，
+/// 不跳过就会被当成「素材自带的简介」，下一轮把上一轮 AI 的输出当原始输入。
+/// 各模式的落点名都从上面的常量来，桌面端拼路径时用同一组常量，两边不会对不上。
+const PRODUCT_SUBDIRS: &[&str] = &[
+    PACKAGE_OUTPUT_DIR,
+    NUDGE_OUTPUT_DIR,
+    RECUT_OUTPUT_DIR,
+    DEEP_OUTPUT_DIR,
+];
 
 /// 扫描素材根目录，返回按名称排序的剧目列表。
 pub fn scan_library(root: &Path) -> std::io::Result<Vec<Drama>> {
@@ -290,6 +305,36 @@ mod tests {
 
         let drama = scan_drama_dir("剧A", &p.join("剧A"));
         assert_eq!(drama.episodes.len(), 1);
+        std::fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn scan_ignores_generated_synopsis_in_deep_output() {
+        // 深度处理在 <剧目录>/深度处理/ 写 AI 生成的 简介.txt：它不能被当成素材自带的简介。
+        let p = std::env::temp_dir().join(format!("dossier-deep-synopsis-{}", std::process::id()));
+        std::fs::remove_dir_all(&p).ok();
+        let drama_dir = p.join("剧A");
+        std::fs::create_dir_all(drama_dir.join(DEEP_OUTPUT_DIR).join("视频成片")).unwrap();
+        std::fs::write(drama_dir.join("第1集.mp4"), b"x").unwrap();
+        std::fs::write(drama_dir.join(DEEP_OUTPUT_DIR).join("简介.txt"), "AI 生成").unwrap();
+        std::fs::write(
+            drama_dir
+                .join(DEEP_OUTPUT_DIR)
+                .join("视频成片")
+                .join("第01集.mp4"),
+            b"x",
+        )
+        .unwrap();
+
+        // 剧目录没有自己的简介：不能退而读到生成的那份
+        let drama = scan_drama_dir("剧A", &drama_dir);
+        assert_eq!(drama.synopsis, None, "生成的简介被当成了素材简介");
+        assert_eq!(drama.episodes.len(), 1);
+
+        // 剧目录有自己的简介：必须用它
+        std::fs::write(drama_dir.join("简介.txt"), "原始").unwrap();
+        let drama = scan_drama_dir("剧A", &drama_dir);
+        assert_eq!(drama.synopsis, Some(drama_dir.join("简介.txt")));
         std::fs::remove_dir_all(&p).ok();
     }
 

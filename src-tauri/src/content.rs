@@ -22,6 +22,8 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter};
 
 use crate::ai;
+use crate::tasks::CancelToken;
+use crate::toolbox::FfmpegCtx;
 
 /// ASR 单集采样上限：足够理解主线，也避免首屏材料被整部长片拖住。
 pub const ASR_SAMPLE_SECONDS: f64 = 240.0;
@@ -345,7 +347,7 @@ fn asr_gpu_failure_worth_cpu_retry(detail: &str) -> bool {
 }
 
 /// 把一集视频转成“对白 + 画面文字”证据。
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn extract_episode(
     app: &AppHandle,
     settings: &AppSettings,
@@ -354,8 +356,9 @@ fn extract_episode(
     episode: &ProbedEpisode,
     work_dir: &Path,
     index: usize,
+    cancel: &CancelToken,
 ) -> Result<EpisodeEvidence, String> {
-    if crate::toolbox::transcode_cancelled() {
+    if cancel.is_cancelled() {
         return Err("已停止".into());
     }
     crate::logging::log_event(
@@ -395,6 +398,7 @@ fn extract_episode(
             "16000",
             &audio_str,
         ],
+        FfmpegCtx::light(cancel),
     )?;
 
     // 2) 调用既有 ASR 适配层；这里显式设置超时并接入统一停止开关。
@@ -433,7 +437,7 @@ fn extract_episode(
         Ok(spec)
     };
     let mut output = runner
-        .run_cancellable(&build_spec(has_gpu)?, &crate::toolbox::transcode_cancelled)
+        .run_cancellable(&build_spec(has_gpu)?, &|| cancel.is_cancelled())
         .map_err(|error| format!("ASR 执行失败：{error}"))?;
     if !output.success() {
         let mut detail = last_line(&output);
@@ -446,7 +450,7 @@ fn extract_episode(
                 "GPU 转写不可用（torch 不带 CUDA），自动改用 CPU 重新转写",
             );
             output = runner
-                .run_cancellable(&build_spec(false)?, &crate::toolbox::transcode_cancelled)
+                .run_cancellable(&build_spec(false)?, &|| cancel.is_cancelled())
                 .map_err(|error| format!("ASR 执行失败：{error}"))?;
             detail = last_line(&output);
         }
@@ -577,6 +581,7 @@ pub(crate) fn extract_content(
     ffmpeg: &Path,
     episodes: &[ProbedEpisode],
     work_dir: &Path,
+    cancel: &CancelToken,
 ) -> Result<ContentEvidence, String> {
     if episodes.is_empty() {
         return Err("没有可分析的分集".into());
@@ -588,10 +593,12 @@ pub(crate) fn extract_content(
     let mut extracted = Vec::new();
     let mut messages = Vec::new();
     for (index, episode) in episodes.iter().take(sample_count).enumerate() {
-        if crate::toolbox::transcode_cancelled() {
+        if cancel.is_cancelled() {
             return Err("已停止".into());
         }
-        match extract_episode(app, settings, runtime, ffmpeg, episode, work_dir, index) {
+        match extract_episode(
+            app, settings, runtime, ffmpeg, episode, work_dir, index, cancel,
+        ) {
             Ok(item) => extracted.push(item),
             Err(error) => {
                 let message = format!(
@@ -1156,6 +1163,7 @@ fn generate_process_images(
     episodes: &[ProbedEpisode],
     output_dir: &Path,
     canvas: &ProcessImageContext,
+    cancel: &CancelToken,
 ) -> Result<Vec<PathBuf>, String> {
     let frames_dir = output_dir.join(".material-frames");
     let _ = std::fs::remove_dir_all(&frames_dir);
@@ -1168,7 +1176,7 @@ fn generate_process_images(
     let mut frames = Vec::new();
     let mut labels = Vec::new();
     for slot in 0..4usize {
-        if crate::toolbox::transcode_cancelled() {
+        if cancel.is_cancelled() {
             let _ = std::fs::remove_dir_all(&frames_dir);
             return Err("已停止".into());
         }
@@ -1197,6 +1205,7 @@ fn generate_process_images(
                     "3",
                     &path.display().to_string(),
                 ],
+                FfmpegCtx::light(cancel),
             ) {
                 let _ = std::fs::remove_dir_all(&frames_dir);
                 return Err(format!("抽取过程图帧失败：{error}"));
@@ -1292,6 +1301,7 @@ pub(crate) fn start_material_pipeline(
     episodes: &[ProbedEpisode],
     output_dir: &Path,
     drama_dir: &Path,
+    cancel: CancelToken,
     proof: MaterialProofContext,
 ) -> MaterialJob {
     let result = Arc::new(Mutex::new(None));
@@ -1313,6 +1323,7 @@ pub(crate) fn start_material_pipeline(
             &output_dir,
             &drama_dir,
             &proof,
+            &cancel,
         );
         if let Ok(mut guard) = thread_result.lock() {
             *guard = Some(value);
@@ -1335,6 +1346,7 @@ fn material_pipeline_blocking(
     output_dir: &Path,
     drama_dir: &Path,
     proof: &MaterialProofContext,
+    cancel: &CancelToken,
 ) -> Result<MaterialPipelineReport, String> {
     let mut messages = Vec::new();
     if !settings.effective_material_pipeline_enabled() {
@@ -1380,6 +1392,7 @@ fn material_pipeline_blocking(
             ffmpeg,
             episodes,
             &output_dir.join(".material-content"),
+            cancel,
         ) {
             Ok(evidence) => {
                 messages.extend(evidence.messages.iter().cloned());
@@ -1406,7 +1419,7 @@ fn material_pipeline_blocking(
         ));
         None
     };
-    if crate::toolbox::transcode_cancelled() {
+    if cancel.is_cancelled() {
         return Err("已停止".into());
     }
 
@@ -1445,6 +1458,10 @@ fn material_pipeline_blocking(
             }
             context
         });
+        // 计费调用之前再看一次令牌：编码失败或用户停止后不再发起新的 LLM 请求。
+        if cancel.is_cancelled() {
+            return Err("已停止".into());
+        }
         match ai::material_identity_blocking(settings, &context) {
             Ok(identity) => Some(identity),
             Err(error) => {
@@ -1506,6 +1523,17 @@ fn material_pipeline_blocking(
         .flatten();
     let (title, title_source) = (title_resolved.value, title_resolved.source);
     let (synopsis, synopsis_source) = (synopsis_resolved.value, synopsis_resolved.source);
+    // 已付费拿到的剧名/简介立即写回本剧材料：后面海报、过程图阶段若因编码失败或用户停止
+    // 提前返回，下一轮直接复用，不再重复计费。
+    if let Err(error) = persist_generated(
+        app,
+        &material_key,
+        generated_title.as_deref(),
+        generated_synopsis.as_deref(),
+    ) {
+        crate::logging::log_event("材料", error.clone());
+        messages.push(error);
+    }
 
     // 过程图不再携带分镜概要文字（纯原片帧 + 角标），来源固定为原始素材抽帧。
     let storyboard_source = "原始素材抽帧".to_string();
@@ -1547,6 +1575,10 @@ fn material_pipeline_blocking(
         Some(path) => (Some(path), "本地提供（素材封面）".to_string()),
         None => (None, reason.to_string()),
     };
+    // 生图同样计费：发起前确认任务没有被停止 / 编码没有失败。
+    if action == PosterAction::Generate && cancel.is_cancelled() {
+        return Err("已停止".into());
+    }
     let (poster, poster_source) = match action {
         PosterAction::Generate => match ai::poster_blocking(
             settings,
@@ -1597,7 +1629,7 @@ fn material_pipeline_blocking(
         _ => Some(PosterBasis::default()),
     };
 
-    if crate::toolbox::transcode_cancelled() {
+    if cancel.is_cancelled() {
         return Err("已停止".into());
     }
     let _ = app.emit(
@@ -1616,15 +1648,16 @@ fn material_pipeline_blocking(
         synopsis: synopsis.as_deref(),
         poster: poster.as_deref(),
     };
-    let process_images = match generate_process_images(app, ffmpeg, episodes, output_dir, &canvas) {
-        Ok(paths) => paths,
-        Err(error) => {
-            messages.push(format!("过程图生成失败：{error}"));
-            Vec::new()
-        }
-    };
+    let process_images =
+        match generate_process_images(app, ffmpeg, episodes, output_dir, &canvas, cancel) {
+            Ok(paths) => paths,
+            Err(error) => {
+                messages.push(format!("过程图生成失败：{error}"));
+                Vec::new()
+            }
+        };
 
-    if crate::toolbox::transcode_cancelled() {
+    if cancel.is_cancelled() {
         return Err("已停止".into());
     }
     // 简介落盘：输出目录带一份 简介.txt（AI 生成或素材目录原有，随成片一起交付）。
@@ -1653,15 +1686,6 @@ fn material_pipeline_blocking(
             None
         }
     };
-    if let Err(error) = persist_generated(
-        app,
-        &material_key,
-        generated_title.as_deref(),
-        generated_synopsis.as_deref(),
-    ) {
-        messages.push(error);
-    }
-
     let status = if messages.is_empty() {
         "completed"
     } else {

@@ -85,11 +85,16 @@ fn payload(app: &AppHandle, store: &AccountStore) -> Result<AccountPayload, Stri
 #[tauri::command]
 pub fn account_register(app: AppHandle, args: RegisterArgs) -> Result<AccountPayload, String> {
     // 测试期关键日志：只记邮箱与结果，绝不记密码 / 验证码。
-    crate::logging::log_event("注册", format!("开始：{}", args.email));
+    crate::logging::log_event(
+        "注册",
+        format!("开始：{}", crate::logging::mask_email(&args.email)),
+    );
     let result = account_register_inner(&app, args.email.clone(), &args.password);
     crate::logging::log_event(
         "注册",
-        crate::logging::result_text(&result, |_| format!("成功：{}", args.email)),
+        crate::logging::result_text(&result, |_| {
+            format!("成功：{}", crate::logging::mask_email(&args.email))
+        }),
     );
     result
 }
@@ -112,11 +117,16 @@ pub fn account_login(
     password: String,
 ) -> Result<AccountPayload, String> {
     // 测试期关键日志：只记邮箱与结果，绝不记密码。
-    crate::logging::log_event("登录", format!("开始：{email}"));
+    crate::logging::log_event(
+        "登录",
+        format!("开始：{}", crate::logging::mask_email(&email)),
+    );
     let result = account_login_inner(&app, &email, &password);
     crate::logging::log_event(
         "登录",
-        crate::logging::result_text(&result, |_| format!("成功：{email}")),
+        crate::logging::result_text(&result, |_| {
+            format!("成功：{}", crate::logging::mask_email(&email))
+        }),
     );
     result
 }

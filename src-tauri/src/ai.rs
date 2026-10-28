@@ -14,6 +14,12 @@ use serde_json::json;
 
 /// 单次请求超时：生图可能较慢，放宽到 3 分钟。
 const HTTP_TIMEOUT: Duration = Duration::from_secs(180);
+/// AI 生成剧名的长度上限（字符数）：报审表格与海报排版都放不下更长的剧名。超出视为生成失败。
+pub(crate) const MAX_TITLE_CHARS: usize = 15;
+/// AI 生成简介的长度上限（字符数）。
+pub(crate) const MAX_SYNOPSIS_CHARS: usize = 2000;
+/// 按 URL 下载海报的大小上限：竖版海报正常只有几 MB，超过说明拿到的不是一张海报。
+const MAX_POSTER_BYTES: u64 = 20 * 1024 * 1024;
 
 /// 取出必填的非空配置项；未配置时返回带指引的提示。
 fn required_field<'a>(
@@ -185,15 +191,69 @@ fn build_poster_prompt(title: &str, synopsis: &str) -> String {
     prompt
 }
 
-/// 写入海报文件（父目录自动创建）。
+/// 按文件头识别图片格式，返回扩展名；不是 png / jpeg / webp 一律 None（拒收）。
+fn image_format(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("jpg")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else {
+        None
+    }
+}
+
+/// 写入海报文件（父目录自动创建），扩展名跟随实际格式。
+///
+/// 以前一律存成 `.png`：服务返回 jpeg/webp 时扩展名与内容不符，部分查看器与平台上传会拒收；
+/// 返回的是错误页（HTML）时也照样存成「海报」。现在不是图片就报错，旧海报原样保留。
 fn save_poster_bytes(output_dir: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    let ext = image_format(bytes).ok_or_else(|| {
+        format!(
+            "生图接口返回的不是 png / jpeg / webp 图片（开头字节：{:02x?}），未保存",
+            &bytes[..bytes.len().min(8)]
+        )
+    })?;
     std::fs::create_dir_all(output_dir)
         .map_err(|error| format!("创建输出目录失败（{}）：{error}", output_dir.display()))?;
-    let path = output_dir.join("剧目海报.png");
-    // 原子覆盖：写到一半失败时旧海报原样保留，不会留下截断的 png。
+    let path = output_dir.join(format!("剧目海报.{ext}"));
+    // 原子覆盖：写到一半失败时旧海报原样保留，不会留下截断的图片。
     crate::paths::write_atomic(&path, bytes)
         .map_err(|error| format!("写入海报失败（{}）：{error}", path.display()))?;
+    // 删掉其他扩展名的旧海报：否则「输出目录已有海报就沿用」会读到上一张。
+    for other in ["png", "jpg", "jpeg", "webp"]
+        .into_iter()
+        .filter(|e| *e != ext)
+    {
+        let _ = std::fs::remove_file(output_dir.join(format!("剧目海报.{other}")));
+    }
     Ok(path)
+}
+
+/// 生图失败是不是「不支持 size 参数」：只有这种才值得去掉 size 重试一次。
+///
+/// 以前只要错误文字里出现 "size" 就重试（`max_size exceeded`、超时信息里的 `body size` 都会命中），
+/// 等于把各种失败都多请求一次、可能多扣一次费用，还掩盖了真正的错误。
+fn size_param_rejected(status: u16, body: &str) -> bool {
+    if status != 400 {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    // OpenAI 规范的错误体会直接指明出错的参数：`"param":"size"`（允许冒号后有空格）。
+    let names_size_param = lower.replace(' ', "").contains("\"param\":\"size\"");
+    let says_size_unsupported = lower.contains("size")
+        && ["invalid", "unsupported", "not support"]
+            .iter()
+            .any(|marker| lower.contains(marker));
+    names_size_param || says_size_unsupported
+}
+
+/// 生图请求失败的完整信息：状态码（连不上时为 None）+ 给用户看的说明 + 原始响应体。
+struct ImageApiFailure {
+    status: Option<u16>,
+    message: String,
+    body: String,
 }
 
 /// 按指定的剧名/简介生成竖版海报并落盘。
@@ -206,47 +266,78 @@ pub(crate) fn poster_blocking(
     let (base, key, model) = img_config(settings)?;
     let prompt = build_poster_prompt(title, synopsis);
     let client = http_client()?;
-    let post = |payload: serde_json::Value| -> Result<String, String> {
+    let post = |payload: serde_json::Value| -> Result<String, ImageApiFailure> {
         let response = client
             .post(format!("{base}/images/generations"))
             .bearer_auth(&key)
             .json(&payload)
             .send()
-            .map_err(|error| format!("连接生图 API 失败：{error}。请检查网络与 API 地址。"))?;
+            .map_err(|error| ImageApiFailure {
+                status: None,
+                message: format!("连接生图 API 失败：{error}。请检查网络与 API 地址。"),
+                body: String::new(),
+            })?;
         let status = response.status();
-        let body = response
-            .text()
-            .map_err(|error| format!("读取生图响应失败：{error}"))?;
+        let body = response.text().map_err(|error| ImageApiFailure {
+            status: Some(status.as_u16()),
+            message: format!("读取生图响应失败：{error}"),
+            body: String::new(),
+        })?;
         if !status.is_success() {
             let detail = serde_json::from_str::<serde_json::Value>(&body)
                 .ok()
                 .and_then(|value| value["error"]["message"].as_str().map(str::to_string))
                 .unwrap_or_else(|| body.chars().take(200).collect::<String>());
-            return Err(format!("生图 API 返回 {status}：{detail}"));
+            return Err(ImageApiFailure {
+                status: Some(status.as_u16()),
+                message: format!("生图 API 返回 {status}：{detail}"),
+                body,
+            });
         }
         Ok(body)
     };
-    // 先按竖版尺寸请求；部分兼容服务不支持 size 参数，报错后去掉重试一次。
+    // 先按竖版尺寸请求；只有服务明确报「不支持 size 参数」时才去掉它重试一次。
     // 不发 n：火山方舟图片接口未定义该参数（固定单图），OpenAI 规范缺省值也是 1。
     let with_size = json!({"model": model, "prompt": prompt, "size": "1024x1792"});
     let body = match post(with_size) {
         Ok(body) => body,
-        Err(error) if error.contains("size") => post(json!({"model": model, "prompt": prompt}))?,
-        Err(error) => return Err(error),
+        Err(failure)
+            if failure
+                .status
+                .is_some_and(|status| size_param_rejected(status, &failure.body)) =>
+        {
+            post(json!({"model": model, "prompt": prompt})).map_err(|failure| failure.message)?
+        }
+        Err(failure) => return Err(failure.message),
     };
     let bytes = match parse_image_payload(&body)? {
         ImagePayload::Base64(b64) => decode_base64(&b64)?,
-        ImagePayload::Url(url) => client
-            .get(url)
-            .send()
-            .map_err(|error| format!("下载海报失败：{error}"))?
-            .error_for_status()
-            .map_err(|error| format!("下载海报失败：{error}"))?
-            .bytes()
-            .map_err(|error| format!("读取海报数据失败：{error}"))?
-            .to_vec(),
+        ImagePayload::Url(url) => download_poster(&client, &url)?,
     };
     save_poster_bytes(output_dir, &bytes)
+}
+
+/// 按 URL 下载海报，限 20 MB：多读 1 字节就能判断是否超限，不会把整个大文件读进内存。
+fn download_poster(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let response = client
+        .get(url)
+        .send()
+        .map_err(|error| format!("下载海报失败：{error}"))?
+        .error_for_status()
+        .map_err(|error| format!("下载海报失败：{error}"))?;
+    let mut bytes = Vec::new();
+    response
+        .take(MAX_POSTER_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("读取海报数据失败：{error}"))?;
+    if bytes.len() as u64 > MAX_POSTER_BYTES {
+        return Err(format!(
+            "海报文件超过 {} MB，不像是一张海报，未保存",
+            MAX_POSTER_BYTES / 1024 / 1024
+        ));
+    }
+    Ok(bytes)
 }
 
 /// LLM 三项配置是否齐全（供材料阶段判断剧名/简介走 AI 还是沿用已有内容）。
@@ -305,10 +396,22 @@ pub(crate) fn parse_material_identity(body: &str) -> Result<MaterialIdentity, St
             .map(str::to_string)
             .ok_or_else(|| format!("材料 JSON 缺少 {key}"))
     };
-    Ok(MaterialIdentity {
-        title: required("title")?,
-        synopsis: required("synopsis")?,
-    })
+    let title = required("title")?;
+    let synopsis = required("synopsis")?;
+    // 超长视为生成失败：上层会退回下一个来源（素材自带 / 已保存 / 不填），而不是把超长剧名写进报审材料。
+    let title_chars = title.chars().count();
+    if title_chars > MAX_TITLE_CHARS {
+        return Err(format!(
+            "AI 生成的剧名有 {title_chars} 个字，超过上限 {MAX_TITLE_CHARS} 字：{title}"
+        ));
+    }
+    let synopsis_chars = synopsis.chars().count();
+    if synopsis_chars > MAX_SYNOPSIS_CHARS {
+        return Err(format!(
+            "AI 生成的简介有 {synopsis_chars} 个字，超过上限 {MAX_SYNOPSIS_CHARS} 字"
+        ));
+    }
+    Ok(MaterialIdentity { title, synopsis })
 }
 
 #[cfg(test)]
@@ -411,6 +514,79 @@ mod tests {
         let parsed = parse_material_identity(body).unwrap();
         assert_eq!(parsed.title, "雪夜进山");
         assert_eq!(parsed.synopsis, "医生被困山村。");
+    }
+
+    #[test]
+    fn parse_material_identity_enforces_length_limits() {
+        let ok = format!(
+            r#"{{"title":"{}","synopsis":"简介"}}"#,
+            "字".repeat(MAX_TITLE_CHARS)
+        );
+        assert!(parse_material_identity(&ok).is_ok(), "正好 15 个字可以");
+        let long = format!(
+            r#"{{"title":"{}","synopsis":"简介"}}"#,
+            "字".repeat(MAX_TITLE_CHARS + 1)
+        );
+        assert!(parse_material_identity(&long)
+            .unwrap_err()
+            .contains("超过上限"));
+        let long_synopsis = format!(
+            r#"{{"title":"剧名","synopsis":"{}"}}"#,
+            "字".repeat(MAX_SYNOPSIS_CHARS + 1)
+        );
+        assert!(parse_material_identity(&long_synopsis).is_err());
+    }
+
+    #[test]
+    fn size_retry_only_for_explicit_size_rejection() {
+        assert!(size_param_rejected(
+            400,
+            r#"{"error":{"param":"size","message":"invalid value"}}"#
+        ));
+        assert!(size_param_rejected(400, "Unsupported size 1024x1792"));
+        assert!(size_param_rejected(
+            400,
+            r#"{"error":{"param": "size","message":"bad"}}"#
+        ));
+        // 400 但出错的是别的参数：不重试
+        assert!(!size_param_rejected(
+            400,
+            r#"{"error":{"param":"prompt","message":"too long, size 9000"}}"#
+        ));
+        // 413 / 超时 / 鉴权失败 / 服务端错误：不重试（以前含 "size" 字样就会再扣一次费）
+        assert!(!size_param_rejected(413, "max_size exceeded"));
+        assert!(!size_param_rejected(400, "prompt too long"));
+        assert!(!size_param_rejected(
+            401,
+            "invalid api key, size irrelevant"
+        ));
+        assert!(!size_param_rejected(500, "internal error: size invalid"));
+    }
+
+    #[test]
+    fn poster_format_follows_content() {
+        assert_eq!(image_format(b"\x89PNG\r\n\x1a\nrest"), Some("png"));
+        assert_eq!(image_format(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("jpg"));
+        assert_eq!(image_format(b"RIFF\x00\x00\x00\x00WEBPVP8 "), Some("webp"));
+        assert_eq!(image_format(b"<html>error</html>"), None);
+        assert_eq!(image_format(b""), None);
+
+        let dir = std::env::temp_dir().join(format!("dossier-poster-fmt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("剧目海报.png"), b"old").unwrap();
+        let saved = save_poster_bytes(&dir, &[0xFF, 0xD8, 0xFF, 0xE0, 1, 2]).unwrap();
+        assert_eq!(saved, dir.join("剧目海报.jpg"));
+        assert!(
+            !dir.join("剧目海报.png").exists(),
+            "其他扩展名的旧海报要删掉"
+        );
+        assert!(
+            save_poster_bytes(&dir, b"<html>").is_err(),
+            "不是图片不能存成海报"
+        );
+        assert!(saved.is_file(), "失败时已有海报原样保留");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
