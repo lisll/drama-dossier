@@ -847,10 +847,17 @@ fn transcode_nudge_blocking(
             "-i".into(),
             input_str.clone(),
         ];
+        // 角标作为第二输入必须紧跟首个 -i：夹在输入之间的输出级选项（-vf/-af/-metadata）
+        // 会被 ffmpeg 归给下一个文件，放在 -i 角标之前会报 EINVAL(-22)。
+        if let Some(path) = badge {
+            args.push("-i".into());
+            args.push(path.display().to_string());
+        }
         let mut detail = format!("裁掉开头 {frames} 帧（{offset:.4} 秒，{fps:.2} fps）");
 
         // 去重配方：确定性画面/音频滤镜链（P1）。
         let mut video_chain = String::new();
+        let mut audio_chain: Option<String> = None;
         let mut meta_args: Vec<String> = Vec::new();
         if let Some(plan) = recipe {
             let index = episodes
@@ -860,11 +867,8 @@ fn transcode_nudge_blocking(
             if let Some(variant) = plan.variant(index) {
                 video_chain = variant
                     .compile_video_filters(episode.spec.width.max(2), episode.spec.height.max(2));
-                args.push("-vf".into());
-                args.push(video_chain.clone());
                 if episode.spec.audio_codec.is_some() {
-                    args.push("-af".into());
-                    args.push(variant.compile_audio_filters(crate::dedup::SAMPLE_RATE_HZ));
+                    audio_chain = Some(variant.compile_audio_filters(crate::dedup::SAMPLE_RATE_HZ));
                 }
                 for (key, value) in plan.metadata_tags(index) {
                     meta_args.push(format!("{key}={value}"));
@@ -872,24 +876,33 @@ fn transcode_nudge_blocking(
                 detail.push_str(&format!("；去重（{}）：{}", plan.seed, variant.describe()));
             }
         }
-        for tag in &meta_args {
-            args.push("-metadata".into());
-            args.push(tag.clone());
-        }
-
-        // AI 合规角标：角标 PNG 作第二输入，视频链并入 filter_complex 后 overlay（P2）。
-        if let Some(path) = badge {
-            args.push("-i".into());
-            args.push(path.display().to_string());
+        // 有角标：视频链并入 filter_complex 后 overlay；无角标：沿用简单 -vf。
+        if badge.is_some() {
+            let graph = if video_chain.is_empty() {
+                format!("[0:v:0][1:v:0]overlay=x={AI_BADGE_MARGIN}:y={AI_BADGE_MARGIN}[vout]")
+            } else {
+                format!(
+                    "[0:v:0]{video_chain}[base];[base][1:v:0]overlay=x={AI_BADGE_MARGIN}:y={AI_BADGE_MARGIN}[vout]"
+                )
+            };
             args.push("-filter_complex".into());
-            args.push(format!(
-                "[0:v:0]{video_chain}[base];[base][1:v:0]overlay=x={AI_BADGE_MARGIN}:y={AI_BADGE_MARGIN}[vout]"
-            ));
+            args.push(graph);
             args.push("-map".into());
             args.push("[vout]".into());
             args.push("-map".into());
             args.push("0:a?".into());
             detail.push_str("；已烧录 AI 合规角标");
+        } else if !video_chain.is_empty() {
+            args.push("-vf".into());
+            args.push(video_chain);
+        }
+        if let Some(chain) = audio_chain {
+            args.push("-af".into());
+            args.push(chain);
+        }
+        for tag in &meta_args {
+            args.push("-metadata".into());
+            args.push(tag.clone());
         }
 
         args.extend(encode_output_args(&output, &lanes.encoder));
