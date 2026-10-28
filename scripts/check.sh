@@ -100,8 +100,11 @@ if [ "$run_rust" -eq 1 ] && require cargo; then
   step "Format：cargo fmt --all -- --check" \
     cargo fmt --all -- --check
   if rust_env_ready; then
-    step "Clippy：cargo clippy --workspace --all-targets --no-deps -- -D warnings" \
-      cargo clippy --workspace --all-targets --no-deps -- -D warnings
+    # 与 CI 一致：授权形态 feature 互斥（official-release 与 license-test-mode 不能同开，
+    # official-release 在填好正式公钥前必然编译失败），不能用 --all-features；统一按内测版授权检查。
+    license_feature="--features drama-dossier/license-test-mode"
+    step "Clippy：cargo clippy --workspace --all-targets --no-deps $license_feature -- -D warnings" \
+      cargo clippy --workspace --all-targets --no-deps $license_feature -- -D warnings
     # windows 目标交叉 lint：抓只在 Windows 编译路径上的问题（死代码、cfg 拼写错等）。
     # tauri-winres 要调 llvm-rc（mac 没有），用桩糊弄过构建脚本——clippy 不链接资源，
     # 空产物无害。桩解析 /FO 参数生成空文件后退出 0。
@@ -113,13 +116,15 @@ if [ "$run_rust" -eq 1 ] && require cargo; then
       chmod +x "$stub_dir/llvm-rc"
       step "Clippy（windows 目标）：--target x86_64-pc-windows-msvc -- -D warnings" \
         env PATH="$stub_dir:$PATH" cargo clippy --workspace --all-targets \
-          --target x86_64-pc-windows-msvc --no-deps -- -D warnings
+          --target x86_64-pc-windows-msvc --no-deps $license_feature -- -D warnings
     fi
     if [ "$fast" -eq 1 ]; then
       printf '==> 跳过 Test（--fast，pre-push 或 CI 会跑）\n'
     else
-      step "Test：cargo test --workspace --all-features" \
-        cargo test --workspace --all-features
+      step "Test：cargo test --workspace $license_feature" \
+        cargo test --workspace $license_feature
+      step "Check：cargo check -p drama-dossier（默认不开授权 feature）" \
+        cargo check -p drama-dossier
     fi
   else
     printf '==> 跳过 Clippy / Test：本机缺 webkit2gtk-4.1 或 libsoup-3.0，编译不了 src-tauri\n'

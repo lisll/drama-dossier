@@ -39,10 +39,15 @@ jobs:
         run: cargo fmt --all -- --check
       # --no-deps：只警告我们自己的代码。依赖库（tauri 系等）在 windows 宿主机
       # 编译构建脚本时会暴露它们自身的 clippy 警告，不由本仓库把关。
+      # 授权形态 feature 互斥（official-release 与 license-test-mode 不能同开），
+      # 不能用 --all-features；测试统一按内测版授权跑，单测需要本机签发凭证。
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
+        run: cargo clippy --workspace --all-targets --no-deps --features drama-dossier/license-test-mode -- -D warnings
       - name: Test
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace --features drama-dossier/license-test-mode
+      # 正式发布形态在填好正式公钥前必然编译失败，这里只确认「默认（不开任何授权 feature）」能编过。
+      - name: Check default build
+        run: cargo check -p drama-dossier
 
   bundle:
     needs: test
@@ -230,7 +235,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: .
-          args: ${{ matrix.args }}
+          # 标签触发 = 正式包（official-release，未填正式公钥时在这里编译失败，release 任务随之不执行）；
+          # 手动触发 = 内测包（license-test-mode），只上传 Artifacts，release 任务只在标签时运行。
+          args: ${{ matrix.args }} --features ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/app-v') && 'official-release' || 'license-test-mode' }}
       - name: Upload Windows bundle
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
@@ -257,7 +264,7 @@ jobs:
   # 不会产生残缺的 Release。
   release:
     needs: bundle
-    if: startsWith(github.ref, 'refs/tags/app-v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/app-v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
