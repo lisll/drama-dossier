@@ -502,14 +502,15 @@ cd drama-dossier
 ### 3. 开发运行
 
 ```bash
-cargo test --workspace --all-features
-cargo tauri dev
+cargo test --workspace --features drama-dossier/license-test-mode
+cargo tauri dev --features license-test-mode
 ```
 
 ### 4. 构建安装包
 
 ```bash
-cargo tauri build
+# 内测包（内部测试卡密可激活）；不带 feature 构建出的包永远「未激活」，不要分发
+cargo tauri build --features license-test-mode
 ```
 
 产物位置：
@@ -519,24 +520,21 @@ cargo tauri build
 
 ## 内部测试版：授权激活
 
-当前 `master` 上的安装包是**内部测试版**：带授权激活，但激活过程不联网，只用一张通用测试卡密。
+内部测试版安装包用 `--features license-test-mode` 构建，只从 Actions Artifacts 手动分发，不进 Release：带授权激活，但激活过程不联网，只用一张内部测试卡密。构建形态见 [docs/LICENSING.md](docs/LICENSING.md)。
 
-> 这一节只写给内部测试人员。正式版会用服务器下发的卡密，届时本节的测试卡密和测试版标识都会被删除。
+> 这一节只写给内部测试人员。正式版会用服务器下发的卡密，届时测试版标识会被删除。
 
 ### 用哪张卡密
 
-```
-DDK-TEST-CARD-2345-6789
-```
-
-- 只认这一张。输入其他卡密会提示"测试版只接受测试卡密"。
-- 不区分大小写，中间的空格和短横线可以省掉，例如 `ddk test card 2345 6789` 也能通过。
+- 向安装包发放人索取内部测试卡密（仓库文档里不再公开卡密原文）。
+- 只认这一张。输入其他卡密会提示"测试版只接受内部测试卡密，请联系发放人"。
+- 不区分大小写，中间的空格和短横线可以省掉。
 - 激活页标题旁边有 **"测试版授权"** 标签，看到它说明装的是测试版。
 
 ### 第一次激活
 
 1. 打开软件，会出现全屏的激活页。
-2. 输入上面的测试卡密，点「激活」。
+2. 输入拿到的内部测试卡密，点「激活」。
 3. 提示"激活成功"后自动进入主界面。激活过程不联网。
 
 ### 有效期
@@ -554,7 +552,7 @@ DDK-TEST-CARD-2345-6789
 
 | 现象 | 常见原因 | 怎么办 |
 |---|---|---|
-| 输入卡密提示"测试版只接受测试卡密" | 卡密输错，或者装的是正式版 | 核对卡密；确认激活页上有"测试版授权"标签 |
+| 输入卡密提示"测试版只接受内部测试卡密" | 卡密输错，或者装的是正式版 | 核对卡密；确认激活页上有"测试版授权"标签 |
 | 提示"授权信息无效，请重新激活" | 授权文件被改动、被其他程序破坏，或从别的电脑拷过来 | 重新输入测试卡密 |
 | 提示"检测到系统时间异常" | 电脑时间和真实时间差太多 | 校正系统时间后重新打开 |
 | 提示"无法读取本机标识" | 系统信息读不到（精简系统、部分虚拟机） | 联系开发者，附上日志 |
@@ -613,8 +611,8 @@ DDK-TEST-CARD-2345-6789
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-features
+cargo clippy --workspace --all-targets --features drama-dossier/license-test-mode -- -D warnings
+cargo test --workspace --features drama-dossier/license-test-mode
 python3 -m json.tool src-tauri/tauri.conf.json
 python3 -m json.tool src-tauri/capabilities/default.json
 node --check src/main.js
@@ -626,7 +624,7 @@ node --check src/main.js
 cargo fmt
 cargo clippy --fix --allow-dirty --allow-staged
 cargo test
-cargo tauri build
+cargo tauri build --features license-test-mode
 ```
 
 上面这一串等价于一条命令（与 CI 的 Format / Clippy / Test 三步一一对应）：
@@ -721,9 +719,9 @@ GitHub Actions 工作流：
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-features
-cargo tauri build
+cargo clippy --workspace --all-targets --features drama-dossier/license-test-mode -- -D warnings
+cargo test --workspace --features drama-dossier/license-test-mode
+cargo tauri build --features official-release   # 正式公钥填好前会编译失败，属预期
 ```
 
 同时人工验证：
@@ -751,8 +749,11 @@ git push origin app-v0.2.1
    并自动附加变更列表。发布说明中的安装须知由工作流的 `release` job 提供,如需补充
    或修正,在 GitHub 上编辑该 Release 即可。
 
-> `release` job 只在推 tag(`app-v*`)时运行。手动触发(`workflow_dispatch`)只做构建,
+> `release` job 只在推 tag(`app-v*`)时运行。手动触发(`workflow_dispatch`)只构建内测包,
 > 不会创建 Release;推 `master` 只跑质量门与测试。
+>
+> 正式公钥(`PRODUCTION_KEYS`)填好之前,tag 构建会在 `bundle` 阶段编译失败、不会产生 Release——
+> 这是有意设置的发布防线,见 [docs/LICENSING.md](docs/LICENSING.md)「构建形态」。
 
 ### Windows 分发
 

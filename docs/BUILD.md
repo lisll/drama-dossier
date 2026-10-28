@@ -3,11 +3,12 @@
 ## 本地开发
 
 ```bash
-cargo test --workspace --all-features
-cargo clippy --workspace --all-targets -- -D warnings
+# 授权形态 feature 互斥，不能用 --all-features（见 docs/LICENSING.md「构建形态」）
+cargo test --workspace --features drama-dossier/license-test-mode
+cargo clippy --workspace --all-targets --features drama-dossier/license-test-mode -- -D warnings
 cargo install tauri-cli --locked
-cargo tauri dev
-cargo tauri build
+cargo tauri dev --features license-test-mode
+cargo tauri build --features license-test-mode   # 内测包；正式包用 --features official-release
 ```
 
 **Linux 系统依赖**（与 CI 一致，缺了会在编译 `src-tauri` 时失败，而不是 lint 报错）：

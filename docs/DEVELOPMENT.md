@@ -78,8 +78,8 @@ Rust 命令使用 snake_case，Tauri 会把 JavaScript 的 camelCase 参数映�
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-features
+cargo clippy --workspace --all-targets --features drama-dossier/license-test-mode -- -D warnings
+cargo test --workspace --features drama-dossier/license-test-mode
 python3 -m json.tool src-tauri/tauri.conf.json
 python3 -m json.tool src-tauri/capabilities/default.json
 node --check src/main.js

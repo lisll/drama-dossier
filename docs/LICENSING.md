@@ -4,11 +4,11 @@
 
 - **激活时必须联网**：服务器核销卡密，并把授权和这台电脑绑定。
 - **日常使用不联网**：每次都在本机校验服务器的签名。
-- **每 24 小时自动联网续期一次**。连续 7 天连不上服务器，软件就会锁定；重新联网后自动恢复，激活页上也可以点「联网重试」。
+- **每 24 小时自动联网续期一次**。连续 3 天（服务端 `DD_LICENSE_TOKEN_DAYS`，默认 3）连不上服务器，软件就会锁定；重新联网后自动恢复，激活页上也可以点「联网重试」。
 
 授权与电脑**固定绑定**，不支持迁移。用户重装系统、或者 Windows 电脑更换主板后，机器码会改变，需要重新兑换一张卡。
 
-> **当前是离线测试版**：不连服务器，只接受一张通用测试卡密。见下文「离线测试版」。正式上线前必须按「删除测试版」整体删除。
+> **当前只发内测包**：正式服务器上线前，只用 `--features license-test-mode` 构建离线测试版，从 Actions Artifacts 手动分发，不进 Release。见下文「构建形态」与「离线测试版」。
 
 | 部分 | 位置 |
 |---|---|
@@ -69,7 +69,7 @@ payload 是 JSON 对象，序列化时按键名排序、使用紧凑分隔符、
 | `plan` | 卡种：`trial` / `month` / `quarter` / `year` / `lifetime` |
 | `until` | 使用权到期时间（Unix 秒）；永久卡为 `null` |
 | `iat` | 签发时间 |
-| `exp` | 凭证到期时间：`min(iat + 7 天, until)`。永久卡也会到期，需要定期续签 |
+| `exp` | 凭证到期时间：`min(iat + 凭证有效期, until)`，有效期默认 3 天（`DD_LICENSE_TOKEN_DAYS`，1–30）。永久卡也会到期，需要定期续签 |
 
 客户端按以下顺序判定，任何一步失败都会锁定：
 
@@ -93,6 +93,8 @@ payload 是 JSON 对象，序列化时按键名排序、使用紧凑分隔符、
 | `mac` | 校验码：`HMAC-SHA256(程序内置密钥, 机器码 + 凭证 + last_seen + revoked)` |
 
 `last_seen` 和 `revoked` 没有服务器签名，所以用校验码绑在一起。手改任何一个数字，校验码就对不上，判为"授权信息无效"，需要重新激活。缺少任何字段的老格式文件同样判为无效。
+
+同样两项再写一份到**系统凭据库**（Windows 凭据管理器 / macOS 钥匙串，条目 `drama-dossier` / `license-anchor`，同样带校验码，被停用的凭证只存 sha256），见 `src-tauri/src/license_anchor.rs`。判定时取授权文件、本次运行内存、凭据库三处最晚的时间作为回拨下限，任一处记录了停用即锁定：备份并恢复一份停用前的授权文件，只能回滚其中一处。凭据库读写失败（拒绝钥匙串访问、Linux 没有后端）时退回只看授权文件，不会因此锁死用户。
 
 ### 卡种规则
 
@@ -121,7 +123,7 @@ payload 是 JSON 对象，序列化时按键名排序、使用紧凑分隔符、
 - `export_draft` 和 `generate_mount_copy_csv`
 - 所有 AI 调用的统一入口 `ai::http_client`
 
-未授权时也放行的命令：授权自身的四个命令、看日志（`open_log_dir`、`read_recent_logs`），以及停止转码、查询擦除状态（`transcode_stop`、`erase_status`）。授权在长任务中途失效时，用户必须还能把任务停下来。
+未授权时也放行的命令：授权自身的四个命令、看日志（`open_log_dir`、`read_recent_logs`），以及停止长任务、查询擦除状态（`transcode_stop`、`bitrate_stop`、`dedup_demo_stop`、`erase_status`）。授权在长任务中途失效时，用户必须还能把任务停下来。
 
 ### 锁定规则
 
@@ -147,14 +149,31 @@ payload 是 JSON 对象，序列化时按键名排序、使用紧凑分隔符、
 
 **防不住**：
 - 熟悉逆向工程的人直接修改二进制文件，或者从程序里找出校验码的密钥自己重算。多层验权的作用，是把破解从"改一处"变成"找到并改掉十几处分散的检查，同时还要绕开自检和守护线程"，而且每发一个新版本都得重新来一遍。要进一步提高门槛，只能靠商业加壳，或者把核心功能放到服务端去执行。
-- 长期把系统时间设在过去，并且每次启动前都还原一份旧的授权文件；或者用虚拟机快照反复回到同一个时间点。这是所有离线验证共同的限制。
+- 长期把系统时间设在过去，并且每次启动前同时还原旧的授权文件**和**凭据库里的条目；或者用虚拟机快照反复回到同一个时间点。这是所有离线验证共同的限制，上限是一个凭证有效期（默认 3 天）。只还原授权文件已经不够（见「授权文件」一节的第二份存档）。
 - 拿到源码后自己编译一个去掉检查的版本。仓库公开时这一条无法防住，见「上线检查清单」。
+
+## 构建形态
+
+授权形态必须在构建时显式选择，`src-tauri/Cargo.toml` 的默认 feature 为空：
+
+| 构建命令 | 结果 |
+|---|---|
+| `cargo tauri build` | 不含任何可信公钥，授权恒为「未激活」。只用于确认能编译，不要分发 |
+| `cargo tauri build --features license-test-mode` | 离线测试版，只发给内部测试人员 |
+| `cargo tauri build --features official-release` | 正式版。`PRODUCTION_KEYS` 为空时**编译失败**；与 `license-test-mode` 同时开启也**编译失败** |
+
+CI 对应关系：
+
+- `desktop.yml` 手动触发（`workflow_dispatch`）→ 内测包，只上传 Actions Artifacts。
+- `desktop.yml` 推 `app-v*` 标签 → 正式包并发布 Release。正式公钥填好前这条路会在打包阶段编译失败，Release 不会执行，这是有意的硬防线。
+- `build-windows.yml` 只能手动触发，固定构建内测包。
+- 测试与 clippy 统一用 `--features drama-dossier/license-test-mode`；两个授权 feature 互斥，不能用 `--all-features`。
 
 ## 离线测试版（TEST-MODE）
 
-当前代码默认就是测试版：`src-tauri/Cargo.toml` 的 `license-test-mode` 开关默认打开。
+用 `--features license-test-mode` 构建。
 
-- 激活页显示「测试版授权」标识，只接受通用测试卡密 **`DDK-TEST-CARD-2345-6789`**（不区分大小写，可以带空格或短横线），输入其他卡密会提示"测试版只接受测试卡密"。
+- 激活页显示「测试版授权」标识，只接受内部测试卡密（向发放人索取；不区分大小写，可以带空格或短横线）。输入其他卡密会提示"测试版只接受内部测试卡密，请联系发放人"，不会回显卡密。
 - 激活时不联网：程序用内置的测试私钥，为本机机器码签发一份 30 天的试用凭证。之后的验签、机器绑定、写入授权文件、到期判断、防改校验，走的都是正式版代码。
 - 30 天到期后，再输入一次测试卡密即可续用。测试版不会联网续签。
 - 测试私钥就写在 `license_test_mode.rs` 里，拿到源码的人都能签发测试凭证，所以**测试版只能发给内部测试人员**。
@@ -165,14 +184,14 @@ payload 是 JSON 对象，序列化时按键名排序、使用紧凑分隔符、
 测试通过后执行。所有接入点都标了 `TEST-MODE`，用 `git grep -n "TEST-MODE\|license-test-mode\|license_test_mode"` 就能找全：
 
 1. 删除 `src-tauri/src/license_test_mode.rs`，以及 `src-tauri/src/lib.rs` 里对应的 `mod` 声明。
-2. 删除 `src-tauri/Cargo.toml` 中的 `[features]` 段（`default` 和 `license-test-mode`）。
+2. 删除 `src-tauri/Cargo.toml` 中的 `license-test-mode` feature（保留 `default = []` 与 `official-release`）。
 3. 删除 `src-tauri/src/license.rs` 中所有标了 `TEST-MODE` 的代码块，包括编译期检查、`trusted_keys` 里的测试公钥分支、`license_activate` 里的测试卡密分支，以及 `test_mode()` 和 `LicenseStatus` 里的 `test_mode` 字段。
 4. 删除 `src/license.js`、`src/license.css` 中标了 `TEST-MODE` 的部分。
 5. 运行 `scripts/check.sh` 并全部通过。
 
 `dossier-cardkey` 的 `test-issuer` 开关保留，单元测试要用它签发凭证；正式版的依赖里不会开启它。
 
-忘了删就填入正式公钥的话，编译会直接失败，并提示先删除测试版，所以测试版不会混进正式版。
+忘了删就填入正式公钥的话，编译会直接失败，并提示先删除测试版；`official-release` 与 `license-test-mode` 同时开启也会编译失败。所以测试版不会混进正式版。
 
 ## 本地开发
 
@@ -182,7 +201,7 @@ payload 是 JSON 对象，序列化时按键名排序、使用紧凑分隔符、
 
 ## 上线检查清单
 
-合并到 master 之前必须全部完成。否则打 `app-v*` tag 时，CI 会自动发布 Release，而发出去的安装包谁都激活不了，程序会锁定，不会放行。
+合并到 master 之前必须全部完成。推 `app-v*` 标签时 CI 用 `official-release` 构建，正式公钥没填就会编译失败、不发布。
 
 1. [ ] 仓库改为私有，或者确认接受"源码公开、任何人都能自行编译去掉检查的版本"。
 2. [ ] 按上文「删除测试版」删除测试版代码。
@@ -204,6 +223,6 @@ payload 是 JSON 对象，序列化时按键名排序、使用紧凑分隔符、
 正常的计划内轮换（私钥没有泄露）步骤如下：
 1. 先发布一个客户端版本，`PRODUCTION_KEYS` 里同时包含新旧两把公钥。
 2. 等大多数用户升级完成后，服务器切换到新私钥，同时把旧公钥填进 `DD_LICENSE_EXTRA_PUBKEYS`。这样老用户手里旧私钥签发的凭证仍可用来续签，续签拿到的新凭证则由新私钥签发。
-3. 再发布一个只保留新公钥的版本。7 天以后，清空 `DD_LICENSE_EXTRA_PUBKEYS`。
+3. 再发布一个只保留新公钥的版本。等过一个凭证有效期（默认 3 天）以后，清空 `DD_LICENSE_EXTRA_PUBKEYS`。
 
 私钥泄露时**不要**填 `DD_LICENSE_EXTRA_PUBKEYS`，否则攻击者伪造的凭证也能拿来续签。
