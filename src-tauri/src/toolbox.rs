@@ -1119,6 +1119,9 @@ fn fix_bitrate_blocking(
     ffprobe_path: Option<String>,
 ) -> Result<FixBitrateReport, String> {
     let (min_bps, max_bps) = range;
+    // 本任务自己的停止令牌：只响应「停止码率修复」，不受转码页停止按钮影响。
+    // 一进来就登记：逐集探测期间点停止也要生效（探测完、替换任何文件之前就会退出）。
+    let task = crate::tasks::register(TaskKind::Bitrate);
     let ffmpeg = resolve_ffmpeg(app)?;
     let ffprobe = resolve_ffprobe(app, ffprobe_path.as_deref())?;
     let drama = load_drama(&root, &name)?;
@@ -1127,8 +1130,6 @@ fn fix_bitrate_blocking(
         return Err("没有任何成功探测规格的分集；请先确认素材可读且 ffprobe 可用。".into());
     }
     let report = bitrate_report(&episodes, min_bps, max_bps);
-    // 本任务自己的停止令牌：只响应「停止码率修复」，不受转码页停止按钮影响。
-    let task = crate::tasks::register(TaskKind::Bitrate);
     let durations: std::collections::HashMap<&str, f64> = episodes
         .iter()
         .map(|episode| (episode.file.file_name.as_str(), episode.spec.duration_sec))
@@ -1360,7 +1361,9 @@ fn detect_encode_lanes(ffmpeg: &Path) -> EncodeLanes {
     }
 }
 
-/// 成片的临时文件路径：同目录、点开头（扫描器会跳过）、保留 `.mp4` 后缀（ffmpeg 按后缀选封装格式）。
+/// 成片的临时文件路径：同目录、点开头（扫描器会跳过）、后缀与正式名相同（ffmpeg 按后缀选封装格式：
+/// 智能微调沿用原文件名，`.mkv` 素材就该输出 mkv 封装，不能变成扩展名是 mkv、内容是 mp4 的文件）。
+/// 正式名没有后缀时用 `.mp4`。
 ///
 /// 编码先写这里，**全部单元成功后**才由 [`publish_parts`] 统一改名为正式名：
 /// 中途失败、崩溃或被停止都不会留下与正常成片同名的截断文件，上一轮的正式成片也保持完好。
@@ -1369,7 +1372,12 @@ fn part_path(final_path: &Path) -> PathBuf {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    final_path.with_file_name(format!(".{name}.part.mp4"))
+    let ext = final_path
+        .extension()
+        .map(|ext| ext.to_string_lossy().into_owned())
+        .filter(|ext| !ext.is_empty())
+        .unwrap_or_else(|| "mp4".into());
+    final_path.with_file_name(format!(".{name}.part.{ext}"))
 }
 
 /// 删除一批临时文件（不存在的忽略）。失败 / 停止时调用，保证不留 `.part` 残余。
@@ -4900,9 +4908,18 @@ Conversion failed!
     }
 
     #[test]
-    fn part_path_is_hidden_mp4_in_same_dir() {
+    fn part_path_is_hidden_and_keeps_container_extension() {
         let part = part_path(Path::new("/输出/视频成片/第01集.mp4"));
         assert_eq!(part, PathBuf::from("/输出/视频成片/.第01集.mp4.part.mp4"));
+        // 智能微调沿用原名：mkv 素材的临时文件也得是 .mkv，ffmpeg 才会输出 mkv 封装
+        assert_eq!(
+            part_path(Path::new("/输出/ep1.MKV")),
+            PathBuf::from("/输出/.ep1.MKV.part.MKV")
+        );
+        assert_eq!(
+            part_path(Path::new("/输出/无后缀")),
+            PathBuf::from("/输出/.无后缀.part.mp4")
+        );
     }
 
     #[test]

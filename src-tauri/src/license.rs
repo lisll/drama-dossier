@@ -159,6 +159,16 @@ fn dev_bypass() -> bool {
     false
 }
 
+/// 第二份存档的实现。调试构建跳过授权检查时不碰系统凭据库：每次重新编译二进制签名都会变，
+/// macOS 上会反复弹出钥匙串授权框；正式 / 发布构建一律用平台凭据库。
+fn license_anchor() -> Box<dyn crate::license_anchor::Anchor> {
+    #[cfg(debug_assertions)]
+    if dev_bypass() {
+        return Box::new(crate::license_anchor::NoAnchor);
+    }
+    crate::license_anchor::platform_anchor()
+}
+
 /// 信任的公钥。优先级：debug 构建的 `DD_LICENSE_DEV_PUBKEYS`（连本地测试服务器）
 /// → 测试版内置测试公钥（TEST-MODE）→ `PRODUCTION_KEYS`。
 #[inline(always)]
@@ -552,7 +562,7 @@ pub fn init(app: &AppHandle) {
     });
     let _ = CTX.set(Ctx {
         // 第二份存档放系统凭据库（Windows 凭据管理器 / macOS 钥匙串），见 license_anchor.rs。
-        state: State::with_anchor(path, machine_id, crate::license_anchor::platform_anchor()),
+        state: State::with_anchor(path, machine_id, license_anchor()),
         app_version: app.package_info().version.to_string(),
     });
     let _ = APP.set(app.clone());

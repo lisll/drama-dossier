@@ -348,7 +348,14 @@ function bindStopButton(selector, command, label, sentMessage) {
     button.disabled = true;
     button.textContent = "正在停止…";
     try {
-      await invoke(command);
+      const stopped = await invoke(command);
+      if (stopped === false) {
+        // 后端没有登记中的同类任务（还没开始或刚好结束）：如实提示，按钮恢复可点。
+        toast("当前没有可停止的任务");
+        button.disabled = false;
+        button.textContent = label;
+        return;
+      }
       toast(sentMessage);
     } catch (error) {
       toast(error, true);
@@ -713,13 +720,10 @@ async function saveSettings() {
     return;
   }
   // 字号是整数：填 12.5 时后端反序列化报的是 serde 原文，用户看不懂，先在这里拦下。
-  const badgeFontSize = $("#ai-badge-font-size").value.trim();
-  if (badgeFontSize !== "") {
-    const size = Number(badgeFontSize);
-    if (!Number.isInteger(size) || size < 10 || size > 24) {
-      reportError("AI 角标字号需填 10 到 24 之间的整数（留空用默认 12）。");
-      return;
-    }
+  const badgeError = badgeFontSizeError();
+  if (badgeError) {
+    reportError(badgeError);
+    return;
   }
   try {
     const settings = buildSettingsFromForm(rules);
@@ -829,11 +833,31 @@ async function persistDramaMeta(drama = currentDramaOrNull()) {
     rules = state.settings?.rules ?? null;
   }
   const settings = buildSettingsFromForm(rules);
-  state.settings = settings;
-  loadedSettings = settings;
-  await saveAppSettings(settings);
-  refreshDirtyBadge();
-  await saveDramaTitleFor(drama);
+  // 静默保存不能因为字号填错就整体失败（后端会拒收，连带剧名也存不上）：沿用上次保存的字号并提示。
+  const badgeError = badgeFontSizeError();
+  if (badgeError) {
+    settings.aiBadgeFontSize = loadedSettings?.aiBadgeFontSize ?? null;
+    toast(`${badgeError}本次沿用上次保存的字号。`, true);
+  }
+  try {
+    await saveAppSettings(settings);
+    state.settings = settings;
+    loadedSettings = settings;
+    refreshDirtyBadge();
+  } finally {
+    // 设置保存失败时剧名照样单独保存（两者互不依赖）。
+    await saveDramaTitleFor(drama);
+  }
+}
+
+/** AI 角标字号输入框的校验：留空合法；否则必须是 10–24 的整数。返回错误文案或 null。 */
+function badgeFontSizeError() {
+  const raw = $("#ai-badge-font-size")?.value.trim() ?? "";
+  if (raw === "") return null;
+  const size = Number(raw);
+  return Number.isInteger(size) && size >= 10 && size <= 24
+    ? null
+    : "AI 角标字号需填 10 到 24 之间的整数（留空用默认 12）。";
 }
 
 /**
@@ -1709,11 +1733,13 @@ async function runDedupDemo() {
 /**
  * 生成挂载文案 CSV。目标文件已存在时后端拒绝覆盖；这里给出「覆盖」操作，
  * 用户点了才带 overwrite: true 重新生成（不会在用户不知情时覆盖已编辑过的文案）。
+ * `confirmedPath` 是用户确认覆盖的那个路径：确认后输入框又被改过时，新路径没有经过确认，不带 overwrite。
  */
-async function generatePublishCopy(overwrite = false) {
+async function generatePublishCopy(overwrite = false, confirmedPath = null) {
   try {
     const path = $("#publish-copy-path").value.trim();
     if (!path) throw new Error("请填写挂载文案 CSV 输出路径。");
+    overwrite = overwrite && path === confirmedPath;
     const drama = selectedDrama();
     const result = await call("generate_mount_copy_csv", {
       root: state.root,
@@ -1728,9 +1754,10 @@ async function generatePublishCopy(overwrite = false) {
   } catch (error) {
     const message = String(error);
     if (!overwrite && message.includes("文件已存在")) {
+      const pathToOverwrite = $("#publish-copy-path").value.trim();
       toast(`${message} 覆盖会丢掉文件里已编辑的文案。`, true, {
         label: "覆盖并重新生成",
-        run: () => generatePublishCopy(true),
+        run: () => generatePublishCopy(true, pathToOverwrite),
       });
       return;
     }
@@ -2176,10 +2203,13 @@ function cancelBitrateFix() {
 
 async function applyBitrateFix() {
   if (!bitratePending) return;
+  // cancelBitrateFix 会把 bitratePending 清空：集数先取出来，否则下一行读 null.length 直接抛错，
+  // 「确认修复」点了没有任何反应。
+  const pendingCount = bitratePending.length;
   // 走确认路径时不还焦点：紧接着就会开始长任务并禁用按钮。
   bitrateConfirmReturnFocus = null;
   cancelBitrateFix();
-  if (!beginTask(`正在重编码 ${bitratePending.length} 集（原文件会被替换）`)) return;
+  if (!beginTask(`正在重编码 ${pendingCount} 集（原文件会被替换）`)) return;
   const hideStop = showStopButton("#bitrate-stop", "停止码率修复");
   try {
     const drama = selectedDrama();

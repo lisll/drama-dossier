@@ -360,20 +360,26 @@ fn row_to_csv(row: &MountCopyRow) -> String {
 /// 以这些字符开头的单元格会被 Excel / WPS 当成公式执行（CSV 公式注入）。
 const FORMULA_TRIGGERS: [char; 6] = ['=', '+', '-', '@', '\t', '\r'];
 
+/// 「若干个英文单引号 + 公式触发字符」开头（含零个单引号）：这类值写出时要加保护前缀，读回时要去掉一个。
+/// 写、读用同一个判断，保证任意文本都能原样往返。
+fn formula_like(value: &str) -> bool {
+    value.trim_start_matches('\'').starts_with(FORMULA_TRIGGERS)
+}
+
 /// 写出前给可能被当成公式的单元格加一个英文单引号（OWASP 推荐做法：Excel 把它当文本前缀，不显示）。
+/// 用户原本就写成「单引号 + 触发字符」开头的文本（如 `'-_-`）也补一个，读回时只去掉一个。
 fn guard_formula(value: &str) -> String {
-    if value.starts_with(FORMULA_TRIGGERS) {
+    if formula_like(value) {
         format!("'{value}")
     } else {
         value.to_string()
     }
 }
 
-/// 读回时去掉 [`guard_formula`] 加的单引号：只在单引号后面紧跟公式触发字符时才去掉，
-/// 用户自己写的、以单引号开头的普通文本原样保留。
+/// 读回时去掉 [`guard_formula`] 加的那个单引号；用户自己写的、以单引号开头的普通文本原样保留。
 fn unguard_formula(value: &str) -> String {
     match value.strip_prefix('\'') {
-        Some(rest) if rest.starts_with(FORMULA_TRIGGERS) => rest.to_string(),
+        Some(rest) if formula_like(rest) => rest.to_string(),
         _ => value.to_string(),
     }
 }
@@ -521,6 +527,8 @@ mod tests {
         let mut rows = build_mount_copy_rows("测试剧", &[episode(1, "第1集.mp4")]);
         rows[0].mount_copy = "=1+1 不能被当成公式".into();
         rows[0].description = "'用户自己的单引号".into();
+        // 用户原本就写成「单引号 + 触发字符」开头：读回不能少掉那个单引号
+        rows[0].short_title = "'-_- 颜文字".into();
         write_mount_copy_csv(&path, &rows).unwrap();
         let raw = read_csv_text(&path).unwrap();
         assert!(

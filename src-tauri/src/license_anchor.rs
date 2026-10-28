@@ -21,10 +21,18 @@ pub trait Anchor: Send + Sync {
 }
 
 /// 没有第二份存档（Linux 等没有凭据库后端的平台，以及单测）：行为与加入锚点之前完全一致。
-#[cfg(any(test, not(any(target_os = "windows", target_os = "macos"))))]
+#[cfg(any(
+    test,
+    debug_assertions,
+    not(any(target_os = "windows", target_os = "macos"))
+))]
 pub struct NoAnchor;
 
-#[cfg(any(test, not(any(target_os = "windows", target_os = "macos"))))]
+#[cfg(any(
+    test,
+    debug_assertions,
+    not(any(target_os = "windows", target_os = "macos"))
+))]
 impl Anchor for NoAnchor {
     fn load(&self) -> Result<Option<String>, String> {
         Ok(None)
