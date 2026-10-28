@@ -314,6 +314,24 @@ pub(crate) fn model_runtime_with_probe(
     }
 }
 
+/// 取命令输出中最后一条非空行：ASR 失败时 stderr 的最后一行最有诊断价值。
+fn last_line(output: &dossier_runtime::CommandOutput) -> String {
+    output
+        .combined()
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("（无输出）")
+        .to_string()
+}
+
+/// GPU 转写失败、但错误指向「CUDA 不可用」（典型：asr-env 里的 torch 装成了
+/// CPU 版，whisper 在加载模型那一步就崩）。此时用 `--device cpu` 重跑是值得的；
+/// 其他错误（音频解码、模型缺失等）重跑也不会好，返回 false。
+fn asr_gpu_failure_worth_cpu_retry(detail: &str) -> bool {
+    detail.contains("on a CUDA device") || detail.contains("torch.cuda.is_available()")
+}
+
 /// 把一集视频转成“对白 + 画面文字”证据。
 #[allow(clippy::too_many_lines)]
 fn extract_episode(
@@ -383,31 +401,46 @@ fn extract_episode(
     let has_gpu = crate::toolbox::nvidia_gpu_present() || cfg!(target_os = "macos");
     plan.gpu = Some(has_gpu);
     let runner = SystemRunner::new();
-    let mut spec = plan
-        .build_command(&asr_program, runtime.asr.ok)
-        .map_err(|error| error.to_string())?;
-    spec.timeout = Some(Duration::from_secs(ASR_TIMEOUT_SECS));
-    // whisper CLI 解码音频统一走 PATH 上的 ffmpeg；GUI 进程 PATH 很干净，
-    // 把当前解析出的 ffmpeg 所在目录前置注入，避免 Windows 打包版报找不到 ffmpeg。
-    if let Some(ffmpeg_dir) = ffmpeg.parent() {
-        let chained = std::env::join_paths(std::iter::once(ffmpeg_dir.to_path_buf()).chain(
-            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
-        ))
-        .map(|value| value.display().to_string())
-        .unwrap_or_default();
-        spec.env.push(("PATH".into(), chained));
-    }
-    let output = runner
-        .run_cancellable(&spec, &crate::toolbox::transcode_cancelled)
+    // GPU 转写失败要能降级 CPU 重试，所以按当前 plan 现算命令（含 PATH 注入）。
+    let mut build_spec = |gpu: bool| -> Result<CommandSpec, String> {
+        plan.gpu = Some(gpu);
+        let mut spec = plan
+            .build_command(&asr_program, runtime.asr.ok)
+            .map_err(|error| error.to_string())?;
+        spec.timeout = Some(Duration::from_secs(ASR_TIMEOUT_SECS));
+        // whisper CLI 解码音频统一走 PATH 上的 ffmpeg；GUI 进程 PATH 很干净，
+        // 把当前解析出的 ffmpeg 所在目录前置注入，避免 Windows 打包版报找不到 ffmpeg。
+        if let Some(ffmpeg_dir) = ffmpeg.parent() {
+            let chained = std::env::join_paths(std::iter::once(ffmpeg_dir.to_path_buf()).chain(
+                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+            ))
+            .map(|value| value.display().to_string())
+            .unwrap_or_default();
+            spec.env.push(("PATH".into(), chained));
+        }
+        Ok(spec)
+    };
+    let mut output = runner
+        .run_cancellable(&build_spec(has_gpu)?, &crate::toolbox::transcode_cancelled)
         .map_err(|error| format!("ASR 执行失败：{error}"))?;
     if !output.success() {
-        let combined = output.combined();
-        let detail = combined
-            .lines()
-            .rev()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or("（无输出）");
-        return Err(format!("ASR 退出码 {}：{detail}", output.code_label()));
+        let mut detail = last_line(&output);
+        // 「机器有 NVIDIA」不代表 asr-env 里的 torch 真带 CUDA（旧版安装/升级失败
+        // 都会装成 CPU 版），此时 whisper 在加载模型那一步就崩。自动降级 CPU 重跑
+        // 一次，别让整轮材料报废。
+        if has_gpu && asr_gpu_failure_worth_cpu_retry(&detail) {
+            crate::logging::log_event(
+                "材料",
+                "GPU 转写不可用（torch 不带 CUDA），自动改用 CPU 重新转写",
+            );
+            output = runner
+                .run_cancellable(&build_spec(false)?, &crate::toolbox::transcode_cancelled)
+                .map_err(|error| format!("ASR 执行失败：{error}"))?;
+            detail = last_line(&output);
+        }
+        if !output.success() {
+            return Err(format!("ASR 退出码 {}：{detail}", output.code_label()));
+        }
     }
     let subtitle = plan.expected_subtitle_path();
     let cues = dossier_media::asr::load_transcript(&subtitle).map_err(|error| error.to_string())?;
@@ -1341,6 +1374,19 @@ fn material_pipeline_blocking(
 mod tests {
     use super::*;
     use dossier_runtime::{CommandOutput, FakeRunner};
+
+    /// 本机踩过的真实崩溃：GPU 版意图 + CPU 版 torch，加载模型即崩，应触发 CPU 重试。
+    #[test]
+    fn cpu_only_torch_failures_trigger_cpu_retry() {
+        let cuda_error = "RuntimeError: Attempting to deserialize object on a CUDA device but \
+torch.cuda.is_available() is False. If you are running on a CPU-only machine, please use \
+torch.load with map_location=torch.device('cpu') to map your storages to the CPU.";
+        assert!(asr_gpu_failure_worth_cpu_retry(cuda_error));
+        // 其他错误（音频解码失败等）重跑也不会好，不值得再跑一次
+        assert!(!asr_gpu_failure_worth_cpu_retry(
+            "Invalid data found when processing input"
+        ));
+    }
 
     #[test]
     fn parses_asr_engine_aliases() {
