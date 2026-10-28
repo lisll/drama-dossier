@@ -1584,9 +1584,10 @@ fn transcode_deep_blocking(
         if let Err(error) = generate_process_images_blocking(
             app,
             ffmpeg,
-            drama_name,
+            materials.title.as_deref().unwrap_or(drama_name),
+            materials.synopsis.as_deref(),
+            materials.poster.as_deref(),
             &picks,
-            episodes.len(),
             output_dir,
         ) {
             crate::logging::log_event("材料", format!("过程图生成失败（不影响成片）：{error}"));
@@ -1852,17 +1853,18 @@ fn render_ai_badge(app: &AppHandle, output_dir: &Path, enabled: bool) -> Option<
     }
 }
 
-/// 生成报审过程图：从原始素材代表集抽帧，交给 Pillow 脚本排版出 4 张竖屏单帧图。
-///
-/// 每张图就是一帧原片画面（保留原生画面与硬字幕），仅叠右上角半透明角标
-/// （集号 + 集内时间码），观感对齐剪辑软件导出的分镜帧。整个函数是
+/// 生成报审过程图：从原始素材代表集抽帧，交给 Pillow 脚本排版成
+/// Grove-Max 同款「AI 分镜创作画布」整屏截图（4 张：顶部窗口栏 + 故事梗概 +
+/// 资产/分镜提示词/分镜图帧三列节点卡 + 贝塞尔连线 + 底部工具栏；
+/// 第 N 张展示第 N 个代表集的 3 个分镜图帧）。整个函数是
 /// 「软失败」语义：调用方（deep 流程）只把错误记日志，不影响成片产物。
 fn generate_process_images_blocking(
     app: &AppHandle,
     ffmpeg: &Path,
-    _drama_name: &str,
+    drama_name: &str,
+    synopsis: Option<&str>,
+    poster: Option<&Path>,
     video_specs: &[(PathBuf, f64)],
-    _episode_count: usize,
     output_dir: &Path,
 ) -> Result<(), String> {
     if video_specs.is_empty() {
@@ -1870,12 +1872,11 @@ fn generate_process_images_blocking(
     }
 
     // 1) 每个代表集在 10% / 40% / 70% 处各抓一帧（video_specs 已是代表集清单），
-    //    同时记录帧的真实出处（集号 + 集内时间码）作为角标标签。
+    //    帧清单按「代表集 × 步长」排列：脚本按每 3 帧一组还原出各画面的图帧。
     let frames_dir = output_dir.join(".process-frames");
     let _ = std::fs::remove_dir_all(&frames_dir);
     std::fs::create_dir_all(&frames_dir).map_err(|error| format!("创建抽帧目录失败：{error}"))?;
     let mut frame_paths: Vec<String> = Vec::new();
-    let mut frame_labels: Vec<String> = Vec::new();
     let sample_points = [0.10f64, 0.40, 0.70];
     for slot in 0..PROCESS_IMAGE_COUNT {
         let (video, duration) = &video_specs[slot % video_specs.len()];
@@ -1899,13 +1900,6 @@ fn generate_process_images_blocking(
                 let _ = std::fs::remove_dir_all(&frames_dir);
                 return Err(format!("抽帧失败（{}）：{error}", video.display()));
             }
-            let seconds = (*duration * pct) as u64;
-            frame_labels.push(format!(
-                "第{}集 {:02}:{:02}",
-                slot + 1,
-                seconds / 60,
-                seconds % 60
-            ));
             frame_paths.push(frame_path.display().to_string());
         }
     }
@@ -1920,10 +1914,14 @@ fn generate_process_images_blocking(
             script.display().to_string(),
             "--output-dir".into(),
             output_dir.display().to_string(),
+            "--title".into(),
+            drama_name.to_string(),
+            "--synopsis".into(),
+            synopsis.unwrap_or("").to_string(),
+            "--poster".into(),
+            poster.map(|path| path.display().to_string()).unwrap_or_default(),
             "--frames".into(),
             frame_paths.join(","),
-            "--labels".into(),
-            frame_labels.join("|"),
         ])
         // 排版是纯 CPU 图像处理，2 分钟封顶防挂死。
         .timeout(Duration::from_secs(120));
