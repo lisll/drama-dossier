@@ -2738,6 +2738,30 @@ fn transcode_blocking(
     }
     match result {
         Ok(mut report) => {
+            let mut materials = materials;
+            // 深度处理：成片已全部发布，补上成片指纹与实际处理方式后才生成 AI 制作证明。
+            if let Some(material_report) = materials.as_mut().filter(|_| mode == "deep") {
+                let processing = crate::content::ProofProcessing {
+                    encoder: lanes.describe(),
+                    dedup_seed: report.dedup.as_ref().map(|summary| summary.seed),
+                    badge_text: badge_path
+                        .is_some()
+                        .then(|| settings.effective_ai_badge_text()),
+                };
+                let outputs: Vec<PathBuf> = report
+                    .items
+                    .iter()
+                    .map(|item| PathBuf::from(&item.output))
+                    .collect();
+                crate::content::finalize_deep_proof(
+                    app,
+                    &output_dir,
+                    material_report,
+                    &processing,
+                    &outputs,
+                    cancel,
+                );
+            }
             report.materials = materials;
             Ok(report)
         }

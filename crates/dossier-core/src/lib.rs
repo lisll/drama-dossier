@@ -50,7 +50,9 @@ pub use draft::{
     export_capcut_draft, import_capcut_draft, CapcutDraft, DraftExportOptions, DraftExportResult,
 };
 pub use ledger::{append_record, list_records, now_timestamp, LedgerRecord};
-pub use package::{generate_report_package, CostSheetForm, PackageOptions, PackageResult};
+pub use package::{
+    generate_report_package, sha256_file, CostSheetForm, PackageOptions, PackageResult,
+};
 pub use pipeline_version::{
     check_consistency, load_and_check, pipeline_version, ArtifactStamp, ConsistencyIssue,
     ConsistencyReport, SkewKind, ToolStamp, ERASE_PIPELINE, REPORT_PIPELINE, STAMP_SUFFIX,

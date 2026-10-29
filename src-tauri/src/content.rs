@@ -148,6 +148,10 @@ pub struct MaterialPipelineReport {
     /// 海报的 data URL，供转码页直接预览；落盘清单里不包含它。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub poster_data_url: Option<String>,
+    /// AI 制作证明字段：材料线程组装，深度处理收尾时补上成片清单与处理方式后出证明
+    /// （见 [`finalize_deep_proof`]）。不发给界面，落盘时单独写进清单的 `proofPayload`。
+    #[serde(skip)]
+    pub proof_payload: Option<serde_json::Value>,
 }
 
 impl MaterialPipelineReport {
@@ -169,6 +173,7 @@ impl MaterialPipelineReport {
             poster_regenerable: false,
             poster_basis: None,
             poster_data_url: None,
+            proof_payload: None,
         }
     }
 }
@@ -957,7 +962,8 @@ fn persist_generated(
     .map_err(|error| format!("保存材料元数据失败：{error}"))
 }
 
-fn local_date_string() -> String {
+/// 当前日期（**北京时间** UTC+8，与系统时区无关）。证明里按此标注为「北京时间」。
+fn beijing_date_string() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -977,7 +983,168 @@ fn local_date_string() -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
-/// AI 制作证明的字段。另存进清单（`proofPayload`），「按新文案重做海报」时据此重渲证明。
+/// 证明里的一条文件指纹，与报审包清单的 `{fileName, size, sha256}` 同口径。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProofFile {
+    pub file_name: String,
+    pub size: u64,
+    pub sha256: String,
+}
+
+/// 逐个计算文件指纹（流式 SHA-256）。每个文件之间检查停止令牌；任何一个读不到都整体报错，
+/// 证明里不会出现缺项的清单。
+pub(crate) fn proof_files(
+    paths: &[PathBuf],
+    cancel: &CancelToken,
+) -> Result<Vec<ProofFile>, String> {
+    paths
+        .iter()
+        .map(|path| {
+            if cancel.is_cancelled() {
+                return Err("已停止".to_string());
+            }
+            let size = std::fs::metadata(path)
+                .map_err(|error| format!("读取 {} 失败：{error}", path.display()))?
+                .len();
+            let sha256 = dossier_core::sha256_file(path)
+                .map_err(|error| format!("计算 {} 的 SHA-256 失败：{error}", path.display()))?;
+            Ok(ProofFile {
+                file_name: path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                size,
+                sha256,
+            })
+        })
+        .collect()
+}
+
+/// 本次深度处理实际执行了哪些处理（编码结束才完整可知）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProofProcessing {
+    /// 编码器与并行路数，如「libx264（2 路并行）」
+    pub encoder: String,
+    /// 去重配方种子；`None` = 没有启用去重配方（也就没有改写元数据）
+    pub dedup_seed: Option<u64>,
+    /// 烧录的 AI 角标文案；`None` = 没有烧录
+    pub badge_text: Option<String>,
+}
+
+/// 证明「处理方式」的逐行文字（纯函数，便于单测）。与深度处理的实际开关一一对应，
+/// 去重配方写入的元数据也如实列出（见 `dedup.rs` 的 `metadata_tags`）。
+pub(crate) fn processing_lines(processing: &ProofProcessing) -> Vec<String> {
+    let mut lines = vec![
+        "源文件原样保留，成片为重新编码的新文件".to_string(),
+        "按场景切点重组分集".to_string(),
+        "逐集微帧".to_string(),
+        format!("编码：{}", processing.encoder),
+    ];
+    match processing.dedup_seed {
+        Some(seed) => {
+            lines.push(format!(
+                "去重配方：种子 {seed}，逐集参数存证于 {}",
+                crate::dedup::RECIPE_FILE_NAME
+            ));
+            lines.push(
+                "成片元数据改写：make（iPhone 机型）、software（iOS 版本）、creation_time（推算的拍摄时间）"
+                    .to_string(),
+            );
+        }
+        None => lines.push("去重配方：未启用".to_string()),
+    }
+    lines.push(match &processing.badge_text {
+        Some(text) => format!("AI 合规角标：已烧录「{text}」"),
+        None => "AI 合规角标：未烧录".to_string(),
+    });
+    lines
+}
+
+/// 一项材料的 AI 参与情况（按来源说明判断）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AiOrigin {
+    /// 由 AI 生成（含沿用的、原来就是 AI 生成的海报）
+    Ai,
+    /// 非 AI（本地提供、素材封面、原始素材抽帧）
+    NotAi,
+    /// 沿用的值，当初是否由 AI 生成没有记录
+    Unrecorded,
+}
+
+/// 按来源说明判断 AI 参与情况；值为空（未生成 / 未填写 / 失败）时返回 None，声明里不列。
+fn ai_origin(value_present: bool, source: &str) -> Option<AiOrigin> {
+    if !value_present {
+        return None;
+    }
+    // 「沿用（…；原为 X）」取出 X 再判断；没有「原为」的沿用就是来源未记录。
+    let origin = original_poster_source(source);
+    Some(
+        if origin.starts_with("AI 生成") && !origin.contains("失败") {
+            AiOrigin::Ai
+        } else if source.starts_with("沿用") && origin == source {
+            AiOrigin::Unrecorded
+        } else {
+            AiOrigin::NotAi
+        },
+    )
+}
+
+/// 由证明字段算出 AI 声明：逐项按实际来源列出（纯函数，便于单测）。
+/// 返回 `(是否含 AI 生成内容, 声明正文)`；含 AI 项时页眉才显示「由人工智能辅助制作」。
+pub(crate) fn proof_declaration(payload: &serde_json::Value) -> (bool, String) {
+    let text = |key: &str| payload[key].as_str().unwrap_or_default();
+    let items = [
+        (
+            "剧名",
+            !text("title").trim().is_empty(),
+            text("titleSource"),
+        ),
+        (
+            "简介",
+            !text("synopsis").trim().is_empty(),
+            text("synopsisSource"),
+        ),
+        ("海报", !text("posterName").is_empty(), text("posterSource")),
+        (
+            "过程图",
+            payload["processCount"].as_u64().unwrap_or(0) > 0,
+            text("storyboardSource"),
+        ),
+    ];
+    let mut ai = Vec::new();
+    let mut not_ai = Vec::new();
+    let mut unrecorded = Vec::new();
+    for (label, present, source) in items {
+        match ai_origin(present, source) {
+            Some(AiOrigin::Ai) => ai.push(format!("{label}（{}）", original_poster_source(source))),
+            Some(AiOrigin::NotAi) => not_ai.push(format!("{label}（{source}）")),
+            Some(AiOrigin::Unrecorded) => unrecorded.push(label.to_string()),
+            None => {}
+        }
+    }
+    let mut parts = Vec::new();
+    if !ai.is_empty() {
+        parts.push(format!("由人工智能生成：{}。", ai.join("、")));
+    }
+    if !not_ai.is_empty() {
+        parts.push(format!("非人工智能生成：{}。", not_ai.join("、")));
+    }
+    if !unrecorded.is_empty() {
+        parts.push(format!(
+            "{}沿用本剧已保存的内容，当初是否由人工智能生成未记录，请制作方确认。",
+            unrecorded.join("、")
+        ));
+    }
+    if parts.is_empty() {
+        parts.push("本目录未生成剧名、简介、海报或过程图。".into());
+    }
+    parts.push("成片的处理方式见上文，报审前请人工复核上述内容。".into());
+    (!ai.is_empty(), parts.join(""))
+}
+
+/// AI 制作证明的字段（材料线程组装；成片清单与处理方式在编码结束后由
+/// [`attach_proof_outcome`] 补上）。另存进清单（`proofPayload`），「按新文案重做海报」时据此重渲证明。
 #[allow(clippy::too_many_arguments)]
 fn build_proof_payload(
     app: &AppHandle,
@@ -991,18 +1158,15 @@ fn build_proof_payload(
     poster_source: &str,
     storyboard_source: &str,
     process_count: usize,
+    sources: Option<&[ProofFile]>,
 ) -> serde_json::Value {
     let version = app.package_info().version.to_string();
     json!({
-        "date": local_date_string(),
+        "date": beijing_date_string(),
         "version": version,
         "dramaName": context.drama_name,
         "originalEpisodes": context.original_episodes,
         "encoder": context.encoder,
-        "processing": format!(
-            "按场景切点重组分集并逐集微帧，编码 {}。",
-            context.encoder
-        ),
         "evidence": evidence.map_or_else(
             || "未提取（ASR/OCR 未就绪或未启用）".to_string(),
             |value| format!("本地 ASR/OCR，共 {} 集", value.episodes.len())
@@ -1021,23 +1185,71 @@ fn build_proof_payload(
             .unwrap_or_default(),
         "processCount": process_count,
         "storyboardSource": storyboard_source,
+        // None = 素材指纹没算出来（读取失败或被停止），证明里写「未记录」
+        "sources": sources,
     })
 }
 
-/// 渲染 AI 制作证明：优先出图片；排版 Python 不可用时退回文本版，保证证明文件不缺位。
+/// 编码完成后补上处理方式与成片清单（`outputs` 为 None = 成片指纹没算出来）。
+pub(crate) fn attach_proof_outcome(
+    payload: &mut serde_json::Value,
+    processing: &ProofProcessing,
+    outputs: Option<&[ProofFile]>,
+) {
+    payload["processingLines"] = json!(processing_lines(processing));
+    payload["outputs"] = json!(outputs);
+}
+
+/// 渲染 AI 制作证明：先按当前字段重算 AI 声明，再优先出图片；图片失败退回文本版，
+/// 并把图片失败的真实原因作为提示返回。只保留一份当前证明：写成哪种就删掉另一种。
+/// 两种都失败时两份旧证明都删掉——留着会被当成本次的证明，而它对应的是上一轮的成片或海报。
 fn render_ai_proof(
     app: &AppHandle,
     output_dir: &Path,
-    payload: &serde_json::Value,
-) -> Result<PathBuf, String> {
-    if let Ok(path) = write_ai_proof_image(app, output_dir, payload) {
-        return Ok(path);
+    payload: &mut serde_json::Value,
+) -> Result<(PathBuf, Option<String>), String> {
+    let (ai_assisted, declaration) = proof_declaration(payload);
+    payload["aiAssisted"] = json!(ai_assisted);
+    payload["declaration"] = json!(declaration);
+    let png = output_dir.join(PROOF_IMAGE_FILE);
+    let txt = output_dir.join(PROOF_TEXT_FILE);
+    match write_ai_proof_image(app, output_dir, payload) {
+        Ok(path) => {
+            let _ = std::fs::remove_file(&txt);
+            Ok((path, None))
+        }
+        Err(image_error) => {
+            crate::logging::log_event(
+                "材料",
+                format!("AI 制作证明图片生成失败，改出文本版：{image_error}"),
+            );
+            match write_ai_proof_text(output_dir, payload) {
+                Ok(path) => {
+                    let _ = std::fs::remove_file(&png);
+                    Ok((
+                        path,
+                        Some(format!(
+                            "AI 制作证明图片生成失败，已改出文本版：{image_error}"
+                        )),
+                    ))
+                }
+                Err(text_error) => {
+                    let _ = std::fs::remove_file(&png);
+                    let _ = std::fs::remove_file(&txt);
+                    Err(format!(
+                        "AI 制作证明生成失败（图片：{image_error}；文本：{text_error}）"
+                    ))
+                }
+            }
+        }
     }
-    write_ai_proof_text(output_dir, payload)
 }
 
-/// 调 Pillow 脚本把证明字段渲染成 `AI制作证明.png`（toolbox 兜底证明复用）。
-pub(crate) fn write_ai_proof_image(
+const PROOF_IMAGE_FILE: &str = "AI制作证明.png";
+const PROOF_TEXT_FILE: &str = "AI制作证明.txt";
+
+/// 调 Pillow 脚本把证明字段渲染成 `AI制作证明.png`。
+fn write_ai_proof_image(
     app: &AppHandle,
     output_dir: &Path,
     payload: &serde_json::Value,
@@ -1051,7 +1263,7 @@ pub(crate) fn write_ai_proof_image(
     };
     let python = crate::toolbox::locate_materials_python(app).map_err(cleanup)?;
     let script = crate::toolbox::materials_script(app, "make_proof_image.py").map_err(cleanup)?;
-    let output_path = output_dir.join("AI制作证明.png");
+    let output_path = output_dir.join(PROOF_IMAGE_FILE);
     let spec = CommandSpec::new(python.display().to_string())
         .arg(script.display().to_string())
         .args(["--data", &data_path.display().to_string()])
@@ -1081,15 +1293,26 @@ pub(crate) fn write_ai_proof_image(
     Ok(output_path)
 }
 
-/// 兜底文本版证明：字段拼成 `AI制作证明.txt`（排版 Python 不可用时）。
-pub(crate) fn write_ai_proof_text(
-    output_dir: &Path,
-    payload: &serde_json::Value,
-) -> Result<PathBuf, String> {
-    crate::logging::log_event(
-        "材料",
-        "AI 制作证明图片生成失败，已退回文本版（材料排版 Python 环境不可用）",
-    );
+/// 文件清单的文字版：每行「文件名　大小　SHA-256」；没有记录时如实说明（纯函数，便于单测）。
+fn proof_file_section(title: &str, files: &serde_json::Value, missing: &str) -> String {
+    let Some(list) = files.as_array() else {
+        return format!("{title}：{missing}\n");
+    };
+    let mut text = format!("{title}（{} 个）：\n", list.len());
+    for file in list {
+        text.push_str(&format!(
+            "  {}　{} 字节　SHA-256 {}\n",
+            file["fileName"].as_str().unwrap_or_default(),
+            file["size"].as_u64().unwrap_or(0),
+            file["sha256"].as_str().unwrap_or_default(),
+        ));
+    }
+    text
+}
+
+/// 文本版证明的正文（纯函数，便于单测）：与图片版内容一致，文件清单列全。
+/// 调用前 `payload` 里须已有 `declaration`（见 [`render_ai_proof`]）。
+fn proof_text_body(payload: &serde_json::Value) -> String {
     let get = |key: &str| payload[key].as_str().unwrap_or_default();
     let line = |label: &str, value: &str, source: &str| {
         format!(
@@ -1099,30 +1322,58 @@ pub(crate) fn write_ai_proof_text(
     };
     let mut body = String::new();
     body.push_str("AI 制作证明\n\n");
-    body.push_str(&format!("生成日期：{}（本地时间）\n", get("date")));
+    body.push_str(&format!("生成日期：{}（北京时间）\n", get("date")));
     body.push_str(&format!("制作工具：DramaDossier v{}\n", get("version")));
     body.push_str(&format!(
-        "原剧目：{}（原始素材 {} 集）\n",
+        "原剧目：{}（原始素材 {} 集）\n\n",
         get("dramaName"),
         payload["originalEpisodes"].as_u64().unwrap_or(0)
     ));
-    body.push_str(&format!("处理方式：{}\n\n", get("processing")));
-    body.push_str(&format!("内容证据：{}\n\n", get("evidence")));
+    body.push_str("处理方式：\n");
+    match payload["processingLines"].as_array() {
+        Some(lines) => {
+            for item in lines {
+                body.push_str(&format!("  · {}\n", item.as_str().unwrap_or_default()));
+            }
+        }
+        None => body.push_str("  未记录（上次深度处理未完成）\n"),
+    }
+    body.push_str(&format!("\n内容证据：{}\n\n", get("evidence")));
     body.push_str(&line("剧名", get("title"), get("titleSource")));
-    body.push_str(&line("简介", get("synopsis"), get("synopsisSource")));
+    if get("synopsis").trim().is_empty() {
+        body.push_str(&format!("简介：未填写\n来源：{}\n", get("synopsisSource")));
+    } else {
+        body.push_str(&line("简介", get("synopsis"), get("synopsisSource")));
+    }
     body.push_str(&line("海报", get("posterName"), get("posterSource")));
-    body.push_str(&format!(
-        "过程图：已生成 {} 张（画面抽自原始素材代表集）\n来源：{}\n\n",
-        payload["processCount"].as_u64().unwrap_or(0),
-        get("storyboardSource"),
+    let count = payload["processCount"].as_u64().unwrap_or(0);
+    if count == 0 {
+        body.push_str("过程图：未生成\n\n");
+    } else {
+        body.push_str(&format!(
+            "过程图：已生成 {count} 张（画面抽自原始素材代表集）\n来源：{}\n\n",
+            get("storyboardSource"),
+        ));
+    }
+    body.push_str(&proof_file_section(
+        "成片清单",
+        &payload["outputs"],
+        "未记录（上次深度处理未完成）",
     ));
-    body.push_str(
-        "AI 声明：本目录中的剧名、简介、海报与过程图由人工智能辅助生成或整理，\
-         分集重组与微帧由 DramaDossier 自动化完成，原始视频素材未作改动。\
-         报审前请人工复核上述内容。\n",
-    );
-    let path = output_dir.join("AI制作证明.txt");
-    std::fs::write(&path, body)
+    body.push_str(&proof_file_section(
+        "原始素材",
+        &payload["sources"],
+        "未记录（素材指纹未能计算）",
+    ));
+    body.push_str(&format!("\nAI 声明：{}\n\n", get("declaration")));
+    body.push_str("制作方：________________　签署：________________　日期：________________\n");
+    body
+}
+
+/// 文本版证明 `AI制作证明.txt`（图片版生成失败时）。
+fn write_ai_proof_text(output_dir: &Path, payload: &serde_json::Value) -> Result<PathBuf, String> {
+    let path = output_dir.join(PROOF_TEXT_FILE);
+    std::fs::write(&path, proof_text_body(payload))
         .map_err(|error| format!("写入 AI 制作证明失败（{}）：{error}", path.display()))?;
     Ok(path)
 }
@@ -1367,6 +1618,7 @@ fn material_pipeline_blocking(
             poster_regenerable: false,
             poster_basis: None,
             poster_data_url: None,
+            proof_payload: None,
         });
     }
 
@@ -1535,9 +1787,6 @@ fn material_pipeline_blocking(
         messages.push(error);
     }
 
-    // 过程图不再携带分镜概要文字（纯原片帧 + 角标），来源固定为原始素材抽帧。
-    let storyboard_source = "原始素材抽帧".to_string();
-
     // ── 海报：本次输出目录已有就沿用（处理中不重做）→ AI → 素材封面 → 无 ──
     let old_poster = existing_poster(output_dir);
     let poster_ai_on = settings.ai_poster_enabled != Some(false);
@@ -1660,12 +1909,36 @@ fn material_pipeline_blocking(
     if cancel.is_cancelled() {
         return Err("已停止".into());
     }
+    // 过程图是纯原片帧；一张都没生成时如实写「未生成」。
+    let storyboard_source = if process_images.is_empty() {
+        "未生成".to_string()
+    } else {
+        "原始素材抽帧".to_string()
+    };
     // 简介落盘：输出目录带一份 简介.txt（AI 生成或素材目录原有，随成片一起交付）。
     if let Some(text) = synopsis.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
         if let Err(error) = std::fs::write(output_dir.join("简介.txt"), text) {
             messages.push(format!("简介.txt 写入失败：{error}"));
         }
     }
+    // 原始素材指纹：在材料线程里算，和编码并行，不额外拖慢收尾。
+    let _ = app.emit(
+        "material-progress",
+        json!({ "stage": "proof", "label": "材料线程：正在计算原始素材指纹" }),
+    );
+    let source_paths: Vec<PathBuf> = episodes
+        .iter()
+        .map(|episode| episode.file.path.clone())
+        .collect();
+    let sources = match proof_files(&source_paths, cancel) {
+        Ok(files) => Some(files),
+        Err(error) if cancel.is_cancelled() => return Err(error),
+        Err(error) => {
+            crate::logging::log_event("材料", format!("原始素材指纹未算出：{error}"));
+            messages.push(format!("原始素材指纹未算出（证明里写「未记录」）：{error}"));
+            None
+        }
+    };
     let proof_payload = build_proof_payload(
         app,
         proof,
@@ -1678,14 +1951,8 @@ fn material_pipeline_blocking(
         &poster_source,
         &storyboard_source,
         process_images.len(),
+        sources.as_deref(),
     );
-    let proof_path = match render_ai_proof(app, output_dir, &proof_payload) {
-        Ok(path) => Some(path),
-        Err(error) => {
-            messages.push(error);
-            None
-        }
-    };
     let status = if messages.is_empty() {
         "completed"
     } else {
@@ -1698,7 +1965,8 @@ fn material_pipeline_blocking(
         synopsis,
         poster,
         process_images,
-        proof: proof_path,
+        // 证明要等成片哈希与实际处理方式，深度处理收尾时才生成（finalize_deep_proof）。
+        proof: None,
         evidence,
         messages,
         title_source,
@@ -1709,27 +1977,85 @@ fn material_pipeline_blocking(
         poster_regenerable,
         poster_basis,
         poster_data_url,
+        proof_payload: Some(proof_payload),
     };
-    // data URL 只用于本次界面的预览回包，落盘清单保留路径即可，避免文件膨胀；
-    // 清单另带一份证明字段（proofPayload），「按新文案重做海报」时据此重渲证明。
+    record_manifest(output_dir, &mut report);
+    Ok(report)
+}
+
+/// 写材料清单：报告字段 + `proofPayload`（data URL 只用于本次界面预览，不写入）。
+fn write_material_manifest(
+    output_dir: &Path,
+    report: &MaterialPipelineReport,
+) -> Result<(), String> {
     let mut manifest_report = report.clone();
     manifest_report.poster_data_url = None;
-    let written = serde_json::to_value(&manifest_report)
-        .map_err(|error| format!("生成清单失败：{error}"))
-        .and_then(|mut value| {
-            value["proofPayload"] = proof_payload;
-            write_manifest(output_dir, &value)
-        });
-    if let Err(error) = written {
-        // 清单写不进去：上一份清单原样保留（原子写），但要让用户看到——
-        // 下次的过期判断与重做海报都依赖它。
+    let mut value =
+        serde_json::to_value(&manifest_report).map_err(|error| format!("生成清单失败：{error}"))?;
+    if let Some(payload) = &report.proof_payload {
+        value["proofPayload"] = payload.clone();
+    }
+    write_manifest(output_dir, &value)
+}
+
+/// 写清单；写不进去时上一份清单原样保留（原子写），把后果写进报告让用户看到——
+/// 下次的过期判断与重做海报都依赖它。
+fn record_manifest(output_dir: &Path, report: &mut MaterialPipelineReport) {
+    if let Err(error) = write_material_manifest(output_dir, report) {
         crate::logging::log_event("材料", &error);
         report.messages.push(format!(
             "{error}。下次深度处理的海报过期判断可能不准，「按新文案重做海报」也可能不可用。"
         ));
         report.status = "partial".into();
     }
-    Ok(report)
+}
+
+/// 深度处理收尾（编码成功、材料线程汇合之后）：补上成片清单与处理方式，生成 AI 制作证明并改写清单。
+///
+/// 只在编码成功后调用：编码失败或停止时不出新证明，上一轮的证明仍与上一轮成片对应。
+/// 材料线程失败（没有证明字段）时什么都不做。
+pub(crate) fn finalize_deep_proof(
+    app: &AppHandle,
+    output_dir: &Path,
+    report: &mut MaterialPipelineReport,
+    processing: &ProofProcessing,
+    output_paths: &[PathBuf],
+    cancel: &CancelToken,
+) {
+    let Some(mut payload) = report.proof_payload.take() else {
+        return;
+    };
+    let before = report.messages.len();
+    let _ = app.emit(
+        "material-progress",
+        json!({ "stage": "proof", "label": "正在计算成片指纹并生成 AI 制作证明" }),
+    );
+    let outputs = match proof_files(output_paths, cancel) {
+        Ok(files) => Some(files),
+        Err(error) => {
+            crate::logging::log_event("材料", format!("成片指纹未算出：{error}"));
+            report
+                .messages
+                .push(format!("成片指纹未算出（证明里写「未记录」）：{error}"));
+            None
+        }
+    };
+    attach_proof_outcome(&mut payload, processing, outputs.as_deref());
+    match render_ai_proof(app, output_dir, &mut payload) {
+        Ok((path, warning)) => {
+            report.proof = Some(path);
+            report.messages.extend(warning);
+        }
+        Err(error) => {
+            crate::logging::log_event("材料", &error);
+            report.messages.push(error);
+        }
+    }
+    if report.messages.len() > before {
+        report.status = "partial".into();
+    }
+    report.proof_payload = Some(payload);
+    record_manifest(output_dir, report);
 }
 
 /// 过期提示消息的特征文本（材料线程写入、重做成功后移除）。
@@ -1843,20 +2169,26 @@ pub(crate) fn regenerate_poster_blocking(
     }
     let poster_source = ai_source_label(&settings.img_model);
     let mut messages = Vec::new();
+    let mut proof_render_failed = false;
     let proof = match manifest.get_mut("proofPayload").filter(|v| v.is_object()) {
         Some(payload) => {
-            payload["date"] = json!(local_date_string());
+            payload["date"] = json!(beijing_date_string());
             payload["posterName"] = json!(poster
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or_default());
             payload["posterSource"] = json!(poster_source);
             payload["posterPath"] = json!(poster.display().to_string());
-            let payload = payload.clone();
-            match render_ai_proof(app, output_dir, &payload) {
-                Ok(path) => Some(path),
+            // 就地渲染：重算的 AI 声明随清单一起写回。旧清单没有成片清单 / 处理方式时，
+            // 证明里如实写「未记录（上次深度处理未完成）」。
+            match render_ai_proof(app, output_dir, payload) {
+                Ok((path, warning)) => {
+                    messages.extend(warning);
+                    Some(path)
+                }
                 Err(error) => {
                     messages.push(format!("海报已重做，但 AI 制作证明重渲失败：{error}"));
+                    proof_render_failed = true;
                     None
                 }
             }
@@ -1879,6 +2211,10 @@ pub(crate) fn regenerate_poster_blocking(
             Some(synopsis.as_str()).filter(|text| !text.is_empty()),
         ),
     );
+    // 重渲失败时旧证明已被删（它配的是旧海报），清单里不能再指向它。
+    if proof_render_failed {
+        manifest["proof"] = serde_json::Value::Null;
+    }
     write_manifest(output_dir, &manifest)
         .map_err(|error| format!("海报已重做，但改写清单失败：{error}"))?;
     crate::logging::log_event(
@@ -2326,5 +2662,164 @@ torch.load with map_location=torch.device('cpu') to map your storages to the CPU
             status.guidance
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn proof_payload_fixture() -> serde_json::Value {
+        json!({
+            "date": "2026-10-29",
+            "version": "0.2.24",
+            "dramaName": "测试剧",
+            "originalEpisodes": 2,
+            "evidence": "本地 ASR/OCR，共 2 集",
+            "title": "新剧名",
+            "titleSource": "AI 生成（模型 m）",
+            "synopsis": "简介",
+            "synopsisSource": SOURCE_LOCAL_DIR,
+            "posterName": "剧目海报.png",
+            "posterSource": "沿用（本次输出目录已有；原为 AI 生成（模型 img））",
+            "processCount": 4,
+            "storyboardSource": "原始素材抽帧",
+        })
+    }
+
+    #[test]
+    fn declaration_lists_items_by_actual_source() {
+        let (ai, text) = proof_declaration(&proof_payload_fixture());
+        assert!(ai, "含 AI 项时页眉显示徽章");
+        assert!(
+            text.contains(
+                "由人工智能生成：剧名（AI 生成（模型 m））、海报（AI 生成（模型 img））。"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("非人工智能生成：简介（本地提供（素材目录））、过程图（原始素材抽帧）。"),
+            "{text}"
+        );
+        assert!(!text.contains("请制作方确认"), "{text}");
+
+        // 全部非 AI：不显示徽章，声明里没有「由人工智能生成」
+        let mut payload = proof_payload_fixture();
+        payload["titleSource"] = json!(SOURCE_SAVED);
+        payload["posterSource"] = json!("本地提供（素材封面）");
+        let (ai, text) = proof_declaration(&payload);
+        assert!(!ai);
+        assert!(!text.contains("由人工智能生成："), "{text}");
+        // 沿用已保存的剧名：来源未记录，请制作方确认
+        assert!(text.contains("剧名沿用本剧已保存的内容"), "{text}");
+
+        // 失败 / 未生成的项不列；过程图 0 张也不列
+        let mut payload = proof_payload_fixture();
+        payload["title"] = json!("");
+        payload["titleSource"] = json!("AI 生成失败，未填写");
+        payload["processCount"] = json!(0);
+        payload["storyboardSource"] = json!("未生成");
+        let (_, text) = proof_declaration(&payload);
+        assert!(!text.contains("剧名"), "{text}");
+        assert!(!text.contains("过程图"), "{text}");
+    }
+
+    #[test]
+    fn processing_lines_follow_actual_switches() {
+        let full = processing_lines(&ProofProcessing {
+            encoder: "libx264（2 路并行）".into(),
+            dedup_seed: Some(42),
+            badge_text: Some("内容由AI生成".into()),
+        });
+        assert_eq!(full[0], "源文件原样保留，成片为重新编码的新文件");
+        assert!(full.contains(&"编码：libx264（2 路并行）".to_string()));
+        assert!(full
+            .iter()
+            .any(|line| line.starts_with("去重配方：种子 42")));
+        assert!(
+            full.iter()
+                .any(|line| line.contains("make（iPhone 机型）") && line.contains("creation_time")),
+            "启用去重配方时必须如实列出元数据改写"
+        );
+        assert!(full.contains(&"AI 合规角标：已烧录「内容由AI生成」".to_string()));
+
+        let bare = processing_lines(&ProofProcessing {
+            encoder: "h264_nvenc（3 路并行）".into(),
+            dedup_seed: None,
+            badge_text: None,
+        });
+        assert!(bare.contains(&"去重配方：未启用".to_string()));
+        assert!(bare.contains(&"AI 合规角标：未烧录".to_string()));
+        assert!(!bare.iter().any(|line| line.contains("元数据改写")));
+    }
+
+    #[test]
+    fn proof_text_lists_files_and_handles_missing_records() {
+        let mut payload = proof_payload_fixture();
+        let file = |name: &str| ProofFile {
+            file_name: name.into(),
+            size: 3,
+            sha256: "ab".repeat(32),
+        };
+        attach_proof_outcome(
+            &mut payload,
+            &ProofProcessing {
+                encoder: "libx264（2 路并行）".into(),
+                dedup_seed: None,
+                badge_text: None,
+            },
+            Some(&[file("第01集.mp4"), file("第02集.mp4")]),
+        );
+        payload["sources"] = json!([file("ep1.mp4")]);
+        let (_, declaration) = proof_declaration(&payload);
+        payload["declaration"] = json!(declaration);
+        let body = proof_text_body(&payload);
+        assert!(body.contains("生成日期：2026-10-29（北京时间）"), "{body}");
+        assert!(body.contains("成片清单（2 个）"), "{body}");
+        assert!(body.contains(&format!("第02集.mp4　3 字节　SHA-256 {}", "ab".repeat(32))));
+        assert!(body.contains("原始素材（1 个）"), "{body}");
+        assert!(body.contains("  · 去重配方：未启用"), "{body}");
+
+        // 旧清单：没有成片清单与处理方式；没有简介、过程图 0 张
+        let mut old = proof_payload_fixture();
+        old["synopsis"] = json!("");
+        old["processCount"] = json!(0);
+        let body = proof_text_body(&old);
+        assert!(
+            body.contains("处理方式：\n  未记录（上次深度处理未完成）"),
+            "{body}"
+        );
+        assert!(
+            body.contains("成片清单：未记录（上次深度处理未完成）"),
+            "{body}"
+        );
+        assert!(
+            body.contains("原始素材：未记录（素材指纹未能计算）"),
+            "{body}"
+        );
+        assert!(body.contains("过程图：未生成"), "{body}");
+        assert!(!body.contains("0 字"), "{body}");
+    }
+
+    #[test]
+    fn proof_files_hash_each_file_and_report_missing() {
+        let dir = std::env::temp_dir().join(format!("dossier-proof-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.mp4"), b"abc").unwrap();
+        let cancel = CancelToken::new();
+        let files = proof_files(&[dir.join("a.mp4")], &cancel).unwrap();
+        assert_eq!(
+            files,
+            vec![ProofFile {
+                file_name: "a.mp4".into(),
+                size: 3,
+                // sha256("abc")
+                sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+            }]
+        );
+        let error = proof_files(&[dir.join("缺失.mp4")], &cancel).unwrap_err();
+        assert!(error.contains("缺失.mp4"), "{error}");
+        cancel.cancel();
+        assert_eq!(
+            proof_files(&[dir.join("a.mp4")], &cancel).unwrap_err(),
+            "已停止"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

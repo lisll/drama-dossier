@@ -256,7 +256,9 @@ fn collect_files(dir: &Path, out: &mut Vec<ManifestFile>) -> std::io::Result<()>
     Ok(())
 }
 
-fn sha256_file(p: &Path) -> std::io::Result<String> {
+/// 文件的 SHA-256（小写十六进制），64 KiB 分块流式读取，大视频文件也不会整份读进内存。
+/// 报审包清单与 AI 制作证明的文件指纹共用这一个实现。
+pub fn sha256_file(p: &Path) -> std::io::Result<String> {
     let mut h = Sha256::new();
     let mut file = File::open(p)?;
     let mut buffer = [0_u8; 64 * 1024];
