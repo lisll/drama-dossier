@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// 可被停止的长任务类别；每类对应界面上一个停止按钮。
+/// 长任务类别。前三类各对应界面上一个停止按钮；其余只登记「正在运行」，
+/// 供应用升级前判断能不能退出（它们有各自原来的停止方式，不走这里的令牌）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskKind {
     /// 转码（微调 / 重组 / 深度处理，含材料线程）
@@ -19,6 +20,29 @@ pub enum TaskKind {
     Bitrate,
     /// V5 去重验证
     DedupDemo,
+    /// 字幕 / 水印擦除
+    Erase,
+    /// 一键安装运行环境、内容模型
+    Install,
+    /// 生成报审包
+    Package,
+    /// 按新文案重做海报（联网生图并写文件）
+    Poster,
+}
+
+impl TaskKind {
+    /// 给用户看的名称（升级被拦下时告诉用户在等哪个任务）。
+    pub fn label(self) -> &'static str {
+        match self {
+            TaskKind::Transcode => "转码",
+            TaskKind::Bitrate => "码率修复",
+            TaskKind::DedupDemo => "去重验证",
+            TaskKind::Erase => "擦除",
+            TaskKind::Install => "安装运行环境 / 模型",
+            TaskKind::Package => "生成报审包",
+            TaskKind::Poster => "重做海报",
+        }
+    }
 }
 
 /// 取消令牌：`cancel()` 只置位自己；`is_cancelled()` 同时看父令牌。
@@ -110,6 +134,19 @@ pub fn cancel_kind(kind: TaskKind) -> usize {
     count
 }
 
+/// 当前正在运行的任务类别（去重，按登记顺序无关的固定顺序返回）。
+pub fn running_kinds() -> Vec<TaskKind> {
+    let tasks = lock();
+    let mut kinds: Vec<TaskKind> = Vec::new();
+    for (kind, _) in tasks.values() {
+        if !kinds.contains(kind) {
+            kinds.push(*kind);
+        }
+    }
+    kinds.sort_by_key(|kind| *kind as u8);
+    kinds
+}
+
 #[cfg(test)]
 fn is_registered(id: u64) -> bool {
     lock().contains_key(&id)
@@ -162,5 +199,27 @@ mod tests {
         assert!(is_registered(id));
         drop(guard);
         assert!(!is_registered(id), "任务结束后不能残留在活动表里");
+    }
+
+    #[test]
+    fn running_kinds_tracks_guards() {
+        let guard = register(TaskKind::Erase);
+        assert!(running_kinds().contains(&TaskKind::Erase));
+        drop(guard);
+        // 同一类别登记多个任务时只列一次（「是否释放」由 guard_drop_removes_task 覆盖）
+        let poster = register(TaskKind::Poster);
+        assert!(running_kinds().contains(&TaskKind::Poster));
+        assert_eq!(TaskKind::Poster.label(), "重做海报");
+        drop(poster);
+        let a = register(TaskKind::Package);
+        let b = register(TaskKind::Package);
+        assert_eq!(
+            running_kinds()
+                .iter()
+                .filter(|kind| **kind == TaskKind::Package)
+                .count(),
+            1
+        );
+        drop((a, b));
     }
 }

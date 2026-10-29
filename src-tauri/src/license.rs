@@ -39,6 +39,9 @@ const ALLOWED_WITHOUT_LICENSE: &[&str] = &[
     "license_activate",
     "license_refresh",
     "license_machine_code",
+    // 授权过期 / 被锁定的用户也必须能升级：修复授权问题的版本要能送到他们手上
+    "app_update_check",
+    "app_update_install",
     "open_log_dir",
     "read_recent_logs",
     "transcode_stop",
@@ -740,7 +743,7 @@ mod tests {
     fn whitelist_commands_exist() {
         let lib = include_str!("lib.rs");
         for cmd in ALLOWED_WITHOUT_LICENSE {
-            let found = ["license", "logging", "toolbox", "erase"]
+            let found = ["license", "logging", "toolbox", "erase", "app_update"]
                 .iter()
                 .any(|m| lib.contains(&format!("{m}::{cmd},")))
                 || lib.contains(&format!("            {cmd},"));

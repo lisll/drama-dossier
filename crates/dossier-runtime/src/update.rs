@@ -350,17 +350,7 @@ pub fn verify_release_signature_with(
         });
     }
 
-    let workspace = std::env::temp_dir().join(format!(
-        "dossier-update-{}-{}-{}",
-        std::process::id(),
-        sanitize_version(&release.version),
-        VERIFY_WORKSPACE_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_dir_all(&workspace);
-    std::fs::create_dir_all(&workspace).map_err(|source| UpdateError::Io {
-        path: workspace.clone(),
-        source,
-    })?;
+    let workspace = create_verify_workspace(&std::env::temp_dir(), &release.version)?;
     let payload_path = workspace.join("payload.bin");
     let signature_path = workspace.join("release.sig");
     let cleanup = |path: &Path| {
@@ -372,8 +362,12 @@ pub fn verify_release_signature_with(
             source,
         })
     };
-    write(&payload_path, &payload)?;
-    write(&signature_path, &signature)?;
+    if let Err(error) =
+        write(&payload_path, &payload).and_then(|()| write(&signature_path, &signature))
+    {
+        cleanup(&workspace);
+        return Err(error);
+    }
 
     let public_key_text = public_key_pem.display().to_string();
     let mut unavailable: Vec<String> = Vec::new();
@@ -414,6 +408,84 @@ pub fn verify_release_signature_with(
         "链上没有可用的 Ed25519 验签器（{}）",
         unavailable.join("；")
     )))
+}
+
+/// 独占创建验签工作目录时最多尝试几个序号。
+const VERIFY_WORKSPACE_ATTEMPTS: u64 = 16;
+
+/// 只有当前用户能进入的目录构建器：Unix 上 0700。
+///
+/// Windows 上不单独设置 ACL：新目录继承 `%TEMP%` 的权限，而 `%TEMP%` 默认位于用户目录下、
+/// 只有本人可访问。若把 TEMP 改到多人共享的目录，这层保护就不存在（已知限制）。
+#[cfg(unix)]
+fn private_dir_builder() -> std::fs::DirBuilder {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder
+}
+
+#[cfg(not(unix))]
+fn private_dir_builder() -> std::fs::DirBuilder {
+    std::fs::DirBuilder::new()
+}
+
+/// 每次调用都不同、别人猜不到的 64 位值。
+///
+/// `RandomState` 的种子来自操作系统随机数，且每个实例的键都不同，用它哈希一个空值即可
+/// 得到不可预测的值，不需要额外的随机数依赖。
+fn unpredictable_token() -> u64 {
+    use std::hash::BuildHasher;
+    std::collections::hash_map::RandomState::new().hash_one(())
+}
+
+/// 在 `base` 下新建一个只属于本次验签的工作目录。
+///
+/// 为什么不「先删后建」：临时目录是多用户共享的。同机其他用户可以抢先建好同名目录（或指向
+/// 别处的符号链接），等我们写入载荷后、验签前把文件换掉，签名就和清单脱钩了。所以这里：
+/// - 用 `create_dir` 独占创建——已存在就换下一个名字，绝不复用、也不删除别人的东西；
+/// - Unix 下创建时即为 0700，别的用户既不能往里写，也不能替换里面的文件；
+/// - 名字里带随机值，别人无法预先占满所有候选名字、让验签一直失败。
+fn create_verify_workspace(base: &Path, version: &str) -> Result<PathBuf, UpdateError> {
+    let token = unpredictable_token();
+    create_workspace_with(base, VERIFY_WORKSPACE_ATTEMPTS, |_| {
+        format!(
+            "dossier-update-{}-{}-{token:016x}-{}",
+            std::process::id(),
+            sanitize_version(version),
+            VERIFY_WORKSPACE_SEQ.fetch_add(1, Ordering::Relaxed)
+        )
+    })
+}
+
+/// 依次尝试 `name(0..attempts)` 给出的目录名，返回第一个独占创建成功的目录。
+/// 名字由调用方给出，测试可以传入确定的序列。
+fn create_workspace_with(
+    base: &Path,
+    attempts: u64,
+    mut name: impl FnMut(u64) -> String,
+) -> Result<PathBuf, UpdateError> {
+    let mut last_error = None;
+    for attempt in 0..attempts {
+        let candidate = base.join(name(attempt));
+        match private_dir_builder().create(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_error = Some((candidate, error));
+            }
+            Err(source) => {
+                return Err(UpdateError::Io {
+                    path: candidate,
+                    source,
+                })
+            }
+        }
+    }
+    let (path, source) = last_error.ok_or_else(|| UpdateError::Io {
+        path: base.to_path_buf(),
+        source: std::io::Error::other("没有可尝试的目录名"),
+    })?;
+    Err(UpdateError::Io { path, source })
 }
 
 /// 单次验签尝试的结果：要么「这个后端用不了」，要么「这个后端明确拒绝」，要么成功。
@@ -1427,5 +1499,78 @@ fs.writeFileSync(signaturePath, crypto.sign(null, fs.readFileSync(payloadPath), 
         let path = directory.join(name);
         std::fs::write(&path, bytes).unwrap();
         path
+    }
+
+    /// 测试用的独立临时根目录（不同用例互不影响）。
+    fn workspace_test_base(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "dossier-update-ws-{tag}-{}-{:016x}",
+            std::process::id(),
+            unpredictable_token()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    /// 前几个名字已被别人占用：必须跳过它们、用下一个新名字，且不能动对方的内容。
+    /// 名字序列由测试给定，不受其它并行用例推进全局计数器的影响。
+    #[test]
+    fn verify_workspace_skips_taken_names_without_touching_them() {
+        let base = workspace_test_base("skip");
+        let name = |n: u64| format!("ws-{n}");
+        for n in 0..3 {
+            let dir = base.join(name(n));
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("payload.bin"), b"theirs").unwrap();
+        }
+        let created = create_workspace_with(&base, 16, name).unwrap();
+        assert_eq!(created, base.join("ws-3"), "必须跳过已被占用的 3 个名字");
+        assert_eq!(std::fs::read_dir(&created).unwrap().count(), 0);
+        for n in 0..3 {
+            assert_eq!(
+                std::fs::read(base.join(name(n)).join("payload.bin")).unwrap(),
+                b"theirs"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&created).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 候选名字全被占用：返回 AlreadyExists 错误，不复用其中任何一个。
+    #[test]
+    fn verify_workspace_fails_when_every_name_is_taken() {
+        let base = workspace_test_base("full");
+        for n in 0..4 {
+            std::fs::create_dir(base.join(format!("ws-{n}"))).unwrap();
+        }
+        match create_workspace_with(&base, 4, |n| format!("ws-{n}")) {
+            Err(UpdateError::Io { path, source }) => {
+                assert_eq!(source.kind(), std::io::ErrorKind::AlreadyExists);
+                assert_eq!(path, base.join("ws-3"));
+            }
+            other => panic!("应返回 AlreadyExists，实际 {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 真实的工作目录名里带随机值：同一进程、同一版本连续两次也不同，别人无法预先占位。
+    #[test]
+    fn verify_workspace_names_are_unpredictable() {
+        let base = workspace_test_base("rand");
+        let first = create_verify_workspace(&base, "1.0.0").unwrap();
+        let second = create_verify_workspace(&base, "1.0.0").unwrap();
+        assert_ne!(first, second);
+        let name = first.file_name().unwrap().to_string_lossy().into_owned();
+        // dossier-update-<pid>-<版本>-<16 位随机十六进制>-<序号>；版本里也可能有 `-`，所以从尾部取
+        let token = name.rsplit('-').nth(1).unwrap();
+        assert_eq!(token.len(), 16, "{name}");
+        assert!(token.bytes().all(|b| b.is_ascii_hexdigit()), "{name}");
+        assert_ne!(unpredictable_token(), unpredictable_token());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

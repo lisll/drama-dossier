@@ -28,7 +28,10 @@ use thiserror::Error;
 
 use crate::command::{CommandError, CommandRunner, CommandSpec};
 use crate::digest::{is_sha256_hex, sha256_bytes, sha256_file};
-use crate::manifest::{is_safe_relative_path, Component, ManifestError, RuntimeManifest};
+use crate::manifest::{
+    install_path_issues, is_safe_relative_path, is_safe_version, Component, ManifestError,
+    RuntimeManifest,
+};
 
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const EXTRACT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -402,16 +405,30 @@ impl RuntimeStore {
 
     fn load_state(&self, id: &str) -> Result<StoreState, StoreError> {
         let path = self.state_path(id);
-        match fs::read(&path) {
+        let state: StoreState = match fs::read(&path) {
             Ok(raw) => serde_json::from_slice(&raw).map_err(|error| StoreError::InvalidState {
                 id: id.to_string(),
                 message: error.to_string(),
-            }),
+            })?,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                Ok(StoreState::default())
+                return Ok(StoreState::default())
             }
-            Err(source) => Err(StoreError::Io { path, source }),
+            Err(source) => return Err(StoreError::Io { path, source }),
+        };
+        // 这里的版本号会被 resolve / verify_component / rollback 直接拼成目录路径；
+        // state.json 在本地磁盘上可能被改过，读出来先按清单同一套规则校验。
+        let bad = state
+            .current
+            .iter()
+            .chain(state.versions.iter().map(|record| &record.version))
+            .find(|version| !is_safe_version(version));
+        if let Some(version) = bad {
+            return Err(StoreError::InvalidState {
+                id: id.to_string(),
+                message: format!("状态文件里的版本号 `{version}` 不是合法目录名，拒绝使用"),
+            });
         }
+        Ok(state)
     }
 
     fn save_state(&self, id: &str, state: &StoreState) -> Result<(), StoreError> {
@@ -517,6 +534,7 @@ impl RuntimeStore {
         component: &Component,
         source_dir: &Path,
     ) -> Result<InstallReport, StoreError> {
+        ensure_component_valid(component)?;
         if !source_dir.exists() {
             return Err(StoreError::SourceMissing(source_dir.to_path_buf()));
         }
@@ -634,6 +652,7 @@ impl RuntimeStore {
         component: &Component,
         runner: &dyn CommandRunner,
     ) -> Result<InstallReport, StoreError> {
+        ensure_component_valid(component)?;
         let url = component
             .source
             .url
@@ -933,6 +952,16 @@ fn first_line(text: &str) -> String {
         .find(|line| !line.is_empty())
         .unwrap_or("")
         .to_string()
+}
+
+/// 安装前再校验一次 `id` 与 `version`：两者会拼进安装目录路径，安装时还会先删除该目录。
+fn ensure_component_valid(component: &Component) -> Result<(), StoreError> {
+    let issues = install_path_issues(component);
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(StoreError::Manifest(ManifestError::Invalid { issues }))
+    }
 }
 
 fn create_dir_all(path: &Path) -> Result<(), StoreError> {
@@ -1368,6 +1397,90 @@ mod tests {
         assert!(status[0].satisfied());
         assert!(status[0].detail.contains("2 个文件"));
     }
+
+    /// 版本号会拼进安装目录且安装前会删除该目录：`../..` 这类版本必须在动文件之前被拒绝，
+    /// 组件目录以外的东西不能被删。
+    #[test]
+    fn install_rejects_path_traversal_version_before_touching_files() {
+        let fixture = Fixture::new("traversal");
+        let root = fixture.path("runtime");
+        let victim = fixture.write("victim/keep.txt", b"do-not-delete");
+        let mut component = make_component(&fixture, "m", "1.0", &[("a.bin", b"payload")]);
+        component.version = "../../../victim".into();
+        let store = open_store(&root);
+
+        let error = store
+            .install_local(&component, &fixture.path("src/m"))
+            .unwrap_err();
+        assert!(matches!(error, StoreError::Manifest(_)), "{error}");
+        assert!(error.to_string().contains("的版本"), "{error}");
+        assert_eq!(fs::read(&victim).unwrap(), b"do-not-delete");
+        assert!(!root.join("m").exists(), "被拒绝时不应创建任何安装目录");
+
+        component.source.url = Some("https://example.invalid/m.zip".into());
+        component.source.sha256 = Some(DIGEST_FOR_REJECT.into());
+        let error = store
+            .install_from_url(&component, &crate::command::SystemRunner::new())
+            .unwrap_err();
+        assert!(matches!(error, StoreError::Manifest(_)), "{error}");
+    }
+
+    /// 调用方没先 validate 整份清单时，文件路径 / layout 越界也必须在动任何文件之前被拒绝。
+    #[test]
+    fn install_rejects_unsafe_file_path_and_layout_before_touching_files() {
+        let fixture = Fixture::new("unsafe-files");
+        let root = fixture.path("runtime");
+        let store = open_store(&root);
+        let mut component = make_component(&fixture, "m", "1.0", &[("a.bin", b"payload")]);
+        component.files[0].path = "../escape.bin".into();
+        let error = store
+            .install_local(&component, &fixture.path("src/m"))
+            .unwrap_err();
+        assert!(error.to_string().contains("安全的相对路径"), "{error}");
+        assert!(!root.join("m").exists(), "被拒绝时不应创建任何安装目录");
+
+        let mut component = make_component(&fixture, "n", "1.0", &[("a.bin", b"payload")]);
+        component.source.layout = Some("/etc".into());
+        let error = store
+            .install_local(&component, &fixture.path("src/n"))
+            .unwrap_err();
+        assert!(error.to_string().contains("layout"), "{error}");
+        assert!(!root.join("n").exists());
+    }
+
+    /// state.json 被改成越界版本号：resolve / rollback / verify 都必须报错，不能拼出越界路径。
+    #[test]
+    fn tampered_state_versions_are_refused() {
+        let fixture = Fixture::new("tampered-state");
+        let root = fixture.path("runtime");
+        let store = open_store(&root);
+        let component = make_component(&fixture, "m", "1.0", &[("a.bin", b"payload")]);
+        store
+            .install_local(&component, &fixture.path("src/m"))
+            .unwrap();
+        let state_path = root.join("m/state.json");
+        let raw = fs::read_to_string(&state_path).unwrap();
+        assert!(raw.contains("\"1.0\""), "{raw}");
+
+        for bad in ["../../victim", "/etc", ".hidden"] {
+            fs::write(&state_path, raw.replace("\"1.0\"", &format!("\"{bad}\""))).unwrap();
+            for result in [
+                store.resolve("m").map(|_| ()),
+                store.rollback(&component).map(|_| ()),
+                store.verify_component(&component).map(|_| ()),
+            ] {
+                match result {
+                    Err(StoreError::InvalidState { message, .. }) => {
+                        assert!(message.contains("不是合法目录名"), "{message}")
+                    }
+                    other => panic!("版本号 {bad} 应被拒绝，实际 {other:?}"),
+                }
+            }
+        }
+    }
+
+    const DIGEST_FOR_REJECT: &str =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     #[test]
     fn install_refuses_sources_that_do_not_match_the_manifest() {

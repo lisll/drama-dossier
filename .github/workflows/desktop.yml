@@ -49,8 +49,28 @@ jobs:
       - name: Check default build
         run: cargo check -p drama-dossier
 
+  # 升级脚本单测（每次都跑，很快）；打标签时再确认标签版本 = 源码版本，
+  # 放在打包之前：版本号对不上时不必白跑三平台打包。
+  release-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install script dependencies
+        run: python -m pip install "cryptography==50.0.2"
+      - name: Test updater manifest script
+        run: python -m unittest discover -s scripts/tests -v
+      - name: Check tag matches source version
+        if: startsWith(github.ref, 'refs/tags/app-v')
+        # 标签名经环境变量传入，不直接拼进 shell 文本：git ref 允许 $( 与反引号
+        env:
+          TAG: ${{ github.ref_name }}
+        run: python scripts/make_latest_json.py check-version --tag "$TAG"
+
   bundle:
-    needs: test
+    needs: [test, release-check]
     if: startsWith(github.ref, 'refs/tags/app-v') || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
@@ -179,7 +199,7 @@ jobs:
       # macOS 包内置 ffmpeg/ffprobe：与 Windows 同一思路，用安装包资源实现运行时零下载。
       # 两个矩阵项架构不同（arm64 / x86_64），evermeet 只提供 x86_64 构建，
       # arm64 上通过 Rosetta 2 运行（自检会在缺 Rosetta 时明确提示）。
-      # 下载后校验字节数，与客户端下载路径用的是同一份期望值。
+      # 下载后校验 sha256，与客户端兜底下载（src-tauri/src/downloads.rs 的 EVERMEET）是同一组值，升级版本时两处一起改。
       - name: 预置 ffmpeg 到安装包资源（macOS）
         if: runner.os == 'macOS'
         shell: bash
@@ -191,17 +211,17 @@ jobs:
             local url="https://evermeet.cx/ffmpeg/${name}-9.0.2.zip"
             local zip="$RUNNER_TEMP/${name}.zip"
             curl -sSL --retry 5 --max-time 600 -o "$zip" "$url"
-            local size
-            size=$(wc -c < "$zip" | tr -d ' ')
-            if [ "$size" != "$expect" ]; then
-              echo "::error::${name}.zip 字节数不符：期望 $expect，实际 $size"
+            local actual
+            actual=$(shasum -a 256 "$zip" | awk '{print $1}')
+            if [ "$actual" != "$expect" ]; then
+              echo "::error::${name}.zip sha256 不符：期望 $expect，实际 $actual"
               exit 1
             fi
             unzip -o -q "$zip" -d src-tauri/resources/ffmpeg
             rm -f "$zip"
           }
-          fetch ffmpeg 26198325
-          fetch ffprobe 26104193
+          fetch ffmpeg 4acc0be580f9b2788029eb7bd4d645ff87968911b0a62aeeb3940d42d54558d5
+          fetch ffprobe 24a9c968cd4da72d99c7245e914b921815835eb6dff01d99868031aebaf1d439
           chmod +x src-tauri/resources/ffmpeg/ffmpeg src-tauri/resources/ffmpeg/ffprobe
           ls -lh src-tauri/resources/ffmpeg
           # 自检：Intel runner 直接能跑；arm64 runner 需要 Rosetta 2。
@@ -233,6 +253,10 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 升级签名私钥：tauri.conf.json 开了 createUpdaterArtifacts，缺它打包直接失败。
+          # 必须与 plugins.updater.pubkey 配对，release 任务会再验一遍签名。
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: .
           # 标签触发 = 正式包（official-release，未填正式公钥时在这里编译失败，release 任务随之不执行）；
@@ -243,16 +267,21 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: DramaDossier-windows-x64
+          # NSIS 安装包本身就是升级包，旁边的 .sig 是它的升级签名
           path: |
             target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe.sig
           if-no-files-found: error
       - name: Upload macOS bundle
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
           name: DramaDossier-${{ matrix.target }}
+          # .app.tar.gz 是 macOS 的升级包（dmg 只给首次手动安装用）
           path: |
             target/${{ matrix.target }}/release/bundle/macos/*.app
+            target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz
+            target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz.sig
             target/${{ matrix.target }}/release/bundle/dmg/*.dmg
           if-no-files-found: error
 
@@ -269,16 +298,71 @@ jobs:
     permissions:
       contents: write
     steps:
+      # 需要仓库里的 scripts/make_latest_json.py 与 tauri.conf.json（验签公钥、版本号）
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install script dependencies
+        run: python -m pip install "cryptography==50.0.2"
+
       - name: Download all bundles
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
+      # 把要发布的文件收拢到 dist/。两个 macOS 架构的升级包同名（DramaDossier.app.tar.gz），
+      # 按架构改名；签名只覆盖文件内容与版本号，不含文件名，改名不影响验签。
+      - name: Collect release files
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${VERSION#app-v}"
+          mkdir dist
+          shopt -s nullglob
+          single() {
+            local matches=("$@")
+            if [ "${#matches[@]}" -ne 1 ]; then
+              echo "::error::期望恰好 1 个文件，实际 ${#matches[@]} 个：${matches[*]:-无}" >&2
+              exit 1
+            fi
+            printf '%s' "${matches[0]}"
+          }
+          exe=$(single artifacts/DramaDossier-windows-x64/*-setup.exe)
+          cp "$exe" "$exe.sig" dist/
+          for pair in aarch64-apple-darwin:aarch64 x86_64-apple-darwin:x64; do
+            target="${pair%%:*}" arch="${pair##*:}"
+            dir="artifacts/DramaDossier-$target"
+            tarball=$(single "$dir"/macos/*.app.tar.gz)
+            cp "$tarball" "dist/DramaDossier_${version}_${arch}.app.tar.gz"
+            cp "$tarball.sig" "dist/DramaDossier_${version}_${arch}.app.tar.gz.sig"
+            cp "$(single "$dir"/dmg/*.dmg)" dist/
+          done
+          ls -l dist
+
+      # 用客户端内置的同一把公钥逐个验签，并核对签名里的版本号；任何一项不通过就不发布。
+      - name: Verify signatures and generate latest.json
+        env:
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          version="${TAG#app-v}"
+          exe=$(ls dist/*-setup.exe)
+          python scripts/make_latest_json.py build \
+            --tag "$TAG" --repo "$REPO" --out dist/latest.json \
+            --artifact "windows-x86_64=$exe" \
+            --artifact "darwin-aarch64=dist/DramaDossier_${version}_aarch64.app.tar.gz" \
+            --artifact "darwin-x86_64=dist/DramaDossier_${version}_x64.app.tar.gz"
+          cat dist/latest.json
+
       - name: Generate SHA256SUMS
         run: |
-          cd artifacts
-          find . -type f \( -name '*.exe' -o -name '*.dmg' \) -print0 \
-            | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+          cd dist
+          sha256sum *.exe *.dmg *.app.tar.gz latest.json > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Create GitHub Release
@@ -288,12 +372,19 @@ jobs:
           # （Info.plist、可执行文件、图标）位于 macos/ 目录，用 **/* 会把它们
           # 一并传上去，用户会看到一堆无意义条目。
           files: |
-            artifacts/*/*.exe
-            artifacts/*/dmg/*.dmg
-            artifacts/SHA256SUMS.txt
+            dist/*.exe
+            dist/*.exe.sig
+            dist/*.dmg
+            dist/*.app.tar.gz
+            dist/*.app.tar.gz.sig
+            dist/latest.json
+            dist/SHA256SUMS.txt
           # 任一平台产物缺失就失败，不静默发一个残缺的 Release。
           fail_on_unmatched_files: true
-          prerelease: true
+          # 必须是正式版并标为 latest：客户端的检查地址是 releases/latest/download/latest.json，
+          # GitHub 的 latest 会跳过预发布版本。
+          prerelease: false
+          make_latest: true
           generate_release_notes: true
           body: |
             > 本项目仅用于技术学习与交流，不用于实际报审提交或对外分发。
@@ -314,5 +405,9 @@ jobs:
             ## 已知问题
 
             - 分集表格的「集号」「文件名」两列可能显示为空白：后端结构体缺少 camelCase 序列化声明，界面读不到这两个字段。**不影响生成的材料包内容**，报告数据本身完整。
+
+            **自动升级**：从这个版本起，软件启动后会自动检查新版本，发现后顶部出现「立即升级」，
+            也可以在「设置 → 软件」里点「检查更新」。升级包经过签名校验，校验不通过不会安装。
+            已安装更早版本的用户需要手动下载安装一次本版本。
 
             下载后可对照本页 `SHA256SUMS.txt` 校验完整性。

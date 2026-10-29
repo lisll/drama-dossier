@@ -3393,7 +3393,7 @@ const CURL_PROGRAM: &str = "/usr/bin/curl";
 const CURL_PROGRAM: &str = "curl";
 
 // ffmpeg / ffprobe 的下载源与完整性凭据集中在 `crate::downloads`：
-// 那里按平台给出多源列表与各自的 sha256（macOS 因上游只提供 GPG 签名，退回字节数校验）。
+// 那里按平台给出多源列表与各自的 sha256（macOS 的 evermeet 源钉版本化地址与我们核对过的 sha256）。
 // 原来写在本文件里的 EVERMEET_* / GYAN_* 常量已迁走，避免两处地址不一致。
 
 /// Windows 一键配置的第 3 个组件：官方 CPython 3.11.9（amd64）安装器，约 25MB。
@@ -4095,9 +4095,12 @@ fn install_runtime_blocking(_app: &AppHandle) -> Result<InstallRuntimeReport, St
 pub async fn install_runtime(app: AppHandle) -> Result<InstallRuntimeReport, String> {
     // 测试期关键日志：一键配置运行环境（下载 ~25MB）是最关键的修复入口。
     crate::logging::log_event("环境", "开始一键安装运行环境");
-    let result = tauri::async_runtime::spawn_blocking(move || install_runtime_blocking(&app))
-        .await
-        .map_err(|error| format!("运行环境安装任务失败：{error}"))?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let _task = crate::tasks::register(TaskKind::Install);
+        install_runtime_blocking(&app)
+    })
+    .await
+    .map_err(|error| format!("运行环境安装任务失败：{error}"))?;
     crate::logging::log_event(
         "环境",
         crate::logging::result_text(&result, |report| {

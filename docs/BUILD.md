@@ -11,6 +11,18 @@ cargo tauri dev --features license-test-mode
 cargo tauri build --features license-test-mode   # 内测包；正式包用 --features official-release
 ```
 
+**本地打包需要升级签名私钥**：`tauri.conf.json` 开启了 `createUpdaterArtifacts`，`cargo tauri build`
+会给安装包生成升级签名，缺私钥时直接失败（`A public key has been found, but no private key`）。
+私钥只放在仓库外的 `~/.drama-dossier-keys/`，打包前在当前终端临时导出，不要写进任何文件：
+
+```bash
+export TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.drama-dossier-keys/updater.key)"
+export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$(cat ~/.drama-dossier-keys/updater.password)"
+cargo tauri build --features license-test-mode
+```
+
+`cargo test`、`cargo clippy`、`cargo tauri dev` 不签名，不需要这两个变量。
+
 **Linux 系统依赖**（与 CI 一致，缺了会在编译 `src-tauri` 时失败，而不是 lint 报错）：
 
 ```bash
@@ -39,10 +51,17 @@ scripts/install-hooks.sh    # 启用 .githooks（pre-commit 快检 / pre-push �
 
 GitHub Actions 工作流会先运行 Rust 测试和 Clippy，再使用 Tauri Action 构建三个平台的安装包。
 
-发布 tag 形如 `app-v0.2.1` 时，`bundle` 三个平台全部构建成功后，`release` job 会自动创建
-GitHub Release（标记为 prerelease），并挂上 Windows NSIS `.exe`、两个 macOS `.dmg`
-以及 `SHA256SUMS.txt`。任一平台构建失败则不会创建 Release；产物缺失时 `release` job
-会直接失败，不会发出残缺的 Release。
+发布 tag 形如 `app-v0.2.1` 时：
+
+1. `release-check` 先确认 tag 版本号与 `tauri.conf.json`、`src-tauri/Cargo.toml` 一致，不一致直接失败；
+2. `bundle` 三个平台构建（需要仓库 Secrets `TAURI_SIGNING_PRIVATE_KEY` 与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`）；
+3. 全部成功后，`release` job 用 `tauri.conf.json` 里的升级公钥逐个验证安装包签名，生成 `latest.json`，
+   创建 GitHub Release（**正式版并设为 latest**——客户端检查的是 `releases/latest/download/latest.json`，
+   GitHub 的 latest 会跳过预发布版本）。
+
+Release 挂上：Windows NSIS `.exe` 与 `.exe.sig`、两个 macOS `.dmg`、两个架构的升级包
+`.app.tar.gz` 与 `.sig`、`latest.json`、`SHA256SUMS.txt`。任一平台构建失败、产物缺失或签名
+校验不通过，都不会发出 Release。
 
 `release` job 只在推 tag 时运行：手动触发（`workflow_dispatch`）只构建、不发布，
 推 `master` 只跑质量门与测试。

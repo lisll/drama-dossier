@@ -44,3 +44,8 @@ license-server/var/
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm
+
+# 签名密钥兜底：真正的密钥放在仓库外的 ~/.drama-dossier-keys/，这几条防止误拷进来
+*.key
+updater.password
+.drama-dossier-keys/

@@ -42,15 +42,12 @@ impl Failure {
 
 /// 一个下载源的完整性凭据。
 ///
-/// 有能力提供 sha256 的源（BtbN、gyan.dev 的 `.sha256` 接口）优先用它；
-/// 只提供 GPG 签名、没有 sha256 的源（evermeet.cx）退回"按预期字节数校验"。
-/// 后者弱得多——它能挡住"下了一半"和"下成了别的版本"，挡不住"同尺寸替换"，
-/// 所以这类源只作兜底，不作为首选。取舍理由见 docs 里关于下载源的说明。
+/// 能固定哈希的源一律用 sha256。以前 macOS 的 evermeet 源只校验字节数（数值取自同一台
+/// 服务器），服务器被攻破时文件和字节数可以一起换掉，下载的程序随后会被执行——已改为
+/// 钉版本化地址 + sha256。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Integrity {
     Sha256(&'static str),
-    /// 只有期望的字节数（来源：发布方提供的元数据接口）
-    Size(u64),
     /// 没有可用的固定凭据：上游每日重建、不发布哈希。
     /// 只能靠 HTTPS 与调用方的自检把关；用的时候必须在代码里写明为什么。
     None,
@@ -60,16 +57,12 @@ impl Integrity {
     pub fn describe(&self) -> &'static str {
         match self {
             Integrity::Sha256(_) => "sha256",
-            Integrity::Size(_) => "字节数",
             Integrity::None => "无（仅 HTTPS 与自检）",
         }
     }
 }
 
 /// 一个下载源：地址 + 完整性凭据。
-///
-/// `url` 用 `String` 而不是 `&'static str`：evermeet 会清理旧版本，地址里的版本号
-/// 必须能按运行时查到的当前版本拼出来，写死会在上游发新版后 404。
 #[derive(Debug, Clone)]
 pub struct Source {
     pub url: String,
@@ -82,14 +75,6 @@ impl Source {
         Self {
             url: url.into(),
             integrity: Integrity::Sha256(sha256),
-        }
-    }
-
-    /// 只有字节数的源（兜底）
-    pub fn size(url: impl Into<String>, bytes: u64) -> Self {
-        Self {
-            url: url.into(),
-            integrity: Integrity::Size(bytes),
         }
     }
 }
@@ -134,7 +119,7 @@ pub fn file_sha256(path: &Path) -> Result<String, String> {
         .collect())
 }
 
-/// 按凭据校验文件：sha256 逐一字节比对；只有字节数时比对文件长度；
+/// 按凭据校验文件：sha256 逐一字节比对；
 /// `None` 表示没有可校验的凭据，只要文件存在且非空就放行（调用方必须自己再自检）。
 pub fn verify_file(path: &Path, integrity: &Integrity) -> bool {
     match integrity {
@@ -142,9 +127,6 @@ pub fn verify_file(path: &Path, integrity: &Integrity) -> bool {
             Ok(actual) => actual.eq_ignore_ascii_case(expected),
             Err(_) => false,
         },
-        Integrity::Size(expected) => std::fs::metadata(path)
-            .map(|meta| meta.is_file() && meta.len() == *expected)
-            .unwrap_or(false),
         Integrity::None => std::fs::metadata(path)
             .map(|meta| meta.is_file() && meta.len() > 0)
             .unwrap_or(false),
@@ -219,10 +201,9 @@ where
 ///   以前排在它前面的 BtbN 用的是滚动的 `latest` 地址却钉了固定哈希：上游每次重建（几乎每天）
 ///   校验就必然失败，实际每次都退回 gyan.dev，只是白白多下一遍 —— 已移除。
 ///   正常安装路径用的是安装包内置的 ffmpeg，这里只是兜底。
-/// - **macOS 只有 evermeet.cx** 提供 ffmpeg/ffprobe 单文件包，而它**只提供 GPG 签名**
-///   （`.zip.sig`），项目里没有 GPG 验签能力，所以退回"字节数"校验
-///   （数值取自同一台服务器的 `info/*/release` 接口）。**它只防截断，不防篡改**：
-///   服务器或链路被篡改时字节数也可以一起改。所以 macOS 优先用安装包内置的 ffmpeg，这里只作兜底。
+/// - **macOS 只有 evermeet.cx** 提供 ffmpeg/ffprobe 单文件包，它只发布 GPG 签名、不发布
+///   sha256。这里钉死版本化地址，sha256 由我们下载核对后写死（见 [`EVERMEET`]）。
+///   正常安装路径用的是安装包内置的 ffmpeg，这里只作兜底。
 #[cfg(target_os = "windows")]
 pub fn runtime_ffmpeg() -> Asset {
     Asset::new(
@@ -238,88 +219,49 @@ pub fn runtime_ffmpeg() -> Asset {
 }
 
 /// macOS：ffmpeg 与 ffprobe 分成两个包，各自一个源（evermeet 只有这一家）。
-///
-/// 版本号不写死：evermeet 会定期清理旧版本，写死 `9.0.2` 的 URL 迟早 404。
-/// 这里先问它的 `info/{name}/release` 接口拿到当前版本与 zip 字节数，再拼下载地址；
-/// 拿不到就退回下面这组"已知可用"的兜底值，保证离线/接口故障时仍能尝试。
 #[cfg(target_os = "macos")]
 pub fn runtime_ffmpeg() -> Asset {
-    Asset::new("ffmpeg", vec![evermeet_source("ffmpeg")])
+    Asset::new(
+        "ffmpeg",
+        vec![evermeet_source("ffmpeg", EVERMEET.ffmpeg_sha256)],
+    )
 }
 
 #[cfg(target_os = "macos")]
 pub fn runtime_ffprobe() -> Asset {
-    Asset::new("ffprobe", vec![evermeet_source("ffprobe")])
-}
-
-/// 已知可用的兜底版本与字节数（2026-10-27 核对 `info/*/release`）。
-#[cfg(target_os = "macos")]
-const EVERMEET_FALLBACK: (&str, u64, u64) = ("9.0.2", 26_198_325, 26_104_193);
-
-/// 向 evermeet 的 info 接口问当前版本与 zip 字节数；失败时用兜底值。
-///
-/// 接口返回形如 `{"version":"9.0.2","download":{"zip":{"url":"...","size":26198325}}}`。
-/// 这里只做非常宽松的字符串提取，避免为了两个字段引入 JSON 依赖（serde_json 本仓库已有，
-/// 但这份响应结构不稳定，用正则式提取更耐受字段增减）。
-#[cfg(target_os = "macos")]
-fn evermeet_source(name: &'static str) -> Source {
-    let (fallback_version, fallback_size) = match name {
-        "ffmpeg" => (EVERMEET_FALLBACK.0, EVERMEET_FALLBACK.1),
-        _ => (EVERMEET_FALLBACK.0, EVERMEET_FALLBACK.2),
-    };
-    let (version, size) =
-        evermeet_info(name).unwrap_or((fallback_version.to_string(), fallback_size));
-    if version != fallback_version {
-        crate::logging::log_event(
-            "环境",
-            format!("evermeet 上的 {name} 已更新到 {version}（内置兜底为 {fallback_version}）"),
-        );
-    }
-    Source::size(
-        format!("https://evermeet.cx/ffmpeg/{name}-{version}.zip"),
-        size,
+    Asset::new(
+        "ffprobe",
+        vec![evermeet_source("ffprobe", EVERMEET.ffprobe_sha256)],
     )
 }
 
-/// 查 evermeet 的当前版本与 zip 字节数。任何一步失败都返回 `None`，由调用方用兜底值。
-#[cfg(target_os = "macos")]
-fn evermeet_info(name: &str) -> Option<(String, u64)> {
-    // 函数内导入：放到文件顶部会在非 macOS 上成为未使用导入（CI 以 -D warnings 拦截）
-    use dossier_runtime::CommandRunner;
-
-    let url = format!("https://evermeet.cx/ffmpeg/info/{name}/release");
-    let spec = dossier_runtime::CommandSpec::new("/usr/bin/curl")
-        .args(["-sSL", "--max-time", "15", &url])
-        .timeout(std::time::Duration::from_secs(25));
-    let output = dossier_runtime::SystemRunner::new().run(&spec).ok()?;
-    if !output.success() {
-        return None;
-    }
-    let body = output.combined();
-    let version = extract_json_string(&body, "\"version\":\"")?;
-    // 必须先在 zip 段内定位，否则会取到外层（整包解压后的大小），不是 zip 的大小
-    let zip_start = body.find("\"zip\":")?;
-    let size = extract_json_u64(&body[zip_start..], "\"size\":")?;
-    Some((version, size))
-}
-
-/// 从 JSON 文本里取出 `"key":"value"` 的 value（够用即可，不引 JSON 依赖）。
+/// evermeet 的固定版本与 zip 的 sha256（2026-10-29 下载核对，字节数 26198325 / 26104193）。
 ///
-/// 不加平台限定：这段是纯字符串处理，放在所有平台编译才能在 Linux 上测到，
-/// 真正的 macOS 调用（`evermeet_info`）才是平台限定的。
-fn extract_json_string(body: &str, key: &str) -> Option<String> {
-    let start = body.find(key)? + key.len();
-    let rest = &body[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+/// 为什么写死而不跟随它的 `info/*/release` 接口：接口和文件在同一台服务器上，跟着它走就
+/// 等于没有校验。代价是 evermeet 清理旧版本后这条兜底会 404（下载失败、明确报错，不会装上
+/// 未经核对的文件），届时人工升级这里的版本与哈希，并同步 `.github/workflows/desktop.yml`
+/// 「预置 ffmpeg 到安装包资源（macOS）」步骤里的同一组值。
+#[cfg(any(target_os = "macos", test))]
+struct EvermeetPin {
+    version: &'static str,
+    ffmpeg_sha256: &'static str,
+    ffprobe_sha256: &'static str,
 }
 
-/// 从 JSON 文本里取出 `"size":123` 的数字（取第一个匹配）。
-fn extract_json_u64(body: &str, key: &str) -> Option<u64> {
-    let start = body.find(key)? + key.len();
-    let rest = body[start..].trim_start();
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    digits.parse().ok()
+#[cfg(any(target_os = "macos", test))]
+const EVERMEET: EvermeetPin = EvermeetPin {
+    version: "9.0.2",
+    ffmpeg_sha256: "4acc0be580f9b2788029eb7bd4d645ff87968911b0a62aeeb3940d42d54558d5",
+    ffprobe_sha256: "24a9c968cd4da72d99c7245e914b921815835eb6dff01d99868031aebaf1d439",
+};
+
+/// 平台限定加上 `test`：纯字符串拼接，这样在 Linux 上也能测到。
+#[cfg(any(target_os = "macos", test))]
+fn evermeet_source(name: &str, sha256: &'static str) -> Source {
+    Source::sha256(
+        format!("https://evermeet.cx/ffmpeg/{name}-{}.zip", EVERMEET.version),
+        sha256,
+    )
 }
 
 /// Windows 的 CUDA 版 whisper-cli（安装包只带 CPU 版，检测到显卡后再下这个）。
@@ -463,24 +405,6 @@ mod tests {
             &Integrity::Sha256(Box::leak("0".repeat(64).into_boxed_str()))
         ));
         assert!(!verify_file(&d.join("missing.bin"), &hash));
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    /// 没有 sha256 的源（如 evermeet 只提供 GPG 签名）退回按字节数校验：
-    /// 能挡住"下了一半"和"下成别的版本"，挡不住同尺寸替换——所以这类源只作兜底。
-    #[test]
-    fn size_only_integrity_catches_truncation() {
-        let d = dir("size-only");
-        let f = d.join("a.bin");
-        std::fs::write(&f, GOOD).unwrap();
-        let exact = Integrity::Size(GOOD.len() as u64);
-        assert!(verify_file(&f, &exact));
-        // 只下了一半
-        std::fs::write(&f, &GOOD[..4]).unwrap();
-        assert!(!verify_file(&f, &exact), "下了一半必须被发现");
-        // 下成了别的版本（长度不同）
-        std::fs::write(&f, b"a-different-version").unwrap();
-        assert!(!verify_file(&f, &exact));
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -633,49 +557,26 @@ mod tests {
         assert!(read_header(std::path::Path::new("/不存在/的文件")).is_empty());
     }
 
-    /// 解析 evermeet `info/*/release` 的真实响应片段。
-    /// 用真实片段而不是编造的 JSON，才能验证字段名与嵌套结构没记错。
+    /// macOS 兜底源必须是「版本化地址 + 合法 sha256」，不能再退回只校验字节数。
     #[test]
-    fn parses_evermeet_info_response() {
-        let body = r#"{"name":"ffmpeg","type":"release","version":"9.0.2","size":80827688,"download":{"7z":{"url":"https://evermeet.cx/ffmpeg/ffmpeg-9.0.2.7z","size":18089736},"zip":{"url":"https://evermeet.cx/ffmpeg/ffmpeg-9.0.2.zip","size":26198325}}}"#;
-        assert_eq!(
-            extract_json_string(body, "\"version\":\"").as_deref(),
-            Some("9.0.2")
-        );
-        // "size" 出现两次（外层 80827688、zip 的 26198325）；这里取第一个，
-        // 因此调用方必须用更具体的前缀定位 zip 的 size
-        assert_eq!(extract_json_u64(body, "\"size\":"), Some(80_827_688));
-        assert_eq!(
-            extract_json_u64(body, "\"zip\":{\"url\":"),
-            None,
-            "不是纯数字开头时应返回 None"
-        );
-        // 正确的取法：先定位 zip 段再取 size
-        let zip_start = body.find("\"zip\":").unwrap();
-        assert_eq!(
-            extract_json_u64(&body[zip_start..], "\"size\":"),
-            Some(26_198_325)
-        );
-    }
-
-    #[test]
-    fn malformed_info_response_returns_none() {
-        for body in [
-            "",
-            "{}",
-            "not json",
-            "{\"version\":}",
-            "{\"version\":\"1.0\"",
+    fn evermeet_sources_are_pinned_by_sha256() {
+        for (name, digest) in [
+            ("ffmpeg", EVERMEET.ffmpeg_sha256),
+            ("ffprobe", EVERMEET.ffprobe_sha256),
         ] {
-            assert!(
-                extract_json_string(body, "\"version\":\"").is_none()
-                    || extract_json_string(body, "\"version\":\"").as_deref() == Some("")
-                    || body.contains("version"),
-                "{body} 不应被当成完整响应"
+            let source = evermeet_source(name, digest);
+            assert_eq!(
+                source.url,
+                format!("https://evermeet.cx/ffmpeg/{name}-9.0.2.zip")
             );
+            match source.integrity {
+                Integrity::Sha256(value) => {
+                    assert_eq!(value.len(), 64);
+                    assert!(value.bytes().all(|b| b.is_ascii_hexdigit()));
+                }
+                Integrity::None => panic!("{name} 必须有 sha256"),
+            }
         }
-        assert_eq!(extract_json_u64("{\"size\":}", "\"size\":"), None);
-        assert_eq!(extract_json_u64("{\"size\":\"abc\"}", "\"size\":"), None);
-        assert_eq!(extract_json_string("nothing here", "\"version\":\""), None);
+        assert_ne!(EVERMEET.ffmpeg_sha256, EVERMEET.ffprobe_sha256);
     }
 }

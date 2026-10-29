@@ -34,11 +34,60 @@ fn required_field<'a>(
         .ok_or_else(|| format!("尚未配置{label}。请到 设置 → {setting_page} 填写后再试。"))
 }
 
-/// LLM 三项配置（base_url / api_key / model）。
-fn llm_config(settings: &AppSettings) -> Result<(String, String, String), String> {
-    let base = required_field(&settings.llm_base_url, "LLM API 地址", "转码设置")?;
-    let key = required_field(&settings.llm_api_key, "LLM API 密钥", "转码设置")?;
-    let model = required_field(&settings.llm_model, "LLM 模型名", "转码设置")?;
+/// 校验 API 地址的协议：密钥放在 `Authorization` 头里，`http://` 会把它明文发到网络上。
+///
+/// 只放行 `https://`，以及指向本机的 `http://`（本地跑的 Ollama、LM Studio 等不经过网络）。
+fn ensure_secure_base(base: &str, label: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(base)
+        .map_err(|_| format!("{label}「{base}」不是有效的网址。请到 设置 → 转码设置 修改。"))?;
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if is_loopback_host(&url) => Ok(()),
+        "http" => Err(format!(
+            "{label}「{base}」使用 http://，API 密钥会被明文发送。请到 设置 → 转码设置 改成 https:// 地址（本机服务可用 http://127.0.0.1）。"
+        )),
+        other => Err(format!(
+            "{label}「{base}」的协议 {other}:// 不受支持，只能用 https://。请到 设置 → 转码设置 修改。"
+        )),
+    }
+}
+
+fn is_loopback_host(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    // IPv6 主机在 host_str 里带方括号，如 `[::1]`
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// LLM 三项是否都填了（不做安全检查）。
+fn llm_fields(settings: &AppSettings) -> Result<(&str, &str, &str), String> {
+    Ok((
+        required_field(&settings.llm_base_url, "LLM API 地址", "转码设置")?,
+        required_field(&settings.llm_api_key, "LLM API 密钥", "转码设置")?,
+        required_field(&settings.llm_model, "LLM 模型名", "转码设置")?,
+    ))
+}
+
+/// 生图三项是否都填了（不做安全检查）。
+fn img_fields(settings: &AppSettings) -> Result<(&str, &str, &str), String> {
+    Ok((
+        required_field(&settings.img_base_url, "生图 API 地址", "转码设置")?,
+        required_field(&settings.img_api_key, "生图 API 密钥", "转码设置")?,
+        required_field(&settings.img_model, "生图模型名", "转码设置")?,
+    ))
+}
+
+/// 真正发请求前用的配置：填全 + 地址安全检查（拒绝非本机的 http://）。
+fn checked_config(
+    (base, key, model): (&str, &str, &str),
+    label: &str,
+) -> Result<(String, String, String), String> {
+    ensure_secure_base(base, label)?;
     Ok((
         base.trim_end_matches('/').to_string(),
         key.to_string(),
@@ -46,16 +95,14 @@ fn llm_config(settings: &AppSettings) -> Result<(String, String, String), String
     ))
 }
 
+/// LLM 三项配置（base_url / api_key / model）。
+fn llm_config(settings: &AppSettings) -> Result<(String, String, String), String> {
+    checked_config(llm_fields(settings)?, "LLM API 地址")
+}
+
 /// 生图三项配置。
 fn img_config(settings: &AppSettings) -> Result<(String, String, String), String> {
-    let base = required_field(&settings.img_base_url, "生图 API 地址", "转码设置")?;
-    let key = required_field(&settings.img_api_key, "生图 API 密钥", "转码设置")?;
-    let model = required_field(&settings.img_model, "生图模型名", "转码设置")?;
-    Ok((
-        base.trim_end_matches('/').to_string(),
-        key.to_string(),
-        model.to_string(),
-    ))
+    checked_config(img_fields(settings)?, "生图 API 地址")
 }
 
 /// blocking 客户端（统一超时与 UA 标识）。
@@ -341,13 +388,18 @@ fn download_poster(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<
 }
 
 /// LLM 三项配置是否齐全（供材料阶段判断剧名/简介走 AI 还是沿用已有内容）。
+///
+/// 只看「填没填」，不做地址安全检查：填了 http:// 地址时要让调用走下去，由 `llm_config`
+/// 返回「密钥会被明文发送」的真实原因，而不是在这里返回 false、被调用方说成「未配置」。
 pub(crate) fn storyboard_llm_ready(settings: &AppSettings) -> bool {
-    llm_config(settings).is_ok()
+    llm_fields(settings).is_ok()
 }
 
 /// 生图三项配置是否齐全（未配置时材料线程不发生图请求，退回素材封面）。
+///
+/// 与 [`storyboard_llm_ready`] 一样只看「填没填」，安全检查留给 `img_config` 报真实原因。
 pub(crate) fn poster_api_ready(settings: &AppSettings) -> bool {
-    img_config(settings).is_ok()
+    img_fields(settings).is_ok()
 }
 
 /// 自动材料流水线用的组合文本结果。
@@ -489,6 +541,83 @@ mod tests {
         assert_eq!(base, "https://api.x.com/v1");
         assert_eq!(key, "sk-test");
         assert_eq!(model, "demo");
+    }
+
+    /// 密钥在请求头里：非本机的 http:// 必须拒绝，本机服务（Ollama 等）放行。
+    #[test]
+    fn insecure_base_url_is_refused_except_loopback() {
+        for ok in [
+            "https://api.deepseek.com/v1",
+            "http://127.0.0.1:11434/v1",
+            "http://localhost:1234/v1",
+            "http://LOCALHOST/v1",
+            "http://[::1]:8080/v1",
+        ] {
+            assert!(
+                ensure_secure_base(ok, "LLM API 地址").is_ok(),
+                "{ok} 应放行"
+            );
+        }
+        for bad in [
+            "http://api.example.com/v1",
+            "http://192.168.1.10:11434/v1",
+            "http://localhost.evil.com/v1",
+            "ftp://api.example.com",
+            "api.example.com/v1",
+            "",
+        ] {
+            assert!(
+                ensure_secure_base(bad, "LLM API 地址").is_err(),
+                "{bad} 应拒绝"
+            );
+        }
+        let error = ensure_secure_base("http://api.example.com/v1", "生图 API 地址").unwrap_err();
+        assert!(
+            error.contains("明文") && error.contains("生图 API 地址"),
+            "{error}"
+        );
+
+        let settings = AppSettings {
+            img_base_url: Some("http://api.example.com/v1".to_string()),
+            img_api_key: Some("sk-test".to_string()),
+            img_model: Some("demo".to_string()),
+            ..Default::default()
+        };
+        assert!(img_config(&settings).unwrap_err().contains("明文"));
+    }
+
+    /// 填了 http:// 地址算「已配置」，真正调用时报「明文」的真实原因；没填全才算「未配置」。
+    #[test]
+    fn ready_checks_only_completeness_and_config_reports_real_reason() {
+        let settings = AppSettings {
+            llm_base_url: Some("http://relay.example.com/v1".to_string()),
+            llm_api_key: Some("sk-test".to_string()),
+            llm_model: Some("demo".to_string()),
+            img_base_url: Some("http://relay.example.com/v1".to_string()),
+            img_api_key: Some("sk-test".to_string()),
+            img_model: Some("demo".to_string()),
+            ..Default::default()
+        };
+        assert!(storyboard_llm_ready(&settings));
+        assert!(poster_api_ready(&settings));
+        assert!(llm_config(&settings).unwrap_err().contains("明文"));
+        assert!(img_config(&settings).unwrap_err().contains("明文"));
+
+        for blank in 0..3 {
+            let mut partial = settings.clone();
+            match blank {
+                0 => partial.llm_base_url = None,
+                1 => partial.llm_api_key = Some("  ".to_string()),
+                _ => partial.llm_model = None,
+            }
+            assert!(
+                !storyboard_llm_ready(&partial),
+                "缺第 {blank} 项应判为未配置"
+            );
+        }
+        let mut partial = settings.clone();
+        partial.img_model = None;
+        assert!(!poster_api_ready(&partial));
     }
 
     #[test]

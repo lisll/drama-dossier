@@ -28,7 +28,7 @@ drama-cloud = "drama_cloud.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-drama_cloud = ["web/*.html"]
+drama_cloud = ["web/*.html", "web/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

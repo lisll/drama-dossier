@@ -1229,6 +1229,68 @@ table {
   margin: 10px 0 0 auto;
 }
 
+/* ============ 应用升级提示条（层级 60：高于授权遮罩 50） ============ */
+
+.update-banner {
+  position: fixed;
+  top: 14px;
+  left: 50%;
+  z-index: 60;
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+  width: min(620px, 92vw);
+  padding: 14px 16px;
+  transform: translateX(-50%);
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-3);
+  font-size: 13px;
+}
+
+.update-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.update-current {
+  color: var(--muted);
+}
+
+.update-notes {
+  max-height: 120px;
+  margin: 8px 0 0;
+  overflow: auto;
+  color: var(--muted);
+  white-space: pre-wrap;
+}
+
+.update-status {
+  margin: 6px 0 0;
+  color: var(--muted);
+}
+
+/* 升级弹窗：复用安装弹窗样式，只把层级抬到授权遮罩（50）与提示条（60）之上。
+   必须用双类选择器：元素同时带 .install-overlay（z-index 20，写在后面），
+   单类选择器优先级相同，会被后写的规则覆盖，授权锁定时弹窗就被遮罩盖住。 */
+.install-overlay.update-overlay {
+  z-index: 70;
+}
+
+.update-modal-note {
+  margin: 12px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.update-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
 /* ============ 一键安装运行环境：进度 / 失败弹窗 ============ */
 
 .install-overlay {

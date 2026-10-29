@@ -114,9 +114,18 @@ if [ "$run_rust" -eq 1 ] && require cargo; then
         printf '#!/bin/bash\nprev=""\nfor a in "$@"; do\n  case "$prev" in\n    /FO|-FO|/fo|-fo) mkdir -p "$(dirname "$a")"; : > "$a" ;;\n  esac\n  prev="$a"\ndone\nexit 0\n'
       } > "$stub_dir/llvm-rc"
       chmod +x "$stub_dir/llvm-rc"
-      step "Clippy（windows 目标）：--target x86_64-pc-windows-msvc -- -D warnings" \
-        env PATH="$stub_dir:$PATH" cargo clippy --workspace --all-targets \
+      # 依赖里的 ring 要用 C 编译器编 Windows 目标：普通 cargo 在非 Windows 主机上会挑到 gcc，
+      # 报「GNU compiler is not supported for this target」——这是工具链问题，不是代码问题。
+      # 装了 cargo-xwin 就用它（自动配好 clang-cl 与 Windows SDK 头文件）；没装保持原样。
+      if cargo xwin --version >/dev/null 2>&1; then
+        win_clippy="cargo xwin clippy"
+      else
+        win_clippy="cargo clippy"
+      fi
+      step "Clippy（windows 目标，$win_clippy）：--target x86_64-pc-windows-msvc -- -D warnings" \
+        env PATH="$stub_dir:$PATH" $win_clippy --workspace --all-targets \
           --target x86_64-pc-windows-msvc --no-deps $license_feature -- -D warnings
+      rm -rf "$stub_dir"
     fi
     if [ "$fast" -eq 1 ]; then
       printf '==> 跳过 Test（--fast，pre-push 或 CI 会跑）\n'

@@ -72,6 +72,11 @@ const PIP_INSTALL_TIMEOUT_SECS: u64 = 1800;
 
 /// PyPI 主源：清华镜像。镜像不可用时 pip 会自动落到官方源，不会因此装不上。
 const PYPI_MIRROR: &str = "https://pypi.tuna.tsinghua.edu.cn/simple";
+/// openai-whisper 锁定版本（2026-10-29 核对清华镜像 simple 索引，要求 Python ≥ 3.8）。
+///
+/// 为什么锁：不锁时每次安装取镜像上的「最新」，上游发了坏版本或镜像被投毒，用户机器上
+/// 就装进一份没人核对过的代码。升级时人工核对新版本后改这里。
+const OPENAI_WHISPER_REQUIREMENT: &str = "openai-whisper==20250625";
 /// PyTorch 的 CUDA 轮子源。CUDA 版 torch **不在 PyPI**，必须单独指定；
 /// 选 cu130 是因为内置 Python 是 3.13，老索引（cu121 及更早）没有 3.13 的轮子，
 /// pip 会报「versions: none」。CUDA 13 要求驱动 580+；驱动过旧的机器装完
@@ -646,7 +651,7 @@ fn install_asr(app: &AppHandle) -> Result<String, String> {
             "torchaudio",
         ]);
     }
-    spec = spec.arg("openai-whisper");
+    spec = spec.arg(OPENAI_WHISPER_REQUIREMENT);
     let output = dossier_runtime::SystemRunner::new()
         .run(&spec)
         .map_err(|error| format!("安装 openai-whisper 失败（需要网络）：{error}"))?;
@@ -992,10 +997,12 @@ fn install_content_models_blocking(app: &AppHandle) -> Result<ContentModelsRepor
 #[tauri::command]
 pub async fn install_content_models(app: AppHandle) -> Result<ContentModelsReport, String> {
     crate::logging::log_event("环境", "开始一键安装内容模型（ASR/OCR）");
-    let result =
-        tauri::async_runtime::spawn_blocking(move || install_content_models_blocking(&app))
-            .await
-            .map_err(|error| format!("内容模型安装任务失败：{error}"))?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let _task = crate::tasks::register(crate::tasks::TaskKind::Install);
+        install_content_models_blocking(&app)
+    })
+    .await
+    .map_err(|error| format!("内容模型安装任务失败：{error}"))?;
     crate::logging::log_event(
         "环境",
         crate::logging::result_text(&result, |report| {

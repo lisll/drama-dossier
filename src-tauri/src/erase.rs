@@ -213,6 +213,8 @@ pub async fn run_erase(
 ) -> Result<EraseRun, String> {
     crate::license::guard()?;
     tauri::async_runtime::spawn_blocking(move || {
+        // 登记为运行中：应用升级会先检查有没有长任务在跑，避免中途退出把成片弄坏
+        let _task = crate::tasks::register(crate::tasks::TaskKind::Erase);
         run_erase_blocking(&app, request, tool_path, ffprobe_path, timeout_seconds)
     })
     .await

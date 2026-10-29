@@ -160,6 +160,19 @@ class RateLimiter:
 # ---------- 应用工厂 ----------
 
 
+# 页面只用同源脚本和同源接口；样式里有 style="..." 属性，所以 style-src 保留 'unsafe-inline'（只影响 CSS）。
+CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; "
+    "frame-ancestors 'none'; form-action 'self'"
+)
+
+
+def is_web_client_path(path: str) -> bool:
+    """是否属于 Web 客户端页面（首页与 /static/ 下的脚本、样式）。"""
+    return path == "/" or path.startswith("/static/")
+
+
 def create_app(settings: Optional[Settings] = None) -> FastAPI:
     from .recipes.registry import ensure_modules_loaded
 
@@ -178,6 +191,25 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     app.state.settings = settings
     app.state.limiter = limiter
     app.state.storage = storage
+
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next):
+        """给响应加浏览器安全头。
+
+        CSP 的作用：Web 客户端把令牌存在 localStorage，一旦某处漏了 HTML 转义，
+        注入的脚本就能读走令牌。`script-src 'self'` 让内联脚本与 onclick= 一律不执行，
+        脚本只能来自 /static/app.js；`frame-ancestors 'none'` 防点击劫持。
+
+        CSP 只加在 Web 客户端页面（`/` 与 `/static/`）上：FastAPI 自带的 /docs、/redoc
+        要从 CDN 加载脚本并带内联初始化脚本，套上这条策略会白屏。nosniff 与
+        Referrer-Policy 对所有响应都无害，照常加。
+        """
+        response = await call_next(request)
+        if is_web_client_path(request.url.path):
+            response.headers.setdefault("Content-Security-Policy", CONTENT_SECURITY_POLICY)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        return response
 
     def runtime_manifest() -> RuntimeManifest:
         if settings.runtime_manifest is None:

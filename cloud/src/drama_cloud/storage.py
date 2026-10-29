@@ -47,11 +47,37 @@ class LocalStorage:
     # ---------- 密钥 ----------
 
     def _load_secret(self) -> bytes:
+        """读取签名 URL 用的 HMAC 密钥；不存在就生成。
+
+        先在同目录以 O_EXCL|0600 写好临时文件并 fsync，再用 `os.link` 放到正式位置：
+        - 正式文件要么不存在，要么是完整的 32 字节，别的进程不会读到写了一半的文件；
+        - 目标已存在时 link 失败（FileExistsError），不会覆盖另一个进程先写好的密钥；
+        - 文件从创建起就是 0600，没有「先按 umask 落盘、再 chmod」的空档。
+        """
         path = self.settings.home / "secret.key"
         if not path.exists():
-            path.write_bytes(secrets.token_bytes(32))
-            os.chmod(path, 0o600)
-        return path.read_bytes()
+            tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+            try:
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(secrets.token_bytes(32))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                try:
+                    os.link(tmp, path)
+                except FileExistsError:
+                    pass  # 另一个进程先放好了，用它的
+            finally:
+                try:
+                    os.unlink(tmp)
+                except FileNotFoundError:
+                    pass
+        secret = path.read_bytes()
+        if len(secret) < 32:
+            # 正常流程不会出现（正式文件只经 link 原子出现）；出现就是被截断或手改过。
+            # 宁可报错也不用弱密钥签 URL。
+            raise RuntimeError(f"签名密钥 {path} 长度异常（{len(secret)} 字节），请删除后重启")
+        return secret
 
     # ---------- 键与路径 ----------
 

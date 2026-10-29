@@ -338,7 +338,10 @@ impl RuntimeManifest {
     }
 }
 
-fn component_issues(component: &Component) -> Vec<String> {
+/// `id` 与 `version` 会拼成安装目录 `<root>/<id>/versions/<version>`，安装时还会先删除该目录，
+/// 所以两者都必须是单段安全名。安装入口（`store` 的 `install_local` / `install_from_url`）
+/// 也会单独调用它：调用方可能没先 `validate` 整份清单。
+pub(crate) fn install_path_issues(component: &Component) -> Vec<String> {
     let mut issues = Vec::new();
     let id = &component.id;
     if !is_safe_component_id(id) {
@@ -346,6 +349,34 @@ fn component_issues(component: &Component) -> Vec<String> {
             "组件 id `{id}` 含非法字符；只允许字母、数字、点、下划线和短横线"
         ));
     }
+    if component.version.trim().is_empty() {
+        issues.push(format!("组件 {id} 没有声明版本"));
+    } else if !is_safe_component_id(&component.version) {
+        issues.push(format!(
+            "组件 {id} 的版本 `{}` 含非法字符；只允许字母、数字、点、下划线和短横线，且不能以点开头",
+            component.version
+        ));
+    }
+    // 文件路径与 layout 同样会拼进安装目录 / 源目录，安装入口也要挡住
+    for file in &component.files {
+        if !is_safe_relative_path(&file.path) {
+            issues.push(format!(
+                "组件 {id} 的文件路径 `{}` 不是安全的相对路径",
+                file.path
+            ));
+        }
+    }
+    if let Some(layout) = &component.source.layout {
+        if !is_safe_relative_path(layout) {
+            issues.push(format!("组件 {id} 的 layout `{layout}` 不是安全的相对路径"));
+        }
+    }
+    issues
+}
+
+fn component_issues(component: &Component) -> Vec<String> {
+    let mut issues = install_path_issues(component);
+    let id = &component.id;
     if component.role.trim().is_empty() {
         issues.push(format!("组件 {id} 没有声明角色（role）"));
     } else if !RuntimeRoles::is_known(&component.role) {
@@ -353,9 +384,6 @@ fn component_issues(component: &Component) -> Vec<String> {
             "组件 {id} 的角色 `{}` 未知；可用角色见 RuntimeRoles::ALL",
             component.role
         ));
-    }
-    if component.version.trim().is_empty() {
-        issues.push(format!("组件 {id} 没有声明版本"));
     }
     if component.files.is_empty() {
         issues.push(format!("组件 {id} 的文件清单为空"));
@@ -390,12 +418,6 @@ fn component_issues(component: &Component) -> Vec<String> {
 
     let mut seen_paths: BTreeSet<&str> = BTreeSet::new();
     for file in &component.files {
-        if !is_safe_relative_path(&file.path) {
-            issues.push(format!(
-                "组件 {id} 的文件路径 `{}` 不是安全的相对路径",
-                file.path
-            ));
-        }
         if !seen_paths.insert(file.path.as_str()) {
             issues.push(format!("组件 {id} 的文件路径重复：{}", file.path));
         }
@@ -406,12 +428,13 @@ fn component_issues(component: &Component) -> Vec<String> {
             ));
         }
     }
-    if let Some(layout) = &component.source.layout {
-        if !is_safe_relative_path(layout) {
-            issues.push(format!("组件 {id} 的 layout `{layout}` 不是安全的相对路径"));
-        }
-    }
     issues
+}
+
+/// 组件版本号是否可以安全地作为目录名（与组件 id 同一套规则）。
+/// `store` 读取本地 state.json 里的版本号时也用它：那份文件可能被改过。
+pub(crate) fn is_safe_version(version: &str) -> bool {
+    is_safe_component_id(version)
 }
 
 fn is_safe_component_id(id: &str) -> bool {
@@ -587,6 +610,31 @@ mod tests {
             .collect_issues()
             .iter()
             .any(|issue| issue.contains("非法字符")));
+
+        for version in [
+            "../../x",
+            "/etc",
+            "a/b",
+            "..",
+            ".hidden",
+            "a\\b",
+            "1.0.0+build",
+        ] {
+            let bad_version = component("ok", RuntimeRoles::FFMPEG, version);
+            assert!(
+                manifest(vec![bad_version])
+                    .collect_issues()
+                    .iter()
+                    .any(|issue| issue.contains("的版本")),
+                "版本 {version} 应被拒绝"
+            );
+        }
+        for version in ["1.2.3", "2024-01", "v2_rc1", "6.1"] {
+            assert!(
+                component_issues(&component("ok", RuntimeRoles::FFMPEG, version)).is_empty(),
+                "版本 {version} 应通过"
+            );
+        }
 
         assert!(is_safe_relative_path("models/e2fgvi.pth"));
         assert!(!is_safe_relative_path("/etc/passwd"));

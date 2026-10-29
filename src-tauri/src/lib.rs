@@ -12,6 +12,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 mod account;
 mod ai;
+mod app_update;
 mod content;
 mod dedup;
 mod dossier;
@@ -237,6 +238,8 @@ async fn regenerate_poster(
     license::guard()?;
     let drama = dossier::load_drama(&root, &name)?;
     tauri::async_runtime::spawn_blocking(move || {
+        // 登记为运行中：会联网生图并写文件，应用升级前要等它结束
+        let _task = tasks::register(tasks::TaskKind::Poster);
         content::regenerate_poster_blocking(&app, &drama, Path::new(&output_dir))
     })
     .await
@@ -374,6 +377,8 @@ fn generate_package(
     rules: Option<ChecklistRules>,
 ) -> Result<PackageResult, String> {
     crate::license::guard()?;
+    // 登记为运行中：应用升级前会检查，避免写报审包写到一半被退出
+    let _task = tasks::register(tasks::TaskKind::Package);
     let root = PathBuf::from(root);
     // 测试期关键日志：生成是最容易出问题的链路，入口参数与落点都要留痕。
     logging::log_event(
@@ -514,7 +519,7 @@ pub fn run() {
     // 的工具会抛 UnicodeEncodeError 并以退出码 1 失败。强制 UTF-8 后所有子进程
     // （探测/转写/模型安装）自动继承，仅影响 Python 系列。
     std::env::set_var("PYTHONUTF8", "1");
-    tauri::Builder::default()
+    app_update::init(tauri::Builder::default())
         .setup(|app| {
             // 测试期日志落盘位置：~/Documents/剧备日志/dossier.log（配置目录仅作兜底）。
             let fallback = app
@@ -532,6 +537,8 @@ pub fn run() {
             license::license_activate,
             license::license_refresh,
             license::license_machine_code,
+            app_update::app_update_check,
+            app_update::app_update_install,
             pick_folder,
             scan_library,
             load_app_settings,

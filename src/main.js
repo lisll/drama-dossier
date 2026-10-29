@@ -2614,7 +2614,8 @@ function formatBytes(bytes) {
 // 把弹窗切成「进行中」初始态：标题/副标题/统计/进度条全部复位。
 function openInstallModal() {
   $("#install-overlay").classList.remove("hidden");
-  const modal = document.querySelector(".install-modal");
+  // 限定在安装弹窗内：升级弹窗也带 .install-modal 类，且在页面里排在前面
+  const modal = document.querySelector("#install-overlay .install-modal");
   modal.classList.remove("failed");
   $("#install-icon").textContent = "⬇";
   $("#install-title").textContent = "正在安装本机引擎";
@@ -2667,7 +2668,8 @@ function handleInstallProgress(payload) {
 
 // 失败态：红图标 + 错误详情 + 「重新下载」/关闭。
 function failInstallModal(message) {
-  const modal = document.querySelector(".install-modal");
+  // 限定在安装弹窗内：升级弹窗也带 .install-modal 类，且在页面里排在前面
+  const modal = document.querySelector("#install-overlay .install-modal");
   modal.classList.add("failed");
   $("#install-icon").textContent = "✕";
   $("#install-title").textContent = "引擎安装未完成";
@@ -3293,6 +3295,151 @@ async function loadVersion() {
   } catch {
     $("#about-version").textContent = "未知";
   }
+}
+
+// ============ 应用升级 ============
+//
+// 检查、下载、验签、安装都在后端（app_update.rs），前端只调 app_update_check / app_update_install。
+// 流程：启动 30 秒后静默检查一次，之后每 6 小时一次；发现新版本只弹提示条，不下载。
+// 用户点「立即升级」才打开升级弹窗并开始下载。自动检查失败只写日志，不打扰用户。
+
+const UPDATE_FIRST_CHECK_MS = 30 * 1000;
+const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const updateState = { info: null, dismissedVersion: null, installing: false };
+
+function showUpdateBanner(info) {
+  updateState.info = info;
+  $("#update-version").textContent = info.version;
+  $("#update-current").textContent = info.currentVersion;
+  const notes = $("#update-notes");
+  notes.textContent = info.notes ?? "";
+  notes.classList.toggle("hidden", !info.notes);
+  $("#update-date").textContent = info.date ? `发布日期 ${info.date}` : "";
+  $("#update-banner").classList.remove("hidden");
+}
+
+/** 检查更新。`manual` 为真时（关于页按钮）失败要把原因显示出来。 */
+async function checkAppUpdate(manual = false) {
+  const result = $("#update-check-result");
+  if (!invoke) {
+    if (manual) result.textContent = "请在 DramaDossier 桌面应用中检查更新。";
+    return;
+  }
+  if (updateState.installing) {
+    if (manual) result.textContent = "正在升级，请稍候。";
+    return;
+  }
+  if (manual) result.textContent = "正在检查…";
+  try {
+    const info = await call("app_update_check");
+    if (!info) {
+      if (manual) result.textContent = "已是最新版本。";
+      return;
+    }
+    if (manual) result.textContent = `发现新版本 v${info.version}。`;
+    // 用户点过「稍后」的同一版本，自动检查不再弹；手动检查总是弹
+    if (manual || updateState.dismissedVersion !== info.version) showUpdateBanner(info);
+  } catch (error) {
+    if (manual) result.textContent = String(error);
+  }
+}
+
+/** 升级弹窗复位到「下载中」初始态。 */
+function openUpdateModal() {
+  $("#update-overlay").classList.remove("hidden");
+  $("#update-modal").classList.remove("failed");
+  $("#update-modal-icon").textContent = "⬇";
+  $("#update-modal-title").textContent = "正在升级到新版本";
+  $("#update-modal-subtitle").textContent = "正在连接下载源。";
+  $("#update-modal-version").textContent = updateState.info ? `v${updateState.info.version}` : "—";
+  $("#update-modal-total").textContent = "待计算";
+  $("#update-modal-downloaded").textContent = "待计算";
+  $("#update-modal-percent").textContent = "—";
+  const bar = $("#update-modal-bar");
+  bar.classList.add("indeterminate");
+  bar.style.width = "";
+  $("#update-modal-error").classList.add("hidden");
+  $("#update-modal-retry").classList.add("hidden");
+  $("#update-modal-close").classList.add("hidden");
+}
+
+/** 失败态：红图标 + 原因 + 「重试」/关闭。下载完被任务拦下时，重试会直接安装、不重新下载。 */
+function failUpdateModal(message) {
+  $("#update-modal").classList.add("failed");
+  $("#update-modal-icon").textContent = "✕";
+  $("#update-modal-title").textContent = "升级未完成";
+  const text = String(message);
+  $("#update-modal-subtitle").textContent = text.split("\n").find(Boolean) ?? "升级失败。";
+  $("#update-modal-error").textContent = text;
+  $("#update-modal-error").classList.remove("hidden");
+  $("#update-modal-retry").classList.remove("hidden");
+  $("#update-modal-close").classList.remove("hidden");
+  $("#update-modal-bar").classList.remove("indeterminate");
+}
+
+function handleUpdateProgress(payload) {
+  if (!updateState.installing) return;
+  const bar = $("#update-modal-bar");
+  if (payload.stage === "downloading") {
+    $("#update-modal-subtitle").textContent = "正在下载新版本，请不要关闭软件。";
+    $("#update-modal-downloaded").textContent = formatBytes(payload.downloaded);
+    if (payload.total) {
+      $("#update-modal-total").textContent = formatBytes(payload.total);
+      const ratio = Math.min(100, (payload.downloaded / payload.total) * 100);
+      bar.classList.remove("indeterminate");
+      bar.style.width = `${ratio.toFixed(1)}%`;
+      $("#update-modal-percent").textContent = `${Math.round(ratio)}%`;
+    }
+    return;
+  }
+  // 下载完成：校验中 / 安装中都把进度条拉满
+  bar.classList.remove("indeterminate");
+  bar.style.width = "100%";
+  $("#update-modal-percent").textContent = "100%";
+  if (payload.stage === "verifying") {
+    $("#update-modal-subtitle").textContent = "下载完成，正在校验安装包签名…";
+  } else if (payload.stage === "installing") {
+    if (payload.total) {
+      $("#update-modal-total").textContent = formatBytes(payload.total);
+      $("#update-modal-downloaded").textContent = formatBytes(payload.total);
+    }
+    $("#update-modal-subtitle").textContent = "签名校验通过，正在安装。软件即将自动关闭并重新打开。";
+  }
+}
+
+async function installAppUpdate() {
+  if (updateState.installing) return;
+  updateState.installing = true;
+  $("#update-banner").classList.add("hidden");
+  openUpdateModal();
+  try {
+    // 成功时不会返回：Windows 由安装器接管并退出本进程，macOS 装完直接重启。
+    await call("app_update_install");
+  } catch (error) {
+    failUpdateModal(error);
+  } finally {
+    updateState.installing = false;
+  }
+}
+
+$("#update-install").addEventListener("click", installAppUpdate);
+$("#update-later").addEventListener("click", () => {
+  updateState.dismissedVersion = updateState.info?.version ?? null;
+  $("#update-banner").classList.add("hidden");
+});
+$("#update-modal-retry").addEventListener("click", installAppUpdate);
+$("#update-modal-close").addEventListener("click", () => {
+  $("#update-overlay").classList.add("hidden");
+  // 关掉失败弹窗后把提示条放回去，用户随时可以再点「立即升级」
+  if (updateState.info) showUpdateBanner(updateState.info);
+});
+$("#update-check").addEventListener("click", () => checkAppUpdate(true));
+if (tauriEvent?.listen) {
+  tauriEvent.listen("app-update-progress", (event) => handleUpdateProgress(event.payload));
+}
+if (invoke) {
+  setTimeout(() => checkAppUpdate(false), UPDATE_FIRST_CHECK_MS);
+  setInterval(() => checkAppUpdate(false), UPDATE_INTERVAL_MS);
 }
 
 // ============ 事件绑定 ============

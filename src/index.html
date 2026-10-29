@@ -991,6 +991,10 @@
                 <strong>剧备 DramaDossier</strong> · 版本 <span id="about-version">…</span>
               </p>
               <p class="about-line">
+                <button type="button" id="update-check" class="ghost">检查更新</button>
+                <span id="update-check-result" class="settings-note"></span>
+              </p>
+              <p class="about-line">
                 本地引擎 <span id="about-engine" class="badge">未检测</span>
               </p>
               <p class="settings-note">
@@ -1003,6 +1007,49 @@
       </div>
     </div>
     <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+    <!-- 应用升级提示：发现新版本时只提示，不下载。层级高于授权遮罩，授权过期的用户也能升级拿到修复。 -->
+    <div id="update-banner" class="update-banner hidden" role="status" aria-live="polite">
+      <div class="update-text">
+        <strong>发现新版本 v<span id="update-version"></span></strong>
+        <span class="update-current">（当前 v<span id="update-current"></span>）</span>
+        <p id="update-notes" class="update-notes hidden"></p>
+        <p id="update-date" class="update-status"></p>
+      </div>
+      <div class="update-actions">
+        <button type="button" id="update-install" class="primary">立即升级</button>
+        <button type="button" id="update-later" class="ghost">稍后</button>
+      </div>
+    </div>
+
+    <!-- 升级弹窗：用户点「立即升级」后才出现并开始下载。样式复用运行环境安装弹窗。 -->
+    <div id="update-overlay" class="install-overlay update-overlay hidden" role="dialog" aria-modal="true">
+      <div id="update-modal" class="install-modal">
+        <header class="install-modal-head">
+          <span id="update-modal-icon" class="install-icon">⬇</span>
+          <div class="install-titles">
+            <h3 id="update-modal-title">正在升级到新版本</h3>
+            <p id="update-modal-subtitle">正在连接下载源。</p>
+          </div>
+          <button id="update-modal-close" class="install-close hidden" title="关闭" aria-label="关闭">×</button>
+        </header>
+        <dl class="install-stats">
+          <div><dt>新版本</dt><dd id="update-modal-version">—</dd></div>
+          <div><dt>安装包大小</dt><dd id="update-modal-total">待计算</dd></div>
+          <div><dt>已下载</dt><dd id="update-modal-downloaded">待计算</dd></div>
+        </dl>
+        <div class="install-track-row">
+          <span class="install-track-name">下载进度</span>
+          <span id="update-modal-percent">—</span>
+        </div>
+        <div class="install-track"><div id="update-modal-bar" class="install-bar indeterminate"></div></div>
+        <p class="update-modal-note">下载完成后会校验安装包签名，校验通过才会安装；安装时软件会自动关闭并重新打开。</p>
+        <p id="update-modal-error" class="install-error hidden"></p>
+        <footer class="install-actions">
+          <button id="update-modal-retry" class="success hidden">重试</button>
+        </footer>
+      </div>
+    </div>
 
     <!-- 一键安装运行环境的进度 / 失败弹窗（竞品同款：标题 + 统计 + 进度条，失败时给重新下载） -->
     <div id="install-overlay" class="install-overlay hidden" role="dialog" aria-modal="true">

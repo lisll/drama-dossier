@@ -745,8 +745,9 @@ git push origin app-v0.2.1
 ```
 
 5. 等待 CI 完成:`test` 三平台质量门 → `bundle` 三平台构建 → `release` 自动创建 Release;
-6. Release 由 CI 自动创建(标记为 prerelease,含三个平台的安装包与 `SHA256SUMS.txt`),
-   并自动附加变更列表。发布说明中的安装须知由工作流的 `release` job 提供,如需补充
+6. Release 由 CI 自动创建(正式版并设为 latest,含三个平台的安装包、升级包与签名、
+   `latest.json` 和 `SHA256SUMS.txt`;发布前会用内置升级公钥逐个验签,不通过不发布),
+   并自动附加变更列表。已安装的客户端会在启动后检查到新版本并提示升级。发布说明中的安装须知由工作流的 `release` job 提供,如需补充
    或修正,在 GitHub 上编辑该 Release 即可。
 
 > `release` job 只在推 tag(`app-v*`)时运行。手动触发(`workflow_dispatch`)只构建内测包,
