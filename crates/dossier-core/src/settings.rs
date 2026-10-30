@@ -147,8 +147,11 @@ impl AppSettings {
 
     /// 深度处理重组单集时长区间的生效值：未配置时默认 60~70 秒。
     /// 集数不再直接配置，由「素材总时长 ÷ 单集目标时长」反推。
+    ///
+    /// 下限钳到 5..=3595、上限钳到 下限+5..=3600：上限不大于下限时按「下限 + 5 秒」处理。
+    /// 以前下限先钳到 3600，`clamp(min + 5, 3600)` 下界大于上界直接 panic。
     pub fn effective_recut_range(&self) -> (u32, u32) {
-        let min = self.recut_min_sec.unwrap_or(60).clamp(5, 3600);
+        let min = self.recut_min_sec.unwrap_or(60).clamp(5, 3595);
         let max = self.recut_max_sec.unwrap_or(70).clamp(min + 5, 3600);
         (min, max)
     }
@@ -482,6 +485,33 @@ fn safe_path_component(name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recut_range_never_panics_and_stays_ordered() {
+        let range = |min: Option<u32>, max: Option<u32>| {
+            AppSettings {
+                recut_min_sec: min,
+                recut_max_sec: max,
+                ..Default::default()
+            }
+            .effective_recut_range()
+        };
+        assert_eq!(range(None, None), (60, 70));
+        assert_eq!(range(Some(3600), None), (3595, 3600));
+        assert_eq!(range(Some(u32::MAX), Some(u32::MAX)), (3595, 3600));
+        assert_eq!(
+            range(Some(100), Some(50)),
+            (100, 105),
+            "上限小于下限按下限 + 5"
+        );
+        assert_eq!(range(Some(0), Some(0)), (5, 10));
+        for min in [0, 1, 5, 3594, 3595, 3596, 3600, 4000, u32::MAX] {
+            for max in [0, 5, 3590, 3600, 9999, u32::MAX] {
+                let (lo, hi) = range(Some(min), Some(max));
+                assert!(lo + 5 <= hi && hi <= 3600, "{min}/{max} → {lo}/{hi}");
+            }
+        }
+    }
+
     #[test]
     fn ai_badge_settings_default_validate_and_clamp() {
         let mut settings = AppSettings::default();

@@ -139,7 +139,8 @@ fn mount_csv_template_inner(root: &str, drama_name: &str) -> Result<MountCsvChec
     let drama = load_drama(root, drama_name)?;
     let csv_path = PathBuf::from(&drama.dir).join(MOUNT_CSV_NAME);
 
-    if !csv_path.exists() {
+    // symlink_metadata 判断：悬空链接也算已存在，不顺着它写出模板。
+    if !dossier_core::fsio::path_occupied(&csv_path) {
         let mut body = String::from("集号,文案\n");
         for episode in &drama.episodes {
             let number = episode
@@ -149,7 +150,7 @@ fn mount_csv_template_inner(root: &str, drama_name: &str) -> Result<MountCsvChec
             body.push_str(&format!("{number},\n"));
         }
         // 带 BOM：Windows 上双击用 Excel 打开时中文不乱码。
-        std::fs::write(&csv_path, dossier_core::csv_text_with_bom(&body))
+        crate::paths::write_atomic(&csv_path, dossier_core::csv_text_with_bom(&body).as_bytes())
             .map_err(|error| format!("写入挂载文案模板失败（{}）：{error}", csv_path.display()))?;
     }
 
@@ -194,8 +195,11 @@ fn mount_csv_save_inner(
 ) -> Result<MountCsvCheckPayload, String> {
     let drama = load_drama(root, drama_name)?;
     let csv_path = PathBuf::from(&drama.dir).join(MOUNT_CSV_NAME);
-    std::fs::write(&csv_path, dossier_core::csv_text_with_bom(content))
-        .map_err(|error| format!("保存挂载文案失败（{}）：{error}", csv_path.display()))?;
+    crate::paths::write_atomic(
+        &csv_path,
+        dossier_core::csv_text_with_bom(content).as_bytes(),
+    )
+    .map_err(|error| format!("保存挂载文案失败（{}）：{error}", csv_path.display()))?;
     let numbers: Vec<u32> = drama
         .episodes
         .iter()

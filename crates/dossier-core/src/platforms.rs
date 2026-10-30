@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{EpisodeSpec, ProbedEpisode};
+use crate::types::{EpisodeSpec, ProbeFailure, ProbedEpisode};
 
 /// 一项材料要求。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -356,9 +356,13 @@ pub struct ProfileReview {
 }
 
 /// 按平台档案对照整部剧：逐集跑 [`check_profile`]，并汇总结论。
+///
+/// `probe_failures` 是规格探测失败的分集：每集记一条 `fail` 检查项并写进 `notes`，
+/// 不能因为没探测出来就被当成「无阻断」。
 pub fn review_drama(
     profile: &PlatformProfile,
     episodes: &[ProbedEpisode],
+    probe_failures: &[ProbeFailure],
     has_cover: bool,
     has_synopsis: bool,
 ) -> ProfileReview {
@@ -382,6 +386,23 @@ pub fn review_drama(
             checks,
         });
     }
+    for failure in probe_failures {
+        fail_count += 1;
+        notes.push(format!(
+            "{}：规格探测失败（{}），未能对照",
+            failure.file.file_name, failure.reason
+        ));
+        reviews.push(EpisodeProfileReview {
+            file_name: failure.file.file_name.clone(),
+            episode_number: failure.file.episode_number,
+            checks: vec![ProfileCheck {
+                id: "probe".into(),
+                label: "规格探测".into(),
+                status: "fail".into(),
+                detail: format!("探测失败：{}", failure.reason),
+            }],
+        });
+    }
     ProfileReview {
         profile_id: profile.id.clone(),
         profile_name: profile.name.clone(),
@@ -396,6 +417,7 @@ pub fn review_drama(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::EpisodeFile;
     use std::path::PathBuf;
 
     fn spec(width: u32, height: u32, duration: f64, bitrate: u64) -> EpisodeSpec {
@@ -470,7 +492,6 @@ mod tests {
 
     #[test]
     fn review_drama_aggregates_counts_and_notes() {
-        use crate::types::{EpisodeFile, ProbedEpisode};
         let profile = find_profile("trailer-cut").unwrap();
         let episodes = vec![
             ProbedEpisode {
@@ -493,12 +514,34 @@ mod tests {
                 spec: EpisodeSpec::default(),
             },
         ];
-        let review = review_drama(&profile, &episodes, true, true);
+        let review = review_drama(&profile, &episodes, &[], true, true);
         assert_eq!(review.episodes.len(), 2);
         assert_eq!(review.profile_id, "trailer-cut");
         assert!(review.clean, "{review:?}");
         assert_eq!(review.fail_count, 0);
         assert_eq!(review.notes.len(), 1);
         assert!(review.notes[0].contains("第02集.mp4"));
+    }
+
+    #[test]
+    fn probe_failures_count_as_blocking() {
+        let profile = find_profile("trailer-cut").unwrap();
+        let failure = ProbeFailure {
+            file: EpisodeFile {
+                path: PathBuf::from("/tmp/第03集.mp4"),
+                file_name: "第03集.mp4".into(),
+                size_bytes: 1,
+                episode_number: Some(3),
+            },
+            reason: "moov atom not found".into(),
+        };
+        // 全部失败：以前收到空数组会报「无阻断」。
+        let review = review_drama(&profile, &[], &[failure], true, true);
+        assert!(!review.clean);
+        assert_eq!(review.fail_count, 1);
+        assert_eq!(review.episodes.len(), 1);
+        assert_eq!(review.episodes[0].episode_number, Some(3));
+        assert_eq!(review.episodes[0].checks[0].status, "fail");
+        assert!(review.notes[0].contains("moov atom not found"));
     }
 }

@@ -1047,10 +1047,11 @@ pub(crate) fn processing_lines(processing: &ProofProcessing) -> Vec<String> {
                 "去重配方：种子 {seed}，逐集参数存证于 {}",
                 crate::dedup::RECIPE_FILE_NAME
             ));
-            lines.push(
-                "成片元数据改写：make（iPhone 机型）、software（iOS 版本）、creation_time（推算的拍摄时间）"
-                    .to_string(),
-            );
+            let fields: Vec<String> = crate::dedup::METADATA_FIELDS
+                .iter()
+                .map(|(key, meaning)| format!("{key}（{meaning}）"))
+                .collect();
+            lines.push(format!("成片元数据改写：{}", fields.join("、")));
         }
         None => lines.push("去重配方：未启用".to_string()),
     }
@@ -1248,6 +1249,115 @@ fn render_ai_proof(
 const PROOF_IMAGE_FILE: &str = "AI制作证明.png";
 const PROOF_TEXT_FILE: &str = "AI制作证明.txt";
 
+/// 深度处理开跑前作废上一轮的 AI 制作证明。返回 `true` 表示确实作废了旧证明（文件或清单里的记录）。
+///
+/// 一旦开跑，材料线程会陆续删过程图、换海报和简介，编码成功前随时可能停止或失败；
+/// 旧证明写的是旧内容，留着就会与目录里的实际文件对不上。只有本轮完整成功时，
+/// `finalize_deep_proof` 才生成新证明。宁可暂时没有证明，也不留一张写错的。
+///
+/// 顺序：**先改清单、再删证明文件**。清单写失败时什么都没动，调用方报「未开始处理」是实情；
+/// 清单已改、删文件失败时，清单已不再引用旧证明，报错让用户处理残留文件。
+///
+/// - 清单存在且能解析：`proof` 置空；`proofPayload` 去掉 `outputs`、`processingLines`；
+///   剧名、简介、海报来源与 `posterBasis` 保留，海报过期判断与「按新文案重做海报」照常可用；
+/// - `clear_process_images`（材料流水线开着，本轮会重做过程图）：同时删除旧过程图并把计数清零，
+///   磁盘与清单一致。流水线关着时过程图不会被动，计数原样保留；
+/// - 清单损坏或不是对象：不动它（读清单的逻辑本来就把它当成没有），只删证明并记日志，
+///   不能因此让这部剧再也做不了深度处理；
+/// - 删除 `AI制作证明.png` / `.txt`（不存在不算错）。
+pub(crate) fn invalidate_previous_proof(
+    output_dir: &Path,
+    clear_process_images: bool,
+) -> Result<bool, String> {
+    let mut invalidated = false;
+    let manifest_path = output_dir.join(MANIFEST_FILE);
+    match std::fs::read(&manifest_path) {
+        Ok(raw) => match serde_json::from_slice::<serde_json::Value>(&raw) {
+            Ok(mut manifest) if manifest.is_object() => {
+                if strip_proof_record(&mut manifest, clear_process_images) {
+                    write_manifest(output_dir, &manifest)?;
+                    invalidated = true;
+                }
+            }
+            _ => crate::logging::log_event(
+                "材料",
+                format!(
+                    "材料清单无法解析，保持原样（本轮会重写）：{}",
+                    manifest_path.display()
+                ),
+            ),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "无法读取材料清单（{}：{error}）",
+                manifest_path.display()
+            ))
+        }
+    }
+    let mut doomed: Vec<(PathBuf, bool)> = [PROOF_IMAGE_FILE, PROOF_TEXT_FILE]
+        .iter()
+        .map(|name| (output_dir.join(name), true))
+        .collect();
+    if clear_process_images {
+        doomed.extend(
+            process_image_paths(output_dir)
+                .into_iter()
+                .map(|p| (p, false)),
+        );
+    }
+    for (path, is_proof) in doomed {
+        match std::fs::remove_file(&path) {
+            Ok(()) => invalidated |= is_proof,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "无法作废上一轮 AI 制作证明（{}：{error}）",
+                    path.display()
+                ))
+            }
+        }
+    }
+    Ok(invalidated)
+}
+
+/// 输出目录里的过程图文件（固定 4 张）。生成与作废共用这一份命名。
+fn process_image_paths(output_dir: &Path) -> Vec<PathBuf> {
+    (1..=4)
+        .map(|index| output_dir.join(format!("过程图_{index:02}.png")))
+        .collect()
+}
+
+/// 从清单里去掉与成片（以及将被重做的过程图）对应的证明记录；有改动时返回 true。
+fn strip_proof_record(manifest: &mut serde_json::Value, clear_process_images: bool) -> bool {
+    let Some(object) = manifest.as_object_mut() else {
+        return false;
+    };
+    let mut changed = object.get("proof").is_some_and(|proof| !proof.is_null());
+    object.insert("proof".into(), serde_json::Value::Null);
+    if let Some(payload) = object
+        .get_mut("proofPayload")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        changed |= payload.remove("outputs").is_some();
+        changed |= payload.remove("processingLines").is_some();
+        if clear_process_images
+            && payload
+                .get("processCount")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|count| count > 0)
+        {
+            payload.insert("processCount".into(), json!(0));
+            payload.insert(
+                "storyboardSource".into(),
+                json!("未生成（上次深度处理未完成）"),
+            );
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// 调 Pillow 脚本把证明字段渲染成 `AI制作证明.png`。
 fn write_ai_proof_image(
     app: &AppHandle,
@@ -1419,8 +1529,8 @@ fn generate_process_images(
     let frames_dir = output_dir.join(".material-frames");
     let _ = std::fs::remove_dir_all(&frames_dir);
     // 上一次运行的过程图不能被本次失败继承；先删掉，成功后再返回实际文件。
-    for index in 1..=4 {
-        let _ = std::fs::remove_file(output_dir.join(format!("过程图_{index:02}.png")));
+    for path in process_image_paths(output_dir) {
+        let _ = std::fs::remove_file(path);
     }
     std::fs::create_dir_all(&frames_dir)
         .map_err(|error| format!("创建过程图帧目录失败：{error}"))?;
@@ -1513,8 +1623,8 @@ fn generate_process_images(
             output.code_label()
         ));
     }
-    Ok((1..=4)
-        .map(|index| output_dir.join(format!("过程图_{index:02}.png")))
+    Ok(process_image_paths(output_dir)
+        .into_iter()
         .filter(|path| path.is_file())
         .collect())
 }
@@ -1715,7 +1825,14 @@ fn material_pipeline_blocking(
             return Err("已停止".into());
         }
         match ai::material_identity_blocking(settings, &context) {
-            Ok(identity) => Some(identity),
+            Ok(identity) => {
+                // 超长被作废的那一项按「生成失败」处理（下面 ai_text 走 Failed），原因如实告诉用户。
+                for reason in &identity.rejected {
+                    messages.push(reason.clone());
+                    crate::logging::log_event("材料", reason);
+                }
+                Some(identity)
+            }
             Err(error) => {
                 messages.push(format!("AI 文案生成失败，沿用已有内容：{error}"));
                 crate::logging::log_event(
@@ -1746,12 +1863,16 @@ fn material_pipeline_blocking(
     let title_ai = ai_text(
         title_ai_on,
         need_title,
-        identity.as_ref().map(|identity| &identity.title),
+        identity
+            .as_ref()
+            .and_then(|identity| identity.title.as_ref()),
     );
     let synopsis_ai = ai_text(
         synopsis_ai_on,
         need_synopsis,
-        identity.as_ref().map(|identity| &identity.synopsis),
+        identity
+            .as_ref()
+            .and_then(|identity| identity.synopsis.as_ref()),
     );
     let title_resolved = resolve_title(saved_title.clone(), &title_ai, &llm_label);
     let synopsis_resolved = resolve_synopsis(
@@ -2181,9 +2302,16 @@ pub(crate) fn regenerate_poster_blocking(
             payload["posterPath"] = json!(poster.display().to_string());
             // 就地渲染：重算的 AI 声明随清单一起写回。旧清单没有成片清单 / 处理方式时，
             // 证明里如实写「未记录（上次深度处理未完成）」。
+            let outputs_recorded = payload.get("outputs").is_some_and(|v| !v.is_null());
             match render_ai_proof(app, output_dir, payload) {
                 Ok((path, warning)) => {
                     messages.extend(warning);
+                    if !outputs_recorded {
+                        messages.push(
+                            "AI 制作证明里的成片清单写的是「未记录」（上次深度处理未完成）；完整跑一次深度处理后证明会补全成片清单。"
+                                .into(),
+                        );
+                    }
                     Some(path)
                 }
                 Err(error) => {
@@ -2469,6 +2597,90 @@ torch.load with map_location=torch.device('cpu') to map your storages to the CPU
     }
 
     #[test]
+    fn invalidate_previous_proof_removes_proof_and_keeps_poster_basis() {
+        let dir = std::env::temp_dir().join(format!("dossier-invalidate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 没有清单也没有证明：返回 false，不创建任何文件。
+        assert!(!invalidate_previous_proof(&dir, true).unwrap());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+
+        std::fs::write(dir.join(PROOF_IMAGE_FILE), b"png").unwrap();
+        std::fs::write(dir.join(PROOF_TEXT_FILE), b"txt").unwrap();
+        let manifest = json!({
+            "title": "剧名",
+            "posterSource": "AI 生成（模型 m）",
+            "posterBasis": {"title": "剧名", "synopsis": "简介"},
+            "proof": "/输出/AI制作证明.png",
+            "proofPayload": {
+                "title": "剧名",
+                "outputs": [{"fileName": "第01集.mp4"}],
+                "processingLines": ["逐集微帧"],
+                "processCount": 4,
+                "storyboardSource": "原始素材抽帧",
+                "sources": []
+            }
+        });
+        std::fs::write(dir.join(MANIFEST_FILE), manifest.to_string()).unwrap();
+        for path in process_image_paths(&dir) {
+            std::fs::write(path, b"png").unwrap();
+        }
+
+        // 材料流水线关着：过程图不会被重做，文件与计数都原样保留，只作废证明与成片清单。
+        let backup = std::fs::read(dir.join(MANIFEST_FILE)).unwrap();
+        assert!(invalidate_previous_proof(&dir, false).unwrap());
+        assert!(process_image_paths(&dir).iter().all(|p| p.is_file()));
+        let kept: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join(MANIFEST_FILE)).unwrap()).unwrap();
+        assert_eq!(kept["proofPayload"]["processCount"], 4);
+        assert!(kept["proofPayload"].get("outputs").is_none());
+        assert!(!dir.join(PROOF_IMAGE_FILE).exists());
+
+        // 材料流水线开着：过程图连同计数一起清掉，磁盘与清单一致。
+        std::fs::write(dir.join(MANIFEST_FILE), &backup).unwrap();
+        std::fs::write(dir.join(PROOF_IMAGE_FILE), b"png").unwrap();
+        std::fs::write(dir.join(PROOF_TEXT_FILE), b"txt").unwrap();
+        assert!(invalidate_previous_proof(&dir, true).unwrap());
+        assert!(process_image_paths(&dir).iter().all(|p| !p.exists()));
+        assert!(!dir.join(PROOF_IMAGE_FILE).exists());
+        assert!(!dir.join(PROOF_TEXT_FILE).exists());
+        let after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join(MANIFEST_FILE)).unwrap()).unwrap();
+        assert!(after["proof"].is_null());
+        assert!(after["proofPayload"].get("outputs").is_none());
+        assert!(after["proofPayload"].get("processingLines").is_none());
+        // 过程图开跑就会被删除重做：作废后计数清零，重做海报时不会写「已生成 4 张」。
+        assert_eq!(after["proofPayload"]["processCount"], 0);
+        assert!(after["proofPayload"]["storyboardSource"]
+            .as_str()
+            .unwrap()
+            .starts_with("未生成"));
+        assert_eq!(after["proofPayload"]["title"], "剧名");
+        assert_eq!(after["posterBasis"]["synopsis"], "简介");
+        assert_eq!(after["posterSource"], "AI 生成（模型 m）");
+        // 再作废一次：已经没有可作废的了。
+        assert!(!invalidate_previous_proof(&dir, true).unwrap());
+
+        // 只有成片清单、没有证明文件也没有 proof 字段：照样算作废（以前返回 false，提示里漏说）。
+        let partial = json!({"proof": null, "proofPayload": {"outputs": []}});
+        std::fs::write(dir.join(MANIFEST_FILE), partial.to_string()).unwrap();
+        assert!(invalidate_previous_proof(&dir, true).unwrap());
+
+        // 清单是数组（非对象）：不动它，不报错。
+        std::fs::write(dir.join(MANIFEST_FILE), b"[1, 2]").unwrap();
+        assert!(!invalidate_previous_proof(&dir, true).unwrap());
+        assert_eq!(std::fs::read(dir.join(MANIFEST_FILE)).unwrap(), b"[1, 2]");
+
+        // 清单损坏：证明照删，清单原样保留，不报错。
+        std::fs::write(dir.join(PROOF_IMAGE_FILE), b"png").unwrap();
+        std::fs::write(dir.join(MANIFEST_FILE), b"{ broken").unwrap();
+        assert!(invalidate_previous_proof(&dir, true).unwrap());
+        assert!(!dir.join(PROOF_IMAGE_FILE).exists());
+        assert_eq!(std::fs::read(dir.join(MANIFEST_FILE)).unwrap(), b"{ broken");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn previous_manifest_and_regeneration_manifest_handle_missing_or_bad_files() {
         let dir = std::env::temp_dir().join(format!("dossier-manifest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2737,6 +2949,22 @@ torch.load with map_location=torch.device('cpu') to map your storages to the CPU
             "启用去重配方时必须如实列出元数据改写"
         );
         assert!(full.contains(&"AI 合规角标：已烧录「内容由AI生成」".to_string()));
+        // 证明列出的字段必须与实际写入成片的元数据键完全一致（以前漏了 comment / copyright）。
+        let metadata_line = full
+            .iter()
+            .find(|line| line.starts_with("成片元数据改写："))
+            .unwrap();
+        let plan = crate::dedup::DedupRecipePlan::build("剧A", 1);
+        for (key, _) in plan.metadata_tags(0) {
+            assert!(
+                metadata_line.contains(&format!("{key}（")),
+                "证明漏写 {key}：{metadata_line}"
+            );
+        }
+        assert_eq!(
+            metadata_line.matches('（').count(),
+            plan.metadata_tags(0).len()
+        );
 
         let bare = processing_lines(&ProofProcessing {
             encoder: "h264_nvenc（3 路并行）".into(),

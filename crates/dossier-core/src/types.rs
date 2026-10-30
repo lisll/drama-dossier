@@ -53,6 +53,15 @@ pub struct ProbedEpisode {
     pub spec: EpisodeSpec,
 }
 
+/// 规格探测失败的分集：文件信息 + 原因。调用方据此拒绝执行或在结果里标明，不能静默跳过。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeFailure {
+    #[serde(flatten)]
+    pub file: EpisodeFile,
+    pub reason: String,
+}
+
 /// 检查项状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

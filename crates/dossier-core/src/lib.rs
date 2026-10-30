@@ -12,6 +12,7 @@
 //! - [`progress`]：长任务进度流（JSONL 追加写 + 乱序拦截）
 //! - [`checkpoint`]：检查点与断点续跑（产物校验 + 输入指纹）
 //! - [`pipeline_version`]：管线版本化与跨产物一致性校验
+//! - [`fsio`]：写进用户目录时不跟随符号链接的原子写入与临时文件清理
 //!
 //! 合规边界：本 crate 不提供、也不应加入任何内容指纹规避、
 //! 版权保护绕过或材料伪造能力。报审包内置于权属声明模板。
@@ -21,6 +22,7 @@ pub mod checklist;
 pub mod checkpoint;
 pub mod diff;
 pub mod draft;
+pub mod fsio;
 pub mod ledger;
 pub mod package;
 pub mod pipeline_version;
@@ -88,4 +90,4 @@ pub use tools::{
     BitrateDirection, BitrateItem, MountCsvCheck, MountCsvIssue, RecutPlan, RenameItem, RenamePlan,
 };
 pub use transcode::{advise_episode, plan_normalization, NormalizationPlan, TranscodeTarget};
-pub use types::{CheckStatus, Drama, EpisodeFile, EpisodeSpec, ProbedEpisode};
+pub use types::{CheckStatus, Drama, EpisodeFile, EpisodeSpec, ProbeFailure, ProbedEpisode};

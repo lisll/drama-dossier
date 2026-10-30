@@ -4,7 +4,7 @@
 //! 包路径与大小，作为「生成历史 / 消耗流水」的演示数据源；云端版将改为
 //! 从服务端拉取积分流水，本模块保留为离线兜底。
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -60,11 +60,12 @@ pub fn list_records(path: &Path) -> std::io::Result<Vec<LedgerRecord>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let file = std::fs::File::open(path)?;
-    let mut records: Vec<LedgerRecord> = BufReader::new(file)
+    // 整份读入后宽松解码：一行坏字节（非 UTF-8）只影响那一行。按行读的 `lines()` 遇到非 UTF-8
+    // 会返回 Err，以前用 map_while 一停就把后面所有记录都丢了。
+    let bytes = std::fs::read(path)?;
+    let mut records: Vec<LedgerRecord> = String::from_utf8_lossy(&bytes)
         .lines()
-        .map_while(Result::ok)
-        .filter_map(|line| serde_json::from_str(&line).ok())
+        .filter_map(|line| serde_json::from_str(line).ok())
         .collect();
     records.sort_by(|a, b| b.ts.cmp(&a.ts));
     Ok(records)
@@ -106,6 +107,23 @@ mod tests {
         assert_eq!(records[0].drama_name, "剧B");
         assert_eq!(records[1].drama_name, "剧A");
         assert_eq!(records[2].drama_name, "剧C");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn invalid_utf8_line_does_not_hide_later_records() {
+        let path = temp_path("utf8");
+        append_record(&path, &record("2026-10-14T10:00:00+08:00", "剧A")).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"{\"ts\":\"\xff\xfe\"}\n").unwrap();
+        drop(file);
+        append_record(&path, &record("2026-10-14T12:00:00+08:00", "剧B")).unwrap();
+        let records = list_records(&path).unwrap();
+        let names: Vec<&str> = records.iter().map(|r| r.drama_name.as_str()).collect();
+        assert_eq!(names, ["剧B", "剧A"], "坏行前后的记录都要在");
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 

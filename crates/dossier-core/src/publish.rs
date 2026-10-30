@@ -171,7 +171,8 @@ pub fn csv_text_with_bom(text: &str) -> String {
     }
 }
 
-/// 写入 UTF-8（带 BOM）CSV。写入采用临时文件替换，避免中途崩溃留下半份文案。
+/// 写入 UTF-8（带 BOM）CSV。原子写入（[`crate::fsio::write_atomic`]）：中途崩溃不留半份文案，
+/// 也不会顺着输出位置预先放好的符号链接写到别处。
 pub fn write_mount_copy_csv(
     path: &Path,
     rows: &[MountCopyRow],
@@ -180,7 +181,6 @@ pub fn write_mount_copy_csv(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("csv.tmp");
     let mut output = String::from(UTF8_BOM);
     output.push_str(MOUNT_COPY_HEADER);
     output.push('\n');
@@ -188,8 +188,7 @@ pub fn write_mount_copy_csv(
         output.push_str(&row_to_csv(row));
         output.push('\n');
     }
-    fs::write(&tmp, output.as_bytes())?;
-    fs::rename(&tmp, path)?;
+    crate::fsio::write_atomic(path, output.as_bytes())?;
     Ok(MountCopyWriteResult {
         path: path.to_path_buf(),
         row_count: rows.len(),
@@ -384,7 +383,9 @@ fn unguard_formula(value: &str) -> String {
     }
 }
 
-fn csv_escape(value: &str) -> String {
+/// CSV 单元格转义：先做公式注入防护（[`guard_formula`]），再按 RFC 4180 加引号。
+/// 挂载文案与报审包分集清单共用这一份。
+pub(crate) fn csv_escape(value: &str) -> String {
     let value = guard_formula(value);
     if value.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", value.replace('"', "\"\""))

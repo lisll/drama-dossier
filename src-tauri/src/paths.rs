@@ -119,28 +119,12 @@ pub(crate) fn claim_output_dir(dir: &Path) -> Result<BusyOutputDir, ()> {
     Ok(BusyOutputDir { dir })
 }
 
-/// 原子写入：先写到同一目录下的唯一临时文件，再 `rename` 覆盖目标。
+/// 原子写入：先写到同一目录下的独占临时文件，再 `rename` 覆盖目标（实现见 `dossier_core::fsio`）。
 ///
 /// 写到一半失败（磁盘满、被占用）时旧文件原样保留，不会留下截断的海报、清单或标记；
-/// 临时文件名带进程号与序号，并发写同一目标时互不踩踏；失败时清掉临时文件。
+/// 临时文件独占创建，不会顺着输出目录里预先放好的符号链接写到别处。
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let name = path
-        .file_name()
-        .ok_or_else(|| std::io::Error::other(format!("不是文件路径：{}", path.display())))?;
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let temp = path.with_file_name(format!(
-        ".{}.{}.{seq}.tmp",
-        name.to_string_lossy(),
-        std::process::id()
-    ));
-    std::fs::write(&temp, bytes).inspect_err(|_| {
-        let _ = std::fs::remove_file(&temp);
-    })?;
-    std::fs::rename(&temp, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&temp);
-    })
+    dossier_core::fsio::write_atomic(path, bytes)
 }
 
 /// 平台对应的「打开文件管理器」命令；不支持的平台返回 `None`。

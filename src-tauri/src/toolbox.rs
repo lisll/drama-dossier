@@ -642,11 +642,26 @@ pub fn probe_bitrate(
     let (min_bps, max_bps) = bitrate_range(min_kbps, max_kbps)?;
     let drama = load_drama(&root, &name)?;
     let ffprobe = resolve_ffprobe(&app, ffprobe_path.as_deref())?;
-    let episodes = probe_all(&drama, Some(ffprobe.display().to_string()));
-    if episodes.is_empty() {
-        return Err("没有任何成功探测规格的分集；请先确认素材可读且 ffprobe 可用。".into());
-    }
-    Ok(bitrate_report(&episodes, min_bps, max_bps))
+    let probes = probe_all(&drama, Some(ffprobe.display().to_string()));
+    probes.require_some("检测码率")?;
+    // 探测失败的分集也列一行（原因写在 error 里），不从表里消失。
+    let mut items = bitrate_report(&probes.ok, min_bps, max_bps);
+    items.extend(probes.failed.iter().map(|failure| {
+        BitrateItem::probe_failed(
+            &failure.file.file_name,
+            &failure.file.path.display().to_string(),
+            &failure.reason,
+        )
+    }));
+    // 失败行按原分集顺序插回，不集中堆在表尾。
+    let order: std::collections::HashMap<String, usize> = drama
+        .episodes
+        .iter()
+        .enumerate()
+        .map(|(index, episode)| (episode.path.display().to_string(), index))
+        .collect();
+    items.sort_by_key(|item| order.get(&item.path).copied().unwrap_or(usize::MAX));
+    Ok(items)
 }
 
 /// 修复结果：修了什么、跳过了什么。
@@ -823,7 +838,7 @@ fn summarize_ffmpeg_failure(stderr: &str) -> String {
 /// 码率修复的第二遍目标：按第一遍偏离区间的程度等比修正。
 ///
 /// 平均码率编码对细节少的画面会编不满、对细节多的画面会超出，按 `本次目标 × 期望 / 实测` 再给一次
-/// 额度通常能落进区间。修正幅度封顶：偏低时最多放大到下限的 2 倍，偏高时最多压到上限的一半，
+/// 额度通常能落进区间。修正幅度封顶：偏低时最多放大到下限的 2 倍（且不超过上限），偏高时最多压到上限的一半，
 /// 防止极端画面把目标推到离谱的值（那种素材再怎么调也落不进区间，如实报失败）。
 fn retry_target_bps(min_bps: u64, max_bps: u64, attempted_bps: u64, measured_bps: u64) -> u64 {
     let scale = |desired: u64| -> u64 {
@@ -834,7 +849,9 @@ fn retry_target_bps(min_bps: u64, max_bps: u64, attempted_bps: u64, measured_bps
     };
     if measured_bps < min_bps {
         let desired = bitrate_fix_target(BitrateDirection::Low, min_bps, max_bps);
-        scale(desired).clamp(desired, min_bps.saturating_mul(2).max(desired))
+        // `desired ≤ max_bps`（bitrate_fix_target 保证），所以上界不会小于下界。
+        let cap = min_bps.saturating_mul(2).min(max_bps).max(desired);
+        scale(desired).clamp(desired, cap)
     } else {
         let floor = (max_bps / 2).max(min_bps);
         scale(max_bps).clamp(floor, max_bps)
@@ -875,12 +892,12 @@ impl StreamCompat {
     fn note(self) -> Option<String> {
         match self {
             Self::CopyAll => None,
-            Self::Convert => {
-                Some("原音轨 / 字幕格式无法直接封装进 mp4，已转为 AAC 音轨与 mov_text 字幕".into())
-            }
-            Self::DropSubtitles => {
-                Some("原字幕轨格式无法封装进 mp4，修复后的文件不含字幕轨（音轨已转为 AAC）".into())
-            }
+            Self::Convert => Some(
+                "原音轨 / 字幕格式无法直接封装进 mp4/mov，已转为 AAC 音轨与 mov_text 字幕".into(),
+            ),
+            Self::DropSubtitles => Some(
+                "原字幕轨格式无法封装进 mp4/mov，修复后的文件不含字幕轨（音轨已转为 AAC）".into(),
+            ),
         }
     }
 }
@@ -900,15 +917,32 @@ fn is_container_compat_error(error: &str) -> bool {
     .any(|pattern| error.contains(pattern))
 }
 
+/// 码率修复支持的封装：扩展名（不区分大小写）为 mp4 / m4v → mp4 封装器，mov → mov 封装器。
+///
+/// 编码参数整套按 ISO BMFF 设计（`+faststart`、字幕转 mov_text），mkv / ts / flv / webm 装不下：
+/// 以前临时文件固定 `.mp4`，替换后得到「扩展名是 mkv、内容是 mp4」的文件。其余格式明确拒绝。
+fn bitrate_fix_muxer(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "mp4" | "m4v" => Some("mp4"),
+        "mov" => Some("mov"),
+        _ => None,
+    }
+}
+
 /// 码率修复的 ffmpeg 参数（纯函数，便于单测）。
 ///
 /// `-map 0:V` 只取真正的视频轨（大写 V 排除封面图这类附加图片），`0:a?` / `0:s?` 保留全部音轨与字幕轨；
 /// 只重编视频，其余按 `compat` 原样拷贝或转换。不加 `-map` 时 ffmpeg 只挑一条音轨、丢掉字幕。
+///
+/// `muxer` 显式指定封装器（`-f mp4` / `-f mov`），不让 ffmpeg 按临时文件扩展名去选：
+/// `.m4v` 默认会选 ipod 封装器，它能装的音频编码更少。
 fn bitrate_encode_args(
     input: &str,
     output: &str,
     target_bps: u64,
     compat: StreamCompat,
+    muxer: &str,
 ) -> Vec<String> {
     let target_kbps = (target_bps / 1000).max(1);
     let maxrate_kbps = target_kbps + target_kbps / 4;
@@ -945,7 +979,13 @@ fn bitrate_encode_args(
             args.extend(["-c:a", "aac", "-b:a", "128k", "-sn"].map(String::from))
         }
     }
-    args.extend(["-movflags".into(), "+faststart".into(), output.into()]);
+    args.extend([
+        "-movflags".into(),
+        "+faststart".into(),
+        "-f".into(),
+        muxer.into(),
+        output.into(),
+    ]);
     args
 }
 
@@ -968,11 +1008,14 @@ fn encode_at_bitrate(
     compat: StreamCompat,
     ctx: FfmpegCtx,
 ) -> Result<EncodedMeasure, String> {
+    // 临时文件沿用原扩展名（bitrate_fix_temp_path），封装器按它定。
+    let muxer = bitrate_fix_muxer(tmp).ok_or_else(|| unsupported_bitrate_container(tmp))?;
     let args = bitrate_encode_args(
         &input.display().to_string(),
         &tmp.display().to_string(),
         target_bps,
         compat,
+        muxer,
     );
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     run_ffmpeg(ffmpeg, &arg_refs, ctx)?;
@@ -1002,6 +1045,29 @@ fn encode_at_bitrate(
     })
 }
 
+/// 码率修复的临时文件：`.{原文件名}.fixing.{原扩展名}`。
+fn bitrate_fix_temp_path(input: &Path) -> PathBuf {
+    let name = input
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = input
+        .extension()
+        .map(|ext| ext.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "mp4".into());
+    input.with_file_name(format!(".{name}.fixing.{ext}"))
+}
+
+fn unsupported_bitrate_container(input: &Path) -> String {
+    let ext = input
+        .extension()
+        .map(|ext| ext.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "无扩展名".into());
+    format!(
+        "码率修复暂只支持 mp4 / m4v / mov 封装（本集是 {ext}），原文件未改动。请先用其他工具转成 mp4 后再修复。"
+    )
+}
+
 /// 重编码成功的结果：替换后的实测码率与兼容处理说明。
 struct ReencodeOutcome {
     measured_bps: Option<u64>,
@@ -1022,18 +1088,16 @@ fn reencode_to_bitrate(
     target_bps: u64,
     ctx: FfmpegCtx,
 ) -> Result<ReencodeOutcome, String> {
-    // 临时文件点开头：中途崩溃留下的残余不会被扫描器当成新一集。
-    let tmp = input.with_file_name(format!(
-        ".{}.fixing.mp4",
-        input
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    ));
+    if bitrate_fix_muxer(input).is_none() {
+        return Err(unsupported_bitrate_container(input));
+    }
+    // 临时文件点开头：中途崩溃留下的残余不会被扫描器当成新一集；扩展名沿用原文件。
+    let tmp = bitrate_fix_temp_path(input);
     let mut compat = StreamCompat::CopyAll;
     // 先确定能封装进 mp4 的兼容处理方式：只在「流放不进容器」时逐级降级。
     let mut attempt = |target: u64| -> Result<EncodedMeasure, String> {
         loop {
+            clear_temp(&tmp)?;
             match encode_at_bitrate(ffmpeg, ffprobe, input, &tmp, target, compat, ctx) {
                 Ok(measure) => return Ok(measure),
                 Err(error) => {
@@ -1125,18 +1189,31 @@ fn fix_bitrate_blocking(
     let ffmpeg = resolve_ffmpeg(app)?;
     let ffprobe = resolve_ffprobe(app, ffprobe_path.as_deref())?;
     let drama = load_drama(&root, &name)?;
-    let episodes = probe_all(&drama, Some(ffprobe.display().to_string()));
-    if episodes.is_empty() {
-        return Err("没有任何成功探测规格的分集；请先确认素材可读且 ffprobe 可用。".into());
-    }
+    let probes = probe_all(&drama, Some(ffprobe.display().to_string()));
+    probes.require_some("修复码率")?;
+    let episodes = probes.ok;
     let report = bitrate_report(&episodes, min_bps, max_bps);
-    let durations: std::collections::HashMap<&str, f64> = episodes
+    // 按完整路径查：不同子目录里的同名分集各有各的时长（以前按文件名查，会拿到同一个）。
+    let durations: std::collections::HashMap<String, f64> = episodes
         .iter()
-        .map(|episode| (episode.file.file_name.as_str(), episode.spec.duration_sec))
+        .map(|episode| {
+            (
+                episode.file.path.display().to_string(),
+                episode.spec.duration_sec,
+            )
+        })
         .collect();
 
     let mut fixed = Vec::new();
-    let mut failed = Vec::new();
+    // 探测失败的分集不修，但必须出现在失败列表里（以前直接从结果里消失）。
+    let mut failed: Vec<FailedItem> = probes
+        .failed
+        .iter()
+        .map(|failure| FailedItem {
+            file_name: failure.file.file_name.clone(),
+            reason: format!("探测失败：{}", failure.reason),
+        })
+        .collect();
     let mut untouched = 0_usize;
     let fix_total = report.iter().filter(|item| item.needs_fix).count() as u64;
     let mut fix_index = 0_u64;
@@ -1165,10 +1242,7 @@ fn fix_bitrate_blocking(
         );
         let from_kbps = item.bitrate_bps.unwrap_or(0) / 1000;
         let path = PathBuf::from(&item.path);
-        let duration = durations
-            .get(item.file_name.as_str())
-            .copied()
-            .unwrap_or_default();
+        let duration = durations.get(&item.path).copied().unwrap_or_default();
         let ctx = FfmpegCtx::encode(task.token(), duration, false);
         let target = bitrate_fix_target(direction, min_bps, max_bps);
         match reencode_to_bitrate(&ffmpeg, &ffprobe, &path, duration, range, target, ctx) {
@@ -1361,6 +1435,55 @@ fn detect_encode_lanes(ffmpeg: &Path) -> EncodeLanes {
     }
 }
 
+/// 智能微调开始前的检查（沿用原文件名与扩展名输出，编码参数是 libx264 + aac）：
+/// - webm 封装装不下 H.264 / AAC，ffmpeg 只会报一句难懂的错误；
+/// - 不同子目录里的同名分集会并行写进同一个输出文件、互相覆盖（比较不区分大小写）。
+fn nudge_precheck(episodes: &[ProbedEpisode]) -> Result<(), String> {
+    let webm: Vec<&str> = episodes
+        .iter()
+        .filter(|episode| {
+            Path::new(&episode.file.file_name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("webm"))
+        })
+        .map(|episode| episode.file.file_name.as_str())
+        .collect();
+    if !webm.is_empty() {
+        return Err(format!(
+            "智能微调暂不支持 webm 素材：{}。请先转成 mp4，或改用分集重组 / 深度处理（输出 mp4）。",
+            webm.join("、")
+        ));
+    }
+    let mut seen: std::collections::HashMap<String, &Path> = std::collections::HashMap::new();
+    let mut clashes = Vec::new();
+    for episode in episodes {
+        let key = episode.file.file_name.to_lowercase();
+        if let Some(first) = seen.get(&key) {
+            clashes.push(format!(
+                "{}（{} 与 {}）",
+                episode.file.file_name,
+                first.display(),
+                episode.file.path.display()
+            ));
+        } else {
+            seen.insert(key, &episode.file.path);
+        }
+    }
+    if !clashes.is_empty() {
+        return Err(format!(
+            "以下分集文件名相同，智能微调会互相覆盖：{}。请先把其中一个改名后再试。",
+            clashes.join("；")
+        ));
+    }
+    Ok(())
+}
+
+/// 按目标集数重组时切出的段数不足目标：如实提示，不让用户以为拿到了要的集数。
+fn target_count_shortfall_note(planned: usize, target: usize) -> Option<String> {
+    (planned < target)
+        .then(|| format!("素材只能切成 {planned} 集（目标 {target} 集）：可用的切点或总时长不足"))
+}
+
 /// 成片的临时文件路径：同目录、点开头（扫描器会跳过）、后缀与正式名相同（ffmpeg 按后缀选封装格式：
 /// 智能微调沿用原文件名，`.mkv` 素材就该输出 mkv 封装，不能变成扩展名是 mkv、内容是 mp4 的文件）。
 /// 正式名没有后缀时用 `.mp4`。
@@ -1378,6 +1501,13 @@ fn part_path(final_path: &Path) -> PathBuf {
         .filter(|ext| !ext.is_empty())
         .unwrap_or_else(|| "mp4".into());
     final_path.with_file_name(format!(".{name}.part.{ext}"))
+}
+
+/// 写临时文件前清掉同名旧文件：上次崩溃的残件，或输出目录里预先放好的符号链接
+/// （ffmpeg 会顺着链接写到别处）。删的是路径本身；被真实目录占住时报错。
+fn clear_temp(path: &Path) -> Result<(), String> {
+    dossier_core::fsio::clear_stale_temp(path)
+        .map_err(|error| format!("无法清理临时文件 {}：{error}", path.display()))
 }
 
 /// 删除一批临时文件（不存在的忽略）。失败 / 停止时调用，保证不留 `.part` 残余。
@@ -1697,6 +1827,7 @@ fn transcode_nudge_blocking(
         if job.badge.is_some() {
             detail.push_str("；已烧录 AI 合规角标");
         }
+        clear_temp(&part).map_err(|error| format!("{}：{error}", episode.file.file_name))?;
         let args = build_nudge_args(&job);
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         // 带去重配方或角标的编码滤镜链最重，超时系数按深度处理算。
@@ -1889,7 +2020,14 @@ fn transcode_recut_blocking(
 
     let mut out_of_range_note = None;
     let segments = match strategy {
-        RecutStrategy::TargetCount(target) => plan_recut_segments(&boundaries, total, target, 1.0),
+        RecutStrategy::TargetCount(target) => {
+            let segments = plan_recut_segments(&boundaries, total, target, 1.0);
+            if let Some(note) = target_count_shortfall_note(segments.len(), target) {
+                crate::logging::log_event("转码", &note);
+                out_of_range_note = Some(note);
+            }
+            segments
+        }
         RecutStrategy::DurationRange {
             min_sec,
             max_sec,
@@ -2027,6 +2165,7 @@ fn encode_recut_job(
 ) -> Result<(), String> {
     // 写临时文件，由调用方在全部单元成功后统一发布为 job.output。
     let output = &part_path(&job.output);
+    clear_temp(output).map_err(|error| format!("第 {} 集：{error}", job.index + 1))?;
     let spans = &job.spans;
     if spans.len() == 1 {
         // 单源片段：一条命令直达。
@@ -2059,6 +2198,12 @@ fn encode_recut_job(
                 .parent()
                 .unwrap_or(Path::new("."))
                 .join(format!(".recut-{:02}-part{:02}.mp4", job.index, part_index));
+            if let Err(error) = clear_temp(&part) {
+                for part in &part_paths {
+                    let _ = std::fs::remove_file(part);
+                }
+                return Err(format!("第 {} 集：{error}", job.index + 1));
+            }
             let mut args: Vec<String> = vec![
                 "-y".into(),
                 "-ss".into(),
@@ -2075,6 +2220,8 @@ fn encode_recut_job(
                 &arg_refs,
                 FfmpegCtx::encode(cancel, span.duration, false),
             ) {
+                // 当前这一段也可能写了一半：连同已切好的片段一起清掉。
+                let _ = std::fs::remove_file(&part);
                 for part in &part_paths {
                     let _ = std::fs::remove_file(part);
                 }
@@ -2097,7 +2244,7 @@ fn encode_recut_job(
             .map(|part| concat_entry(part))
             .collect::<Vec<_>>()
             .join("\n");
-        if let Err(error) = std::fs::write(&list_path, &list_body) {
+        if let Err(error) = crate::paths::write_atomic(&list_path, list_body.as_bytes()) {
             for part in &part_paths {
                 let _ = std::fs::remove_file(part);
             }
@@ -2310,25 +2457,13 @@ fn transcode_deep_blocking(
     // 阶段二：逐集微帧（进度 50~100）。成片单独放「视频成片/」子目录，材料与视频分层清晰。
     let final_video_dir = output_dir.join("视频成片");
 
-    // 去重配方：剧名 seed 确定性派生逐集扰动参数，配方全文落盘存证。
+    // 去重配方：剧名 seed 确定性派生逐集扰动参数。此处只在内存里生成；
+    // 存证文件等成片全部发布后才落盘（见下文），中途停止 / 失败不会留下与成片对不上的本轮配方。
     let recipe_plan = if settings.effective_dedup_recipe_enabled() {
-        let plan = crate::dedup::DedupRecipePlan::build(drama_name, recut_files.len());
-        match plan.save_to(output_dir) {
-            Ok(path) => crate::logging::log_event(
-                "去重",
-                format!(
-                    "配方已签发：seed {}，{} 集，存证 {}",
-                    plan.seed,
-                    plan.variants.len(),
-                    path.display()
-                ),
-            ),
-            Err(error) => crate::logging::log_event(
-                "去重",
-                format!("配方存证写入失败（不影响成片）：{error}"),
-            ),
-        }
-        Some(plan)
+        Some(crate::dedup::DedupRecipePlan::build(
+            drama_name,
+            recut_files.len(),
+        ))
     } else {
         crate::logging::log_event("去重", "已在设置中关闭，成片只做重组 + 微帧");
         None
@@ -2377,24 +2512,62 @@ fn transcode_deep_blocking(
         );
     }
 
+    // 成片已发布：配方存证此时落盘，与目录里的成片一一对应。
+    // 写入失败时删掉上一轮留下的存证：它和本轮成片对不上，也不能在报告里冒充本轮配方。
+    let recipe_saved = recipe_plan
+        .as_ref()
+        .map(|plan| match plan.save_to(output_dir) {
+            Ok(path) => {
+                crate::logging::log_event(
+                    "去重",
+                    format!(
+                        "配方已签发：seed {}，{} 集，存证 {}",
+                        plan.seed,
+                        plan.variants.len(),
+                        path.display()
+                    ),
+                );
+                Some(path)
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(output_dir.join(crate::dedup::RECIPE_FILE_NAME));
+                crate::logging::log_event(
+                    "去重",
+                    format!("配方存证写入失败（不影响成片，已删除上一轮存证）：{error}"),
+                );
+                None
+            }
+        });
+    // 本轮没开去重：上一轮的存证与本轮成片对不上，删掉（不存在时什么都不做）。
+    if recipe_plan.is_none()
+        && std::fs::remove_file(output_dir.join(crate::dedup::RECIPE_FILE_NAME)).is_ok()
+    {
+        crate::logging::log_event("去重", "本轮未启用去重配方，已删除上一轮的配方存证");
+    }
+
     // 汇总报告：去重摘要 + 完成说明。
-    let recipe_file = output_dir.join(crate::dedup::RECIPE_FILE_NAME);
     let dedup_summary = recipe_plan.map(|plan| crate::dedup::DedupRecipeSummary {
         seed: plan.seed,
         episode_count: plan.variants.len(),
-        recipe_file: recipe_file
-            .is_file()
-            .then(|| recipe_file.display().to_string()),
+        recipe_file: recipe_saved
+            .flatten()
+            .map(|path| path.display().to_string()),
     });
     let mut note = format!(
         "深度处理完成：全剧按场景切点重组后逐集微帧（{}），共 {episode_count} 集，成片在「视频成片/」子目录，原素材未改动。",
         lanes.describe()
     );
     if let Some(summary) = &dedup_summary {
-        note.push_str(&format!(
-            " 已注入确定性去重配方（seed {}，逐集参数存证于 去重配方.json）。",
-            summary.seed
-        ));
+        note.push_str(&match summary.recipe_file {
+            Some(_) => format!(
+                " 已注入确定性去重配方（seed {}，逐集参数存证于 去重配方.json）。",
+                summary.seed
+            ),
+            None => format!(
+                " 已注入确定性去重配方（seed {}），但配方存证写入失败，详见日志。",
+                summary.seed
+            ),
+        });
     }
     if badge.is_some() {
         note.push_str(&format!(
@@ -2460,6 +2633,7 @@ fn render_ai_badge(
         let python = locate_materials_python(app)?;
         let script = materials_script(app, "make_ai_badge.py")?;
         let target = output_dir.join(AI_BADGE_FILE);
+        clear_temp(&target)?;
         let spec = CommandSpec::new(python.display().to_string())
             .args(ai_badge_script_args(
                 &script,
@@ -2520,14 +2694,18 @@ fn transcode_blocking(
         format!("编码器：{}，依据：{}", lanes.describe(), lanes.reason),
     );
     let drama = load_drama(&root, &name)?;
-    let episodes = probe_all(&drama, Some(ffprobe.display().to_string()));
-    if episodes.is_empty() {
-        return Err("没有任何成功探测规格的分集；请先确认素材可读且 ffprobe 可用。".into());
-    }
+    // 三种模式都要求每一集都探测成功：重组 / 深度处理按顺序拼全剧，少一集内容就断；
+    // 智能微调的输出目录之后会拿去生成报审包，缺集会被悄悄带过去。
+    let episodes =
+        probe_all(&drama, Some(ffprobe.display().to_string())).require_all("开始转码")?;
 
     let mode = request.mode.as_str();
     if !matches!(mode, "nudge" | "recut" | "deep") {
         return Err(format!("未知转码模式：{mode}（支持 nudge / recut / deep）"));
+    }
+    // 智能微调沿用原文件名与扩展名：先拦住编不出来、或会互相覆盖的情况，再创建任何目录。
+    if mode == "nudge" {
+        nudge_precheck(&episodes)?;
     }
     // 落点规则与报审包同一套（`dossier_core::resolve_product_dir`）：
     // 本次覆盖（页内输出目录，即最终目录本身）→ 产物根目录下的 `<剧名>/<子目录>` → 剧目目录内。
@@ -2627,6 +2805,31 @@ fn transcode_blocking(
         }
     } else {
         None
+    };
+    // 深度处理开跑前作废上一轮的 AI 制作证明（不论材料流水线开没开）：
+    // 一旦开跑，过程图、海报、简介、成片都会被替换，旧证明不可能再与目录内容对应；
+    // 只有本轮完整成功才会生成新证明（finalize_deep_proof）。作废失败时还没动任何材料文件，直接报错。
+    let proof_invalidated = if mode == "deep" {
+        // 材料流水线开着时本轮会重做过程图，旧过程图一并删除；关着时过程图不动。
+        let clear_process_images = settings.effective_material_pipeline_enabled();
+        match crate::content::invalidate_previous_proof(&output_dir, clear_process_images) {
+            Ok(invalidated) => {
+                if invalidated {
+                    crate::logging::log_event("材料", "深度处理开始：已作废上一轮 AI 制作证明");
+                }
+                invalidated
+            }
+            Err(error) => {
+                let mut leftovers = produced.clone();
+                if let Some(path) = &badge_path {
+                    leftovers.push(path.clone());
+                }
+                rollback(&leftovers);
+                return Err(format!("{error}，未开始处理。"));
+            }
+        }
+    } else {
+        false
     };
     // 深度处理材料开关开着才启动材料线程，与编码并行；材料失败不回滚成片。
     // 关着就不产出任何材料（不调 ASR/OCR/LLM/生图）。
@@ -2762,6 +2965,12 @@ fn transcode_blocking(
                     cancel,
                 );
             }
+            // 上一轮证明开跑时已作废，而本轮没有生成新证明（材料流水线关着、材料线程失败、或渲染失败）：
+            // 如实说明，别让用户以为目录里还有证明。
+            let proof_generated = materials.as_ref().is_some_and(|m| m.proof.is_some());
+            if let Some(note) = missing_proof_note(mode, proof_invalidated, proof_generated) {
+                report.note.push_str(note);
+            }
             report.materials = materials;
             Ok(report)
         }
@@ -2776,24 +2985,53 @@ fn transcode_blocking(
                         produced.len()
                     ),
                 );
-                return Err("已按要求停止转码，正在输出的目录已删除。".into());
+                return Err(stopped_message(dir_existed, proof_invalidated));
             }
             // 编码失败（非用户停止）：成片未发布，上一轮正式成片保持不动；
             // 已生成的剧名 / 简介 / 海报不删除（已付过 AI 费用，下次处理可直接复用）。
             // 材料线程被叫停时报告是 failed（字段为空），但剧名/简介在生成当下就已写回本剧材料、
             // 海报直接落在输出目录，所以同样提示「成片未完成、已生成的保留」。
+            let proof_note = if proof_invalidated {
+                PROOF_INVALIDATED_NOTE
+            } else {
+                ""
+            };
             match &materials {
                 Some(report) if report.title.is_some() || report.poster.is_some() => Err(format!(
-                    "{error}\n成片未完成。已生成的材料保留在 {}，下次处理时会直接复用。",
+                    "{error}\n成片未完成。已生成的材料保留在 {}，下次处理时会直接复用。{proof_note}",
                     output_dir.display()
                 )),
                 Some(_) => Err(format!(
-                    "{error}\n成片未完成，材料线程已随之停止；如有已生成的剧名、简介、海报，均已保存，下次处理时会直接复用。"
+                    "{error}\n成片未完成，材料线程已随之停止；如有已生成的剧名、简介、海报，均已保存，下次处理时会直接复用。{proof_note}"
                 )),
+                None if proof_invalidated => Err(format!("{error}\n{proof_note}")),
                 None => Err(error),
             }
         }
     }
+}
+
+/// 上一轮 AI 制作证明已在开跑时作废、本轮又没完成时附在提示末尾。
+const PROOF_INVALIDATED_NOTE: &str =
+    "上一轮 AI 制作证明已作废（它描述的内容已被本轮部分替换），请重新完整深度处理以生成新证明。";
+
+/// 深度处理成功、但目录里没有对应本轮的 AI 制作证明时附在完成说明后的提示。
+fn missing_proof_note(mode: &str, invalidated: bool, generated: bool) -> Option<&'static str> {
+    (mode == "deep" && invalidated && !generated).then_some(
+        " 注意：上一轮 AI 制作证明已在开始时作废，本轮未生成新证明（材料流水线关闭、材料线程失败或证明渲染失败，详见材料结果）；需要证明时请开启材料流水线后重新深度处理。",
+    )
+}
+
+/// 停止转码时的提示：按输出目录是否本轮新建、上一轮证明是否已作废如实写。
+fn stopped_message(dir_existed: bool, proof_invalidated: bool) -> String {
+    if !dir_existed {
+        return "已按要求停止转码，本次新建的输出目录已删除。".into();
+    }
+    let mut message = "已按要求停止转码，本次产物已删除，上一轮成片保留。".to_string();
+    if proof_invalidated {
+        message.push_str(PROOF_INVALIDATED_NOTE);
+    }
+    message
 }
 
 /// 停止后清理本次转码产物：目录是本次新建的 → 整目录删除；
@@ -3212,6 +3450,41 @@ pub(crate) fn materials_script(app: &AppHandle, name: &str) -> Result<PathBuf, S
     ))
 }
 
+/// 去重验证脚本的参数来源。
+struct DedupDemoArgs<'a> {
+    input: &'a str,
+    output_dir: &'a str,
+    seed: i64,
+    series: &'a str,
+    badge: Option<&'a str>,
+    watermark: Option<&'a str>,
+    time_stretch: &'a str,
+    ffmpeg: &'a Path,
+    ffprobe: &'a Path,
+}
+
+/// demo_dedup.py 的命令行参数。用户填写或外部路径的值一律写成 `--key=value` 一个参数：
+/// 分开写时，以 `-` 开头的文案（如剧名「-序章-」）会被 argparse 当成另一个选项而报错或错位。
+fn dedup_demo_args(a: &DedupDemoArgs<'_>) -> Vec<String> {
+    let mut args = vec![
+        "-m".to_string(),
+        "drama_cloud.demo_dedup".to_string(),
+        format!("--input={}", a.input),
+        format!("--output-dir={}", a.output_dir),
+        format!("--seed={}", a.seed),
+        format!("--series={}", a.series),
+        format!("--time-stretch={}", a.time_stretch),
+        format!("--ffmpeg={}", a.ffmpeg.display()),
+        format!("--ffprobe={}", a.ffprobe.display()),
+    ];
+    for (key, value) in [("badge", a.badge), ("watermark", a.watermark)] {
+        if let Some(text) = value.map(str::trim).filter(|text| !text.is_empty()) {
+            args.push(format!("--{key}={text}"));
+        }
+    }
+    args
+}
+
 /// V5 去重验证主流程：拼 CLI 参数 → 跑 demo_dedup.py → 收日志 + 读 manifest。
 #[allow(clippy::too_many_arguments)]
 fn dedup_demo_blocking(
@@ -3237,40 +3510,17 @@ fn dedup_demo_blocking(
     let ffmpeg = resolve_ffmpeg(app)?;
     let ffprobe = resolve_ffprobe(app, None)?;
 
-    let mut args: Vec<String> = vec![
-        "-m".into(),
-        "drama_cloud.demo_dedup".into(),
-        "--input".into(),
-        input.to_string(),
-        "--output-dir".into(),
-        output_dir.to_string(),
-        "--seed".into(),
-        seed.to_string(),
-        "--series".into(),
-        series.to_string(),
-        "--time-stretch".into(),
-        time_stretch.to_string(),
-        "--ffmpeg".into(),
-        ffmpeg.display().to_string(),
-        "--ffprobe".into(),
-        ffprobe.display().to_string(),
-    ];
-    if let Some(text) = badge
-        .as_deref()
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-    {
-        args.push("--badge".into());
-        args.push(text.to_string());
-    }
-    if let Some(text) = watermark
-        .as_deref()
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-    {
-        args.push("--watermark".into());
-        args.push(text.to_string());
-    }
+    let args = dedup_demo_args(&DedupDemoArgs {
+        input,
+        output_dir,
+        seed,
+        series,
+        badge: badge.as_deref(),
+        watermark: watermark.as_deref(),
+        time_stretch,
+        ffmpeg: &ffmpeg,
+        ffprobe: &ffprobe,
+    });
 
     let spec = CommandSpec::new(python.display().to_string())
         .args(args)
@@ -4522,11 +4772,26 @@ Conversion failed!
         assert_eq!(retry_target_bps(MIN, MAX, 8_000_000, 10_000_000), 6_400_000);
         // 超得离谱 → 最多压到上限的一半（且不低于下限）。
         assert_eq!(retry_target_bps(MIN, MAX, 8_000_000, 40_000_000), 4_000_000);
+        // 区间窄（4–5 Mbps）：偏低的第二遍目标不能超过上限（以前会算到 6750k，编出来必然超标）。
+        assert_eq!(
+            retry_target_bps(MIN, 5_000_000, 4_500_000, 3_000_000),
+            5_000_000
+        );
+        assert_eq!(
+            retry_target_bps(MIN, 5_000_000, 4_500_000, 1_000_000),
+            5_000_000
+        );
     }
 
     #[test]
     fn bitrate_encode_args_keep_all_streams_and_degrade_compat() {
-        let args = bitrate_encode_args("/in.mp4", "/tmp.mp4", 4_500_000, StreamCompat::CopyAll);
+        let args = bitrate_encode_args(
+            "/in.mp4",
+            "/tmp.mp4",
+            4_500_000,
+            StreamCompat::CopyAll,
+            "mp4",
+        );
         let joined = args.join(" ");
         assert!(joined.contains("-map 0:V -map 0:a? -map 0:s?"), "{joined}");
         assert!(
@@ -4534,10 +4799,17 @@ Conversion failed!
             "{joined}"
         );
         assert!(joined.contains("-c:a copy -c:s copy"), "{joined}");
+        assert!(joined.ends_with("-f mp4 /tmp.mp4"), "{joined}");
         assert_eq!(args.last().unwrap(), "/tmp.mp4");
 
-        let joined =
-            bitrate_encode_args("/in.mp4", "/tmp.mp4", 8_000_000, StreamCompat::Convert).join(" ");
+        let joined = bitrate_encode_args(
+            "/in.mp4",
+            "/tmp.mp4",
+            8_000_000,
+            StreamCompat::Convert,
+            "mp4",
+        )
+        .join(" ");
         assert!(
             joined.contains("-c:a aac -b:a 128k -c:s mov_text"),
             "{joined}"
@@ -4547,6 +4819,7 @@ Conversion failed!
             "/tmp.mp4",
             8_000_000,
             StreamCompat::DropSubtitles,
+            "mp4",
         )
         .join(" ");
         assert!(
@@ -4642,6 +4915,7 @@ Conversion failed!
             &output.display().to_string(),
             1_000_000,
             StreamCompat::CopyAll,
+            "mp4",
         );
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         run_ffmpeg(&ffmpeg, &arg_refs, FfmpegCtx::light(&cancel)).unwrap();
@@ -4662,6 +4936,192 @@ Conversion failed!
         let audio_tracks = String::from_utf8_lossy(&probe.stdout).lines().count();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(audio_tracks, 2, "修复后音轨数不对");
+    }
+
+    #[test]
+    fn bitrate_fix_only_accepts_iso_bmff_containers() {
+        assert_eq!(bitrate_fix_muxer(Path::new("/a/第1集.mp4")), Some("mp4"));
+        assert_eq!(bitrate_fix_muxer(Path::new("/a/第1集.MP4")), Some("mp4"));
+        assert_eq!(bitrate_fix_muxer(Path::new("/a/第1集.m4v")), Some("mp4"));
+        assert_eq!(bitrate_fix_muxer(Path::new("/a/第1集.MOV")), Some("mov"));
+        for name in ["/a/1.mkv", "/a/1.ts", "/a/1.flv", "/a/1.webm", "/a/无后缀"] {
+            assert_eq!(bitrate_fix_muxer(Path::new(name)), None, "{name}");
+        }
+        assert_eq!(
+            bitrate_fix_temp_path(Path::new("/a/第1集.MOV")),
+            PathBuf::from("/a/.第1集.MOV.fixing.MOV")
+        );
+        let reason = unsupported_bitrate_container(Path::new("/a/第1集.mkv"));
+        assert!(
+            reason.contains("本集是 mkv") && reason.contains("原文件未改动"),
+            "{reason}"
+        );
+        let mov = bitrate_encode_args("/in.mov", "/t.mov", 4_500_000, StreamCompat::CopyAll, "mov");
+        assert!(mov.join(" ").ends_with("-f mov /t.mov"));
+    }
+
+    /// 真实 ffmpeg：m4v（显式 -f mp4）与 mov（-f mov）的临时文件都能封装成功，且仍是 ISO BMFF。
+    #[test]
+    fn bitrate_encode_writes_m4v_and_mov_with_real_ffmpeg() {
+        let Some(ffmpeg) = which_ffmpeg() else {
+            eprintln!("本机没有 ffmpeg，跳过");
+            return;
+        };
+        let dir = unique_dir("bitrate-muxer");
+        let source = dir.join("source.mp4");
+        let source_str = source.display().to_string();
+        let cancel = CancelToken::new();
+        run_ffmpeg(
+            &ffmpeg,
+            &[
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=duration=1:size=320x240:rate=25",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-c:v",
+                "libx264",
+                "-c:a",
+                "aac",
+                "-shortest",
+                &source_str,
+            ],
+            FfmpegCtx::light(&cancel),
+        )
+        .unwrap();
+        for name in ["第1集.m4v", "第1集.mov"] {
+            let input = dir.join(name);
+            let muxer = bitrate_fix_muxer(&input).unwrap();
+            let tmp = bitrate_fix_temp_path(&input);
+            let args = bitrate_encode_args(
+                &source_str,
+                &tmp.display().to_string(),
+                500_000,
+                StreamCompat::CopyAll,
+                muxer,
+            );
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            run_ffmpeg(&ffmpeg, &arg_refs, FfmpegCtx::light(&cancel))
+                .unwrap_or_else(|error| panic!("{name}：{error}"));
+            let head = std::fs::read(&tmp).unwrap();
+            assert_eq!(&head[4..8], b"ftyp", "{name} 应为 ISO BMFF 封装");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 不支持的封装：直接失败、不调用 ffmpeg（ffmpeg 路径不存在也不会报「启动失败」）、原文件不动。
+    #[test]
+    fn bitrate_fix_rejects_mkv_without_touching_it() {
+        let dir = std::env::temp_dir().join(format!("dossier-fix-mkv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("第1集.mkv");
+        std::fs::write(&input, b"mkv bytes").unwrap();
+        let cancel = CancelToken::new();
+        let error = reencode_to_bitrate(
+            Path::new("/不存在/ffmpeg"),
+            Path::new("/不存在/ffprobe"),
+            &input,
+            60.0,
+            (4_000_000, 8_000_000),
+            4_500_000,
+            FfmpegCtx::light(&cancel),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("暂只支持 mp4 / m4v / mov"), "{error}");
+        assert_eq!(std::fs::read(&input).unwrap(), b"mkv bytes");
+        assert!(!dir.join(".第1集.mkv.fixing.mkv").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dedup_demo_args_keep_dash_values_as_one_argument() {
+        let args = dedup_demo_args(&DedupDemoArgs {
+            input: "-素材.mp4",
+            output_dir: "/out",
+            seed: -3,
+            series: "-序章-",
+            badge: Some("  --AI 生成  "),
+            watermark: Some("   "),
+            time_stretch: "on",
+            ffmpeg: Path::new("/bin/ffmpeg"),
+            ffprobe: Path::new("/bin/ffprobe"),
+        });
+        assert!(args.contains(&"--input=-素材.mp4".to_string()));
+        assert!(args.contains(&"--series=-序章-".to_string()));
+        assert!(args.contains(&"--seed=-3".to_string()));
+        assert!(args.contains(&"--badge=--AI 生成".to_string()));
+        assert!(
+            !args.iter().any(|arg| arg.starts_with("--watermark")),
+            "空白文案不传"
+        );
+        // 除了 `-m 模块名`，不再有单独成参的值。
+        assert!(args[2..]
+            .iter()
+            .all(|arg| arg.starts_with("--") && arg.contains('=')));
+    }
+
+    #[test]
+    fn nudge_precheck_rejects_webm_and_duplicate_names() {
+        let ep = |path: &str| ProbedEpisode {
+            file: EpisodeFile {
+                path: PathBuf::from(path),
+                file_name: Path::new(path)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                size_bytes: 1,
+                episode_number: None,
+            },
+            spec: Default::default(),
+        };
+        assert!(nudge_precheck(&[ep("/剧/第1集.mp4"), ep("/剧/第2集.mkv")]).is_ok());
+        let error = nudge_precheck(&[ep("/剧/第1集.mp4"), ep("/剧/第2集.WEBM")]).unwrap_err();
+        assert!(
+            error.contains("不支持 webm") && error.contains("第2集.WEBM"),
+            "{error}"
+        );
+        let error = nudge_precheck(&[ep("/剧/上/第1集.mp4"), ep("/剧/下/第1集.MP4")]).unwrap_err();
+        assert!(error.contains("互相覆盖"), "{error}");
+        assert!(
+            error.contains("/剧/上/第1集.mp4") && error.contains("/剧/下/第1集.MP4"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn missing_proof_is_reported_only_when_old_one_was_invalidated() {
+        assert!(missing_proof_note("deep", true, false)
+            .unwrap()
+            .contains("未生成新证明"));
+        assert!(missing_proof_note("deep", true, true).is_none());
+        assert!(missing_proof_note("deep", false, false).is_none());
+        assert!(missing_proof_note("recut", true, false).is_none());
+    }
+
+    #[test]
+    fn stop_message_matches_what_actually_happened() {
+        assert!(stopped_message(false, false).contains("新建的输出目录已删除"));
+        let kept = stopped_message(true, false);
+        assert!(
+            kept.contains("上一轮成片保留") && !kept.contains("证明"),
+            "{kept}"
+        );
+        let invalidated = stopped_message(true, true);
+        assert!(invalidated.contains("AI 制作证明已作废"), "{invalidated}");
+    }
+
+    #[test]
+    fn target_count_shortfall_is_reported() {
+        assert_eq!(target_count_shortfall_note(10, 10), None);
+        assert_eq!(target_count_shortfall_note(12, 10), None);
+        let note = target_count_shortfall_note(7, 10).unwrap();
+        assert!(note.contains("只能切成 7 集（目标 10 集）"), "{note}");
     }
 
     #[test]

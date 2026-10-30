@@ -16,21 +16,87 @@ use dossier_core::{
     scan_drama_dir, transition_publish_row, validate_drama_dir, validate_drama_name,
     validate_library_root, validate_publish_update, write_mount_copy_csv, CapcutDraft,
     DraftExportOptions, DraftExportResult, Drama, FfprobeConfig, MountCopyRow,
-    MountCopyWriteResult, NormalizationPlan, PackageDiff, PlatformProfile, ProbedEpisode,
-    ProfileReview, PublishPreview, TranscodeTarget,
+    MountCopyWriteResult, NormalizationPlan, PackageDiff, PlatformProfile, ProbeFailure,
+    ProbedEpisode, ProfileReview, PublishPreview, TranscodeTarget,
 };
 use serde::Serialize;
 
+/// 逐集探测结果：成功的与失败的分开交给调用方。
+///
+/// 以前失败的分集被 `filter_map(.ok())` 静默丢掉，草稿、文案、转码产物里少了几集也照样报成功。
+/// 现在每个调用方都必须决定：拒绝执行（[`ProbeSplit::require_all`]），或在结果里标明失败项。
+#[derive(Debug, Default)]
+pub(crate) struct ProbeSplit {
+    pub ok: Vec<ProbedEpisode>,
+    pub failed: Vec<ProbeFailure>,
+}
+
+impl ProbeSplit {
+    /// 失败分集的可读清单：`a.mp4（原因）；b.mp4（原因）`。
+    pub fn failure_list(&self) -> String {
+        self.failed
+            .iter()
+            .map(|failure| format!("{}（{}）", failure.file.file_name, failure.reason))
+            .collect::<Vec<_>>()
+            .join("；")
+    }
+
+    /// 产物依赖完整集数的入口用：有任何一集探测失败就拒绝，并列出文件与原因。
+    pub fn require_all(self, action: &str) -> Result<Vec<ProbedEpisode>, String> {
+        if !self.failed.is_empty() {
+            return Err(format!(
+                "有 {} 集探测失败，未{action}（避免产物缺集）：{}。请修复或移走这些文件后重试。",
+                self.failed.len(),
+                self.failure_list()
+            ));
+        }
+        if self.ok.is_empty() {
+            return Err(format!("没有任何分集，无法{action}。"));
+        }
+        Ok(self.ok)
+    }
+
+    /// 只读分析的入口用：允许部分失败（结果里标明），但一集都没探测成功时报错并列出原因。
+    pub fn require_some(&self, action: &str) -> Result<(), String> {
+        if !self.ok.is_empty() {
+            return Ok(());
+        }
+        if self.failed.is_empty() {
+            return Err(format!("没有任何分集，无法{action}。"));
+        }
+        Err(format!(
+            "所有分集都探测失败，无法{action}：{}。请先确认素材可读且 ffprobe 可用。",
+            self.failure_list()
+        ))
+    }
+}
+
 /// 逐集探测（与 `analyze_drama` 走同一个探测函数，避免两套行为）。
-pub(crate) fn probe_all(drama: &Drama, ffprobe_path: Option<String>) -> Vec<ProbedEpisode> {
+pub(crate) fn probe_all(drama: &Drama, ffprobe_path: Option<String>) -> ProbeSplit {
     let config = FfprobeConfig {
         bin: ffprobe_path.map(PathBuf::from),
     };
-    drama
-        .episodes
-        .iter()
-        .filter_map(|episode| probe_episode(episode, &config).ok())
-        .collect()
+    split_probes(&drama.episodes, |episode| {
+        probe_episode(episode, &config).map_err(|error| error.to_string())
+    })
+}
+
+/// 分拣逻辑本身（探测函数可注入，单测不依赖 ffprobe）。
+fn split_probes(
+    episodes: &[dossier_core::EpisodeFile],
+    mut probe: impl FnMut(&dossier_core::EpisodeFile) -> Result<ProbedEpisode, String>,
+) -> ProbeSplit {
+    let mut split = ProbeSplit::default();
+    for episode in episodes {
+        match probe(episode) {
+            Ok(probed) => split.ok.push(probed),
+            Err(reason) => split.failed.push(ProbeFailure {
+                file: episode.clone(),
+                reason,
+            }),
+        }
+    }
+    split
 }
 
 pub(crate) fn load_drama(root: &str, name: &str) -> Result<Drama, String> {
@@ -48,6 +114,8 @@ pub(crate) fn load_drama(root: &str, name: &str) -> Result<Drama, String> {
 pub struct TranscodeAdvicePayload {
     plan: NormalizationPlan,
     script: String,
+    /// 探测失败、未纳入建议的分集（文件名 + 原因）。
+    skipped: Vec<ProbeFailure>,
 }
 
 /// 生成转码建议（只建议，不执行任何转码）。
@@ -59,18 +127,21 @@ pub fn transcode_advice(
     ffprobe_path: Option<String>,
 ) -> Result<TranscodeAdvicePayload, String> {
     let drama = load_drama(&root, &name)?;
-    let episodes = probe_all(&drama, ffprobe_path);
-    if episodes.is_empty() {
-        return Err("没有任何成功探测规格的分集；请先确认素材可读且 ffprobe 可用。".into());
-    }
+    // 只建议、不执行：探测失败的分集不拦，列在结果里（它们往往最需要处理）。
+    let probes = probe_all(&drama, ffprobe_path);
+    probes.require_some("生成转码建议")?;
     let plan = plan_normalization(
         &drama.name,
         &drama.dir,
-        &episodes,
+        &probes.ok,
         &target.unwrap_or_default(),
     )?;
     let script = plan.script();
-    Ok(TranscodeAdvicePayload { plan, script })
+    Ok(TranscodeAdvicePayload {
+        plan,
+        script,
+        skipped: probes.failed,
+    })
 }
 
 /// 两份报审包的清单差异。
@@ -97,10 +168,12 @@ pub fn platform_review(
     let profile =
         find_profile(&profile_id).ok_or_else(|| format!("未知的平台档案：{profile_id}"))?;
     let drama = load_drama(&root, &name)?;
-    let episodes = probe_all(&drama, ffprobe_path);
+    // 只读对照：探测失败的分集计入阻断项并写进说明，不静默跳过。
+    let probes = probe_all(&drama, ffprobe_path);
     Ok(review_drama(
         &profile,
-        &episodes,
+        &probes.ok,
+        &probes.failed,
         drama.cover.is_some(),
         drama.synopsis.is_some(),
     ))
@@ -116,10 +189,7 @@ pub fn export_draft(
 ) -> Result<DraftExportResult, String> {
     crate::license::guard()?;
     let drama = load_drama(&root, &name)?;
-    let episodes = probe_all(&drama, ffprobe_path);
-    if episodes.is_empty() {
-        return Err("没有任何成功探测规格的分集，无法导出草稿。".into());
-    }
+    let episodes = probe_all(&drama, ffprobe_path).require_all("导出草稿")?;
     export_capcut_draft(
         &drama.name,
         &drama.dir,
@@ -146,7 +216,8 @@ fn csv_output_path(path: &str, overwrite: bool) -> Result<PathBuf, String> {
     if !is_csv {
         return Err(format!("挂载文案只能保存为 .csv 文件：{}", path.display()));
     }
-    if !overwrite && path.exists() {
+    // symlink_metadata 判断：悬空链接也算已存在，不顺着它写出文件。
+    if !overwrite && dossier_core::fsio::path_occupied(&path) {
         return Err(format!(
             "文件已存在：{}。确认覆盖后再生成。",
             path.display()
@@ -168,10 +239,7 @@ pub fn generate_mount_copy_csv(
     crate::license::guard()?;
     let output_path = csv_output_path(&output_path, overwrite == Some(true))?;
     let drama = load_drama(&root, &name)?;
-    let episodes = probe_all(&drama, ffprobe_path);
-    if episodes.is_empty() {
-        return Err("没有任何成功探测规格的分集，无法生成挂载文案。".into());
-    }
+    let episodes = probe_all(&drama, ffprobe_path).require_all("生成挂载文案")?;
     let rows = build_mount_copy_rows(&drama.name, &episodes);
     write_mount_copy_csv(&output_path, &rows).map_err(|error| error.to_string())
 }
@@ -247,6 +315,89 @@ mod tests {
         let error = csv_output_path(&path, false).unwrap_err();
         assert!(error.contains("已存在"), "{error}");
         assert!(csv_output_path(&path, true).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn episode_file(name: &str) -> dossier_core::EpisodeFile {
+        dossier_core::EpisodeFile {
+            path: PathBuf::from(format!("/素材/{name}")),
+            file_name: name.into(),
+            size_bytes: 1,
+            episode_number: dossier_core::scanner::parse_episode_number(name),
+        }
+    }
+
+    fn split_with_failures(failing: &[&str]) -> ProbeSplit {
+        let files: Vec<_> = ["第1集.mp4", "第2集.mp4", "第3集.mp4"]
+            .iter()
+            .map(|name| episode_file(name))
+            .collect();
+        split_probes(&files, |file| {
+            if failing.contains(&file.file_name.as_str()) {
+                Err("moov atom not found".into())
+            } else {
+                Ok(ProbedEpisode {
+                    file: file.clone(),
+                    spec: Default::default(),
+                })
+            }
+        })
+    }
+
+    #[test]
+    fn probe_split_keeps_failures_instead_of_dropping_them() {
+        let split = split_with_failures(&["第2集.mp4"]);
+        assert_eq!(split.ok.len(), 2);
+        assert_eq!(split.failed.len(), 1);
+        assert_eq!(split.failed[0].file.file_name, "第2集.mp4");
+        assert_eq!(split.failure_list(), "第2集.mp4（moov atom not found）");
+    }
+
+    #[test]
+    fn require_all_rejects_any_failure_with_file_and_reason() {
+        let error = split_with_failures(&["第2集.mp4"])
+            .require_all("导出草稿")
+            .unwrap_err();
+        assert!(error.contains("有 1 集探测失败，未导出草稿"), "{error}");
+        assert!(
+            error.contains("第2集.mp4（moov atom not found）"),
+            "{error}"
+        );
+        assert_eq!(
+            split_with_failures(&[])
+                .require_all("导出草稿")
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn require_some_allows_partial_but_lists_reasons_when_all_fail() {
+        assert!(split_with_failures(&["第2集.mp4"])
+            .require_some("检测码率")
+            .is_ok());
+        let error = split_with_failures(&["第1集.mp4", "第2集.mp4", "第3集.mp4"])
+            .require_some("检测码率")
+            .unwrap_err();
+        assert!(error.contains("所有分集都探测失败"), "{error}");
+        assert!(
+            error.contains("第3集.mp4（moov atom not found）"),
+            "{error}"
+        );
+    }
+
+    /// 真实探测：ffprobe 指向不存在的路径时，每一集都进 failed，不会被静默丢掉。
+    #[test]
+    fn probe_all_reports_every_episode_when_ffprobe_is_missing() {
+        let dir = std::env::temp_dir().join(format!("dossier-probe-all-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("第1集.mp4"), b"x").unwrap();
+        std::fs::write(dir.join("第2集.mp4"), b"x").unwrap();
+        let drama = scan_drama_dir("剧", &dir);
+        let split = probe_all(&drama, Some("/不存在/ffprobe".into()));
+        assert!(split.ok.is_empty());
+        assert_eq!(split.failed.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -92,6 +92,24 @@ pub struct BitrateItem {
     pub estimated: bool,
     pub needs_fix: bool,
     pub direction: Option<BitrateDirection>,
+    /// 规格探测失败的原因；为空表示探测成功（不序列化，兼容旧界面）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl BitrateItem {
+    /// 探测失败的分集：码率未知、不修，原因写进 `error` 让界面显示。
+    pub fn probe_failed(file_name: &str, path: &str, reason: &str) -> Self {
+        Self {
+            file_name: file_name.to_string(),
+            path: path.to_string(),
+            bitrate_bps: None,
+            estimated: false,
+            needs_fix: false,
+            direction: None,
+            error: Some(format!("探测失败：{reason}")),
+        }
+    }
 }
 
 /// 判定用的视频轨码率：视频轨 stream 码率 → 文件码率减音频码率 → 文件码率。
@@ -135,6 +153,7 @@ pub fn bitrate_report(
                 estimated,
                 needs_fix: direction.is_some(),
                 direction,
+                error: None,
             }
         })
         .collect()

@@ -403,10 +403,15 @@ pub(crate) fn poster_api_ready(settings: &AppSettings) -> bool {
 }
 
 /// 自动材料流水线用的组合文本结果。
+///
+/// 剧名、简介各自判定：一项超长只作废这一项（`None`，原因写进 `rejected`），
+/// 另一项照常可用——两项是一次付费调用生成的，不能因为剧名多一个字把合格的简介也扔掉。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MaterialIdentity {
-    pub title: String,
-    pub synopsis: String,
+    pub title: Option<String>,
+    pub synopsis: Option<String>,
+    /// 被作废的项及原因（给界面与日志看）。
+    pub rejected: Vec<String>,
 }
 
 /// 根据视频内容证据一次性生成剧名与简介。
@@ -448,22 +453,34 @@ pub(crate) fn parse_material_identity(body: &str) -> Result<MaterialIdentity, St
             .map(str::to_string)
             .ok_or_else(|| format!("材料 JSON 缺少 {key}"))
     };
+    // 缺字段说明响应格式不对，整体报错；超长只作废那一项，上层对该项退回下一个来源
+    // （素材自带 / 已保存 / 不填），不会把超长剧名写进报审材料。
     let title = required("title")?;
     let synopsis = required("synopsis")?;
-    // 超长视为生成失败：上层会退回下一个来源（素材自带 / 已保存 / 不填），而不是把超长剧名写进报审材料。
+    let mut rejected = Vec::new();
     let title_chars = title.chars().count();
-    if title_chars > MAX_TITLE_CHARS {
-        return Err(format!(
-            "AI 生成的剧名有 {title_chars} 个字，超过上限 {MAX_TITLE_CHARS} 字：{title}"
+    let title = if title_chars > MAX_TITLE_CHARS {
+        rejected.push(format!(
+            "AI 生成的剧名有 {title_chars} 个字，超过上限 {MAX_TITLE_CHARS} 字，已作废：{title}"
         ));
-    }
+        None
+    } else {
+        Some(title)
+    };
     let synopsis_chars = synopsis.chars().count();
-    if synopsis_chars > MAX_SYNOPSIS_CHARS {
-        return Err(format!(
-            "AI 生成的简介有 {synopsis_chars} 个字，超过上限 {MAX_SYNOPSIS_CHARS} 字"
+    let synopsis = if synopsis_chars > MAX_SYNOPSIS_CHARS {
+        rejected.push(format!(
+            "AI 生成的简介有 {synopsis_chars} 个字，超过上限 {MAX_SYNOPSIS_CHARS} 字，已作废"
         ));
-    }
-    Ok(MaterialIdentity { title, synopsis })
+        None
+    } else {
+        Some(synopsis)
+    };
+    Ok(MaterialIdentity {
+        title,
+        synopsis,
+        rejected,
+    })
 }
 
 #[cfg(test)]
@@ -631,8 +648,8 @@ mod tests {
     fn parse_material_identity_accepts_fenced_json() {
         let body = "```json\n{\"title\":\"雪夜进山\",\"synopsis\":\"医生被困山村。\"}\n```";
         let parsed = parse_material_identity(body).unwrap();
-        assert_eq!(parsed.title, "雪夜进山");
-        assert_eq!(parsed.synopsis, "医生被困山村。");
+        assert_eq!(parsed.title.as_deref(), Some("雪夜进山"));
+        assert_eq!(parsed.synopsis.as_deref(), Some("医生被困山村。"));
     }
 
     #[test]
@@ -641,8 +658,8 @@ mod tests {
                     {\"title\":\"雪夜进山\",\"synopsis\":\"医生被困山村。\"}\n\
                     以上内容仅供参考。";
         let parsed = parse_material_identity(body).unwrap();
-        assert_eq!(parsed.title, "雪夜进山");
-        assert_eq!(parsed.synopsis, "医生被困山村。");
+        assert_eq!(parsed.title.as_deref(), Some("雪夜进山"));
+        assert_eq!(parsed.synopsis.as_deref(), Some("医生被困山村。"));
     }
 
     #[test]
@@ -651,19 +668,46 @@ mod tests {
             r#"{{"title":"{}","synopsis":"简介"}}"#,
             "字".repeat(MAX_TITLE_CHARS)
         );
-        assert!(parse_material_identity(&ok).is_ok(), "正好 15 个字可以");
+        let exact = parse_material_identity(&ok).unwrap();
+        assert!(
+            exact.title.is_some() && exact.rejected.is_empty(),
+            "正好 15 个字可以"
+        );
+
+        // 剧名超长：只作废剧名，合格的简介保留，原因写进 rejected。
         let long = format!(
             r#"{{"title":"{}","synopsis":"简介"}}"#,
             "字".repeat(MAX_TITLE_CHARS + 1)
         );
-        assert!(parse_material_identity(&long)
-            .unwrap_err()
-            .contains("超过上限"));
+        let identity = parse_material_identity(&long).unwrap();
+        assert_eq!(identity.title, None);
+        assert_eq!(identity.synopsis.as_deref(), Some("简介"));
+        assert_eq!(identity.rejected.len(), 1);
+        assert!(identity.rejected[0].contains("剧名") && identity.rejected[0].contains("超过上限"));
+
+        // 简介超长：只作废简介。
         let long_synopsis = format!(
             r#"{{"title":"剧名","synopsis":"{}"}}"#,
             "字".repeat(MAX_SYNOPSIS_CHARS + 1)
         );
-        assert!(parse_material_identity(&long_synopsis).is_err());
+        let identity = parse_material_identity(&long_synopsis).unwrap();
+        assert_eq!(identity.title.as_deref(), Some("剧名"));
+        assert_eq!(identity.synopsis, None);
+
+        // 两项都超长：都作废，两条原因。
+        let both = format!(
+            r#"{{"title":"{}","synopsis":"{}"}}"#,
+            "字".repeat(MAX_TITLE_CHARS + 1),
+            "字".repeat(MAX_SYNOPSIS_CHARS + 1)
+        );
+        let identity = parse_material_identity(&both).unwrap();
+        assert!(identity.title.is_none() && identity.synopsis.is_none());
+        assert_eq!(identity.rejected.len(), 2);
+
+        // 缺字段仍然整体报错。
+        assert!(parse_material_identity(r#"{"title":"剧名"}"#)
+            .unwrap_err()
+            .contains("缺少 synopsis"));
     }
 
     #[test]

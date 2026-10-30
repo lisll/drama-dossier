@@ -27,6 +27,16 @@ pub const SAMPLE_RATE_HZ: u32 = 48_000;
 /// 配方存证文件名（落在深度处理输出目录，随成片一起交付）。
 pub const RECIPE_FILE_NAME: &str = "去重配方.json";
 
+/// 去重配方改写的成片元数据字段（键 + 证明里的说明），顺序与 [`DedupRecipePlan::metadata_tags`] 一致。
+/// AI 制作证明直接用这张表列字段，写元数据与证明不会再对不上。
+pub const METADATA_FIELDS: [(&str, &str); 5] = [
+    ("comment", "剧名与集号"),
+    ("copyright", "剧名与时间戳"),
+    ("make", "iPhone 机型"),
+    ("software", "iOS 版本"),
+    ("creation_time", "推算的拍摄时间"),
+];
+
 // ---------------------------------------------------------------------------
 // 确定性随机源：SplitMix64（无依赖、跨平台逐字节可复现）
 // ---------------------------------------------------------------------------
@@ -420,13 +430,18 @@ impl DedupRecipePlan {
         let creation = CREATION_EPOCH + (self.seed % 86_400) as i64 - self.variants.len() as i64
             + index as i64 * 60;
         let stamp = format_utc_compact(creation.max(0) as u64);
-        vec![
-            ("comment", format!("{} 第{}集", self.drama_name, index + 1)),
-            ("copyright", format!("{} {}", self.drama_name, stamp)),
-            ("make", make.to_string()),
-            ("software", software.to_string()),
-            ("creation_time", format_utc(creation.max(0) as u64)),
-        ]
+        let values = [
+            format!("{} 第{}集", self.drama_name, index + 1),
+            format!("{} {}", self.drama_name, stamp),
+            make.to_string(),
+            software.to_string(),
+            format_utc(creation.max(0) as u64),
+        ];
+        METADATA_FIELDS
+            .iter()
+            .map(|(key, _)| *key)
+            .zip(values)
+            .collect()
     }
 
     /// 存证 JSON（配方全文 + 逐集元数据，可离线复算滤镜链）。
@@ -458,12 +473,14 @@ impl DedupRecipePlan {
         })
     }
 
-    /// 把存证 JSON 写进深度处理输出目录，返回文件路径。
+    /// 把存证 JSON 原子写进深度处理输出目录，返回文件路径。
+    /// 只在成片全部发布成功后调用：存证与目录里的成片一一对应，中途停止不会留下本轮配方。
     pub fn save_to(&self, output_dir: &Path) -> Result<PathBuf, String> {
         let path = output_dir.join(RECIPE_FILE_NAME);
         let body = serde_json::to_vec_pretty(&self.to_json())
             .map_err(|error| format!("配方序列化失败：{error}"))?;
-        std::fs::write(&path, body).map_err(|error| format!("写入配方存证失败：{error}"))?;
+        crate::paths::write_atomic(&path, &body)
+            .map_err(|error| format!("写入配方存证失败：{error}"))?;
         Ok(path)
     }
 }

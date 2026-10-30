@@ -1526,7 +1526,8 @@ async function transcodeAdvice() {
           ? `<table><thead><tr><th>集号</th><th>文件</th><th>原因</th></tr></thead><tbody>${rows}</tbody></table>`
           : "<p>所有分集都符合目标规格。</p>"
       }
-      ${plan.transcodeCount ? `<details><summary>批量脚本预览</summary><pre>${esc(payload.script)}</pre></details>` : ""}`,
+      ${plan.transcodeCount ? `<details><summary>批量脚本预览</summary><pre>${esc(payload.script)}</pre></details>` : ""}
+      ${skippedProbeHtml(payload.skipped)}`,
       paths: [["transcode-output", plan.outputDir]],
     });
   } catch (error) {
@@ -1534,6 +1535,15 @@ async function transcodeAdvice() {
   } finally {
     endTask();
   }
+}
+
+/** 探测失败、未纳入结果的分集清单（后端 ProbeFailure：fileName + reason）。 */
+function skippedProbeHtml(skipped) {
+  if (!skipped?.length) return "";
+  const items = skipped
+    .map((item) => `<li>${esc(item.fileName)}：${esc(item.reason)}</li>`)
+    .join("");
+  return `<p class="status-fail">以下 ${skipped.length} 集探测失败，未纳入建议：</p><ul>${items}</ul>`;
 }
 
 async function diffReportPackages() {
@@ -2112,6 +2122,7 @@ function bitrateRangeKbps() {
 }
 
 function bitrateStatusText(item) {
+  if (item.error) return item.error;
   if (item.bitrateBps == null) return "探测不到码率";
   if (item.direction === "low") return "低于下限";
   if (item.direction === "high") return "高于上限";
@@ -2139,19 +2150,20 @@ async function probeBitrate() {
     const rows = bitrateItems
       .map((item) => {
         const kbps = item.bitrateBps == null ? null : Number(item.bitrateBps);
-        const status = kbps == null ? "unknown" : item.needsFix ? "fail" : "pass";
+        const status = item.error ? "fail" : kbps == null ? "unknown" : item.needsFix ? "fail" : "pass";
         return `<tr>
           <td>${esc(item.fileName)}</td>
           <td>${kbps == null ? "未知" : `${(kbps / 1000).toFixed(0)} kbps${item.estimated ? "（估算）" : ""}`}</td>
-          <td class="status-${status}">${bitrateStatusText(item)}</td>
+          <td class="status-${status}">${esc(bitrateStatusText(item))}</td>
         </tr>`;
       })
       .join("");
     const fixable = bitrateItems.filter((item) => item.needsFix).length;
+    const probeFailed = bitrateItems.filter((item) => item.error).length;
     renderResult("#bitrate-result", {
-      tone: fixable ? "warn" : "ok",
+      tone: probeFailed ? "error" : fixable ? "warn" : "ok",
       html: `
-      <strong>共 ${bitrateItems.length} 集：${fixable} 集超出 ${range.minKbps / 1000}–${range.maxKbps / 1000} Mbps</strong>
+      <strong>共 ${bitrateItems.length} 集：${fixable} 集超出 ${range.minKbps / 1000}–${range.maxKbps / 1000} Mbps${probeFailed ? `，${probeFailed} 集探测失败` : ""}</strong>
       <table><thead><tr><th>文件</th><th>视频轨码率</th><th>状态</th></tr></thead><tbody>${rows}</tbody></table>
       ${
         bitrateItems.some((item) => item.estimated)

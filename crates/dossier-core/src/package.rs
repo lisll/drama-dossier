@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Read;
 
+use crate::publish::{csv_escape, csv_text_with_bom};
 use crate::types::ProbedEpisode;
 
 /// 报审包生成选项。
@@ -68,6 +69,10 @@ pub fn generate_report_package(
         .output_dir
         .clone()
         .unwrap_or_else(|| drama_dir.join("报审包"));
+    if let Some(form) = &opts.cost_sheet {
+        form.validate()
+            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+    }
     if pkg_dir.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
@@ -128,43 +133,48 @@ fn write_package_contents(
     let info_dir = pkg_dir.join("01_剧集信息");
     std::fs::create_dir_all(&info_dir)?;
     std::fs::write(info_dir.join("剧名.txt"), drama_name)?;
+    // 包内统一命名（MATERIAL_SPEC「v1 报审包结构」）：简介.<原扩展名>、封面.<原扩展名>、第NN集.<原扩展名>。
     if let Some(s) = synopsis {
-        if let Some(name) = s.file_name() {
-            std::fs::copy(s, info_dir.join(name))?;
-        }
+        std::fs::copy(s, info_dir.join(fixed_name("简介", s)))?;
     }
     if let Some(c) = cover {
         let poster_dir = pkg_dir.join("02_封面海报");
         std::fs::create_dir_all(&poster_dir)?;
-        if let Some(name) = c.file_name() {
-            std::fs::copy(c, poster_dir.join(name))?;
-        }
+        std::fs::copy(c, poster_dir.join(fixed_name("封面", c)))?;
     }
+    let names = package_episode_names(episodes);
 
     // 03 分集清单
-    let mut csv = String::from("集号,文件名,时长(秒),宽,高,视频编码,音频编码,码率(Mbps),SHA256\n");
-    for ep in episodes {
+    let mut csv =
+        String::from("集号,文件名,时长(秒),宽,高,视频编码,音频编码,码率(Mbps),SHA256,包内文件名\n");
+    for (ep, package_name) in episodes.iter().zip(&names) {
         let no = ep
             .file
             .episode_number
             .map(|n| n.to_string())
             .unwrap_or_default();
         csv.push_str(&format!(
-            "{},{},{:.1},{},{},{},{},{:.2},{}\n",
+            "{},{},{:.1},{},{},{},{},{:.2},{},{}\n",
             no,
             csv_escape(&ep.file.file_name),
             ep.spec.duration_sec,
             ep.spec.width,
             ep.spec.height,
-            ep.spec.video_codec.as_deref().unwrap_or(""),
-            ep.spec.audio_codec.as_deref().unwrap_or(""),
+            csv_escape(ep.spec.video_codec.as_deref().unwrap_or("")),
+            csv_escape(ep.spec.audio_codec.as_deref().unwrap_or("")),
             ep.spec.bitrate_bps.unwrap_or(0) as f64 / 1e6,
             sha256_file(&ep.file.path)?,
+            if opts.copy_episodes {
+                csv_escape(package_name)
+            } else {
+                String::new()
+            },
         ));
     }
     let list_dir = pkg_dir.join("03_分集清单");
     std::fs::create_dir_all(&list_dir)?;
-    std::fs::write(list_dir.join("分集清单.csv"), csv)?;
+    // 带 BOM：Windows 上双击用 Excel 打开时中文不乱码。
+    std::fs::write(list_dir.join("分集清单.csv"), csv_text_with_bom(&csv))?;
 
     // 04 成本配置表（真实数据模板）
     let cost_dir = pkg_dir.join("04_成本配置表");
@@ -190,10 +200,8 @@ fn write_package_contents(
     if opts.copy_episodes {
         let ep_dir = pkg_dir.join("06_分集视频");
         std::fs::create_dir_all(&ep_dir)?;
-        for ep in episodes {
-            if let Some(name) = Path::new(&ep.file.file_name).file_name() {
-                std::fs::copy(&ep.file.path, ep_dir.join(name))?;
-            }
+        for (ep, name) in episodes.iter().zip(&names) {
+            std::fs::copy(&ep.file.path, ep_dir.join(name))?;
         }
     }
 
@@ -272,12 +280,104 @@ pub fn sha256_file(p: &Path) -> std::io::Result<String> {
     Ok(format!("{:x}", h.finalize()))
 }
 
-fn csv_escape(value: &str) -> String {
-    if value.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value.to_string()
+/// `<主名>.<原扩展名>`；原文件没有扩展名时只用主名。
+fn fixed_name(stem: &str, original: &Path) -> String {
+    match original.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) if !ext.is_empty() => format!("{stem}.{ext}"),
+        _ => stem.to_string(),
     }
+}
+
+/// 分集在 `06_分集视频/` 里的文件名，与 `episodes` 一一对应。
+///
+/// - 有集号：`第NN集.<原扩展名>`，NN 位数取 max(2, 最大集号位数)；
+/// - 没有集号：保留原文件名；
+/// - 重名（重复集号、或原名恰好撞上）：按（有集号在前、集号、完整路径）的固定顺序，
+///   后来者依次加 `-2`、`-3`……；比较不区分大小写（Windows / macOS 默认文件系统）。
+pub(crate) fn package_episode_names(episodes: &[ProbedEpisode]) -> Vec<String> {
+    let width = episodes
+        .iter()
+        .filter_map(|ep| ep.file.episode_number)
+        .max()
+        .map_or(2, |max| max.to_string().len().max(2));
+    let wanted: Vec<(String, String)> = episodes
+        .iter()
+        .map(|ep| {
+            let path = Path::new(&ep.file.file_name);
+            let ext = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| format!(".{ext}"))
+                .unwrap_or_default();
+            match ep.file.episode_number {
+                Some(n) => (format!("第{n:0width$}集"), ext),
+                None => (
+                    path.file_stem()
+                        .map(|stem| stem.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    ext,
+                ),
+            }
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..episodes.len()).collect();
+    order.sort_by(|&a, &b| {
+        let (ea, eb) = (&episodes[a].file, &episodes[b].file);
+        ea.episode_number
+            .is_none()
+            .cmp(&eb.episode_number.is_none())
+            .then(ea.episode_number.cmp(&eb.episode_number))
+            .then_with(|| ea.path.cmp(&eb.path))
+    });
+    let mut used = std::collections::HashSet::new();
+    let mut names = vec![String::new(); episodes.len()];
+    for index in order {
+        let (stem, ext) = &wanted[index];
+        let mut candidate = format!("{stem}{ext}");
+        let mut n = 2;
+        while !used.insert(candidate.to_lowercase()) {
+            candidate = format!("{stem}-{n}{ext}");
+            n += 1;
+        }
+        names[index] = candidate;
+    }
+    names
+}
+
+impl CostSheetForm {
+    /// 后端再校验一次（前端已拦）：数值必须是有限数，投资额不小于 0，占比在 0–100 之间。
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(value) = self.total_investment_wan {
+            if !value.is_finite() || value < 0.0 {
+                return Err("投资总额必须是不小于 0 的数字。".into());
+            }
+        }
+        if let Some(value) = self.actor_ratio_percent {
+            if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+                return Err("演员成本占比必须在 0–100 之间。".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 成本表里的数值：最多两位小数、去掉末尾 0（`50`、`50.5`、`33.33`；`0.1+0.2` 显示 `0.3`）。
+fn format_amount(value: f64) -> String {
+    let text = format!("{value:.2}");
+    let text = text.trim_end_matches('0').trim_end_matches('.');
+    if text == "-0" {
+        "0".into()
+    } else {
+        text.to_string()
+    }
+}
+
+/// Markdown 表格单元格：`|` 会切断表格、换行会断行，分别转义 / 换成空格。
+fn md_cell(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace(['\r', '\n'], " ")
 }
 
 fn render_cost_sheet_md(f: &CostSheetForm) -> String {
@@ -290,14 +390,14 @@ fn render_cost_sheet_md(f: &CostSheetForm) -> String {
          | 演员成本占比 | {} % |\n\
          | 联系方式 | {} |\n\n\
          使用者须对以上数据的真实性负责。\n",
-        f.company_name,
+        md_cell(&f.company_name),
         f.total_investment_wan
-            .map(|v| v.to_string())
+            .map(format_amount)
             .unwrap_or_else(|| "（待填写）".into()),
         f.actor_ratio_percent
-            .map(|v| v.to_string())
+            .map(format_amount)
             .unwrap_or_else(|| "（待填写）".into()),
-        f.contact,
+        md_cell(&f.contact),
     )
 }
 
@@ -519,5 +619,156 @@ mod tests {
         assert!(ownership_declaration("剧A", &opts).contains("已按平台要求进行 AI 生成标识"));
         opts.ai_generated = false;
         assert!(ownership_declaration("剧A", &opts).contains("未使用 AI 生成"));
+    }
+
+    fn probed(dir: &Path, rel: &str, number: Option<u32>) -> ProbedEpisode {
+        let path = dir.join(rel);
+        ProbedEpisode {
+            file: EpisodeFile {
+                file_name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                path,
+                size_bytes: 3,
+                episode_number: number,
+            },
+            spec: EpisodeSpec {
+                duration_sec: 61.0,
+                width: 1080,
+                height: 1920,
+                bitrate_bps: Some(5_000_000),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn episode_names_follow_spec_and_resolve_collisions() {
+        let d = Path::new("/素材/剧A");
+        let eps = vec![
+            probed(d, "b/第3集.mp4", Some(3)),
+            probed(d, "a/ep03.MP4", Some(3)),
+            probed(d, "第1集.mkv", Some(1)),
+            probed(d, "花絮.mp4", None),
+            // 无集号、原名恰好撞上 第01集（扩展名大小写不同也算同名）。
+            probed(d, "x/第01集.MKV", None),
+        ];
+        // 同集号按完整路径排：a/ 在 b/ 前，a/ep03.MP4 拿基础名，b/ 的加 -2。
+        assert_eq!(
+            package_episode_names(&eps),
+            [
+                "第03集-2.mp4",
+                "第03集.MP4",
+                "第01集.mkv",
+                "花絮.mp4",
+                "第01集-2.MKV"
+            ]
+        );
+        let big = vec![
+            probed(d, "e100.mp4", Some(100)),
+            probed(d, "e7.mp4", Some(7)),
+        ];
+        assert_eq!(package_episode_names(&big), ["第100集.mp4", "第007集.mp4"]);
+    }
+
+    #[test]
+    fn package_copies_every_duplicate_and_lists_them_consistently() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        let base = std::env::temp_dir().join(format!("dossier-pkg-dup-{unique}"));
+        let d = base.join("剧A");
+        std::fs::create_dir_all(d.join("上")).unwrap();
+        std::fs::create_dir_all(d.join("下")).unwrap();
+        std::fs::write(d.join("上").join("=第1集.mp4"), b"one").unwrap();
+        std::fs::write(d.join("下").join("=第1集.mp4"), b"two").unwrap();
+        std::fs::write(d.join("海报cover.png"), b"png").unwrap();
+        std::fs::write(d.join("intro.md"), "简介内容").unwrap();
+        let eps = vec![
+            probed(&d, "上/=第1集.mp4", Some(1)),
+            probed(&d, "下/=第1集.mp4", Some(1)),
+        ];
+        let out = d.join("out");
+        let mut opts = base_opts(out.clone());
+        opts.copy_episodes = true;
+        generate_report_package(
+            "剧A",
+            &d,
+            Some(&d.join("海报cover.png")),
+            Some(&d.join("intro.md")),
+            &eps,
+            &opts,
+        )
+        .unwrap();
+        assert!(out.join("02_封面海报").join("封面.png").is_file());
+        assert!(out.join("01_剧集信息").join("简介.md").is_file());
+        assert!(out.join("01_剧集信息").join("剧名.txt").is_file());
+        let videos = out.join("06_分集视频");
+        assert_eq!(std::fs::read(videos.join("第01集.mp4")).unwrap(), b"one");
+        assert_eq!(std::fs::read(videos.join("第01集-2.mp4")).unwrap(), b"two");
+
+        let csv = std::fs::read_to_string(out.join("03_分集清单").join("分集清单.csv")).unwrap();
+        assert!(csv.starts_with('\u{feff}'), "分集清单要带 BOM");
+        let rows: Vec<&str> = csv.trim_start_matches('\u{feff}').lines().collect();
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0].ends_with(",包内文件名"));
+        assert!(
+            rows[1].starts_with("1,'=第1集.mp4,"),
+            "公式注入防护：{}",
+            rows[1]
+        );
+        assert!(rows[1].ends_with(",第01集.mp4"), "{}", rows[1]);
+        assert!(rows[2].ends_with(",第01集-2.mp4"), "{}", rows[2]);
+
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out.join("manifest.json")).unwrap()).unwrap();
+        let videos_in_manifest = manifest["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["path"].as_str().unwrap().starts_with("06_分集视频/"))
+            .count();
+        assert_eq!(videos_in_manifest, 2, "清单与包内文件一一对应");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn cost_sheet_formats_numbers_and_escapes_cells() {
+        let md = render_cost_sheet_md(&CostSheetForm {
+            company_name: "A|B\n文化".into(),
+            total_investment_wan: Some(0.1 + 0.2),
+            actor_ratio_percent: Some(33.333_333),
+            contact: "张三 | 138".into(),
+        });
+        assert!(md.contains("| 制作机构 | A\\|B 文化 |"), "{md}");
+        assert!(md.contains("| 投资总额 | 0.3 万元 |"), "{md}");
+        assert!(md.contains("| 演员成本占比 | 33.33 % |"), "{md}");
+        assert!(md.contains("| 联系方式 | 张三 \\| 138 |"), "{md}");
+        assert_eq!(format_amount(50.0), "50");
+        assert_eq!(format_amount(50.5), "50.5");
+        assert_eq!(format_amount(0.0), "0");
+    }
+
+    #[test]
+    fn cost_sheet_rejects_invalid_numbers_before_writing() {
+        let base = std::env::temp_dir().join(format!("dossier-pkg-cost-{}", std::process::id()));
+        let out = base.join("out");
+        for (investment, ratio) in [
+            (Some(f64::NAN), None),
+            (Some(f64::INFINITY), None),
+            (Some(-1.0), None),
+            (None, Some(101.0)),
+            (None, Some(-0.5)),
+        ] {
+            let mut opts = base_opts(out.clone());
+            opts.cost_sheet = Some(CostSheetForm {
+                total_investment_wan: investment,
+                actor_ratio_percent: ratio,
+                ..Default::default()
+            });
+            let error = generate_report_package("剧A", &base, None, None, &[], &opts).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(!out.exists(), "校验失败时不能写出任何东西");
+        }
+        std::fs::remove_dir_all(&base).ok();
     }
 }
