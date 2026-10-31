@@ -74,6 +74,10 @@ pub struct AppSettings {
     pub img_model: Option<String>,
     /// 深度处理输出目录；`None` 表示写在剧目目录内（同 `resolve_product_dir` 语义）。
     pub deep_output_dir: Option<PathBuf>,
+    /// 生成报审包时是否默认带上 AI 制作证明与过程图；`None` 表示默认带上。
+    pub package_with_proof: Option<bool>,
+    /// 覆盖旧报审包时的默认方式；`None` 表示整体替换。
+    pub package_overwrite_mode: Option<crate::package::OverwriteMode>,
     /// 深度处理重组的单集最短时长（秒）；`None` 表示默认 60。
     pub recut_min_sec: Option<u32>,
     /// 深度处理重组的单集最长时长（秒）；`None` 表示默认 70。
@@ -164,6 +168,16 @@ impl AppSettings {
     /// 深度处理默认开启材料流水线；如用户显式关闭则不再自动请求模型。
     pub fn effective_material_pipeline_enabled(&self) -> bool {
         self.material_pipeline_enabled.unwrap_or(true)
+    }
+
+    /// 生成报审包时是否默认带上证明与过程图（默认带上：与平台要求的材料构成一致）。
+    pub fn effective_package_with_proof(&self) -> bool {
+        self.package_with_proof.unwrap_or(true)
+    }
+
+    /// 覆盖旧报审包的默认方式（默认整体替换）。
+    pub fn effective_package_overwrite_mode(&self) -> crate::package::OverwriteMode {
+        self.package_overwrite_mode.unwrap_or_default()
     }
 
     /// 深度处理默认启用去重配方（seed 确定性扰动）；显式关闭后成片只做重组 + 微帧。

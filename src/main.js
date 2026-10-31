@@ -548,7 +548,7 @@ function renderDefaultHints() {
   const root = state.settings?.outputDir?.trim()
     ? stripPath(state.settings.outputDir.trim())
     : "";
-  // 报审包入口暂时隐藏：#output-dir 不在 DOM，占位提示仅在卡片恢复后生效。
+  // 报审包「本次覆盖」输入框的占位提示（卡片已恢复显示）。
   const outputDirField = $("#output-dir");
   if (outputDirField)
     outputDirField.placeholder = root
@@ -575,6 +575,8 @@ function settingsSnapshot() {
     ffprobe: $("#ffprobe-path").value.trim(),
     output: $("#settings-output").value.trim(),
     deepOutput: $("#deep-output-dir")?.value.trim() ?? "",
+    packageWithProof: $("#with-proof")?.checked ?? true,
+    packageOverwriteMode: $("#overwrite-default")?.value ?? "replaceAll",
     recutMinSec: $("#recut-min-sec")?.value.trim() ?? "",
     recutMaxSec: $("#recut-max-sec")?.value.trim() ?? "",
     aiTitleMode: $("#ai-title-mode")?.checked ?? true,
@@ -612,6 +614,9 @@ function refreshDirtyBadge() {
     ffprobe: state.settings?.ffprobePath ?? "",
     output: state.settings?.outputDir ?? "",
     deepOutput: state.settings?.deepOutputDir ?? "",
+    packageWithProof: state.settings?.packageWithProof !== false,
+    packageOverwriteMode:
+      state.settings?.packageOverwriteMode === "standardOnly" ? "standardOnly" : "replaceAll",
     recutMinSec: state.settings?.recutMinSec == null ? "" : String(state.settings.recutMinSec),
     recutMaxSec: state.settings?.recutMaxSec == null ? "" : String(state.settings.recutMaxSec),
     // 开关缺省语义 = AI（None 视为 true）。
@@ -662,6 +667,10 @@ async function loadSettings() {
     if (settings.aiTemplate) $("#ai-template").value = settings.aiTemplate;
     // 转码设置（深度处理）与 AI 接口配置。
     if (settings.deepOutputDir) $("#deep-output-dir").value = settings.deepOutputDir;
+    // 报审包：是否默认带证明与过程图、覆盖旧包时默认用哪种方式。
+    $("#with-proof").checked = settings.packageWithProof !== false;
+    $("#overwrite-default").value =
+      settings.packageOverwriteMode === "standardOnly" ? "standardOnly" : "replaceAll";
     if (settings.recutMinSec != null)
       $("#recut-min-sec").value = String(settings.recutMinSec);
     if (settings.recutMaxSec != null)
@@ -764,6 +773,8 @@ function buildSettingsFromForm(rules) {
     jianyingDraftDir: $("#jianying-draft-dir").value.trim() || null,
     // 转码设置（深度处理）+ 剧名/简介/海报 + AI 接口（云端版接入前的自配方案）。
     deepOutputDir: $("#deep-output-dir").value.trim() || null,
+    packageWithProof: $("#with-proof").checked,
+    packageOverwriteMode: $("#overwrite-default").value,
     recutMinSec:
       $("#recut-min-sec").value.trim() === ""
         ? null
@@ -949,6 +960,8 @@ async function rememberRoot(root) {
     jianyingDraftDir: state.settings?.jianyingDraftDir ?? null,
     // 转码设置（深度处理）+ 剧名/简介/海报 + AI 接口，同样原样带回。
     deepOutputDir: state.settings?.deepOutputDir ?? null,
+    packageWithProof: state.settings?.packageWithProof ?? null,
+    packageOverwriteMode: state.settings?.packageOverwriteMode ?? null,
     recutMinSec: state.settings?.recutMinSec ?? null,
     recutMaxSec: state.settings?.recutMaxSec ?? null,
     llmBaseUrl: state.settings?.llmBaseUrl ?? null,
@@ -1396,7 +1409,7 @@ function validateCostForm() {
   return problems.length ? null : { investment, ratio };
 }
 
-async function generate() {
+async function generate(overwrite = false, confirmedPath = null, overwriteMode = null) {
   if (state.selected == null) return;
   const drama = state.dramas[state.selected];
   const cost = validateCostForm();
@@ -1404,6 +1417,9 @@ async function generate() {
     toast("请先修正表单里标红的字段", true);
     return;
   }
+  // 覆盖只对「用户确认过的那个目录」生效：确认后改了输入框，新路径不经确认不带 overwrite。
+  const targetPath = effectivePackageDir();
+  const effectiveOverwrite = overwrite && targetPath === confirmedPath;
   if (!beginTask(`正在探测并生成《${drama.name}》的报审包`)) return;
   try {
     const result = await call("generate_package", {
@@ -1415,6 +1431,11 @@ async function generate() {
       aiGenerated: $("#ai-generated").checked,
       // 只有使用者确认成片已标注 AI 声明，权属声明里才写「已按平台要求进行标识」。
       aiLabelConfirmed: $("#ai-label-confirmed")?.checked ?? false,
+      overwrite: effectiveOverwrite,
+      overwriteMode: effectiveOverwrite ? overwriteMode : null,
+      withProof: $("#with-proof").checked,
+      proofSourceDir: $("#proof-source-dir").value.trim() || null,
+      deepOutputRoot: state.settings?.deepOutputDir ?? null,
       ffprobePath: effectiveFfprobe(),
       rules: effectiveRules(),
       costSheet: {
@@ -1428,16 +1449,20 @@ async function generate() {
       tone: "ok",
       html: `<strong>报审包已生成</strong><br />
         位置：${esc(result.packageDir)}<br />
-        文件数：${result.fileCount} · 总大小：${formatBytes(Number(result.totalBytes))}`,
+        文件数：${result.fileCount} · 总大小：${formatBytes(Number(result.totalBytes))}<br />
+        ${esc(overwriteSummary(result, effectiveOverwrite))}<br />
+        ${esc(proofSummary(result.proof))}`,
       paths: [["package", result.packageDir]],
     });
     toast("报审包生成完成");
   } catch (error) {
     const message = String(error);
     // 「目录已存在」是可控的：后端没有动任何文件，把旧包位置摆出来，
-    // 直接给「打开旧包 / 换个目录」两条路，而不是让人自己去找那个路径。
+    // 让使用者自己选覆盖方式或换目录，而不是替它做破坏性决定。
     if (/已存在/.test(message)) {
-      const existing = effectivePackageDir();
+      // 确认的对象是「这一次尝试的那个路径」：用户之后改了输出目录，按钮也不会去覆盖新路径。
+      const existing = targetPath;
+      const preferred = $("#overwrite-default").value;
       renderResult("#generate-result", {
         tone: "error",
         html: `<strong>报审包目录已存在，本次未生成任何文件</strong><br />
@@ -1445,9 +1470,9 @@ async function generate() {
           旧目录不会被改动：可以先打开确认，也可以换一个输出目录后重试。`,
         paths: existing ? [["package", existing]] : [],
       });
-      toast("报审包目录已存在：已标出旧包位置", true, {
-        label: "换个输出目录",
-        run: () => browse("#output-dir"),
+      toast(`报审包目录已存在。默认方式：${overwriteModeLabel(preferred)}`, true, {
+        label: `覆盖（${overwriteModeLabel(preferred)}）`,
+        run: () => generate(true, existing, preferred),
       });
     } else {
       renderResult("#generate-result", {
@@ -1459,6 +1484,39 @@ async function generate() {
   } finally {
     endTask();
   }
+}
+
+const OVERWRITE_MODE_LABELS = {
+  replaceAll: "整体替换",
+  standardOnly: "只替换标准文件",
+};
+
+function overwriteModeLabel(mode) {
+  return OVERWRITE_MODE_LABELS[mode] ?? OVERWRITE_MODE_LABELS.replaceAll;
+}
+
+/** 覆盖结果的说明：整体替换要如实说旧包里有多少文件被换掉。 */
+function overwriteSummary(result, overwrite) {
+  if (!overwrite || !result.overwrite) return "未覆盖旧包（新建）";
+  const mode = result.overwrite;
+  if (mode.dropped) {
+    return `已整体替换旧包：旧包里 ${mode.dropped} 个文件已随旧包一起移除`;
+  }
+  if (mode.removed?.length || mode.kept?.length) {
+    const removed = mode.removed?.length ? `清理过期标准文件 ${mode.removed.length} 个` : "无过期标准文件";
+    const kept = mode.kept?.length ? `保留你另外放的 ${mode.kept.length} 个文件` : "没有需要保留的其他文件";
+    return `已只替换标准文件：${removed}，${kept}`;
+  }
+  return "已覆盖旧包";
+}
+
+/** 证明与过程图的收集说明：收齐时报告数量，没收时如实写原因。 */
+function proofSummary(proof) {
+  if (!proof) return "";
+  if (proof.files?.length) {
+    return `证明与过程图：${proof.files.length} 个（07_证明与过程图/）`;
+  }
+  return `证明与过程图：未放入。${proof.note ?? ""}`;
 }
 
 function selectedDrama() {
@@ -3658,11 +3716,10 @@ $("#dedup-demo-run").addEventListener("click", runDedupDemo);
 $("#publish-copy-generate").addEventListener("click", () => generatePublishCopy(false));
 $("#publish-copy-load").addEventListener("click", loadPublishCopy);
 $("#publish-copy-preview").addEventListener("click", previewPublishCopy);
-// 报审包入口（暂时隐藏）：卡片注释后以下绑定一并停用；恢复时取消注释即可。
-// $("#browse-output").addEventListener("click", () => browse("#output-dir"));
+$("#browse-output").addEventListener("click", () => browse("#output-dir"));
 $("#scan").addEventListener("click", scan);
 $("#analyze").addEventListener("click", analyze);
-// $("#generate").addEventListener("click", generate);
+$("#generate").addEventListener("click", () => generate());
 $("#save-settings").addEventListener("click", saveSettings);
 $("#reset-settings").addEventListener("click", () => {
   fillRules(DEFAULT_RULES);
@@ -3696,7 +3753,7 @@ $("#library-root").addEventListener("input", renderEmptyGuide);
   "#rule-min-episodes", "#rule-min-duration", "#rule-max-duration",
   "#rule-max-bitrate",
 ].forEach((selector) => {
-  // 报审包字段（#total-investment / #actor-ratio）随卡片暂时隐藏，元素缺失时跳过。
+  // 元素缺失时跳过（例如只加载部分视图的场景）。
   $(selector)?.addEventListener("input", () => setFieldError(selector, null));
 });
 

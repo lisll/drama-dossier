@@ -293,8 +293,7 @@
                 </div>
               </section>
 
-              <!-- 卡 1：生成报审包（按需求暂时隐藏，代码保留；恢复时取消本注释并还原
-                   main.js 中「报审包入口（暂时隐藏）」标记的两处绑定与 #output-dir 占位提示）
+              <!-- 卡 1：生成报审包 -->
               <section class="panel">
                 <section class="panel-header">
                   <h3>生成报审包</h3>
@@ -314,15 +313,28 @@
                   <label><input id="copy-episodes" type="checkbox" /> 复制分集视频进报审包</label>
                   <label><input id="ai-generated" type="checkbox" /> 剧名/简介/封面使用了 AI 辅助生成</label>
                   <label><input id="ai-label-confirmed" type="checkbox" /> 我已确认成片画面按平台要求标注了 AI 生成声明（勾选后才写入权属声明）</label>
+                  <label><input id="with-proof" type="checkbox" checked /> 带上 AI 制作证明与过程图</label>
+                  <label>覆盖旧包时默认用
+                    <select id="overwrite-default">
+                      <option value="replaceAll" selected>整体替换（旧包里的其他文件一并换掉）</option>
+                      <option value="standardOnly">只替换标准文件（保留我另外放的文件）</option>
+                    </select>
+                  </label>
                   <button id="browse-output" class="ghost">选择输出目录</button>
                   <button id="generate" data-long-task class="success">生成材料包</button>
+                </div>
+                <p class="hint">
+                  证明与过程图取自深度处理的输出目录：留空时按「设置 → 深度处理输出根目录 / 剧名 / 深度处理」查找，
+                  没跑过深度处理就不放这些材料（不阻断生成）。
+                </p>
+                <div class="form-grid">
+                  <label>深度处理输出目录（读取证明与过程图）<input id="proof-source-dir" type="text" placeholder="留空时自动查找" /></label>
                 </div>
                 <div id="generate-result" class="result hidden"></div>
                 <p class="legal">
                   合规说明：剧备只整理使用者提供的真实材料，不伪造签名、印章或时间戳；报审包固定包含内容权属声明模板。
                 </p>
               </section>
-              -->
 
               <!-- 卡 2：转码处理 → 深度处理（合并「智能微帧 + 分集重组」两步，对照 Grove-Max「深度处理」） -->
               <section class="panel">

@@ -309,11 +309,19 @@ mp4, mov, mkv, flv, ts, m4v, webm
 │   └── 内容权属声明.txt
 ├── 06_分集视频/          # 仅选择复制时生成
 │   └── 第01集.mp4
+├── 07_证明与过程图/      # 深度处理有证明/过程图时生成（默认带上）
+│   ├── AI制作证明.png
+│   └── 过程图_01.png … 过程图_04.png
 └── manifest.json
 ```
 
 包内简介、封面、分集统一命名为 `简介.*`、`封面.*`、`第NN集.*`，扩展名跟原文件；重复集号依次加 `-2`、`-3`。
 `分集清单.csv` 带 BOM 并做公式注入防护，末列「包内文件名」。完整规则见 [`docs/MATERIAL_SPEC.md`](docs/MATERIAL_SPEC.md)。
+
+目标目录已存在时先询问：可「整体替换」旧包（默认，旧包里的其他文件一并换掉），也可「只替换标准文件」
+（保留使用者另外放进包里的文件，只清理过期标准文件）。生成命令的参数为 `overwrite` / `overwriteMode` /
+`withProof` / `proofSourceDir` / `deepOutputRoot`；设置项 `packageWithProof`（默认带上证明与过程图）与
+`packageOverwriteMode`（默认整体替换）决定界面上的默认值。
 
 `manifest.json` 记录：
 

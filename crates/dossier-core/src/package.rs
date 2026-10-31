@@ -30,6 +30,283 @@ pub struct PackageOptions {
     /// 只有确认了，权属声明里才写「已按平台要求进行 AI 生成标识」——不替使用者声称没核实过的事。
     #[serde(default)]
     pub ai_label_confirmed: bool,
+    /// 输出目录已存在时是否覆盖（默认不覆盖：先让使用者确认）。
+    #[serde(default)]
+    pub overwrite: bool,
+    /// 覆盖方式（只在使用 `overwrite` 时有意义）。
+    #[serde(default)]
+    pub overwrite_mode: OverwriteMode,
+    /// 是否把深度处理的 AI 制作证明与过程图收进包（`07_证明与过程图/`）。
+    #[serde(default = "default_true")]
+    pub with_proof: bool,
+    /// 深度处理输出目录（读取证明与过程图的地方）；None / 空表示没有跑的记录。
+    #[serde(default)]
+    pub proof_source_dir: Option<PathBuf>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// 覆盖旧包的方式。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OverwriteMode {
+    /// 整体替换：旧包整个换掉，使用者放进旧包里的其他文件也会消失。
+    #[default]
+    ReplaceAll,
+    /// 只替换标准文件：只覆盖本程序生成的那些路径，旧包里其他文件原地保留，
+    /// 并按标准命名清理本次不再生成的旧文件。
+    StandardOnly,
+}
+
+/// 报审包的固定目录名与包内文件名。`StandardOnly` 靠它区分「本程序生成的文件」与「使用者自己放的文件」。
+pub const DIR_INFO: &str = "01_剧集信息";
+pub const DIR_COVER: &str = "02_封面海报";
+pub const DIR_LIST: &str = "03_分集清单";
+pub const DIR_COST: &str = "04_成本配置表";
+pub const DIR_DECL: &str = "05_权属声明";
+pub const DIR_EPISODES: &str = "06_分集视频";
+pub const DIR_PROOF: &str = "07_证明与过程图";
+pub const FILE_TITLE: &str = "剧名.txt";
+pub const FILE_LIST: &str = "分集清单.csv";
+pub const FILE_COST: &str = "成本配置表.md";
+pub const FILE_DECL: &str = "内容权属声明.txt";
+pub const FILE_MANIFEST: &str = "manifest.json";
+/// 包内保留的文件（不含目录）：固定名单里的几个，外加按命名规则生成的分集、简介、封面、证明与过程图。
+fn is_standard_named_file(rel: &str) -> bool {
+    let (dir, name) = match rel.split_once('/') {
+        Some(parts) => parts,
+        // 包根：只有 manifest.json 是本程序生成的。
+        None => return rel == FILE_MANIFEST,
+    };
+    match dir {
+        DIR_INFO => name == FILE_TITLE || stem_is(name, "简介"),
+        DIR_COVER => stem_is(name, "封面"),
+        DIR_LIST => name == FILE_LIST,
+        DIR_COST => name == FILE_COST,
+        DIR_DECL => name == FILE_DECL,
+        DIR_EPISODES => is_episode_name(name),
+        DIR_PROOF => is_proof_name(name),
+        _ => false,
+    }
+}
+
+/// 文件名主干是否为 `stem`（扩展名任取）：`简介.txt`、`封面.PNG` 都算。
+fn stem_is(name: &str, stem: &str) -> bool {
+    match name.split_once('.') {
+        Some((base, ext)) => base == stem && !ext.is_empty(),
+        None => name == stem,
+    }
+}
+
+/// `第NN集.<ext>`（数字至少两位，与生成规则一致），允许重复集号时的 `-2` 后缀。
+fn is_episode_name(name: &str) -> bool {
+    let Some((base, ext)) = name.split_once('.') else {
+        return false;
+    };
+    if ext.is_empty() {
+        return false;
+    }
+    let Some(rest) = base.strip_prefix('第') else {
+        return false;
+    };
+    let Some((digits, tail)) = rest.split_once('集') else {
+        return false;
+    };
+    if digits.len() < 2 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    tail.is_empty()
+        || tail
+            .strip_prefix('-')
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// `AI制作证明.png|txt`、`过程图_NN.png`，以及随包附上的 `剧目海报.<ext>`。
+fn is_proof_name(name: &str) -> bool {
+    matches!(name, "AI制作证明.png" | "AI制作证明.txt")
+        || is_process_image(name)
+        || stem_is(name, "剧目海报")
+}
+
+fn is_process_image(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("过程图_") else {
+        return false;
+    };
+    let Some((digits, ext)) = rest.split_once('.') else {
+        return false;
+    };
+    ext == "png" && digits.len() == 2 && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// 从深度处理输出目录收进包的证明材料。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProofMaterials {
+    /// 包内相对路径（`07_证明与过程图/…`）与源文件，按固定顺序。
+    pub files: Vec<(String, PathBuf)>,
+    /// 没有收进来时的原因说明（给界面与清单看）。
+    pub note: Option<String>,
+}
+
+/// 输出目录里的证明材料：AI 制作证明（png 优先，退回 txt）与原色过程图，外加一张剧目海报。
+///
+/// 只认本程序生成的文件名；目录里没有就如实说明原因，不阻断生成。
+pub fn collect_proof_materials(proof_dir: Option<&Path>) -> ProofMaterials {
+    let Some(dir) = proof_dir else {
+        return ProofMaterials {
+            files: Vec::new(),
+            note: Some("未指定深度处理输出目录，包内不含证明与过程图".into()),
+        };
+    };
+    if !dir.is_dir() {
+        return ProofMaterials {
+            files: Vec::new(),
+            note: Some(format!(
+                "没有找到深度处理输出目录（{}），包内不含证明与过程图；请先跑一次深度处理",
+                dir.display()
+            )),
+        };
+    }
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    for name in ["AI制作证明.png", "AI制作证明.txt"] {
+        let path = dir.join(name);
+        if path.is_file() {
+            files.push((format!("{DIR_PROOF}/{name}"), path));
+            break;
+        }
+    }
+    for index in 1..=4 {
+        let name = format!("过程图_{index:02}.png");
+        let path = dir.join(&name);
+        if path.is_file() {
+            files.push((format!("{DIR_PROOF}/{name}"), path));
+        }
+    }
+    // 剧目海报（本程序按 `剧目海报.<ext>` 生成）也一并附上，方便与样包的材料构成一致。
+    for ext in ["png", "jpg", "jpeg", "webp"] {
+        let path = dir.join(format!("剧目海报.{ext}"));
+        if path.is_file() {
+            files.push((format!("{DIR_PROOF}/剧目海报.{ext}"), path));
+            break;
+        }
+    }
+    let note = files.is_empty().then(|| {
+        format!(
+            "深度处理输出目录（{}）里没有证明或过程图，包内不含这些材料",
+            dir.display()
+        )
+    });
+    ProofMaterials { files, note }
+}
+
+/// 把证明材料复制进 `07_证明与过程图/`；一个都没有时不建目录。
+fn copy_proof_materials(
+    pkg_dir: &Path,
+    opts: &PackageOptions,
+) -> std::io::Result<Option<ProofMaterials>> {
+    if !opts.with_proof {
+        return Ok(Some(ProofMaterials {
+            files: Vec::new(),
+            note: Some("本次未勾选「生成证明与过程图」".into()),
+        }));
+    }
+    let materials = collect_proof_materials(opts.proof_source_dir.as_deref());
+    if materials.files.is_empty() {
+        return Ok(Some(materials));
+    }
+    let dir = pkg_dir.join(DIR_PROOF);
+    std::fs::create_dir_all(&dir)?;
+    for (rel, source) in &materials.files {
+        let name = rel.strip_prefix(&format!("{DIR_PROOF}/")).unwrap_or(rel);
+        std::fs::copy(source, dir.join(name))?;
+    }
+    Ok(Some(materials))
+}
+
+/// `StandardOnly` 覆盖的合并结果：替换了哪些、清理了哪些过期文件、保留了哪些使用者自放的文件。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeReport {
+    /// 写进（或替换）的文件数。
+    pub replaced: u32,
+    /// `StandardOnly`：被清掉的过期标准文件。
+    pub removed: Vec<String>,
+    /// `StandardOnly`：保留的、使用者自己放的文件。
+    pub kept: Vec<String>,
+    /// `ReplaceAll`：旧包里被整体换掉的文件数（含使用者自放的文件）。
+    pub dropped: u32,
+}
+
+/// 把 staging 里的标准文件逐个覆盖进 `pkg_dir`，清掉旧包里本次不再生成的标准文件，
+/// 其余文件（使用者自己放进去的）原地保留。
+fn merge_standard_files(staging: &Path, pkg_dir: &Path) -> std::io::Result<MergeReport> {
+    let mut fresh: Vec<String> = Vec::new();
+    collect_relative_files(staging, staging, &mut fresh)?;
+    let mut existing: Vec<String> = Vec::new();
+    collect_relative_files(pkg_dir, pkg_dir, &mut existing)?;
+
+    let mut report = MergeReport::default();
+    for rel in &fresh {
+        let target = pkg_dir.join(rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(staging.join(rel), &target)?;
+        report.replaced += 1;
+    }
+    for rel in &existing {
+        if !is_standard_named_file(rel) {
+            report.kept.push(rel.clone());
+            continue;
+        }
+        if fresh.contains(rel) {
+            continue;
+        }
+        let path = pkg_dir.join(rel);
+        let _ = std::fs::remove_file(&path);
+        report.removed.push(rel.clone());
+        // 顺带清掉因此变空的目录（包根 `pkg_dir` 本身不删）。
+        let mut cursor = path.parent();
+        while let Some(dir) = cursor {
+            if dir == pkg_dir {
+                break;
+            }
+            if std::fs::remove_dir(dir).is_err() {
+                break;
+            }
+            cursor = dir.parent();
+        }
+    }
+    Ok(report)
+}
+
+/// 目录下所有文件的相对路径（`/` 分隔），跳过以 `.` 开头的临时文件。
+fn collect_relative_files(
+    root: &Path,
+    current: &Path,
+    out: &mut Vec<String>,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(current)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            collect_relative_files(root, &path, out)?;
+        } else {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push(rel);
+        }
+    }
+    Ok(())
 }
 
 /// 成本配置表单 —— 只承载使用者提供的真实数据。
@@ -51,6 +328,12 @@ pub struct PackageResult {
     pub package_dir: PathBuf,
     pub file_count: u32,
     pub total_bytes: u64,
+    /// 本次使用的覆盖方式；没有覆盖旧包时为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overwrite: Option<MergeReport>,
+    /// 证明与过程图的收集情况（含「为什么包里没有」的说明）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<ProofMaterials>,
 }
 
 /// 生成报审包：先写到同级的临时目录，`manifest.json` 写完后整体改名为最终目录。
@@ -73,41 +356,87 @@ pub fn generate_report_package(
         form.validate()
             .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
     }
-    if pkg_dir.exists() {
+    if pkg_dir.exists() && !opts.overwrite {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             format!(
-                "报审包目录已存在：{}。请选择新的输出目录或先移除旧目录。",
+                "报审包目录已存在：{}。可以选择覆盖旧包，或换一个输出目录。",
                 pkg_dir.display()
             ),
         ));
     }
+    if opts.overwrite {
+        guard_overwrite_target(&pkg_dir, drama_dir)?;
+    }
 
     let parent = pkg_dir.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)?;
-    let staging = parent.join(format!(
-        ".{}.part-{}-{}",
-        pkg_dir
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "报审包".into()),
+    let nonce = format!(
+        "{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|value| value.as_nanos())
             .unwrap_or_default()
-    ));
+    );
+    let leaf = pkg_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "报审包".into());
+    let staging = parent.join(format!(".{leaf}.part-{nonce}"));
     let written = write_package_contents(&staging, drama_name, cover, synopsis, episodes, opts)
         .and_then(|summary| {
-            // 写完才改名：最终目录要么不存在，要么是完整的包。
-            std::fs::rename(&staging, &pkg_dir)?;
-            Ok(summary)
+            match (pkg_dir.exists(), opts.overwrite, opts.overwrite_mode) {
+                // 目录不存在：写完才改名，最终目录要么不存在，要么是完整的包。
+                (false, _, _) => std::fs::rename(&staging, &pkg_dir)?,
+                // 整体替换：旧包先挪成备份 → 新包就位 → 删备份。任何时刻正式目录都是完整的旧包或新包。
+                (true, true, OverwriteMode::ReplaceAll) => {
+                    let backup = parent.join(format!(".{leaf}.old-{nonce}"));
+                    std::fs::rename(&pkg_dir, &backup)?;
+                    if let Err(error) = std::fs::rename(&staging, &pkg_dir) {
+                        // 新包没能就位：把旧包改回原名，别让用户发现包不见了。
+                        let _ = std::fs::rename(&backup, &pkg_dir);
+                        return Err(error);
+                    }
+                    // 备份里的文件数写进报告：整体替换后用户能知道旧包里有几个文件被换掉。
+                    let mut dropped: Vec<String> = Vec::new();
+                    collect_relative_files(&backup, &backup, &mut dropped)?;
+                    let _ = std::fs::remove_dir_all(&backup);
+                    return Ok((
+                        summary.0,
+                        summary.1,
+                        Some(MergeReport {
+                            replaced: summary.0,
+                            removed: Vec::new(),
+                            kept: Vec::new(),
+                            dropped: dropped.len() as u32,
+                        }),
+                        summary.2,
+                    ));
+                }
+                // 只替换标准文件：逐文件覆盖，非标准文件原地保留，过期标准路径清掉。
+                (true, true, OverwriteMode::StandardOnly) => {
+                    let report = merge_standard_files(&staging, &pkg_dir)?;
+                    let _ = std::fs::remove_dir_all(&staging);
+                    return Ok((summary.0, summary.1, Some(report), summary.2));
+                }
+                // 覆盖关掉但目录又在（生成期间被别人建出来）：当作冲突，删临时目录。
+                (true, false, _) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("报审包目录已存在：{}。", pkg_dir.display()),
+                    ))
+                }
+            }
+            Ok((summary.0, summary.1, None, summary.2))
         });
     match written {
-        Ok((file_count, total_bytes)) => Ok(PackageResult {
+        Ok((file_count, total_bytes, overwrite, proof)) => Ok(PackageResult {
             package_dir: pkg_dir,
             file_count,
             total_bytes,
+            overwrite,
+            proof,
         }),
         Err(error) => {
             let _ = std::fs::remove_dir_all(&staging);
@@ -116,7 +445,37 @@ pub fn generate_report_package(
     }
 }
 
-/// 把报审包的全部内容写进 `pkg_dir`（临时目录），返回 `(文件数, 总字节数)`。
+/// 覆盖前的安全闸：只允许替换一个真正的报审包目录，不允许把剧目目录或磁盘根当旧包换掉。
+fn guard_overwrite_target(pkg_dir: &Path, drama_dir: &Path) -> std::io::Result<()> {
+    let refuse = |reason: &str| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("拒绝覆盖 {reason}：{}", pkg_dir.display()),
+        ))
+    };
+    if !pkg_dir.is_dir() {
+        return refuse("不是目录的旧包位置");
+    }
+    let parent = pkg_dir.parent().unwrap_or(Path::new("."));
+    if pkg_dir.parent().is_none() || parent == pkg_dir {
+        return refuse("磁盘根目录");
+    }
+    if same_path(pkg_dir, drama_dir) {
+        return refuse("剧目目录本身");
+    }
+    Ok(())
+}
+
+/// 路径是否指向同一个位置（能取到规范路径时按规范路径比，取不到就按字面比）。
+fn same_path(left: &Path, right: &Path) -> bool {
+    let canon = |path: &Path| std::fs::canonicalize(path).ok();
+    match (canon(left), canon(right)) {
+        (Some(a), Some(b)) => a == b,
+        _ => left == right,
+    }
+}
+
+/// 把报审包的全部内容写进 `pkg_dir`（临时目录），返回 `(文件数, 总字节数, 证明材料)`。
 fn write_package_contents(
     pkg_dir: &Path,
     drama_name: &str,
@@ -124,21 +483,21 @@ fn write_package_contents(
     synopsis: Option<&Path>,
     episodes: &[ProbedEpisode],
     opts: &PackageOptions,
-) -> std::io::Result<(u32, u64)> {
+) -> std::io::Result<(u32, u64, Option<ProofMaterials>)> {
     std::fs::create_dir_all(pkg_dir)?;
 
     let mut manifest_files: Vec<ManifestFile> = Vec::new();
 
     // 01 剧集信息
-    let info_dir = pkg_dir.join("01_剧集信息");
+    let info_dir = pkg_dir.join(DIR_INFO);
     std::fs::create_dir_all(&info_dir)?;
-    std::fs::write(info_dir.join("剧名.txt"), drama_name)?;
+    std::fs::write(info_dir.join(FILE_TITLE), drama_name)?;
     // 包内统一命名（MATERIAL_SPEC「v1 报审包结构」）：简介.<原扩展名>、封面.<原扩展名>、第NN集.<原扩展名>。
     if let Some(s) = synopsis {
         std::fs::copy(s, info_dir.join(fixed_name("简介", s)))?;
     }
     if let Some(c) = cover {
-        let poster_dir = pkg_dir.join("02_封面海报");
+        let poster_dir = pkg_dir.join(DIR_COVER);
         std::fs::create_dir_all(&poster_dir)?;
         std::fs::copy(c, poster_dir.join(fixed_name("封面", c)))?;
     }
@@ -171,39 +530,42 @@ fn write_package_contents(
             },
         ));
     }
-    let list_dir = pkg_dir.join("03_分集清单");
+    let list_dir = pkg_dir.join(DIR_LIST);
     std::fs::create_dir_all(&list_dir)?;
     // 带 BOM：Windows 上双击用 Excel 打开时中文不乱码。
-    std::fs::write(list_dir.join("分集清单.csv"), csv_text_with_bom(&csv))?;
+    std::fs::write(list_dir.join(FILE_LIST), csv_text_with_bom(&csv))?;
 
     // 04 成本配置表（真实数据模板）
-    let cost_dir = pkg_dir.join("04_成本配置表");
+    let cost_dir = pkg_dir.join(DIR_COST);
     std::fs::create_dir_all(&cost_dir)?;
     if let Some(form) = &opts.cost_sheet {
-        std::fs::write(cost_dir.join("成本配置表.md"), render_cost_sheet_md(form))?;
+        std::fs::write(cost_dir.join(FILE_COST), render_cost_sheet_md(form))?;
     } else {
         std::fs::write(
-            cost_dir.join("成本配置表.md"),
+            cost_dir.join(FILE_COST),
             render_cost_sheet_md(&CostSheetForm::default()),
         )?;
     }
 
     // 05 权属声明（固定模板，使用者如实填写）
-    let decl_dir = pkg_dir.join("05_权属声明");
+    let decl_dir = pkg_dir.join(DIR_DECL);
     std::fs::create_dir_all(&decl_dir)?;
     std::fs::write(
-        decl_dir.join("内容权属声明.txt"),
+        decl_dir.join(FILE_DECL),
         ownership_declaration(drama_name, opts),
     )?;
 
     // 06 分集视频（可选复制）
     if opts.copy_episodes {
-        let ep_dir = pkg_dir.join("06_分集视频");
+        let ep_dir = pkg_dir.join(DIR_EPISODES);
         std::fs::create_dir_all(&ep_dir)?;
         for (ep, name) in episodes.iter().zip(&names) {
             std::fs::copy(&ep.file.path, ep_dir.join(name))?;
         }
     }
+
+    // 07 证明与过程图（来自深度处理输出目录；一个都没有时不建目录）
+    let proof = copy_proof_materials(pkg_dir, opts)?;
 
     // manifest
     collect_files(pkg_dir, &mut manifest_files)?;
@@ -214,15 +576,38 @@ fn write_package_contents(
         ai_generated: opts.ai_generated,
         copy_episodes: opts.copy_episodes,
         files: manifest_files,
+        proof_files: proof
+            .as_ref()
+            .map(|proof| {
+                proof
+                    .files
+                    .iter()
+                    .map(|(rel, source)| ManifestFile {
+                        path: rel.clone(),
+                        size_bytes: std::fs::metadata(source).map(|m| m.len()).unwrap_or(0),
+                        sha256: sha256_file(source).unwrap_or_default(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        proof_source: proof.as_ref().and_then(|proof| {
+            proof.note.as_ref().map(|note| ProofSourceRecord {
+                dir: opts
+                    .proof_source_dir
+                    .as_ref()
+                    .map(|dir| dir.display().to_string()),
+                note: note.clone(),
+            })
+        }),
     };
     std::fs::write(
-        pkg_dir.join("manifest.json"),
+        pkg_dir.join(FILE_MANIFEST),
         serde_json::to_vec_pretty(&manifest)?,
     )?;
 
     let file_count = manifest.files.len() as u32;
     let total_bytes = manifest.files.iter().map(|f| f.size_bytes).sum();
-    Ok((file_count, total_bytes))
+    Ok((file_count, total_bytes, proof))
 }
 
 #[derive(Serialize)]
@@ -234,6 +619,19 @@ struct Manifest {
     ai_generated: bool,
     copy_episodes: bool,
     files: Vec<ManifestFile>,
+    /// 收进包的证明与过程图（这些路径同时也出现在 `files` 里，这里单列一份方便平台与核对工具直接取用）。
+    proof_files: Vec<ManifestFile>,
+    /// 证明材料的来源目录与「没有收进来」的原因；收齐时不写这一项。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proof_source: Option<ProofSourceRecord>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProofSourceRecord {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dir: Option<String>,
+    note: String,
 }
 
 #[derive(Serialize)]
@@ -481,6 +879,7 @@ mod tests {
                 }),
                 ai_generated: true,
                 ai_label_confirmed: false,
+                ..base_opts(d.join("out"))
             },
         )
         .unwrap();
@@ -522,6 +921,7 @@ mod tests {
                 cost_sheet: None,
                 ai_generated: false,
                 ai_label_confirmed: false,
+                ..base_opts(d.join("out"))
             },
         )
         .unwrap();
@@ -564,6 +964,10 @@ mod tests {
             cost_sheet: None,
             ai_generated: true,
             ai_label_confirmed: false,
+            overwrite: false,
+            overwrite_mode: OverwriteMode::ReplaceAll,
+            with_proof: true,
+            proof_source_dir: None,
         }
     }
 
@@ -769,6 +1173,205 @@ mod tests {
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
             assert!(!out.exists(), "校验失败时不能写出任何东西");
         }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 独立临时目录（并行测试互不干扰）。
+    fn scratch(tag: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        let base = std::env::temp_dir().join(format!("dossier-pkg-{tag}-{unique}"));
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    #[test]
+    fn standard_paths_are_recognized_precisely() {
+        for rel in [
+            "manifest.json",
+            "01_剧集信息/剧名.txt",
+            "01_剧集信息/简介.md",
+            "02_封面海报/封面.PNG",
+            "03_分集清单/分集清单.csv",
+            "04_成本配置表/成本配置表.md",
+            "05_权属声明/内容权属声明.txt",
+            "06_分集视频/第09集.mp4",
+            "06_分集视频/第09集-2.mkv",
+            "07_证明与过程图/AI制作证明.png",
+            "07_证明与过程图/过程图_02.png",
+            "07_证明与过程图/剧目海报.webp",
+        ] {
+            assert!(is_standard_named_file(rel), "应算标准文件：{rel}");
+        }
+        for rel in [
+            "06_分集视频/花絮.mp4",
+            "06_分集视频/第9集.mp4",
+            "06_分集视频/第09集-花絮.mp4",
+            "07_证明与过程图/AI制作证明-旧.png",
+            "07_证明与过程图/过程图_2.png",
+            "01_剧集信息/剧名-备份.txt",
+            "01_剧集信息/说明.txt",
+            "说明.txt",
+        ] {
+            assert!(!is_standard_named_file(rel), "不该算标准文件：{rel}");
+        }
+    }
+
+    /// 目录已存在时默认不覆盖，要求先确认。
+    #[test]
+    fn existing_directory_needs_confirmation() {
+        let base = scratch("confirm");
+        let out = base.join("报审包");
+        generate_report_package("剧A", &base, None, None, &[], &base_opts(out.clone())).unwrap();
+        let error = generate_report_package("剧A", &base, None, None, &[], &base_opts(out.clone()))
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(error.to_string().contains("可以选择覆盖旧包"));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 整体替换：用户放进旧包的文件一并消失，不留备份残留。
+    #[test]
+    fn replace_all_swaps_the_whole_package() {
+        let base = scratch("replace");
+        let out = base.join("报审包");
+        generate_report_package("剧A", &base, None, None, &[], &base_opts(out.clone())).unwrap();
+        std::fs::write(out.join("我放的说明.txt"), "手写").unwrap();
+        let mut opts = base_opts(out.clone());
+        opts.overwrite = true;
+        opts.overwrite_mode = OverwriteMode::ReplaceAll;
+        let result = generate_report_package("剧A", &base, None, None, &[], &opts).unwrap();
+        assert!(result.overwrite.is_some());
+        assert!(
+            !out.join("我放的说明.txt").exists(),
+            "整体替换要连自放文件一起换掉"
+        );
+        assert!(out.join("manifest.json").is_file());
+        let leftovers: Vec<String> = std::fs::read_dir(&base)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".old-") || name.contains(".part-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "不能留下备份或临时目录：{leftovers:?}"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 只替换标准文件：用户自放的文件保留，本次不再生成的标准文件被清掉。
+    #[test]
+    fn standard_only_keeps_user_files_and_cleans_stale_ones() {
+        let base = scratch("standard");
+        let d = base.join("剧A");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("第1集.mp4"), b"one").unwrap();
+        std::fs::write(d.join("第2集.mp4"), b"two").unwrap();
+        let out = base.join("报审包");
+        let eps = vec![
+            probed(&d, "第1集.mp4", Some(1)),
+            probed(&d, "第2集.mp4", Some(2)),
+        ];
+        let mut first = base_opts(out.clone());
+        first.copy_episodes = true;
+        generate_report_package("剧A", &d, None, None, &eps, &first).unwrap();
+        assert!(out.join("06_分集视频").join("第02集.mp4").is_file());
+        std::fs::write(out.join("我放的说明.txt"), "手写").unwrap();
+        std::fs::write(out.join("06_分集视频").join("花絮.mp4"), "x").unwrap();
+
+        // 第二次只给一集：第02集是过期标准文件，应被清掉；手写文件与花絮保留。
+        let mut second = base_opts(out.clone());
+        second.copy_episodes = true;
+        second.overwrite = true;
+        second.overwrite_mode = OverwriteMode::StandardOnly;
+        let result = generate_report_package("剧A", &d, None, None, &eps[..1], &second).unwrap();
+        let report = result.overwrite.as_ref().unwrap();
+        assert_eq!(report.removed, vec!["06_分集视频/第02集.mp4".to_string()]);
+        assert!(
+            report.kept.contains(&"我放的说明.txt".to_string()),
+            "{report:?}"
+        );
+        assert!(
+            report.kept.contains(&"06_分集视频/花絮.mp4".to_string()),
+            "{report:?}"
+        );
+        assert!(out.join("我放的说明.txt").is_file());
+        assert!(out.join("06_分集视频").join("花絮.mp4").is_file());
+        assert!(!out.join("06_分集视频").join("第02集.mp4").exists());
+        assert!(out.join("06_分集视频").join("第01集.mp4").is_file());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 安全闸：不允许把剧目目录本身当旧包换掉。
+    #[test]
+    fn overwrite_refuses_drama_directory_itself() {
+        let base = scratch("guard");
+        let d = base.join("剧A");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("第1集.mp4"), b"one").unwrap();
+        let mut opts = base_opts(d.clone());
+        opts.overwrite = true;
+        let error = generate_report_package("剧A", &d, None, None, &[], &opts).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("剧目目录本身"));
+        assert!(d.join("第1集.mp4").is_file(), "素材不能被删");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 证明材料：有就收进 07_，一个都没有时不建目录并写明原因。
+    #[test]
+    fn proof_materials_are_collected_or_explained() {
+        let base = scratch("proof");
+        let deep = base.join("深度处理");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("AI制作证明.png"), b"png").unwrap();
+        for index in 1..=4 {
+            std::fs::write(deep.join(format!("过程图_{index:02}.png")), b"png").unwrap();
+        }
+        std::fs::write(deep.join("剧目海报.png"), b"png").unwrap();
+        let out = base.join("报审包");
+        let mut opts = base_opts(out.clone());
+        opts.proof_source_dir = Some(deep.clone());
+        let result = generate_report_package("剧A", &base, None, None, &[], &opts).unwrap();
+        let proof = result.proof.unwrap();
+        assert_eq!(proof.files.len(), 6, "{proof:?}");
+        assert!(out.join("07_证明与过程图").join("AI制作证明.png").is_file());
+        assert_eq!(
+            std::fs::read_dir(out.join("07_证明与过程图"))
+                .unwrap()
+                .count(),
+            6
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["proofFiles"].as_array().unwrap().len(), 6);
+        assert!(manifest.get("proofSource").is_none(), "收齐时不写说明");
+
+        // 换一部没有深度处理的剧：不建 07_，且写明原因。
+        let empty = base.join("报审包2");
+        let mut opts2 = base_opts(empty.clone());
+        opts2.proof_source_dir = Some(base.join("不存在"));
+        let result = generate_report_package("剧B", &base, None, None, &[], &opts2).unwrap();
+        assert!(result.proof.unwrap().files.is_empty());
+        assert!(!empty.join("07_证明与过程图").exists());
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(empty.join("manifest.json")).unwrap()).unwrap();
+        assert!(manifest["proofSource"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("没有找到深度处理输出目录"));
+
+        // 取消勾选：同样不建目录，说明里写成未勾选。
+        let third = base.join("报审包3");
+        let mut opts3 = base_opts(third.clone());
+        opts3.with_proof = false;
+        opts3.proof_source_dir = Some(deep);
+        let result = generate_report_package("剧C", &base, None, None, &[], &opts3).unwrap();
+        assert!(result.proof.unwrap().note.unwrap().contains("未勾选"));
+        assert!(!third.join("07_证明与过程图").exists());
         std::fs::remove_dir_all(&base).ok();
     }
 }

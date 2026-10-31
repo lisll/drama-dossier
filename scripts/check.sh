@@ -152,6 +152,9 @@ if [ "$run_web" -eq 1 ] && require node; then
   if [ "${node_major:-0}" -ge 14 ] 2>/dev/null; then
     step "语法检查：node --check src/main.js" \
       node --check src/main.js
+    # 报审包生成流程（覆盖确认、路径绑定、证明材料说明）：纯断言，不需要浏览器。
+    step "前端流程检查：报审包生成" \
+      node scripts/tests/test_generate_flow.js
   else
     printf '==> 跳过 node --check：当前 node 是 %s，低于 14 无法解析 src/main.js\n' \
       "$(node --version 2>/dev/null)"

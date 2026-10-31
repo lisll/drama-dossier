@@ -5,7 +5,7 @@ use dossier_core::{
     resolve_product_dir, run_checks, scan_drama_dir, update_settings, validate_drama_dir,
     validate_drama_name, validate_library_root, AppSettings, ChecklistReport, ChecklistRules,
     CostSheetForm, Drama, DramaMaterials, EpisodeSpec, FfprobeConfig, LoadedSettings,
-    PackageOptions, PackageResult, ProbedEpisode,
+    OverwriteMode, PackageOptions, PackageResult, ProbedEpisode,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
@@ -375,6 +375,11 @@ fn generate_package(
     cost_sheet: Option<CostSheetForm>,
     ffprobe_path: Option<String>,
     rules: Option<ChecklistRules>,
+    overwrite: Option<bool>,
+    overwrite_mode: Option<OverwriteMode>,
+    with_proof: Option<bool>,
+    proof_source_dir: Option<String>,
+    deep_output_root: Option<String>,
 ) -> Result<PackageResult, String> {
     crate::license::guard()?;
     // 登记为运行中：应用升级前会检查，避免写报审包写到一半被退出
@@ -384,9 +389,13 @@ fn generate_package(
     logging::log_event(
         "生成",
         format!(
-            "开始：{name}（本次覆盖输出={:?}，默认产物根目录={:?}，复制分集={copy_episodes}）",
+            "开始：{name}（本次覆盖输出={:?}，默认产物根目录={:?}，复制分集={copy_episodes}，\
+             覆盖={:?}，覆盖方式={:?}，带证明={:?}）",
             output_dir.as_deref().unwrap_or("留空"),
             output_root.as_deref().unwrap_or("未设"),
+            overwrite.unwrap_or(false),
+            overwrite_mode.unwrap_or_default(),
+            with_proof.unwrap_or(true),
         ),
     );
     // 生成前会重新探测（避免用过期规格），这一段同样要有进度，否则界面像卡死。
@@ -419,12 +428,24 @@ fn generate_package(
         dossier_core::PACKAGE_OUTPUT_DIR,
     );
 
+    // 证明材料来源：本次覆盖 → 设置里的深度处理输出根目录/<剧名>/深度处理 → 剧目目录/深度处理。
+    let proof_source_dir = resolve_product_dir(
+        proof_source_dir.as_deref().map(Path::new),
+        deep_output_root.as_deref().map(Path::new),
+        &drama.dir,
+        &drama.name,
+        dossier_core::DEEP_OUTPUT_DIR,
+    );
     let opts = PackageOptions {
         output_dir: Some(package_dir),
         copy_episodes,
         cost_sheet,
         ai_generated,
         ai_label_confirmed: ai_label_confirmed == Some(true),
+        overwrite: overwrite == Some(true),
+        overwrite_mode: overwrite_mode.unwrap_or_default(),
+        with_proof: with_proof.unwrap_or(true),
+        proof_source_dir: Some(proof_source_dir),
     };
 
     let result = logging::log_err(
