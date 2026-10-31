@@ -15,15 +15,9 @@ import argparse
 import os
 import sys
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
-# 常见中文字体探测顺序（与制作证明脚本一致）。
-FONT_CANDIDATES = [
-    "/System/Library/Fonts/PingFang.ttc",
-    "/System/Library/Fonts/STHeiti Light.ttc",
-    "C:/Windows/Fonts/msyh.ttc",
-    "C:/Windows/Fonts/simhei.ttf",
-]
+from cjk_font import FontMissingError, load_cjk_font, save_png_atomic
 
 
 def fail(message):
@@ -32,14 +26,12 @@ def fail(message):
 
 
 def load_font(size):
-    """按平台候选顺序探测中文字体；全部缺失时退回 Pillow 默认字体。"""
-    for path in FONT_CANDIDATES:
-        if os.path.isfile(path):
-            try:
-                return ImageFont.truetype(path, size)
-            except OSError:
-                continue
-    return ImageFont.load_default()
+    """中文字体（见 cjk_font）。找不到时报错退出：角标会烧进每一帧，宁可让深度处理在编码前停下，
+    也不能烧进一排看不清的方块。"""
+    try:
+        return load_cjk_font(size)
+    except FontMissingError as error:
+        fail(str(error))
 
 
 def hex_to_rgb(color):
@@ -94,7 +86,7 @@ def main():
         fill=hex_to_rgb(args.fg) + (alpha,),
     )
     try:
-        image.save(args.output, "PNG")
+        save_png_atomic(image, args.output)
     except OSError as error:
         fail(f"写入 {args.output} 失败：{error}")
     print(f"已生成角标：{args.output}（{width}x{height}）")

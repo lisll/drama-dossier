@@ -638,6 +638,7 @@ cargo tauri build --features license-test-mode
 ```bash
 scripts/check.sh            # 全量，等同于 CI
 scripts/check.sh --fast     # 跳过 cargo test
+scripts/check.sh --py       # 只跑排版脚本单测（证明 / 角标 / 过程图，需要 Pillow）
 ```
 
 建议启用仓库自带的 Git hooks，把「推上去才发现 CI 红」挡在本地：

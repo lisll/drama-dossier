@@ -8,6 +8,7 @@
 #   scripts/check.sh --rust       # 只跑 Rust 三项
 #   scripts/check.sh --web        # 只跑 node --check
 #   scripts/check.sh --json       # 只校验 JSON
+#   scripts/check.sh --py         # 只跑排版脚本单测（需要 Pillow）
 #
 # 未指定范围时默认全选；缺少某个工具时跳过该项并给出提示，不算失败。
 # 退出码：0 通过；1 有检查失败；2 用法错误。
@@ -24,6 +25,7 @@ fast=0
 run_rust=0
 run_web=0
 run_json=0
+run_py=0
 any_scope=0
 
 for arg in "$@"; do
@@ -32,6 +34,7 @@ for arg in "$@"; do
     --rust) run_rust=1; any_scope=1 ;;
     --web) run_web=1; any_scope=1 ;;
     --json) run_json=1; any_scope=1 ;;
+    --py) run_py=1; any_scope=1 ;;
     -h|--help) usage; exit 0 ;;
     *)
       printf 'check.sh: 未知参数：%s\n\n' "$arg" >&2
@@ -45,6 +48,7 @@ if [ "$any_scope" -eq 0 ]; then
   run_rust=1
   run_web=1
   run_json=1
+  run_py=1
 fi
 
 fail=0
@@ -160,6 +164,17 @@ if [ "$run_json" -eq 1 ] && require python3; then
     python3 -m json.tool src-tauri/tauri.conf.json
   step_quiet "JSON 校验：src-tauri/capabilities/default.json" \
     python3 -m json.tool src-tauri/capabilities/default.json
+fi
+
+# 排版脚本（证明 / 角标 / 过程图）单测：缺中文字体必须报错，不能出看不清的图。
+if [ "$run_py" -eq 1 ] && require python3; then
+  if python3 -c "import PIL" >/dev/null 2>&1; then
+    step_quiet "排版脚本单测：tools/process_images/tests" \
+      env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/process_images/tests
+  else
+    printf '==> 跳过排版脚本单测：当前 python3 没有 Pillow（pip install pillow）\n'
+    skipped="${skipped}${skipped:+, }Pillow"
+  fi
 fi
 
 printf '\n'

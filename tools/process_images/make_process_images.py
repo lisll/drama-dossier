@@ -32,7 +32,9 @@ import argparse
 import os
 import sys
 
-from PIL import Image, ImageDraw, ImageFont, ImageStat
+from PIL import Image, ImageDraw, ImageStat
+
+from cjk_font import FontMissingError, load_cjk_font, save_png_atomic
 
 IMAGE_COUNT = 4
 FRAMES_PER_CANVAS = 3
@@ -74,33 +76,11 @@ def fail(message):
     sys.exit(1)
 
 
-def probe_font(candidates, size):
-    """按平台候选顺序探测中文字体；全部缺失时退回 Pillow 默认位图字体。"""
-    for path in candidates:
-        if os.path.isfile(path):
-            try:
-                return ImageFont.truetype(path, size)
-            except OSError:
-                continue
-    return ImageFont.load_default()
-
-
 def font(size, bold=False):
+    """中文字体（见 cjk_font）；找不到能画汉字的字体时抛 FontMissingError，由 main 报错退出。"""
     key = (size, bold)
     if key not in _FONT_CACHE:
-        if bold:
-            candidates = [
-                "C:/Windows/Fonts/msyhbd.ttc",
-                "C:/Windows/Fonts/simhei.ttf",
-                "/System/Library/Fonts/PingFang.ttc",
-            ]
-        else:
-            candidates = [
-                "C:/Windows/Fonts/msyh.ttc",
-                "C:/Windows/Fonts/simhei.ttf",
-                "/System/Library/Fonts/PingFang.ttc",
-            ]
-        _FONT_CACHE[key] = probe_font(candidates, size)
+        _FONT_CACHE[key] = load_cjk_font(size, bold)
     return _FONT_CACHE[key]
 
 
@@ -588,17 +568,28 @@ def main():
     scene = grouped[0][len(grouped[0]) // 2]
     prop = grouped[1][len(grouped[1]) // 2] if len(grouped) > 1 else grouped[0][0]
 
-    for index in range(IMAGE_COUNT):
-        frames = list(grouped[index % len(grouped)])
-        fill = 0
-        while len(frames) < FRAMES_PER_CANVAS:
-            frames.append(grouped[index % len(grouped)][fill % len(grouped[index % len(grouped)])])
-            fill += 1
-        canvas = build_canvas(
-            index + 1, args.title, args.synopsis, frames[:FRAMES_PER_CANVAS], poster, scene, prop
-        )
+    # 先把 4 张都画好再写盘：缺中文字体时在画第一张就报错，不会只写出一部分。
+    canvases = []
+    try:
+        for index in range(IMAGE_COUNT):
+            frames = list(grouped[index % len(grouped)])
+            fill = 0
+            while len(frames) < FRAMES_PER_CANVAS:
+                frames.append(grouped[index % len(grouped)][fill % len(grouped[index % len(grouped)])])
+                fill += 1
+            canvases.append(
+                build_canvas(
+                    index + 1, args.title, args.synopsis, frames[:FRAMES_PER_CANVAS], poster, scene, prop
+                )
+            )
+    except FontMissingError as error:
+        fail(str(error))
+    for index, canvas in enumerate(canvases):
         out_path = os.path.join(args.output_dir, f"过程图_{index + 1:02d}.png")
-        canvas.save(out_path)
+        try:
+            save_png_atomic(canvas, out_path)
+        except OSError as error:
+            fail(f"写入 {out_path} 失败：{error}")
         print(f"已生成 {out_path}")
 
 

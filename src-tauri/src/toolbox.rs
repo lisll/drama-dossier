@@ -2616,6 +2616,18 @@ fn ai_badge_script_args(script: &Path, target: &Path, text: &str, font_size: u32
 }
 const AI_BADGE_FILE: &str = ".ai-badge.png";
 
+/// 角标失败时给用户的提示：缺中文字体与 Pillow 环境问题的处理办法不同，分开说。
+fn ai_badge_failure_message(error: &str) -> String {
+    let remedy = if error.contains("找不到可显示中文的字体") {
+        "请安装系统中文字体（如微软雅黑、苹方）后重试"
+    } else {
+        "请联网后重试（首次需要自动安装 Pillow 排版环境）"
+    };
+    format!(
+        "AI 合规角标生成失败：{error}。{remedy}，或在「设置 → 目录与引擎 → 内容模型」关闭「烧录 AI 合规角标」后再处理。"
+    )
+}
+
 /// 渲染 AI 合规角标 PNG（Pillow，与过程图同一套材料排版环境）。
 ///
 /// 开关关闭 → `Ok(None)`；开关打开但渲染失败 → `Err`。角标是成片上的合规标识，
@@ -2666,10 +2678,7 @@ fn render_ai_badge(
                 "材料",
                 format!("AI 合规角标渲染失败，深度处理中止：{error}"),
             );
-            Err(format!(
-                "AI 合规角标生成失败：{error}。请联网后重试（首次需要自动安装 Pillow 排版环境），\
-                 或在「设置 → 目录与引擎 → 内容模型」关闭「烧录 AI 合规角标」后再处理。"
-            ))
+            Err(ai_badge_failure_message(&error))
         }
     }
 }
@@ -2962,7 +2971,6 @@ fn transcode_blocking(
                     material_report,
                     &processing,
                     &outputs,
-                    cancel,
                 );
             }
             // 上一轮证明开跑时已作废，而本轮没有生成新证明（材料流水线关着、材料线程失败、或渲染失败）：
@@ -5092,6 +5100,17 @@ Conversion failed!
             error.contains("/剧/上/第1集.mp4") && error.contains("/剧/下/第1集.MP4"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn badge_failure_message_points_at_the_real_cause() {
+        let fonts = ai_badge_failure_message("退出码 1：找不到可显示中文的字体（已查找：…）");
+        assert!(
+            fonts.contains("安装系统中文字体") && !fonts.contains("Pillow"),
+            "{fonts}"
+        );
+        let env = ai_badge_failure_message("No module named 'PIL'");
+        assert!(env.contains("Pillow"), "{env}");
     }
 
     #[test]

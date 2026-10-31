@@ -24,7 +24,9 @@ import json
 import os
 import sys
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageOps
+
+from cjk_font import FontMissingError, load_cjk_font, save_png_atomic
 
 # 画布与配色：白底正式证明文件，深色页眉呼应工作台产物的品牌黑。
 CANVAS_W, MIN_CANVAS_H = 1240, 1754
@@ -56,26 +58,10 @@ def fail(message):
 
 
 def font(size, bold=False):
-    """加载中文字体：macOS 优先苹方，Windows 优先微软雅黑；全部缺失时退回 Pillow 默认字体。"""
+    """中文字体（见 cjk_font）；找不到能画汉字的字体时抛 FontMissingError，由 main 报错退出。"""
     key = (size, bold)
     if key not in _FONT_CACHE:
-        candidates = [
-            "/System/Library/Fonts/PingFang.ttc",
-            "/System/Library/Fonts/STHeiti Light.ttc",
-            "C:/Windows/Fonts/msyhbd.ttc" if bold else "C:/Windows/Fonts/msyh.ttc",
-            "C:/Windows/Fonts/simhei.ttf",
-            # Linux 开发机兜底（发行包只面向 Windows / macOS）
-            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-        ]
-        loaded = None
-        for path in candidates:
-            if os.path.isfile(path):
-                try:
-                    loaded = ImageFont.truetype(path, size)
-                    break
-                except OSError:
-                    continue
-        _FONT_CACHE[key] = loaded or ImageFont.load_default()
+        _FONT_CACHE[key] = load_cjk_font(size, bold)
     return _FONT_CACHE[key]
 
 
@@ -385,8 +371,15 @@ def main():
 
     output_dir = os.path.dirname(os.path.abspath(args.output))
     os.makedirs(output_dir, exist_ok=True)
-    canvas = render(data)
-    canvas.save(args.output)
+    try:
+        canvas = render(data)
+    except FontMissingError as error:
+        # 不出看不清的图：调用方据此退回文本版证明并提示原因。
+        fail(str(error))
+    try:
+        save_png_atomic(canvas, args.output)
+    except OSError as error:
+        fail(f"写入 {args.output} 失败：{error}")
     print(f"已生成 {args.output}")
 
 

@@ -33,7 +33,7 @@ sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
 提交前可一键跑与 CI 等价的门槛，并建议启用仓库自带的 Git hooks：
 
 ```bash
-scripts/check.sh            # 全量：fmt + clippy + test + JSON + node --check
+scripts/check.sh            # 全量：fmt + clippy + test + JSON + node --check + 排版脚本单测
 scripts/install-hooks.sh    # 启用 .githooks（pre-commit 快检 / pre-push 全量）
 ```
 

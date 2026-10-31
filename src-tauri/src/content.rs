@@ -1191,6 +1191,11 @@ fn build_proof_payload(
     })
 }
 
+/// 把证明日期改为当前北京时间（收尾与重做海报时调用）。
+fn refresh_proof_date(payload: &mut serde_json::Value) {
+    payload["date"] = json!(beijing_date_string());
+}
+
 /// 编码完成后补上处理方式与成片清单（`outputs` 为 None = 成片指纹没算出来）。
 pub(crate) fn attach_proof_outcome(
     payload: &mut serde_json::Value,
@@ -1364,8 +1369,9 @@ fn write_ai_proof_image(
     output_dir: &Path,
     payload: &serde_json::Value,
 ) -> Result<PathBuf, String> {
+    // 独占创建 + 改名替换（fsio）：不会顺着输出目录里预先放好的同名链接写到别处。
     let data_path = output_dir.join(".proof-data.json");
-    std::fs::write(&data_path, payload.to_string())
+    crate::paths::write_atomic(&data_path, payload.to_string().as_bytes())
         .map_err(|error| format!("写入证明数据失败（{}）：{error}", data_path.display()))?;
     let cleanup = |error: String| {
         let _ = std::fs::remove_file(&data_path);
@@ -1376,8 +1382,8 @@ fn write_ai_proof_image(
     let output_path = output_dir.join(PROOF_IMAGE_FILE);
     let spec = CommandSpec::new(python.display().to_string())
         .arg(script.display().to_string())
-        .args(["--data", &data_path.display().to_string()])
-        .args(["--output", &output_path.display().to_string()])
+        .arg(format!("--data={}", data_path.display()))
+        .arg(format!("--output={}", output_path.display()))
         .timeout(Duration::from_secs(120));
     let output = SystemRunner::new()
         .run(&spec)
@@ -1587,27 +1593,31 @@ fn generate_process_images(
         crate::toolbox::materials_script(app, "make_process_images.py").inspect_err(|_| {
             let _ = std::fs::remove_dir_all(&frames_dir);
         })?;
+    // 剧名、简介等都写成 `--key=value` 一个参数：以 `-` 开头的剧名分开写会被 argparse 当成选项。
     let spec = CommandSpec::new(python.display().to_string())
         .arg(script.display().to_string())
-        .args(["--output-dir", &output_dir.display().to_string()])
-        .args([
-            "--frames",
-            &frames
+        .arg(format!("--output-dir={}", output_dir.display()))
+        .arg(format!(
+            "--frames={}",
+            frames
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect::<Vec<_>>()
-                .join(","),
-        ])
-        .args(["--labels", &labels.join("|")])
-        .args(["--title", canvas.title])
-        .args(["--synopsis", canvas.synopsis.unwrap_or_default()])
-        .args([
-            "--poster",
-            &canvas
+                .join(",")
+        ))
+        .arg(format!("--labels={}", labels.join("|")))
+        .arg(format!("--title={}", canvas.title))
+        .arg(format!(
+            "--synopsis={}",
+            canvas.synopsis.unwrap_or_default()
+        ))
+        .arg(format!(
+            "--poster={}",
+            canvas
                 .poster
                 .map(|path| path.display().to_string())
-                .unwrap_or_default(),
-        ])
+                .unwrap_or_default()
+        ))
         .timeout(Duration::from_secs(120));
     let output = SystemRunner::new().run(&spec).map_err(|error| {
         let _ = std::fs::remove_dir_all(&frames_dir);
@@ -2133,7 +2143,8 @@ fn record_manifest(output_dir: &Path, report: &mut MaterialPipelineReport) {
 
 /// 深度处理收尾（编码成功、材料线程汇合之后）：补上成片清单与处理方式，生成 AI 制作证明并改写清单。
 ///
-/// 只在编码成功后调用：编码失败或停止时不出新证明，上一轮的证明仍与上一轮成片对应。
+/// 只在编码成功后调用：编码失败或停止时不出新证明（上一轮证明在开跑时已由
+/// [`invalidate_previous_proof`] 作废）。证明日期取收尾时刻；成片指纹计算不受停止令牌影响。
 /// 材料线程失败（没有证明字段）时什么都不做。
 pub(crate) fn finalize_deep_proof(
     app: &AppHandle,
@@ -2141,7 +2152,6 @@ pub(crate) fn finalize_deep_proof(
     report: &mut MaterialPipelineReport,
     processing: &ProofProcessing,
     output_paths: &[PathBuf],
-    cancel: &CancelToken,
 ) {
     let Some(mut payload) = report.proof_payload.take() else {
         return;
@@ -2151,7 +2161,11 @@ pub(crate) fn finalize_deep_proof(
         "material-progress",
         json!({ "stage": "proof", "label": "正在计算成片指纹并生成 AI 制作证明" }),
     );
-    let outputs = match proof_files(output_paths, cancel) {
+    // 证明日期以收尾为准：材料线程开始时就取了一次，深度处理跨过午夜时会早一天。
+    refresh_proof_date(&mut payload);
+    // 成片已经发布：这里只读文件算指纹，不接停止令牌（不会被停止打断）。否则编码刚完成就点停止时，
+    // 成片明明在，证明却写「成片清单未记录」。
+    let outputs = match proof_files(output_paths, &CancelToken::new()) {
         Ok(files) => Some(files),
         Err(error) => {
             crate::logging::log_event("材料", format!("成片指纹未算出：{error}"));
@@ -2293,7 +2307,7 @@ pub(crate) fn regenerate_poster_blocking(
     let mut proof_render_failed = false;
     let proof = match manifest.get_mut("proofPayload").filter(|v| v.is_object()) {
         Some(payload) => {
-            payload["date"] = json!(beijing_date_string());
+            refresh_proof_date(payload);
             payload["posterName"] = json!(poster
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -2892,6 +2906,31 @@ torch.load with map_location=torch.device('cpu') to map your storages to the CPU
             "processCount": 4,
             "storyboardSource": "原始素材抽帧",
         })
+    }
+
+    /// 收尾与重做海报都把日期改成当前北京时间：材料线程开始时取的日期在跨午夜时会早一天。
+    #[test]
+    fn proof_date_is_refreshed_to_now() {
+        let mut payload = proof_payload_fixture();
+        assert_eq!(payload["date"], "2026-10-29");
+        refresh_proof_date(&mut payload);
+        assert_eq!(payload["date"], beijing_date_string());
+        assert_ne!(payload["date"], "2026-10-29");
+    }
+
+    /// 成片指纹不受停止令牌影响（finalize_deep_proof 传入新令牌）；proof_files 本身仍会响应令牌。
+    #[test]
+    fn output_fingerprints_ignore_an_already_cancelled_task() {
+        let dir = std::env::temp_dir().join(format!("dossier-proof-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("第01集.mp4");
+        std::fs::write(&file, b"abc").unwrap();
+        let cancelled = CancelToken::new();
+        cancelled.cancel();
+        assert!(proof_files(std::slice::from_ref(&file), &cancelled).is_err());
+        let files = proof_files(std::slice::from_ref(&file), &CancelToken::new()).unwrap();
+        assert_eq!(files[0].size, 3);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
