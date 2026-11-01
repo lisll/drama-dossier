@@ -26,6 +26,11 @@
 
 角色等级：`viewer (1) < operator (2) < admin (3)`。
 
+> **⚠ 不做对象级隔离（学习原型的已知限制）**：上表只按**角色**放行，不校验资源**归属**。
+> 同一实例里，任何 viewer 都能列出并下载全部用户的素材与产物，任何 operator 都能取消或重跑他人的任务、
+> 往别人的项目里上传素材。计费接口是唯一做了归属校验的。**多人共用一个实例之前，必须先给
+> assets / tasks / artifacts / review 各端点补上归属校验**（见 `docs/修改方案-业务逻辑对照审查.md` §17.2）。
+
 | 端点类别 | 最低角色 |
 | --- | --- |
 | 查询（whoami / status / assets / tasks 读 / recipes 读 / artifacts 读） | viewer |

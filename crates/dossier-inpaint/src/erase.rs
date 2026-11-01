@@ -109,6 +109,7 @@ impl EraseRequest {
         if self.output.as_os_str().is_empty() {
             return Err("请指定输出视频路径。".into());
         }
+        check_output_file_name(&self.output)?;
         // 输出指向输入本身时，管线会边读边写同一个文件，直接毁掉源素材。
         if dossier_core::same_path(&self.input, &self.output) {
             return Err("输出视频不能与输入视频相同：那会覆盖原素材。请换一个输出路径。".into());
@@ -365,6 +366,70 @@ fn search_path(binary: &str) -> Option<PathBuf> {
     None
 }
 
+/// 临时目录扩展名：`<输出>.inpaint-tmp`。
+pub const TEMP_DIR_EXTENSION: &str = "inpaint-tmp";
+
+/// 临时目录里的标记文件（内容是创建它的擦除工具 pid）：只有带它的目录才会被自动删除。
+pub const TEMP_DIR_MARKER: &str = ".dossier-inpaint-tmp";
+
+/// 输出必须是一个具体的视频文件名。`..`、`/`、`.` 没有文件名，`with_extension` 对它们
+/// 是空操作，临时目录就会等于输出路径本身——那会把用户的上级目录当临时目录删掉。
+pub fn check_output_file_name(output: &Path) -> Result<(), String> {
+    let has_name = output
+        .file_name()
+        .is_some_and(|name| !name.is_empty() && name != "." && name != "..");
+    let is_temp_name = output
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(TEMP_DIR_EXTENSION));
+    if !has_name || is_temp_name {
+        return Err(format!(
+            "输出必须是一个视频文件名（例如 成片.mp4），当前是：{}",
+            output.display()
+        ));
+    }
+    Ok(())
+}
+
+/// 输出对应的临时目录路径。
+pub fn temp_dir_for(output: &Path) -> PathBuf {
+    output.with_extension(TEMP_DIR_EXTENSION)
+}
+
+/// 在新建的临时目录里写下标记（pid）。
+pub fn write_temp_marker(dir: &Path, pid: u32) -> std::io::Result<()> {
+    std::fs::write(dir.join(TEMP_DIR_MARKER), pid.to_string())
+}
+
+/// 是不是本工具建的临时目录：真目录（不是链接）、扩展名对、标记是普通文件。
+/// 是就返回标记里的 pid；否则 None——调用方据此决定能不能删。
+pub fn owned_temp_dir_pid(dir: &Path) -> Option<u32> {
+    let meta = std::fs::symlink_metadata(dir).ok()?;
+    if !meta.is_dir() {
+        return None;
+    }
+    if !dir
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(TEMP_DIR_EXTENSION))
+    {
+        return None;
+    }
+    let marker = dir.join(TEMP_DIR_MARKER);
+    if !std::fs::symlink_metadata(&marker).ok()?.is_file() {
+        return None;
+    }
+    std::fs::read_to_string(marker).ok()?.trim().parse().ok()
+}
+
+/// GUI 端是否该清理临时目录：本次运行失败，且目录是本次子进程建的（标记 pid 对得上）。
+/// 成功时由工具自己清；进程没启动、别的运行建的、没有标记的一律不动。
+pub fn should_clean_temp(
+    run_failed: bool,
+    marker_pid: Option<u32>,
+    child_pid: Option<u32>,
+) -> bool {
+    run_failed && marker_pid.is_some() && marker_pid == child_pid
+}
+
 /// 执行结果。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -437,6 +502,29 @@ impl ProgressTail {
 pub fn run_plan_with_progress(
     plan: &ErasePlan,
     timeout_secs: u64,
+    on_progress: impl FnMut(&ProgressEvent),
+) -> Result<EraseRun, String> {
+    run_plan_observed(plan, timeout_secs, |_| {}, on_progress)
+}
+
+/// 排空线程最多保留的输出尾部：worker 每帧一行日志，长片能攒到几十 MB，界面只展示尾部。
+const OUTPUT_TAIL_BYTES: usize = 64 * 1024;
+
+/// 进程退出后等排空线程收尾的最长时间：Windows 上孤儿 worker 可能一直占着继承来的管道。
+const DRAIN_JOIN_GRACE: Duration = Duration::from_secs(5);
+
+/// 与 [`run_plan_with_progress`] 相同，另在子进程启动后把 pid 交给 `on_spawn`
+/// （GUI 端据此确认临时目录是不是本次运行建的）。
+///
+/// 进程管理要点：
+/// - stdout/stderr 启动后立刻由两个线程排空（只留尾部），不会因管道写满而互等；
+/// - Unix 上子进程自成进程组：超时整组结束；正常退出时先清掉组里残留的孙进程再回收，
+///   回收前组长是僵尸，pid / 进程组号不会被复用，不会误杀；
+/// - 排空线程的 join 有时限，超时就放弃，并在输出里注明。
+pub fn run_plan_observed(
+    plan: &ErasePlan,
+    timeout_secs: u64,
+    on_spawn: impl FnOnce(u32),
     mut on_progress: impl FnMut(&ProgressEvent),
 ) -> Result<EraseRun, String> {
     let mut command = Command::new(&plan.program);
@@ -451,9 +539,18 @@ pub fn run_plan_with_progress(
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000);
     }
+    // 擦除工具自成进程组：它拉起的 ffmpeg / python worker 继承同一组，结束时能整组清理。
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = command
         .spawn()
         .map_err(|error| format!("无法启动擦除工具（{}）：{error}", plan.program.display()))?;
+    on_spawn(child.id());
+    let stdout_reader = child.stdout.take().map(spawn_tail_drain);
+    let stderr_reader = child.stderr.take().map(spawn_tail_drain);
 
     let deadline = if timeout_secs == 0 {
         None
@@ -461,27 +558,34 @@ pub fn run_plan_with_progress(
         Some(Instant::now() + Duration::from_secs(timeout_secs))
     };
     let mut tail = ProgressTail::default();
-    let status = loop {
+    loop {
         if let Some(path) = plan.progress_path.as_deref() {
             for event in tail.drain(path) {
                 on_progress(&event);
             }
         }
-        if let Some(exit) = child
-            .try_wait()
-            .map_err(|error| format!("等待擦除工具失败：{error}"))?
-        {
-            break exit;
+        let exited = poll_exited(&mut child).map_err(|error| {
+            kill_tree(&mut child);
+            format!("等待擦除工具失败：{error}")
+        })?;
+        if exited {
+            break;
         }
         if let Some(deadline) = deadline {
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_tree(&mut child);
+                join_tail_drain(stdout_reader, Instant::now() + DRAIN_JOIN_GRACE);
+                join_tail_drain(stderr_reader, Instant::now() + DRAIN_JOIN_GRACE);
                 return Err(format!("擦除工具超过 {timeout_secs} 秒未结束，已中止。"));
             }
         }
         std::thread::sleep(Duration::from_millis(100));
-    };
+    }
+    // 组长已退出但尚未回收：先清掉组里残留的孙进程（它们可能还占着管道），再回收组长。
+    kill_group(&child);
+    let status = child
+        .wait()
+        .map_err(|error| format!("回收擦除工具进程失败：{error}"))?;
     // 进程退出后可能还有最后几条事件没读：补一次，免得界面少收一个终态。
     if let Some(path) = plan.progress_path.as_deref() {
         for event in tail.drain(path) {
@@ -489,12 +593,12 @@ pub fn run_plan_with_progress(
         }
     }
 
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("读取擦除工具输出失败：{error}"))?;
+    let join_deadline = Instant::now() + DRAIN_JOIN_GRACE;
+    let stdout = join_tail_drain(stdout_reader, join_deadline);
+    let stderr = join_tail_drain(stderr_reader, join_deadline);
     let exit_code = status.code().unwrap_or(-1);
-    let stdout_tail = tail_text(&String::from_utf8_lossy(&output.stdout));
-    let stderr_tail = tail_text(&String::from_utf8_lossy(&output.stderr));
+    let stdout_tail = tail_text(&String::from_utf8_lossy(&stdout));
+    let stderr_tail = tail_text(&String::from_utf8_lossy(&stderr));
     let report = std::fs::read_to_string(&plan.report_path)
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
@@ -509,6 +613,127 @@ pub fn run_plan_with_progress(
         report_path: plan.report_path.clone(),
         report,
     })
+}
+
+/// 读完一个管道，只保留最后 [`OUTPUT_TAIL_BYTES`] 字节。
+fn spawn_tail_drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut kept: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    kept.extend_from_slice(&chunk[..n]);
+                    if kept.len() > OUTPUT_TAIL_BYTES * 2 {
+                        let cut = kept.len() - OUTPUT_TAIL_BYTES;
+                        kept.drain(..cut);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        if kept.len() > OUTPUT_TAIL_BYTES {
+            let cut = kept.len() - OUTPUT_TAIL_BYTES;
+            kept.drain(..cut);
+        }
+        kept
+    })
+}
+
+/// 等排空线程结束，最多等到 `deadline`；等不到就放弃这个线程，输出里注明原因。
+fn join_tail_drain(handle: Option<std::thread::JoinHandle<Vec<u8>>>, deadline: Instant) -> Vec<u8> {
+    let Some(handle) = handle else {
+        return Vec::new();
+    };
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            return "（输出未读完：仍有子进程占用管道）".as_bytes().to_vec();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    handle.join().unwrap_or_default()
+}
+
+/// 子进程是否已退出，**不回收**它（Unix 用 `waitid(WNOWAIT)`）：
+/// 回收前组长是僵尸，进程组号不会被复用，之后向整组发信号不会误杀别的进程。
+#[cfg(unix)]
+fn poll_exited(child: &mut std::process::Child) -> std::io::Result<bool> {
+    // `Child::id()` 是 u32，`id_t` 在 Linux / macOS 上也是 u32：无损转换。
+    let pid = child.id() as libc::id_t;
+    loop {
+        // SAFETY：siginfo_t 是纯数据结构，全零是合法初值；waitid 只写这个结构。
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY：参数都是值或指向本地栈变量的指针；WNOWAIT 只探测，不回收子进程。
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            // WNOHANG 下没有状态变化时也返回 0：只能靠 si_pid 判断是否已退出。
+            return Ok(siginfo_pid(&info) != 0);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn siginfo_pid(info: &libc::siginfo_t) -> libc::pid_t {
+    // SAFETY：waitid 成功返回后 si_pid 已被内核填写（或保持清零）。
+    unsafe { info.si_pid() }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn siginfo_pid(info: &libc::siginfo_t) -> libc::pid_t {
+    info.si_pid
+}
+
+#[cfg(not(unix))]
+fn poll_exited(child: &mut std::process::Child) -> std::io::Result<bool> {
+    Ok(child.try_wait()?.is_some())
+}
+
+/// 向子进程所在的进程组发 SIGKILL（组已空时返回 ESRCH，忽略）。只在子进程尚未回收时调用。
+#[cfg(unix)]
+fn kill_group(child: &std::process::Child) {
+    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+        // SAFETY：kill(2) 只读参数；负 pid 表示向进程组 |pid| 发信号（spawn 时 process_group(0)）。
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+}
+
+/// Windows 正常退出后不额外处理：`taskkill` 只在超时时用（见 [`kill_tree`]）。
+#[cfg(not(unix))]
+fn kill_group(_child: &std::process::Child) {}
+
+/// 终止子进程及其全部后代，然后回收子进程。与 `dossier_runtime::command::kill_tree` 同一写法；
+/// 不直接依赖它，是为了不让擦除工具的二进制带上整个运行时 crate。
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    kill_group(child);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x0800_0000)
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn tail_text(text: &str) -> String {
@@ -837,5 +1062,158 @@ mod tests {
             PathBuf::from("/tmp/does-not-exist-report.json")
         );
         assert_eq!(run.outcome_label, "需要人工抽查");
+    }
+
+    /// 测试用：把一段 sh 脚本包装成擦除计划。
+    #[cfg(unix)]
+    fn sh_plan(dir: &Path, script: &str) -> ErasePlan {
+        ErasePlan {
+            program: PathBuf::from("sh"),
+            args: vec!["-c".into(), script.into()],
+            command_line: String::new(),
+            report_path: dir.join("report.json"),
+            progress_path: None,
+            requires_worker: false,
+        }
+    }
+
+    /// 工具大量往 stderr 打日志（常驻 worker 每帧一行）：必须边跑边读，否则管道写满后两边互等到超时。
+    #[cfg(unix)]
+    #[test]
+    fn run_plan_drains_large_stderr() {
+        let dir = progress_dir("drain");
+        // 约 1 MiB：远超 Linux 64 KiB / macOS 16 KiB 的管道缓冲。
+        let plan = sh_plan(
+            &dir,
+            "i=0; while [ $i -lt 16384 ]; do \
+             echo '[worker] 检测完成：3 个文本框 ................................' >&2; \
+             i=$((i+1)); done; exit 0",
+        );
+        let started = Instant::now();
+        let run = run_plan(&plan, 10).expect("应正常结束而不是超时");
+        assert_eq!(run.exit_code, 0);
+        assert!(run.stderr_tail.contains("检测完成"));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 进程是否已结束（含僵尸：容器里的 PID 1 可能不回收孤儿）。
+    #[cfg(unix)]
+    fn process_gone(pid: i32) -> bool {
+        // SAFETY：kill(pid, 0) 只探测进程是否存在，不发送信号。
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return true;
+        }
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map(|stat| {
+                stat.rsplit_once(')')
+                    .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+            })
+            .unwrap_or(false)
+    }
+
+    #[cfg(unix)]
+    fn wait_gone(pid: i32) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if process_gone(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        process_gone(pid)
+    }
+
+    #[cfg(unix)]
+    fn read_pid(path: &Path) -> i32 {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    /// 超时要结束整棵进程树：擦除工具拉起的 ffmpeg / python worker 不能变成孤儿继续跑。
+    #[cfg(unix)]
+    #[test]
+    fn run_plan_timeout_kills_grandchild() {
+        let dir = progress_dir("grandchild");
+        let pidfile = dir.join("child.pid");
+        let plan = sh_plan(
+            &dir,
+            &format!("sleep 30 & echo $! > '{}'; wait", pidfile.display()),
+        );
+        let error = run_plan(&plan, 1).unwrap_err();
+        assert!(error.contains("未结束"), "{error}");
+        let pid = read_pid(&pidfile);
+        assert!(wait_gone(pid), "孙进程 {pid} 仍在运行");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 工具正常退出但留下仍占着管道的孙进程：要尽快返回，不能等孙进程跑完。
+    #[cfg(unix)]
+    #[test]
+    fn run_plan_returns_when_grandchild_holds_pipe() {
+        let dir = progress_dir("holdpipe");
+        let pidfile = dir.join("child.pid");
+        let plan = sh_plan(
+            &dir,
+            &format!("sleep 30 & echo $! > '{}'; exit 0", pidfile.display()),
+        );
+        let started = Instant::now();
+        let run = run_plan(&plan, 20).unwrap();
+        assert_eq!(run.exit_code, 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "用时 {:?}",
+            started.elapsed()
+        );
+        let pid = read_pid(&pidfile);
+        assert!(wait_gone(pid), "残留的孙进程 {pid} 应被清理");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 输出必须是一个视频文件名：`..`、`/`、以 `.inpaint-tmp` 结尾的路径会让临时目录指向用户目录。
+    #[test]
+    fn validate_rejects_non_file_output() {
+        for output in ["..", "/", ".", "/tmp/x.inpaint-tmp", "/tmp/a/.."] {
+            let mut req = request();
+            req.output = PathBuf::from(output);
+            let err = req.validate().unwrap_err();
+            assert!(err.contains("视频文件名"), "{output}：{err}");
+        }
+    }
+
+    /// 只认带本工具标记的临时目录：同名的用户目录、链接一律不认。
+    #[test]
+    fn owned_temp_dir_requires_marker() {
+        let dir = progress_dir("owned");
+        let temp = dir.join("out.inpaint-tmp");
+        std::fs::create_dir_all(&temp).unwrap();
+        std::fs::write(temp.join("用户文件.txt"), b"user").unwrap();
+        assert_eq!(owned_temp_dir_pid(&temp), None, "没有标记");
+        write_temp_marker(&temp, 4242).unwrap();
+        assert_eq!(owned_temp_dir_pid(&temp), Some(4242));
+        let other = dir.join("other.tmp");
+        std::fs::create_dir_all(&other).unwrap();
+        write_temp_marker(&other, 1).unwrap();
+        assert_eq!(owned_temp_dir_pid(&other), None, "扩展名不对");
+        #[cfg(unix)]
+        {
+            let link = dir.join("link.inpaint-tmp");
+            std::os::unix::fs::symlink(&temp, &link).unwrap();
+            assert_eq!(owned_temp_dir_pid(&link), None, "链接");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// GUI 端只在「本次运行失败 + 标记 pid 是本次子进程」时清理临时目录。
+    #[test]
+    fn should_clean_temp_only_for_own_failed_run() {
+        assert!(should_clean_temp(true, Some(7), Some(7)));
+        assert!(!should_clean_temp(false, Some(7), Some(7)), "成功时不清");
+        assert!(!should_clean_temp(true, Some(7), Some(8)), "别的运行建的");
+        assert!(!should_clean_temp(true, None, Some(7)), "没有标记");
+        assert!(!should_clean_temp(true, Some(7), None), "进程没启动");
     }
 }

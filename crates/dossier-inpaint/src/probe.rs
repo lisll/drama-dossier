@@ -119,6 +119,12 @@ pub fn parse_probe_json(raw: &[u8], source: &str) -> Result<VideoInfo, ProbeErro
     let height = video
         .height
         .ok_or_else(|| ProbeError::Parse(format!("{source} 的视频流缺少 height")))?;
+    if width == 0 || height == 0 {
+        // 0 尺寸意味着每帧 0 字节：读帧循环会把空读当成「读满一帧」，空转到超时。
+        return Err(ProbeError::Parse(format!(
+            "{source} 的视频流宽高为 0（{width}x{height}），可能是损坏文件"
+        )));
+    }
 
     let fps = video
         .avg_frame_rate
@@ -147,16 +153,39 @@ fn parse_frame_rate(value: &str) -> Option<f64> {
     let (numerator, denominator) = value.split_once('/')?;
     let numerator: f64 = numerator.parse().ok()?;
     let denominator: f64 = denominator.parse().ok()?;
-    if denominator == 0.0 || numerator <= 0.0 {
-        None
-    } else {
-        Some(numerator / denominator)
-    }
+    // 检查结果而不是分子：`"nan"`、`"inf"` 都能被 f64 解析，分子或分母任一侧出问题都会让结果非有限。
+    let rate = numerator / denominator;
+    (rate.is_finite() && rate > 0.0).then_some(rate)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 宽或高为 0：后续每帧 0 字节，读帧循环永远「读满」，会空转到超时。必须在探测阶段拒绝。
+    #[test]
+    fn rejects_zero_sized_video() {
+        for (width, height) in [(0, 360), (640, 0)] {
+            let raw = format!(
+                r#"{{"streams":[{{"codec_type":"video","width":{width},"height":{height},
+                   "avg_frame_rate":"30/1"}}],"format":{{}}}}"#
+            );
+            let error = parse_probe_json(raw.as_bytes(), "坏.mp4").unwrap_err();
+            assert!(error.to_string().contains("宽高为 0"), "{error}");
+        }
+    }
+
+    /// 非有限帧率（NaN / inf，分子分母任一侧）一律视为无效。
+    #[test]
+    fn frame_rate_rejects_non_finite_values() {
+        for value in ["nan/1", "30/nan", "inf/1", "1/inf", "-30/1", "30/0"] {
+            assert_eq!(parse_frame_rate(value), None, "{value}");
+        }
+        assert_eq!(
+            parse_frame_rate("30000/1001").map(|r| (r * 1000.0).round()),
+            Some(29970.0)
+        );
+    }
 
     const FIXTURE: &[u8] = br#"{
       "streams": [

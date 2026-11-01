@@ -35,6 +35,16 @@ function grabFunction(name) {
 
 const modeLabels = src.match(/const OVERWRITE_MODE_LABELS = \{[\s\S]*?\};/);
 if (!modeLabels) throw new Error("main.js 里找不到 OVERWRITE_MODE_LABELS");
+const existsMark = src.match(/const PACKAGE_EXISTS_MARK = "([^"]+)";/);
+if (!existsMark) throw new Error("main.js 里找不到 PACKAGE_EXISTS_MARK");
+// 前后端约定同一个前缀：后端改了而前端没跟，覆盖按钮会悄悄消失。
+{
+  const rust = fs.readFileSync(path.join(repo, "crates", "dossier-core", "src", "package.rs"), "utf8");
+  const backend = rust.match(/pub const PACKAGE_EXISTS_MARK: &str = "([^"]+)";/);
+  if (!backend || backend[1].trim() !== existsMark[1]) {
+    throw new Error(`前后端 PACKAGE_EXISTS_MARK 不一致：后端 ${backend?.[1]}，前端 ${existsMark[1]}`);
+  }
+}
 if (!src.includes('$("#generate").addEventListener("click", () => generate());')) {
   throw new Error("「生成材料包」按钮没有绑定 generate()");
 }
@@ -97,8 +107,12 @@ function makeWorld() {
     world.lastResult = { selector, options };
   };
   global.state = {
+    root: "/素材",
     selected: 0,
-    dramas: [{ name: "剧A", dir: "/素材/剧A" }],
+    dramas: [
+      { name: "剧A", dir: "/素材/剧A" },
+      { name: "剧B", dir: "/素材/剧B" },
+    ],
     settings: { deepOutputDir: null },
   };
   global.browse = () => {};
@@ -108,7 +122,19 @@ function makeWorld() {
     if (command !== "generate_package") throw new Error(`意外的命令：${command}`);
     if (!args.overwrite && world.failNext) {
       world.failNext = false;
-      throw new Error("报审包目录已存在：/素材/剧A/报审包。可以选择覆盖旧包，或换一个输出目录。");
+      throw new Error(
+        "[PACKAGE_EXISTS] 报审包目录已存在：/素材/剧A/报审包。可以选择覆盖旧包，或换一个输出目录。",
+      );
+    }
+    if (world.failWith) {
+      const message = world.failWith;
+      world.failWith = null;
+      throw new Error(message);
+    }
+    if (world.onCall) {
+      const hook = world.onCall;
+      world.onCall = null;
+      hook();
     }
     return {
       packageDir: "/素材/剧A/报审包",
@@ -126,7 +152,10 @@ function makeWorld() {
 function loadApi() {
   const code = [
     modeLabels[0],
+    existsMark[0],
     grabFunction("generate"),
+    grabFunction("sameDrama"),
+    grabFunction("stripExistsMark"),
     grabFunction("overwriteModeLabel"),
     grabFunction("overwriteSummary"),
     grabFunction("proofSummary"),
@@ -179,6 +208,39 @@ async function main() {
   world.values["#output-dir"] = "";
   await staleAction.run();
   assert.strictEqual(world.calls.at(-1).overwrite, true, "路径与确认时一致才覆盖");
+
+  // 4b. 显示时去掉前缀：结果区与提示里都不能出现 [PACKAGE_EXISTS]。
+  world.failNext = true;
+  await api.generate();
+  assert.ok(!world.lastResult.options.html.includes("[PACKAGE_EXISTS]"), "结果区要去掉前缀");
+  assert.ok(!String(world.toasts.at(-1).message).includes("[PACKAGE_EXISTS]"), "提示要去掉前缀");
+  const crossDramaAction = world.toasts.at(-1).action;
+
+  // 4c. 系统错误文案里碰巧含「已存在」（中文 Windows 的错误 183）：不能给覆盖按钮。
+  world.failNext = false;
+  world.failWith = "Error: 当文件已存在时，无法创建该文件。 (os error 183)";
+  world.toasts.length = 0;
+  await api.generate();
+  assert.ok(!world.toasts.at(-1)?.action, "系统 183 文案不能弹出覆盖按钮");
+  assert.ok(world.lastResult.options.html.includes("生成失败"));
+
+  // 4d. 确认绑定剧目：拿到剧A的覆盖按钮后切到剧B，点按钮不能覆盖。
+  global.state.selected = 1;
+  world.calls.length = 0;
+  await crossDramaAction.run();
+  assert.strictEqual(world.calls.length, 0, "切换剧目后，旧剧的覆盖确认要作废，不能发起生成");
+  assert.ok(String(world.toasts.at(-1).message).includes("已切换剧目"));
+  global.state.selected = 0;
+
+  // 4e. 生成期间切换了剧目：结果不渲染到新剧下面。
+  world.lastResult = null;
+  world.onCall = () => {
+    global.state.selected = 1;
+  };
+  await api.generate();
+  assert.strictEqual(world.lastResult, null, "切换剧目后不能把旧剧的结果渲染到新剧");
+  assert.ok(String(world.toasts.at(-1).message).includes("剧A"), "要提示是哪部剧的结果");
+  global.state.selected = 0;
 
   // 5. 摘要文案。
   assert.ok(

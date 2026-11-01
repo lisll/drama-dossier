@@ -136,7 +136,13 @@ fn chat_blocking(
             "temperature": 0.9
         }))
         .send()
-        .map_err(|error| format!("连接 LLM API 失败：{error}。请检查网络与 API 地址。"))?;
+        // without_url：错误文本默认带完整请求地址，用户把密钥写进地址（?key= / user:pass@）时会进日志。
+        .map_err(|error| {
+            format!(
+                "连接 LLM API 失败：{}。请检查网络与 API 地址。",
+                error.without_url()
+            )
+        })?;
     let status = response.status();
     let body = response
         .text()
@@ -321,7 +327,10 @@ pub(crate) fn poster_blocking(
             .send()
             .map_err(|error| ImageApiFailure {
                 status: None,
-                message: format!("连接生图 API 失败：{error}。请检查网络与 API 地址。"),
+                message: format!(
+                    "连接生图 API 失败：{}。请检查网络与 API 地址。",
+                    error.without_url()
+                ),
                 body: String::new(),
             })?;
         let status = response.status();
@@ -370,9 +379,10 @@ fn download_poster(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<
     let response = client
         .get(url)
         .send()
-        .map_err(|error| format!("下载海报失败：{error}"))?
+        // 生图服务返回的图片地址常带签名参数：错误里不回显地址。
+        .map_err(|error| format!("下载海报失败：{}", error.without_url()))?
         .error_for_status()
-        .map_err(|error| format!("下载海报失败：{error}"))?;
+        .map_err(|error| format!("下载海报失败：{}", error.without_url()))?;
     let mut bytes = Vec::new();
     response
         .take(MAX_POSTER_BYTES + 1)

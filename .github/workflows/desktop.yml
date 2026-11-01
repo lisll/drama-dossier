@@ -190,9 +190,15 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          # 钉版本化的包名并校验 sha256：滚动地址的内容会随上游变化，不校验就会把未知二进制打进签名安装包。
+          # 版本与哈希和客户端兜底下载 src-tauri/src/downloads.rs 的 runtime_ffmpeg() 是同一组，升级时两处一起改。
+          $url = "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-essentials_build.zip"
+          $sha256 = "60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba"
           $zip = "$env:RUNNER_TEMP\ffmpeg.zip"
-          curl.exe -sSL --retry 5 --max-time 600 -o $zip https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
+          curl.exe -fsSL --retry 5 --max-time 600 -o $zip $url
           if (-not (Test-Path $zip)) { throw "ffmpeg zip 下载失败" }
+          $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          if ($actual -ne $sha256) { throw "ffmpeg zip 的 sha256 不符：期望 $sha256，实际 $actual" }
           $stage = "$env:RUNNER_TEMP\ffstage"
           Expand-Archive -Force $zip $stage
           $bin = (Get-ChildItem -Recurse -Filter ffmpeg.exe $stage | Select-Object -First 1).DirectoryName
@@ -253,7 +259,9 @@ jobs:
           fi
           ls -lh src-tauri/resources/inpaint
       - name: Build desktop bundles
-        uses: tauri-apps/tauri-action@v0
+        # 钉提交 SHA：这一步拿得到升级签名私钥，可变标签一旦被挪动就能签出恶意更新。
+        # 84b9d35b… 即 v0.6.2（与当时 v0 指向同一提交，git ls-remote 核实）；升级时同时改注释。
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # 升级签名私钥：tauri.conf.json 开了 createUpdaterArtifacts，缺它打包直接失败。

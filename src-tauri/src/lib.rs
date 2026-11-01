@@ -328,7 +328,20 @@ fn analyze_drama_inner(
 }
 
 #[tauri::command]
-fn analyze_drama(
+async fn analyze_drama(
+    window: tauri::Window,
+    root: String,
+    name: String,
+    ffprobe_path: Option<String>,
+    rules: Option<ChecklistRules>,
+) -> Result<DramaAnalysis, String> {
+    blocking("探测", move || {
+        analyze_drama_blocking(window, root, name, ffprobe_path, rules)
+    })
+    .await
+}
+
+fn analyze_drama_blocking(
     window: tauri::Window,
     root: String,
     name: String,
@@ -362,7 +375,7 @@ fn analyze_drama(
 // 参数名即前端 IPC 协议字段（camelCase 映射），合并成结构体会破坏现有调用方；
 // 与 dossier-inpaint/src/pipeline.rs 的既有做法一致，这里显式豁免参数数量检查。
 #[allow(clippy::too_many_arguments)]
-fn generate_package(
+async fn generate_package(
     window: tauri::Window,
     app: AppHandle,
     root: String,
@@ -381,103 +394,128 @@ fn generate_package(
     proof_source_dir: Option<String>,
     deep_output_root: Option<String>,
 ) -> Result<PackageResult, String> {
-    crate::license::guard()?;
-    // 登记为运行中：应用升级前会检查，避免写报审包写到一半被退出
-    let _task = tasks::register(tasks::TaskKind::Package);
-    let root = PathBuf::from(root);
-    // 测试期关键日志：生成是最容易出问题的链路，入口参数与落点都要留痕。
-    logging::log_event(
-        "生成",
-        format!(
-            "开始：{name}（本次覆盖输出={:?}，默认产物根目录={:?}，复制分集={copy_episodes}，\
-             覆盖={:?}，覆盖方式={:?}，带证明={:?}）",
-            output_dir.as_deref().unwrap_or("留空"),
-            output_root.as_deref().unwrap_or("未设"),
-            overwrite.unwrap_or(false),
-            overwrite_mode.unwrap_or_default(),
-            with_proof.unwrap_or(true),
-        ),
-    );
-    // 生成前会重新探测（避免用过期规格），这一段同样要有进度，否则界面像卡死。
-    let analysis = logging::log_err(
-        "生成",
-        analyze_drama_inner(
-            root.display().to_string(),
-            name,
-            ffprobe_path,
-            rules,
-            "generate",
-            |progress| {
-                let _ = window.emit("probe-progress", progress);
-            },
-        ),
-    )?;
-    let drama = analysis.drama;
-    let episodes = logging::log_err(
-        "生成",
-        probed_episodes_or_reject(&drama.episodes, analysis.probes),
-    )?;
+    blocking("生成", move || {
+        crate::license::guard()?;
+        // 登记为运行中：应用升级前会检查，避免写报审包写到一半被退出
+        let _task = tasks::register(tasks::TaskKind::Package);
+        let root = PathBuf::from(root);
+        // 测试期关键日志：生成是最容易出问题的链路，入口参数与落点都要留痕。
+        logging::log_event(
+            "生成",
+            format!(
+                "开始：{name}（本次覆盖输出={:?}，默认产物根目录={:?}，复制分集={copy_episodes}，\
+                 覆盖={:?}，覆盖方式={:?}，带证明={:?}）",
+                output_dir.as_deref().unwrap_or("留空"),
+                output_root.as_deref().unwrap_or("未设"),
+                overwrite.unwrap_or(false),
+                overwrite_mode.unwrap_or_default(),
+                with_proof.unwrap_or(true),
+            ),
+        );
+        // 生成前会重新探测（避免用过期规格），这一段同样要有进度，否则界面像卡死。
+        let analysis = logging::log_err(
+            "生成",
+            analyze_drama_inner(
+                root.display().to_string(),
+                name,
+                ffprobe_path,
+                rules,
+                "generate",
+                |progress| {
+                    let _ = window.emit("probe-progress", progress);
+                },
+            ),
+        )?;
+        let drama = analysis.drama;
+        let episodes = logging::log_err(
+            "生成",
+            probed_episodes_or_reject(&drama.episodes, analysis.probes),
+        )?;
 
-    // 落点三层：本次覆盖 → 设置里的「默认输出目录」（产物根目录）→ 剧目目录内。
-    // 规则与单测都在 `dossier_core::resolve_product_dir`，这一层只做字符串到路径的转换。
-    let package_dir = resolve_product_dir(
-        output_dir.as_deref().map(Path::new),
-        output_root.as_deref().map(Path::new),
-        &drama.dir,
-        &drama.name,
-        dossier_core::PACKAGE_OUTPUT_DIR,
-    );
-
-    // 证明材料来源：本次覆盖 → 设置里的深度处理输出根目录/<剧名>/深度处理 → 剧目目录/深度处理。
-    let proof_source_dir = resolve_product_dir(
-        proof_source_dir.as_deref().map(Path::new),
-        deep_output_root.as_deref().map(Path::new),
-        &drama.dir,
-        &drama.name,
-        dossier_core::DEEP_OUTPUT_DIR,
-    );
-    let opts = PackageOptions {
-        output_dir: Some(package_dir),
-        copy_episodes,
-        cost_sheet,
-        ai_generated,
-        ai_label_confirmed: ai_label_confirmed == Some(true),
-        overwrite: overwrite == Some(true),
-        overwrite_mode: overwrite_mode.unwrap_or_default(),
-        with_proof: with_proof.unwrap_or(true),
-        proof_source_dir: Some(proof_source_dir),
-    };
-
-    let result = logging::log_err(
-        "生成",
-        generate_report_package(
-            &drama.name,
+        // 落点三层：本次覆盖 → 设置里的「默认输出目录」（产物根目录）→ 剧目目录内。
+        // 规则与单测都在 `dossier_core::resolve_product_dir`，这一层只做字符串到路径的转换。
+        let package_dir = resolve_product_dir(
+            output_dir.as_deref().map(Path::new),
+            output_root.as_deref().map(Path::new),
             &drama.dir,
-            drama.cover.as_deref(),
-            drama.synopsis.as_deref(),
-            &episodes,
-            &opts,
-        )
-        .map_err(|error| error.to_string()),
-    )?;
+            &drama.name,
+            dossier_core::PACKAGE_OUTPUT_DIR,
+        );
 
-    // 成功后记入本机生成流水（设置-账单页展示；失败不影响生成结果本身）。
-    mount::record_generation(
-        &app,
-        &drama.name,
-        episodes.len(),
-        Path::new(&result.package_dir),
-    )
-    .unwrap_or_else(|error| eprintln!("{error}"));
-    logging::log_event(
-        "生成",
-        format!(
-            "完成：{} 集，包目录 {}",
+        // 证明材料来源：本次覆盖 → 深度处理输出根目录（未设时退回默认输出目录）/<剧名>/深度处理
+        // → 剧目目录/深度处理。与深度处理自己的落点规则（toolbox.rs 的 effective_root）一致。
+        let proof_source_dir = resolve_product_dir(
+            proof_source_dir.as_deref().map(Path::new),
+            proof_root(deep_output_root.as_deref(), output_root.as_deref()).map(Path::new),
+            &drama.dir,
+            &drama.name,
+            dossier_core::DEEP_OUTPUT_DIR,
+        );
+        let opts = PackageOptions {
+            output_dir: Some(package_dir),
+            copy_episodes,
+            cost_sheet,
+            ai_generated,
+            ai_label_confirmed: ai_label_confirmed == Some(true),
+            overwrite: overwrite == Some(true),
+            overwrite_mode: overwrite_mode.unwrap_or_default(),
+            with_proof: with_proof.unwrap_or(true),
+            proof_source_dir: Some(proof_source_dir),
+        };
+
+        let result = logging::log_err(
+            "生成",
+            generate_report_package(
+                &drama.name,
+                &drama.dir,
+                drama.cover.as_deref(),
+                drama.synopsis.as_deref(),
+                &episodes,
+                &opts,
+            )
+            .map_err(|error| error.to_string()),
+        )?;
+
+        // 成功后记入本机生成流水（设置-账单页展示；失败不影响生成结果本身）。
+        mount::record_generation(
+            &app,
+            &drama.name,
             episodes.len(),
-            result.package_dir.display()
-        ),
-    );
-    Ok(result)
+            Path::new(&result.package_dir),
+        )
+        .unwrap_or_else(|error| eprintln!("{error}"));
+        logging::log_event(
+            "生成",
+            format!(
+                "完成：{} 集，包目录 {}",
+                episodes.len(),
+                result.package_dir.display()
+            ),
+        );
+        Ok(result)
+    })
+    .await
+}
+
+/// 在阻塞线程池里跑一个会探测或读写文件的命令体。
+///
+/// 同步 `#[tauri::command]` 在主线程上执行：逐集 ffprobe 期间窗口无响应，进度事件也要等命令返回
+/// 才送得出去。改成 `async fn` + 本函数后，命令跑在 `spawn_blocking` 的线程上（与 `run_erase` 同一约定）。
+pub(crate) async fn blocking<T, F>(label: &str, work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|error| format!("{label}任务异常结束：{error}"))?
+}
+
+/// 证明材料的根目录：设置了「深度处理输出目录」就用它，否则退回「默认输出目录」；
+/// 空字符串视为未设（与 `resolve_product_dir` 一致）。
+fn proof_root<'a>(deep: Option<&'a str>, output: Option<&'a str>) -> Option<&'a str> {
+    deep.filter(|value| !value.is_empty())
+        .or_else(|| output.filter(|value| !value.is_empty()))
 }
 
 /// 报审包只接受「每一集都探测成功」：以前探测失败的分集被静默丢掉，分集清单少了几集
@@ -627,6 +665,16 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 只设了默认输出目录时，证明材料要去那里找（与深度处理的落点一致）。
+    #[test]
+    fn proof_root_falls_back_to_output_root() {
+        assert_eq!(proof_root(Some("/深度"), Some("/产物")), Some("/深度"));
+        assert_eq!(proof_root(None, Some("/产物")), Some("/产物"));
+        assert_eq!(proof_root(Some(""), Some("/产物")), Some("/产物"));
+        assert_eq!(proof_root(Some(""), Some("")), None);
+        assert_eq!(proof_root(None, None), None);
+    }
 
     fn file(name: &str) -> dossier_core::EpisodeFile {
         dossier_core::EpisodeFile {

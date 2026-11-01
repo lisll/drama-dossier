@@ -66,7 +66,12 @@ require() {
 # 所以这里判一次依赖是否齐全，缺了就如实跳过。
 rust_env_ready() {
   [ "$(uname -s)" = "Linux" ] || return 0
-  command -v pkg-config >/dev/null 2>&1 || return 0
+  # 没有 pkg-config 就判断不了系统依赖，编译 src-tauri 时也会因为找不到 webkit2gtk 而失败：按「缺依赖」跳过。
+  if ! command -v pkg-config >/dev/null 2>&1; then
+    rust_env_missing="pkg-config"
+    return 1
+  fi
+  rust_env_missing="webkit2gtk-4.1/libsoup-3.0"
   pkg-config --exists webkit2gtk-4.1 2>/dev/null || return 1
   pkg-config --exists libsoup-3.0 2>/dev/null || return 1
   return 0
@@ -112,23 +117,36 @@ if [ "$run_rust" -eq 1 ] && require cargo; then
     # windows 目标交叉 lint：抓只在 Windows 编译路径上的问题（死代码、cfg 拼写错等）。
     # tauri-winres 要调 llvm-rc（mac 没有），用桩糊弄过构建脚本——clippy 不链接资源，
     # 空产物无害。桩解析 /FO 参数生成空文件后退出 0。
-    if command -v cargo >/dev/null 2>&1; then
+    # 依赖里的 ring 要用 C 编译器编 Windows 目标：非 Windows 主机上普通 cargo 会挑到 gcc，
+    # 报「GNU compiler is not supported for this target」——这是工具链问题，不是代码问题。
+    # 所以：没装 msvc target，或者非 Windows 主机上没有 cargo-xwin，就如实跳过（CI 的 Windows 矩阵兜底）。
+    win_target="x86_64-pc-windows-msvc"
+    case "$(uname -s)" in
+      MINGW* | MSYS* | CYGWIN*) on_windows=1 ;;
+      *) on_windows=0 ;;
+    esac
+    if cargo xwin --version >/dev/null 2>&1; then
+      win_clippy="cargo xwin clippy"
+    elif [ "$on_windows" -eq 1 ]; then
+      win_clippy="cargo clippy"
+    else
+      win_clippy=""
+    fi
+    if command -v rustup >/dev/null 2>&1 && ! rustup target list --installed 2>/dev/null | grep -qx "$win_target"; then
+      printf '==> 跳过 Clippy（windows 目标）：没装 %s（rustup target add %s）\n' "$win_target" "$win_target"
+      skipped="${skipped}${skipped:+, }$win_target"
+    elif [ -z "$win_clippy" ]; then
+      printf '==> 跳过 Clippy（windows 目标）：非 Windows 主机需要 cargo-xwin（cargo install cargo-xwin）\n'
+      skipped="${skipped}${skipped:+, }cargo-xwin"
+    else
       stub_dir=$(mktemp -d)
       {
         printf '#!/bin/bash\nprev=""\nfor a in "$@"; do\n  case "$prev" in\n    /FO|-FO|/fo|-fo) mkdir -p "$(dirname "$a")"; : > "$a" ;;\n  esac\n  prev="$a"\ndone\nexit 0\n'
       } > "$stub_dir/llvm-rc"
       chmod +x "$stub_dir/llvm-rc"
-      # 依赖里的 ring 要用 C 编译器编 Windows 目标：普通 cargo 在非 Windows 主机上会挑到 gcc，
-      # 报「GNU compiler is not supported for this target」——这是工具链问题，不是代码问题。
-      # 装了 cargo-xwin 就用它（自动配好 clang-cl 与 Windows SDK 头文件）；没装保持原样。
-      if cargo xwin --version >/dev/null 2>&1; then
-        win_clippy="cargo xwin clippy"
-      else
-        win_clippy="cargo clippy"
-      fi
-      step "Clippy（windows 目标，$win_clippy）：--target x86_64-pc-windows-msvc -- -D warnings" \
+      step "Clippy（windows 目标，$win_clippy）：--target $win_target -- -D warnings" \
         env PATH="$stub_dir:$PATH" $win_clippy --workspace --all-targets \
-          --target x86_64-pc-windows-msvc --no-deps $license_feature -- -D warnings
+          --target "$win_target" --no-deps $license_feature -- -D warnings
       rm -rf "$stub_dir"
     fi
     if [ "$fast" -eq 1 ]; then
@@ -140,9 +158,14 @@ if [ "$run_rust" -eq 1 ] && require cargo; then
         cargo check -p drama-dossier
     fi
   else
-    printf '==> 跳过 Clippy / Test：本机缺 webkit2gtk-4.1 或 libsoup-3.0，编译不了 src-tauri\n'
-    printf '    安装见 docs/BUILD.md「本地开发」；这些检查由 CI 兜底。\n'
-    skipped="${skipped}${skipped:+, }webkit2gtk-4.1/libsoup-3.0"
+    if [ "$rust_env_missing" = "pkg-config" ]; then
+      printf '==> 跳过 Clippy / Test：本机没有 pkg-config，无法确认 src-tauri 的系统依赖\n'
+      printf '    请先安装 pkg-config（如 apt install pkg-config），再按 docs/BUILD.md「本地开发」装依赖；这些检查由 CI 兜底。\n'
+    else
+      printf '==> 跳过 Clippy / Test：本机缺 webkit2gtk-4.1 或 libsoup-3.0，编译不了 src-tauri\n'
+      printf '    安装见 docs/BUILD.md「本地开发」；这些检查由 CI 兜底。\n'
+    fi
+    skipped="${skipped}${skipped:+, }$rust_env_missing"
   fi
 fi
 

@@ -650,7 +650,7 @@ pub(crate) fn extract_content(
     };
     let raw = serde_json::to_vec_pretty(&evidence)
         .map_err(|error| format!("序列化内容清单失败：{error}"))?;
-    std::fs::write(&evidence.manifest, raw)
+    crate::paths::write_atomic(&evidence.manifest, &raw)
         .map_err(|error| format!("写入内容清单失败：{error}"))?;
     Ok(evidence)
 }
@@ -1489,7 +1489,7 @@ fn proof_text_body(payload: &serde_json::Value) -> String {
 /// 文本版证明 `AI制作证明.txt`（图片版生成失败时）。
 fn write_ai_proof_text(output_dir: &Path, payload: &serde_json::Value) -> Result<PathBuf, String> {
     let path = output_dir.join(PROOF_TEXT_FILE);
-    std::fs::write(&path, proof_text_body(payload))
+    crate::paths::write_atomic(&path, proof_text_body(payload).as_bytes())
         .map_err(|error| format!("写入 AI 制作证明失败（{}）：{error}", path.display()))?;
     Ok(path)
 }
@@ -2048,7 +2048,10 @@ fn material_pipeline_blocking(
     };
     // 简介落盘：输出目录带一份 简介.txt（AI 生成或素材目录原有，随成片一起交付）。
     if let Some(text) = synopsis.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
-        if let Err(error) = std::fs::write(output_dir.join("简介.txt"), text) {
+        // 原子写：不会顺着输出目录里预先放好的同名链接写到别处，写到一半失败也不留半截文件。
+        if let Err(error) =
+            crate::paths::write_atomic(&output_dir.join("简介.txt"), text.as_bytes())
+        {
             messages.push(format!("简介.txt 写入失败：{error}"));
         }
     }

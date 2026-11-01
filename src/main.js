@@ -1365,14 +1365,21 @@ function reportProbeFailure(error) {
 async function analyze() {
   if (state.selected == null) return;
   const drama = state.dramas[state.selected];
+  const root = state.root;
   if (!beginTask(`正在探测《${drama.name}》的分集规格`)) return;
   try {
-    state.analysis = await call("analyze_drama", {
-      root: state.root,
+    const analysis = await call("analyze_drama", {
+      root,
       name: drama.name,
       ffprobePath: effectiveFfprobe(),
       rules: effectiveRules(),
     });
+    // 探测在后台线程跑，期间可能已切到别的剧：旧剧的结果不能写进当前剧的状态。
+    if (!sameDrama(root, drama.name)) {
+      toast(`《${drama.name}》的检查结果已作废（已切换剧目）`);
+      return;
+    }
+    state.analysis = analysis;
     renderChecklist(state.analysis.checklist);
     renderEpisodes(state.analysis.probes);
     toast(state.analysis.checklist.ready ? "检查完成，材料可用" : "检查完成，请处理缺失或警告项");
@@ -1409,9 +1416,29 @@ function validateCostForm() {
   return problems.length ? null : { investment, ratio };
 }
 
-async function generate(overwrite = false, confirmedPath = null, overwriteMode = null) {
+/** 后端「报审包目录已存在」错误的固定前缀（与 dossier-core 的 PACKAGE_EXISTS_MARK 一致）。
+ *  只认这个前缀给覆盖按钮：中文 Windows 的系统错误 183 文案也含「已存在」，不能按文字匹配。 */
+const PACKAGE_EXISTS_MARK = "[PACKAGE_EXISTS]";
+
+/** 显示用：去掉错误里的前缀标记（可能带着 `Error: ` 等包装）。 */
+function stripExistsMark(message) {
+  return String(message).replace(`${PACKAGE_EXISTS_MARK} `, "").replace(PACKAGE_EXISTS_MARK, "");
+}
+
+/** 当前选中的还是不是这部剧：命令在后台线程跑，等结果期间用户可能已经切到别的剧。 */
+function sameDrama(root, name) {
+  const current = state.dramas?.[state.selected];
+  return state.root === root && current?.name === name;
+}
+
+async function generate(overwrite = false, confirmed = null, overwriteMode = null) {
   if (state.selected == null) return;
   const drama = state.dramas[state.selected];
+  // 覆盖确认绑定到「那部剧的那个目录」：确认后切了剧，确认作废，不发起任何生成。
+  if (overwrite && confirmed && !sameDrama(confirmed.root, confirmed.name)) {
+    toast(`已切换剧目，对《${confirmed.name}》的覆盖确认已作废。`, true);
+    return;
+  }
   const cost = validateCostForm();
   if (!cost) {
     toast("请先修正表单里标红的字段", true);
@@ -1419,11 +1446,12 @@ async function generate(overwrite = false, confirmedPath = null, overwriteMode =
   }
   // 覆盖只对「用户确认过的那个目录」生效：确认后改了输入框，新路径不经确认不带 overwrite。
   const targetPath = effectivePackageDir();
-  const effectiveOverwrite = overwrite && targetPath === confirmedPath;
+  const effectiveOverwrite = overwrite && targetPath === confirmed?.path;
+  const root = state.root;
   if (!beginTask(`正在探测并生成《${drama.name}》的报审包`)) return;
   try {
     const result = await call("generate_package", {
-      root: state.root,
+      root,
       name: drama.name,
       outputDir: $("#output-dir").value.trim() || null,
       outputRoot: state.settings?.outputDir ?? null,
@@ -1445,6 +1473,10 @@ async function generate(overwrite = false, confirmedPath = null, overwriteMode =
         contact: $("#contact").value.trim(),
       },
     });
+    if (!sameDrama(root, drama.name)) {
+      toast(`《${drama.name}》的报审包已生成：${result.packageDir}（你已切换到别的剧，结果未显示在这里）`);
+      return;
+    }
     renderResult("#generate-result", {
       tone: "ok",
       html: `<strong>报审包已生成</strong><br />
@@ -1456,19 +1488,25 @@ async function generate(overwrite = false, confirmedPath = null, overwriteMode =
     });
     toast("报审包生成完成");
   } catch (error) {
-    const message = String(error);
+    const raw = String(error);
+    const message = stripExistsMark(raw);
+    if (!sameDrama(root, drama.name)) {
+      // 不在别的剧下面摆出覆盖按钮：那会让用户以为是在覆盖当前剧。
+      toast(`《${drama.name}》的报审包没有生成：${message}`, true);
+      return;
+    }
     // 「目录已存在」是可控的：后端没有动任何文件，把旧包位置摆出来，
     // 让使用者自己选覆盖方式或换目录，而不是替它做破坏性决定。
-    if (/已存在/.test(message)) {
-      // 确认的对象是「这一次尝试的那个路径」：用户之后改了输出目录，按钮也不会去覆盖新路径。
-      const existing = targetPath;
+    if (raw.includes(PACKAGE_EXISTS_MARK)) {
+      // 确认的对象是「这一次尝试的那部剧的那个路径」：之后改了输出目录或切了剧，按钮都不会去覆盖。
+      const existing = { path: targetPath, root, name: drama.name };
       const preferred = $("#overwrite-default").value;
       renderResult("#generate-result", {
         tone: "error",
         html: `<strong>报审包目录已存在，本次未生成任何文件</strong><br />
           ${esc(message)}<br />
           旧目录不会被改动：可以先打开确认，也可以换一个输出目录后重试。`,
-        paths: existing ? [["package", existing]] : [],
+        paths: targetPath ? [["package", targetPath]] : [],
       });
       toast(`报审包目录已存在。默认方式：${overwriteModeLabel(preferred)}`, true, {
         label: `覆盖（${overwriteModeLabel(preferred)}）`,
@@ -1813,7 +1851,7 @@ async function generatePublishCopy(overwrite = false, confirmedPath = null) {
       root: state.root,
       name: drama.name,
       outputPath: path,
-      ffprobePath: $("#ffprobe-path").value.trim() || null,
+      ffprobePath: effectiveFfprobe(),
       overwrite,
     });
     $("#publish-copy-path").value = result.path;
@@ -3630,19 +3668,13 @@ bindStopButton(
 );
 bindStopButton("#dedup-demo-stop", "dedup_demo_stop", "停止验证", "已发送停止指令，正在终止验证进程");
 // 停止转码：后端杀掉正在跑的 ffmpeg、清理本次输出目录，执行中的 transcode_execute 会随之返回。
-$("#exec-stop").addEventListener("click", async (event) => {
-  const button = event.currentTarget;
-  button.disabled = true;
-  button.textContent = "正在停止…";
-  try {
-    await invoke("transcode_stop");
-    toast("已发送停止指令，正在终止 ffmpeg 并清理输出目录");
-  } catch (error) {
-    toast(error, true);
-    button.disabled = false;
-    button.textContent = "停止转码";
-  }
-});
+// 后端在任务真正登记前返回 false（还没开始或刚好结束）时，bindStopButton 会如实提示并恢复按钮。
+bindStopButton(
+  "#exec-stop",
+  "transcode_stop",
+  "停止转码",
+  "已发送停止指令，正在终止 ffmpeg 并清理输出目录",
+);
 // 「重新检测」要有可感知反馈：环境正常时结果不变，不加状态会像点了没反应。
 $("#runtime-recheck").addEventListener("click", async (event) => {
   const button = event.currentTarget;

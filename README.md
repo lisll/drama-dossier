@@ -319,7 +319,8 @@ mp4, mov, mkv, flv, ts, m4v, webm
 `分集清单.csv` 带 BOM 并做公式注入防护，末列「包内文件名」。完整规则见 [`docs/MATERIAL_SPEC.md`](docs/MATERIAL_SPEC.md)。
 
 目标目录已存在时先询问：可「整体替换」旧包（默认，旧包里的其他文件一并换掉），也可「只替换标准文件」
-（保留使用者另外放进包里的文件，只清理过期标准文件）。生成命令的参数为 `overwrite` / `overwriteMode` /
+（保留使用者另外放进包里的文件，只清理过期标准文件）。覆盖只作用于剧备生成的报审包（带 `manifest.json`），
+选中别的文件夹、剧目目录或它的上级目录会被拒绝；空文件夹直接生成。生成命令的参数为 `overwrite` / `overwriteMode` /
 `withProof` / `proofSourceDir` / `deepOutputRoot`；设置项 `packageWithProof`（默认带上证明与过程图）与
 `packageOverwriteMode`（默认整体替换）决定界面上的默认值。
 
@@ -644,7 +645,7 @@ cargo tauri build --features license-test-mode
 上面这一串等价于一条命令（与 CI 的 Format / Clippy / Test 三步一一对应）：
 
 ```bash
-scripts/check.sh            # 全量，等同于 CI
+scripts/check.sh            # 全量：Format / Clippy（含 Windows 交叉，缺工具时跳过）/ Test / 前端检查；云端与授权服务的测试另跑
 scripts/check.sh --fast     # 跳过 cargo test
 scripts/check.sh --py       # 只跑排版脚本单测（证明 / 角标 / 过程图，需要 Pillow）
 ```

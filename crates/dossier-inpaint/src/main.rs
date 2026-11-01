@@ -269,6 +269,39 @@ fn verify_config_from_args(args: &Args) -> VerifyConfig {
     }
 }
 
+/// 准备临时目录：上次留下的、带本工具标记的目录先删掉；同名但没有标记的（旧版本留下的，
+/// 或者用户自己的目录）不动并报错——绝不按名字删用户的东西。然后新建并写入标记。
+fn prepare_temp_dir(temp_dir: &std::path::Path) -> Result<(), String> {
+    use dossier_inpaint::erase::{owned_temp_dir_pid, write_temp_marker};
+    if std::fs::symlink_metadata(temp_dir).is_ok() {
+        if owned_temp_dir_pid(temp_dir).is_none() {
+            return Err(format!(
+                "临时目录 {} 已存在，但没有剧备的标记（可能是旧版本留下的，也可能是你自己的目录）。\
+                 确认无用后请手动删除，或换一个输出文件名。",
+                temp_dir.display()
+            ));
+        }
+        std::fs::remove_dir_all(temp_dir).map_err(|error| format!("无法清理临时目录：{error}"))?;
+    }
+    std::fs::create_dir_all(temp_dir).map_err(|error| format!("无法创建临时目录：{error}"))?;
+    write_temp_marker(temp_dir, std::process::id())
+        .map_err(|error| format!("无法写入临时目录标记：{error}"))
+}
+
+/// 离开 `run` 时清理临时目录（成功或任何提前返回）；只删带本工具标记的目录。
+struct TempDirGuard {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        if !self.keep && dossier_inpaint::erase::owned_temp_dir_pid(&self.path).is_some() {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 fn run(args: &Args) -> Result<ExitCode, String> {
     let lossless_intermediate = match args.intermediate.as_str() {
         "delivery" => false,
@@ -295,17 +328,20 @@ fn run(args: &Args) -> Result<ExitCode, String> {
         if info.has_audio { "有" } else { "无" }
     );
 
-    let temp_dir = args.output.with_extension("inpaint-tmp");
+    dossier_inpaint::erase::check_output_file_name(&args.output)?;
+    let temp_dir = dossier_inpaint::erase::temp_dir_for(&args.output);
     // 无损中间态用 matroska 承载 FFV1；交付模式直接写 mp4。
     let temp_video = temp_dir.join(if lossless_intermediate {
         "video.mkv"
     } else {
         "video.mp4"
     });
-    if temp_dir.exists() {
-        std::fs::remove_dir_all(&temp_dir).map_err(|error| format!("无法清理临时目录：{error}"))?;
-    }
-    std::fs::create_dir_all(&temp_dir).map_err(|error| format!("无法创建临时目录：{error}"))?;
+    prepare_temp_dir(&temp_dir)?;
+    // 之后任何 `?` 提前返回都由 guard 清理（--keep-temp 时保留）；被强杀时由 GUI 端兜底。
+    let _temp_guard = TempDirGuard {
+        path: temp_dir.clone(),
+        keep: args.keep_temp,
+    };
 
     let session = start_worker_session(args)?;
     let detector = build_detector(args, &temp_dir, session.clone())?;
@@ -484,8 +520,6 @@ fn run(args: &Args) -> Result<ExitCode, String> {
     }
     if args.keep_temp {
         println!("中间文件保留在：{}", temp_dir.display());
-    } else {
-        std::fs::remove_dir_all(&temp_dir).ok();
     }
     Ok(verdict_exit_code(
         report.verification.as_ref().map(|report| report.verdict),
@@ -771,6 +805,81 @@ fn worker_config(args: &Args) -> Result<WorkerConfig, String> {
         program: PathBuf::from(program),
         args: args.worker_args.clone(),
     })
+}
+
+#[cfg(test)]
+mod temp_dir_tests {
+    use super::{prepare_temp_dir, TempDirGuard};
+    use std::path::PathBuf;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        let dir = std::env::temp_dir().join(format!("dossier-inpaint-cli-{tag}-{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 同名但没有标记的目录（用户自己的、旧版本留下的）：拒绝，里面的文件一个不动。
+    #[test]
+    fn cli_refuses_foreign_temp_dir() {
+        let base = scratch("foreign");
+        let temp = base.join("out.inpaint-tmp");
+        std::fs::create_dir_all(&temp).unwrap();
+        std::fs::write(temp.join("用户文件.txt"), b"user").unwrap();
+        let error = prepare_temp_dir(&temp).unwrap_err();
+        assert!(error.contains("没有剧备的标记"), "{error}");
+        assert_eq!(std::fs::read(temp.join("用户文件.txt")).unwrap(), b"user");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 上次留下的、带标记的目录：清掉重建，新目录带本进程的标记。
+    #[test]
+    fn cli_recreates_own_temp_dir() {
+        let base = scratch("own");
+        let temp = base.join("out.inpaint-tmp");
+        prepare_temp_dir(&temp).unwrap();
+        std::fs::write(temp.join("上次的.mkv"), b"old").unwrap();
+        prepare_temp_dir(&temp).unwrap();
+        assert!(!temp.join("上次的.mkv").exists());
+        assert_eq!(
+            dossier_inpaint::erase::owned_temp_dir_pid(&temp),
+            Some(std::process::id())
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// guard：带标记时离开就删；--keep-temp 保留；没有标记不删。
+    #[test]
+    fn temp_dir_guard_only_removes_marked_dir() {
+        let base = scratch("guard");
+        let marked = base.join("a.inpaint-tmp");
+        prepare_temp_dir(&marked).unwrap();
+        drop(TempDirGuard {
+            path: marked.clone(),
+            keep: false,
+        });
+        assert!(!marked.exists());
+
+        let kept = base.join("b.inpaint-tmp");
+        prepare_temp_dir(&kept).unwrap();
+        drop(TempDirGuard {
+            path: kept.clone(),
+            keep: true,
+        });
+        assert!(kept.is_dir());
+
+        let foreign = base.join("c.inpaint-tmp");
+        std::fs::create_dir_all(&foreign).unwrap();
+        drop(TempDirGuard {
+            path: foreign.clone(),
+            keep: false,
+        });
+        assert!(foreign.is_dir());
+        std::fs::remove_dir_all(&base).ok();
+    }
 }
 
 #[cfg(test)]

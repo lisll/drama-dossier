@@ -120,7 +120,19 @@ pub struct TranscodeAdvicePayload {
 
 /// 生成转码建议（只建议，不执行任何转码）。
 #[tauri::command]
-pub fn transcode_advice(
+pub async fn transcode_advice(
+    root: String,
+    name: String,
+    target: Option<TranscodeTarget>,
+    ffprobe_path: Option<String>,
+) -> Result<TranscodeAdvicePayload, String> {
+    crate::blocking("转码建议", move || {
+        transcode_advice_blocking(root, name, target, ffprobe_path)
+    })
+    .await
+}
+
+fn transcode_advice_blocking(
     root: String,
     name: String,
     target: Option<TranscodeTarget>,
@@ -159,7 +171,19 @@ pub fn platform_profiles() -> Vec<PlatformProfile> {
 
 /// 按平台档案逐集对照一部剧。
 #[tauri::command]
-pub fn platform_review(
+pub async fn platform_review(
+    root: String,
+    name: String,
+    profile_id: String,
+    ffprobe_path: Option<String>,
+) -> Result<ProfileReview, String> {
+    crate::blocking("平台对照", move || {
+        platform_review_blocking(root, name, profile_id, ffprobe_path)
+    })
+    .await
+}
+
+fn platform_review_blocking(
     root: String,
     name: String,
     profile_id: String,
@@ -181,7 +205,19 @@ pub fn platform_review(
 
 /// 导出剪映草稿（分集顺序与时长）。
 #[tauri::command]
-pub fn export_draft(
+pub async fn export_draft(
+    root: String,
+    name: String,
+    options: Option<DraftExportOptions>,
+    ffprobe_path: Option<String>,
+) -> Result<DraftExportResult, String> {
+    crate::blocking("导出草稿", move || {
+        export_draft_blocking(root, name, options, ffprobe_path)
+    })
+    .await
+}
+
+fn export_draft_blocking(
     root: String,
     name: String,
     options: Option<DraftExportOptions>,
@@ -229,7 +265,20 @@ fn csv_output_path(path: &str, overwrite: bool) -> Result<PathBuf, String> {
 /// 生成可编辑的「挂载文案.csv」。这里只生成本地元数据，不连接第三方平台。
 /// 目标文件已存在时需要前端显式传 `overwrite: true`（用户确认后）才覆盖。
 #[tauri::command]
-pub fn generate_mount_copy_csv(
+pub async fn generate_mount_copy_csv(
+    root: String,
+    name: String,
+    output_path: String,
+    ffprobe_path: Option<String>,
+    overwrite: Option<bool>,
+) -> Result<MountCopyWriteResult, String> {
+    crate::blocking("生成挂载文案", move || {
+        generate_mount_copy_csv_blocking(root, name, output_path, ffprobe_path, overwrite)
+    })
+    .await
+}
+
+fn generate_mount_copy_csv_blocking(
     root: String,
     name: String,
     output_path: String,

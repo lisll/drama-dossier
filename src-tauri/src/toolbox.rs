@@ -203,7 +203,18 @@ pub struct RuntimeStatus {
 }
 
 #[tauri::command]
-pub fn runtime_status(
+pub async fn runtime_status(
+    app: AppHandle,
+    ffprobe_path: Option<String>,
+) -> Result<RuntimeStatus, String> {
+    crate::blocking("环境检测", move || {
+        runtime_status_blocking(app, ffprobe_path)
+    })
+    .await
+}
+
+/// 会同步跑 ffmpeg / ffprobe / python 的 `--version`：必须在阻塞线程上执行。
+fn runtime_status_blocking(
     app: AppHandle,
     ffprobe_path: Option<String>,
 ) -> Result<RuntimeStatus, String> {
@@ -631,7 +642,21 @@ fn bitrate_range(min_kbps: Option<u64>, max_kbps: Option<u64>) -> Result<(u64, u
 
 /// 码率探测结果（附区间判断：偏低 / 偏高 / 正常）。
 #[tauri::command]
-pub fn probe_bitrate(
+pub async fn probe_bitrate(
+    app: AppHandle,
+    root: String,
+    name: String,
+    min_kbps: Option<u64>,
+    max_kbps: Option<u64>,
+    ffprobe_path: Option<String>,
+) -> Result<Vec<BitrateItem>, String> {
+    crate::blocking("码率检测", move || {
+        probe_bitrate_blocking(app, root, name, min_kbps, max_kbps, ffprobe_path)
+    })
+    .await
+}
+
+fn probe_bitrate_blocking(
     app: AppHandle,
     root: String,
     name: String,

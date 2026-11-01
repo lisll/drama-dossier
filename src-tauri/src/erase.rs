@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 
 use dossier_core::same_path;
 use dossier_inpaint::erase::{
-    build_plan, resolve_tool, run_plan_with_progress, ErasePlan, EraseRequest, EraseRun,
+    build_plan, owned_temp_dir_pid, resolve_tool, run_plan_observed, should_clean_temp,
+    temp_dir_for, EraseOutcome, ErasePlan, EraseRequest, EraseRun,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
@@ -246,22 +247,47 @@ fn run_erase_blocking(
         }
     }
     let progress_path = erase_progress_path(&request.output);
-    let result = run_plan_with_progress(&plan, timeout_seconds.unwrap_or(1800), |event| {
-        let _ = app.emit(
-            "erase-progress",
-            EraseProgress {
-                stage: event.progress.stage.clone(),
-                stage_index: event.progress.stage_index,
-                stage_total: event.progress.stage_total,
-                unit_done: event.progress.unit_done,
-                unit_total: event.progress.unit_total,
-                message: event.progress.message.clone(),
-                terminal: event.is_terminal(),
-                failed: matches!(event.kind, dossier_core::ProgressEventKind::Failed),
-            },
-        );
-    });
+    let temp_dir = temp_dir_for(&request.output);
+    let mut child_pid = None;
+    let result = run_plan_observed(
+        &plan,
+        timeout_seconds.unwrap_or(1800),
+        |pid| child_pid = Some(pid),
+        |event| {
+            let _ = app.emit(
+                "erase-progress",
+                EraseProgress {
+                    stage: event.progress.stage.clone(),
+                    stage_index: event.progress.stage_index,
+                    stage_total: event.progress.stage_total,
+                    unit_done: event.progress.unit_done,
+                    unit_total: event.progress.unit_total,
+                    message: event.progress.message.clone(),
+                    terminal: event.is_terminal(),
+                    failed: matches!(event.kind, dossier_core::ProgressEventKind::Failed),
+                },
+            );
+        },
+    );
     let _ = std::fs::remove_file(&progress_path);
+    // 工具被超时强杀时来不及清自己的中间文件（无损模式可能有几个 GB）：
+    // 只有「本次运行失败 + 目录带本次子进程的标记」才删，别的同名目录一律不动。
+    let run_failed = match &result {
+        Err(_) => true,
+        Ok(run) => run.outcome == EraseOutcome::ExecError,
+    };
+    if should_clean_temp(run_failed, owned_temp_dir_pid(&temp_dir), child_pid) {
+        match std::fs::remove_dir_all(&temp_dir) {
+            Ok(()) => crate::logging::log_event(
+                "擦除",
+                format!("已清理本次失败留下的临时目录：{}", temp_dir.display()),
+            ),
+            Err(error) => crate::logging::log_event(
+                "擦除",
+                format!("清理临时目录失败（{}）：{error}", temp_dir.display()),
+            ),
+        }
+    }
     // 只删空目录：成功时目录里有成片或处理日志，这里什么也不会删。
     crate::paths::remove_created_dirs(&created_dirs);
     result

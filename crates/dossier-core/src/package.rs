@@ -239,54 +239,237 @@ pub struct MergeReport {
     pub dropped: u32,
 }
 
-/// 把 staging 里的标准文件逐个覆盖进 `pkg_dir`，清掉旧包里本次不再生成的标准文件，
-/// 其余文件（使用者自己放进去的）原地保留。
-fn merge_standard_files(staging: &Path, pkg_dir: &Path) -> std::io::Result<MergeReport> {
-    let mut fresh: Vec<String> = Vec::new();
-    collect_relative_files(staging, staging, &mut fresh)?;
-    let mut existing: Vec<String> = Vec::new();
-    collect_relative_files(pkg_dir, pkg_dir, &mut existing)?;
+/// 路径比较用的键：标准文件名只有程序生成的几种写法，按小写比较不会误判，
+/// 也能认出不区分大小写的文件系统上「`.JPG` 与 `.jpg` 是同一个文件」。
+fn path_key(rel: &str) -> String {
+    rel.to_lowercase()
+}
 
-    let mut report = MergeReport::default();
-    for rel in &fresh {
-        let target = pkg_dir.join(rel);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
+/// 旧包里本次不再生成的标准文件（按 [`path_key`] 比较；非标准文件不在其列）。
+fn stale_entries(fresh: &[String], existing: &[String]) -> Vec<String> {
+    let fresh_keys: std::collections::HashSet<String> =
+        fresh.iter().map(|rel| path_key(rel)).collect();
+    existing
+        .iter()
+        .filter(|rel| is_standard_named_file(rel) && !fresh_keys.contains(&path_key(rel)))
+        .cloned()
+        .collect()
+}
+
+/// 写入前的预检：`rel` 在包内的每一级前缀和叶子本身都不能是链接，
+/// 叶子已存在时必须是普通文件——否则 rename 会写到包外、替换掉用户的链接，或因目标是目录而失败。
+fn ensure_writable_target(pkg_dir: &Path, rel: &str) -> std::io::Result<()> {
+    let mut cursor = pkg_dir.to_path_buf();
+    let parts: Vec<&str> = rel.split('/').collect();
+    for (index, part) in parts.iter().enumerate() {
+        cursor.push(part);
+        let Ok(meta) = std::fs::symlink_metadata(&cursor) else {
+            return Ok(()); // 这一级不存在，后面的也不会存在
+        };
+        let is_leaf = index + 1 == parts.len();
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::other(format!(
+                "旧包里的 {} 是快捷方式/链接，为防写到包外已中止，旧包未改动",
+                cursor.display()
+            )));
         }
-        std::fs::copy(staging.join(rel), &target)?;
-        report.replaced += 1;
+        if is_leaf && !meta.is_file() {
+            return Err(std::io::Error::other(format!(
+                "旧包里的 {} 不是普通文件，无法替换，旧包未改动",
+                cursor.display()
+            )));
+        }
+        if !is_leaf && !meta.is_dir() {
+            return Err(std::io::Error::other(format!(
+                "旧包里的 {} 不是文件夹，无法写入，旧包未改动",
+                cursor.display()
+            )));
+        }
     }
-    for rel in &existing {
-        if !is_standard_named_file(rel) {
-            report.kept.push(rel.clone());
-            continue;
+    Ok(())
+}
+
+/// `create_dir_all` 的记账版：返回本次新建的各层（由外到内），失败回滚时逆序删除。
+fn create_dirs_tracked(dir: &Path, created: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    let mut missing = Vec::new();
+    let mut cursor = Some(dir);
+    while let Some(path) = cursor {
+        if std::fs::symlink_metadata(path).is_ok() {
+            break;
         }
-        if fresh.contains(rel) {
-            continue;
+        missing.push(path.to_path_buf());
+        cursor = path.parent();
+    }
+    for path in missing.into_iter().rev() {
+        std::fs::create_dir(&path)?;
+        created.push(path);
+    }
+    Ok(())
+}
+
+/// 本次合并的临时文件名：带 nonce，只清理自己的，不会扫掉另一个实例正在用的。
+fn merge_temp_path(target: &Path, nonce: &str) -> PathBuf {
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    target.with_file_name(format!(".{name}.dossier-new-{nonce}"))
+}
+
+/// 删除本次的临时文件：只删普通文件，跳过目录与链接。
+fn remove_temp_file(path: &Path) {
+    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file()) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// 把 staging 里的标准文件覆盖进 `pkg_dir`，清掉旧包里本次不再生成的标准文件，
+/// 其余文件（使用者自己放进去的、链接）原地保留。分三个阶段：
+/// 1. 预检 + 复制到带 nonce 的临时名：任何失败都回滚本次写入，旧包一个字节不动；
+/// 2. 逐个改名到正式名，`manifest.json` 最后；
+/// 3. 清理过期文件（只在新旧两种写法同时作为独立条目存在时才删大小写不同的旧写法）。
+fn merge_standard_files_with_nonce(
+    staging: &Path,
+    pkg_dir: &Path,
+    nonce: &str,
+) -> std::io::Result<MergeReport> {
+    let mut fresh: Vec<String> = Vec::new();
+    collect_relative_files(staging, staging, &mut fresh, &mut Vec::new())?;
+    fresh.sort();
+    // manifest 最后改名：中途失败时旧 manifest 仍对应旧包。
+    if let Some(index) = fresh.iter().position(|rel| rel == FILE_MANIFEST) {
+        let manifest = fresh.remove(index);
+        fresh.push(manifest);
+    }
+    let mut existing: Vec<String> = Vec::new();
+    let mut links: Vec<String> = Vec::new();
+    collect_relative_files(pkg_dir, pkg_dir, &mut existing, &mut links)?;
+
+    // 阶段 1：预检全部目标，再复制到临时名。
+    for rel in &fresh {
+        ensure_writable_target(pkg_dir, rel)?;
+    }
+    let mut created_dirs: Vec<PathBuf> = Vec::new();
+    let mut temps: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let copied: std::io::Result<()> = (|| {
+        for rel in &fresh {
+            let target = pkg_dir.join(rel);
+            if let Some(parent) = target.parent() {
+                create_dirs_tracked(parent, &mut created_dirs)?;
+            }
+            let temp = merge_temp_path(&target, nonce);
+            temps.push((temp.clone(), target));
+            std::fs::copy(staging.join(rel), &temp)?;
         }
+        Ok(())
+    })();
+    if let Err(error) = copied {
+        for (temp, _) in &temps {
+            remove_temp_file(temp);
+        }
+        for dir in created_dirs.iter().rev() {
+            let _ = std::fs::remove_dir(dir);
+        }
+        return Err(error);
+    }
+
+    // 阶段 2：改名到正式名。
+    for (index, (temp, target)) in temps.iter().enumerate() {
+        if let Err(error) = std::fs::rename(temp, target) {
+            for (rest, _) in &temps[index..] {
+                remove_temp_file(rest);
+            }
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "替换 {} 失败：{error}。包可能不完整，请改用「整体替换」重新生成；\
+                     如在 Windows 上，请先关闭正在使用包内文件的程序",
+                    target.display()
+                ),
+            ));
+        }
+    }
+
+    // 阶段 3：清理过期标准文件。
+    let mut report = MergeReport {
+        replaced: fresh.len() as u32,
+        ..MergeReport::default()
+    };
+    let fresh_exact: std::collections::HashSet<&str> = fresh.iter().map(String::as_str).collect();
+    let mut failed: Vec<String> = Vec::new();
+    let mut remove = |rel: &str, report: &mut MergeReport| {
         let path = pkg_dir.join(rel);
-        let _ = std::fs::remove_file(&path);
-        report.removed.push(rel.clone());
-        // 顺带清掉因此变空的目录（包根 `pkg_dir` 本身不删）。
-        let mut cursor = path.parent();
-        while let Some(dir) = cursor {
-            if dir == pkg_dir {
-                break;
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                report.removed.push(rel.to_string());
+                remove_empty_parents(&path, pkg_dir);
             }
-            if std::fs::remove_dir(dir).is_err() {
-                break;
-            }
-            cursor = dir.parent();
+            Err(error) => failed.push(format!("{rel}（{error}）")),
         }
+    };
+    for rel in stale_entries(&fresh, &existing) {
+        remove(&rel, &mut report);
+    }
+    // 大小写不同的同名旧文件：只有它和新写法同时作为独立条目存在时才删（区分大小写的文件系统）。
+    for rel in &existing {
+        if fresh_exact.contains(rel.as_str()) || !is_standard_named_file(rel) {
+            continue;
+        }
+        let Some(twin) = fresh.iter().find(|new| path_key(new) == path_key(rel)) else {
+            continue;
+        };
+        if listed_exactly(pkg_dir, rel) && listed_exactly(pkg_dir, twin) {
+            remove(rel, &mut report);
+        }
+    }
+    report.kept = existing
+        .iter()
+        .filter(|rel| !is_standard_named_file(rel))
+        .cloned()
+        .chain(links)
+        .collect();
+    if !failed.is_empty() {
+        return Err(std::io::Error::other(format!(
+            "新文件已全部写入；以下过期文件没能删除：{}",
+            failed.join("；")
+        )));
     }
     Ok(report)
 }
 
+/// `rel` 的这个确切写法是否作为独立条目出现在父目录的列表里。
+fn listed_exactly(pkg_dir: &Path, rel: &str) -> bool {
+    let path = pkg_dir.join(rel);
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return false;
+    };
+    std::fs::read_dir(parent)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name() == name)
+        })
+        .unwrap_or(false)
+}
+
+/// 删掉因清理过期文件而变空的上级目录（包根 `pkg_dir` 本身不删）。
+fn remove_empty_parents(path: &Path, pkg_dir: &Path) {
+    let mut cursor = path.parent();
+    while let Some(dir) = cursor {
+        if dir == pkg_dir || std::fs::remove_dir(dir).is_err() {
+            break;
+        }
+        cursor = dir.parent();
+    }
+}
+
 /// 目录下所有文件的相对路径（`/` 分隔），跳过以 `.` 开头的临时文件。
+/// 不跟随链接：链接（含 Windows junction）记进 `links`，既不进入也不当文件处理。
 fn collect_relative_files(
     root: &Path,
     current: &Path,
     out: &mut Vec<String>,
+    links: &mut Vec<String>,
 ) -> std::io::Result<()> {
     for entry in std::fs::read_dir(current)? {
         let entry = entry?;
@@ -295,14 +478,17 @@ fn collect_relative_files(
             continue;
         }
         let path = entry.path();
-        if path.is_dir() {
-            collect_relative_files(root, &path, out)?;
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            links.push(rel);
+        } else if kind.is_dir() {
+            collect_relative_files(root, &path, out, links)?;
         } else {
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
             out.push(rel);
         }
     }
@@ -356,18 +542,16 @@ pub fn generate_report_package(
         form.validate()
             .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
     }
-    if pkg_dir.exists() && !opts.overwrite {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!(
-                "报审包目录已存在：{}。可以选择覆盖旧包，或换一个输出目录。",
-                pkg_dir.display()
-            ),
-        ));
-    }
-    if opts.overwrite {
-        guard_overwrite_target(&pkg_dir, drama_dir)?;
-    }
+    // 入口判一次三态：只有「有内容」的目录才需要确认；要覆盖时先过安全闸并记下 `guarded`。
+    // 落盘前 `commit_staging` 还会再判一次：生成要跑几分钟，目录可能在这期间被写进东西。
+    let guarded = match target_state(&pkg_dir) {
+        TargetState::Missing | TargetState::Empty => false,
+        TargetState::Occupied if !opts.overwrite => return Err(package_exists_error(&pkg_dir)),
+        TargetState::Occupied => {
+            guard_overwrite_target(&pkg_dir, drama_dir)?;
+            true
+        }
+    };
 
     let parent = pkg_dir.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)?;
@@ -386,49 +570,15 @@ pub fn generate_report_package(
     let staging = parent.join(format!(".{leaf}.part-{nonce}"));
     let written = write_package_contents(&staging, drama_name, cover, synopsis, episodes, opts)
         .and_then(|summary| {
-            match (pkg_dir.exists(), opts.overwrite, opts.overwrite_mode) {
-                // 目录不存在：写完才改名，最终目录要么不存在，要么是完整的包。
-                (false, _, _) => std::fs::rename(&staging, &pkg_dir)?,
-                // 整体替换：旧包先挪成备份 → 新包就位 → 删备份。任何时刻正式目录都是完整的旧包或新包。
-                (true, true, OverwriteMode::ReplaceAll) => {
-                    let backup = parent.join(format!(".{leaf}.old-{nonce}"));
-                    std::fs::rename(&pkg_dir, &backup)?;
-                    if let Err(error) = std::fs::rename(&staging, &pkg_dir) {
-                        // 新包没能就位：把旧包改回原名，别让用户发现包不见了。
-                        let _ = std::fs::rename(&backup, &pkg_dir);
-                        return Err(error);
-                    }
-                    // 备份里的文件数写进报告：整体替换后用户能知道旧包里有几个文件被换掉。
-                    let mut dropped: Vec<String> = Vec::new();
-                    collect_relative_files(&backup, &backup, &mut dropped)?;
-                    let _ = std::fs::remove_dir_all(&backup);
-                    return Ok((
-                        summary.0,
-                        summary.1,
-                        Some(MergeReport {
-                            replaced: summary.0,
-                            removed: Vec::new(),
-                            kept: Vec::new(),
-                            dropped: dropped.len() as u32,
-                        }),
-                        summary.2,
-                    ));
-                }
-                // 只替换标准文件：逐文件覆盖，非标准文件原地保留，过期标准路径清掉。
-                (true, true, OverwriteMode::StandardOnly) => {
-                    let report = merge_standard_files(&staging, &pkg_dir)?;
-                    let _ = std::fs::remove_dir_all(&staging);
-                    return Ok((summary.0, summary.1, Some(report), summary.2));
-                }
-                // 覆盖关掉但目录又在（生成期间被别人建出来）：当作冲突，删临时目录。
-                (true, false, _) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        format!("报审包目录已存在：{}。", pkg_dir.display()),
-                    ))
-                }
-            }
-            Ok((summary.0, summary.1, None, summary.2))
+            let overwrite = commit_staging(
+                &staging,
+                &pkg_dir,
+                guarded,
+                opts.overwrite_mode,
+                &nonce,
+                summary.0,
+            )?;
+            Ok((summary.0, summary.1, overwrite, summary.2))
         });
     match written {
         Ok((file_count, total_bytes, overwrite, proof)) => Ok(PackageResult {
@@ -445,34 +595,216 @@ pub fn generate_report_package(
     }
 }
 
-/// 覆盖前的安全闸：只允许替换一个真正的报审包目录，不允许把剧目目录或磁盘根当旧包换掉。
-fn guard_overwrite_target(pkg_dir: &Path, drama_dir: &Path) -> std::io::Result<()> {
-    let refuse = |reason: &str| {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("拒绝覆盖 {reason}：{}", pkg_dir.display()),
-        ))
-    };
-    if !pkg_dir.is_dir() {
-        return refuse("不是目录的旧包位置");
-    }
-    let parent = pkg_dir.parent().unwrap_or(Path::new("."));
-    if pkg_dir.parent().is_none() || parent == pkg_dir {
-        return refuse("磁盘根目录");
-    }
-    if same_path(pkg_dir, drama_dir) {
-        return refuse("剧目目录本身");
-    }
-    Ok(())
+/// 报审包 manifest 的 schema 标识：覆盖前据此确认目标真的是剧备生成的包。
+pub const PACKAGE_SCHEMA: &str = "drama-dossier/package@1";
+
+/// 「报审包目录已存在」类错误的固定前缀：前端只认这个前缀给出覆盖按钮，
+/// 不再匹配中文文本（中文 Windows 的系统错误 183 也含「已存在」字样）。
+pub const PACKAGE_EXISTS_MARK: &str = "[PACKAGE_EXISTS] ";
+
+/// manifest 读取上限：真包的 manifest 只有几十 KB，超过就不当报审包处理。
+const MANIFEST_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// 视作「空」时可以忽略的系统杂项文件（按不区分大小写比较）。
+const SYSTEM_JUNK: [&str; 3] = [".ds_store", "thumbs.db", "desktop.ini"];
+
+fn package_exists_error(pkg_dir: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "{PACKAGE_EXISTS_MARK}报审包目录已存在：{}。可以选择覆盖旧包，或换一个输出目录。",
+            pkg_dir.display()
+        ),
+    )
 }
 
-/// 路径是否指向同一个位置（能取到规范路径时按规范路径比，取不到就按字面比）。
-fn same_path(left: &Path, right: &Path) -> bool {
-    let canon = |path: &Path| std::fs::canonicalize(path).ok();
-    match (canon(left), canon(right)) {
-        (Some(a), Some(b)) => a == b,
-        _ => left == right,
+/// 目标位置的状态：不存在 / 空目录（只有系统杂项）/ 有内容。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetState {
+    Missing,
+    Empty,
+    Occupied,
+}
+
+/// 判定目标位置状态；读不了目录（如没有权限）按「有内容」处理，绝不当成空目录去删。
+fn target_state(dir: &Path) -> TargetState {
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return TargetState::Missing;
+    };
+    if !meta.is_dir() {
+        return TargetState::Occupied;
     }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return TargetState::Occupied;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return TargetState::Occupied;
+        };
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        let is_file = entry
+            .file_type()
+            .map(|kind| kind.is_file())
+            .unwrap_or(false);
+        if !(is_file && SYSTEM_JUNK.contains(&name.as_str())) {
+            return TargetState::Occupied;
+        }
+    }
+    TargetState::Empty
+}
+
+/// 目录里是不是一个剧备生成的报审包：`manifest.json` 是普通文件、不太大、schema 对得上。
+fn looks_like_package(dir: &Path) -> bool {
+    let path = dir.join(FILE_MANIFEST);
+    let Ok(meta) = std::fs::symlink_metadata(&path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() > MANIFEST_MAX_BYTES {
+        return false;
+    }
+    std::fs::read(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+        .and_then(|value| {
+            value
+                .get("schema")?
+                .as_str()
+                .map(|schema| schema == PACKAGE_SCHEMA)
+        })
+        .unwrap_or(false)
+}
+
+/// 把写好的 staging 落到 `pkg_dir`。落盘前重新判定目标状态：
+/// - 不存在：直接改名；
+/// - 空目录：清掉系统杂项、`remove_dir`（只能删空目录，本身就是保险）后改名；
+/// - 有内容但入口没过安全闸（生成期间被写进了东西）：按「已存在」拒绝；
+/// - 有内容且过了安全闸：再确认一次是报审包，然后按覆盖方式替换。
+fn commit_staging(
+    staging: &Path,
+    pkg_dir: &Path,
+    guarded: bool,
+    mode: OverwriteMode,
+    nonce: &str,
+    file_count: u32,
+) -> std::io::Result<Option<MergeReport>> {
+    match target_state(pkg_dir) {
+        TargetState::Missing => {
+            std::fs::rename(staging, pkg_dir)?;
+            Ok(None)
+        }
+        TargetState::Empty => {
+            for name in std::fs::read_dir(pkg_dir)?.filter_map(Result::ok) {
+                std::fs::remove_file(name.path())?;
+            }
+            if std::fs::remove_dir(pkg_dir).is_err() {
+                // 删杂项和删目录之间又被写进了东西：当作冲突，用户的内容不动。
+                return Err(package_exists_error(pkg_dir));
+            }
+            if let Err(error) = std::fs::rename(staging, pkg_dir) {
+                // 改名失败：把用户原来的空文件夹补回来，别让它凭空消失。
+                let _ = std::fs::create_dir(pkg_dir);
+                return Err(error);
+            }
+            Ok(None)
+        }
+        TargetState::Occupied if !guarded => Err(package_exists_error(pkg_dir)),
+        TargetState::Occupied => {
+            if !looks_like_package(pkg_dir) {
+                return Err(refuse_overwrite(pkg_dir, NOT_A_PACKAGE));
+            }
+            match mode {
+                OverwriteMode::ReplaceAll => {
+                    replace_all(staging, pkg_dir, nonce, file_count).map(Some)
+                }
+                OverwriteMode::StandardOnly => {
+                    let report = merge_standard_files_with_nonce(staging, pkg_dir, nonce)?;
+                    let _ = std::fs::remove_dir_all(staging);
+                    Ok(Some(report))
+                }
+            }
+        }
+    }
+}
+
+/// 整体替换：旧包先挪成备份 → 新包就位 → 删备份。任何时刻正式目录都是完整的旧包或新包。
+fn replace_all(
+    staging: &Path,
+    pkg_dir: &Path,
+    nonce: &str,
+    replaced: u32,
+) -> std::io::Result<MergeReport> {
+    let parent = pkg_dir.parent().unwrap_or(Path::new("."));
+    let leaf = pkg_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "报审包".into());
+    let backup = parent.join(format!(".{leaf}.old-{nonce}"));
+    std::fs::rename(pkg_dir, &backup)?;
+    if let Err(error) = std::fs::rename(staging, pkg_dir) {
+        // 新包没能就位：把旧包改回原名，别让用户发现包不见了。
+        let _ = std::fs::rename(&backup, pkg_dir);
+        return Err(error);
+    }
+    // 新包已就位：备份里的文件数只用于报告，统计出错不能把成功报成失败。
+    let dropped = count_files_best_effort(&backup);
+    let _ = std::fs::remove_dir_all(&backup);
+    Ok(MergeReport {
+        replaced,
+        removed: Vec::new(),
+        kept: Vec::new(),
+        dropped,
+    })
+}
+
+/// 目录下的文件数；读不全时返回 0（只用于报告，不影响结果）。
+fn count_files_best_effort(dir: &Path) -> u32 {
+    let mut files: Vec<String> = Vec::new();
+    collect_relative_files(dir, dir, &mut files, &mut Vec::new())
+        .map(|()| files.len() as u32)
+        .unwrap_or(0)
+}
+
+const NOT_A_PACKAGE: &str =
+    "这不是剧备生成的报审包（缺少 manifest.json），为防误删不能覆盖。请换一个空文件夹或新文件夹";
+
+fn refuse_overwrite(pkg_dir: &Path, reason: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("拒绝覆盖 {reason}：{}", pkg_dir.display()),
+    )
+}
+
+/// 覆盖前的安全闸：只允许替换一个真正的报审包目录。
+/// 拒绝：链接、无法确认位置、剧目目录本身或它的上级目录（含磁盘根）、不是剧备生成的包。
+fn guard_overwrite_target(pkg_dir: &Path, drama_dir: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(pkg_dir)?;
+    if meta.file_type().is_symlink() {
+        return Err(refuse_overwrite(pkg_dir, "旧包位置是快捷方式/链接"));
+    }
+    if !meta.is_dir() {
+        return Err(refuse_overwrite(pkg_dir, "不是目录的旧包位置"));
+    }
+    // 规范化失败就拒绝，不退回字面比较：Windows 上 `Path` 比较区分大小写，字面比较会漏判。
+    let (Ok(pkg), Ok(drama)) = (
+        std::fs::canonicalize(pkg_dir),
+        std::fs::canonicalize(drama_dir),
+    ) else {
+        return Err(refuse_overwrite(
+            pkg_dir,
+            "无法确认旧包位置（请手动删除旧包或换一个目录）",
+        ));
+    };
+    if pkg.parent().is_none() {
+        return Err(refuse_overwrite(pkg_dir, "磁盘根目录"));
+    }
+    // `Path::starts_with` 按路径组件比较，`D:\剧集` 不会被当成 `D:\剧` 的下级。
+    if drama.starts_with(&pkg) {
+        return Err(refuse_overwrite(pkg_dir, "剧目目录本身或它的上级目录"));
+    }
+    if !looks_like_package(pkg_dir) {
+        return Err(refuse_overwrite(pkg_dir, NOT_A_PACKAGE));
+    }
+    Ok(())
 }
 
 /// 把报审包的全部内容写进 `pkg_dir`（临时目录），返回 `(文件数, 总字节数, 证明材料)`。
@@ -570,7 +902,7 @@ fn write_package_contents(
     // manifest
     collect_files(pkg_dir, &mut manifest_files)?;
     let manifest = Manifest {
-        schema: "drama-dossier/package@1".into(),
+        schema: PACKAGE_SCHEMA.into(),
         drama_name: drama_name.into(),
         generated_at: chrono_now(),
         ai_generated: opts.ai_generated,
@@ -1318,6 +1650,328 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("剧目目录本身"));
         assert!(d.join("第1集.mp4").is_file(), "素材不能被删");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 「选择输出目录」只能选已有文件夹：空文件夹（含系统杂项）不带 overwrite 也要能直接生成。
+    #[test]
+    fn generate_into_existing_empty_dir() {
+        for junk in [None, Some(".DS_Store"), Some("Thumbs.db")] {
+            let base = scratch("empty");
+            let out = base.join("我建的空文件夹");
+            std::fs::create_dir_all(&out).unwrap();
+            if let Some(name) = junk {
+                std::fs::write(out.join(name), b"x").unwrap();
+            }
+            let result =
+                generate_report_package("剧A", &base, None, None, &[], &base_opts(out.clone()))
+                    .unwrap_or_else(|error| panic!("空目录（{junk:?}）应能直接生成：{error}"));
+            assert!(result.overwrite.is_none());
+            assert!(out.join(FILE_MANIFEST).is_file());
+            let leftovers: Vec<String> = std::fs::read_dir(&base)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.contains(".part-"))
+                .collect();
+            assert!(leftovers.is_empty(), "{leftovers:?}");
+            std::fs::remove_dir_all(&base).ok();
+        }
+    }
+
+    /// 入口判定为空、写完 staging 后目录被写进了东西：不能在没过安全闸的情况下替换。
+    #[test]
+    fn occupied_after_check_is_not_replaced() {
+        let base = scratch("toctou");
+        let out = base.join("报审包");
+        let staging = base.join(".报审包.part-test");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join(FILE_MANIFEST), b"{}").unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("用户刚放的.mp4"), b"user").unwrap();
+        let error = commit_staging(&staging, &out, false, OverwriteMode::ReplaceAll, "test", 1)
+            .unwrap_err();
+        assert!(
+            error.to_string().starts_with(PACKAGE_EXISTS_MARK),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(out.join("用户刚放的.mp4")).unwrap(), b"user");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 素材根目录（剧目目录的上级）不能当旧包整体换掉。
+    #[test]
+    fn overwrite_refuses_ancestor_of_drama_dir() {
+        let base = scratch("ancestor");
+        let d = base.join("剧A");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("第1集.mp4"), b"one").unwrap();
+        // 伪造一个 manifest，确认「上级目录」这条规则本身就能拦下，不依赖 manifest 检查。
+        std::fs::write(
+            base.join(FILE_MANIFEST),
+            format!(r#"{{"schema":"{PACKAGE_SCHEMA}"}}"#),
+        )
+        .unwrap();
+        for mode in [OverwriteMode::ReplaceAll, OverwriteMode::StandardOnly] {
+            let mut opts = base_opts(base.clone());
+            opts.overwrite = true;
+            opts.overwrite_mode = mode;
+            let error = generate_report_package("剧A", &d, None, None, &[], &opts).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
+            assert!(error.to_string().contains("上级目录"), "{error}");
+            assert!(!error.to_string().contains(PACKAGE_EXISTS_MARK));
+            assert_eq!(std::fs::read(d.join("第1集.mp4")).unwrap(), b"one");
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 没有剧备 manifest 的目录：两种覆盖模式都拒绝，里面的文件一个不动。
+    #[test]
+    fn overwrite_refuses_dir_without_manifest() {
+        for mode in [OverwriteMode::ReplaceAll, OverwriteMode::StandardOnly] {
+            let base = scratch("nomanifest");
+            let out = base.join("别的文件夹");
+            std::fs::create_dir_all(&out).unwrap();
+            std::fs::write(out.join("第01集.mp4"), b"user").unwrap();
+            let drama = base.join("剧A");
+            std::fs::create_dir_all(&drama).unwrap();
+            let mut opts = base_opts(out.clone());
+            opts.overwrite = true;
+            opts.overwrite_mode = mode;
+            let error = generate_report_package("剧A", &drama, None, None, &[], &opts).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
+            assert!(error.to_string().contains("manifest.json"), "{error}");
+            assert_eq!(std::fs::read(out.join("第01集.mp4")).unwrap(), b"user");
+            std::fs::remove_dir_all(&base).ok();
+        }
+    }
+
+    /// 旧包位置本身是符号链接：拒绝，链接指向的真包不动。
+    #[cfg(unix)]
+    #[test]
+    fn overwrite_refuses_symlinked_package() {
+        let base = scratch("symlink");
+        let real = base.join("真包");
+        generate_report_package("剧A", &base, None, None, &[], &base_opts(real.clone())).unwrap();
+        std::fs::write(real.join("我放的.txt"), b"keep").unwrap();
+        // 名字里不能含「链接」：否则错误信息里的路径本身就能让断言通过，测不出拒绝原因。
+        let link = base.join("link-pkg");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut opts = base_opts(link.clone());
+        opts.overwrite = true;
+        let error = generate_report_package("剧A", &base, None, None, &[], &opts).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
+        assert!(error.to_string().contains("快捷方式/链接"), "{error}");
+        assert_eq!(std::fs::read(real.join("我放的.txt")).unwrap(), b"keep");
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok_and(|meta| meta.file_type().is_symlink()),
+            "链接本身也不能被挪走"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 安全闸本身就要拒绝没有 manifest 的目录（落盘前的二次校验是第二道防线，不能替代这一道）。
+    #[test]
+    fn guard_alone_refuses_dir_without_manifest() {
+        let base = scratch("guardonly");
+        let drama = base.join("剧A");
+        std::fs::create_dir_all(&drama).unwrap();
+        let out = base.join("别的文件夹");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("第01集.mp4"), b"user").unwrap();
+        let error = guard_overwrite_target(&out, &drama).unwrap_err();
+        assert!(error.to_string().contains("manifest.json"), "{error}");
+        std::fs::write(
+            out.join(FILE_MANIFEST),
+            format!(r#"{{"schema":"{PACKAGE_SCHEMA}"}}"#),
+        )
+        .unwrap();
+        assert!(guard_overwrite_target(&out, &drama).is_ok());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 默认产物根目录形态 `<根>/<剧名>/报审包`：带 manifest 的真包允许覆盖。
+    #[test]
+    fn overwrite_allows_package_under_output_root() {
+        let base = scratch("root");
+        let d = base.join("素材").join("剧A");
+        std::fs::create_dir_all(&d).unwrap();
+        let out = base.join("产物").join("剧A").join("报审包");
+        generate_report_package("剧A", &d, None, None, &[], &base_opts(out.clone())).unwrap();
+        let mut opts = base_opts(out.clone());
+        opts.overwrite = true;
+        assert!(generate_report_package("剧A", &d, None, None, &[], &opts).is_ok());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 手工构造一个「旧包」：每个文件内容为 old，带合法 manifest。
+    fn old_package(dir: &Path, files: &[&str]) {
+        std::fs::create_dir_all(dir).unwrap();
+        for rel in files {
+            let path = dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"old").unwrap();
+        }
+        std::fs::write(
+            dir.join(FILE_MANIFEST),
+            format!(r#"{{"schema":"{PACKAGE_SCHEMA}","v":"old"}}"#),
+        )
+        .unwrap();
+    }
+
+    /// 手工构造 staging：每个文件内容为 new。
+    fn new_staging(dir: &Path, files: &[&str]) {
+        for rel in files {
+            let path = dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"new").unwrap();
+        }
+    }
+
+    /// 只差大小写的旧文件不算过期：修复前按原文比较会把 `.JPG` 判为过期（Linux 上也能先红）。
+    #[test]
+    fn stale_entries_ignores_case_only_difference() {
+        let fresh = vec!["02_封面海报/封面.jpg".to_string()];
+        let existing = vec![
+            "02_封面海报/封面.JPG".to_string(),
+            "06_分集视频/第09集.mp4".to_string(),
+            "我的说明.txt".to_string(),
+        ];
+        assert_eq!(
+            stale_entries(&fresh, &existing),
+            vec!["06_分集视频/第09集.mp4"]
+        );
+    }
+
+    /// 端到端回归：大小写变化后读到的是新内容；区分大小写的文件系统上旧写法被清掉。
+    #[test]
+    fn standard_only_case_change_end_to_end() {
+        let base = scratch("case");
+        let pkg = base.join("pkg");
+        let staging = base.join("staging");
+        old_package(&pkg, &["02_封面海报/封面.JPG"]);
+        new_staging(&staging, &["02_封面海报/封面.jpg", FILE_MANIFEST]);
+        merge_standard_files_with_nonce(&staging, &pkg, "t").unwrap();
+        assert_eq!(
+            std::fs::read(pkg.join("02_封面海报/封面.jpg")).unwrap(),
+            b"new"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(!pkg.join("02_封面海报/封面.JPG").exists());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 旧包的分集目录是指向包外的链接：中止，包外文件不动。
+    #[cfg(unix)]
+    #[test]
+    fn standard_only_does_not_follow_links() {
+        let base = scratch("link");
+        let pkg = base.join("pkg");
+        let outside = base.join("外部素材");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("第09集.mp4"), b"user").unwrap();
+        old_package(&pkg, &[]);
+        std::os::unix::fs::symlink(&outside, pkg.join(DIR_EPISODES)).unwrap();
+        let staging = base.join("staging");
+        new_staging(&staging, &["06_分集视频/第01集.mp4", FILE_MANIFEST]);
+        let error = merge_standard_files_with_nonce(&staging, &pkg, "t").unwrap_err();
+        assert!(error.to_string().contains("链接"), "{error}");
+        assert_eq!(std::fs::read(outside.join("第09集.mp4")).unwrap(), b"user");
+        assert!(!outside.join("第01集.mp4").exists(), "不能写到包外");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 目标位置是目录：阶段一预检就中止，旧包内容全部还是 old。
+    #[test]
+    fn standard_only_refuses_directory_at_target() {
+        let base = scratch("dirtarget");
+        let pkg = base.join("pkg");
+        old_package(&pkg, &["02_封面海报/封面.png"]);
+        std::fs::create_dir_all(pkg.join("01_剧集信息/剧名.txt")).unwrap();
+        let staging = base.join("staging");
+        new_staging(
+            &staging,
+            &[
+                "01_剧集信息/剧名.txt",
+                "02_封面海报/封面.png",
+                FILE_MANIFEST,
+            ],
+        );
+        assert!(merge_standard_files_with_nonce(&staging, &pkg, "t").is_err());
+        assert_eq!(
+            std::fs::read(pkg.join("02_封面海报/封面.png")).unwrap(),
+            b"old"
+        );
+        let manifest = std::fs::read_to_string(pkg.join(FILE_MANIFEST)).unwrap();
+        assert!(manifest.contains(r#""v":"old""#));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 复制阶段失败：旧包不变，陷阱目录不被误删，本次的临时文件不残留。
+    #[test]
+    fn standard_only_copy_failure_leaves_old_package() {
+        let base = scratch("copyfail");
+        let pkg = base.join("pkg");
+        old_package(&pkg, &["01_剧集信息/剧名.txt", "02_封面海报/封面.png"]);
+        let staging = base.join("staging");
+        new_staging(
+            &staging,
+            &[
+                "01_剧集信息/剧名.txt",
+                "02_封面海报/封面.png",
+                FILE_MANIFEST,
+            ],
+        );
+        // 排序后 manifest 最后复制：在它的临时名位置放一个同名目录，制造 copy 失败。
+        let trap = merge_temp_path(&pkg.join(FILE_MANIFEST), "t");
+        std::fs::create_dir_all(&trap).unwrap();
+        assert!(merge_standard_files_with_nonce(&staging, &pkg, "t").is_err());
+        for rel in ["01_剧集信息/剧名.txt", "02_封面海报/封面.png"] {
+            assert_eq!(std::fs::read(pkg.join(rel)).unwrap(), b"old", "{rel}");
+        }
+        assert!(std::fs::read_to_string(pkg.join(FILE_MANIFEST))
+            .unwrap()
+            .contains(r#""v":"old""#));
+        assert!(trap.is_dir(), "清理不能删目录");
+        for rel in ["01_剧集信息/剧名.txt", "02_封面海报/封面.png"] {
+            assert!(
+                !merge_temp_path(&pkg.join(rel), "t").exists(),
+                "{rel} 的临时文件残留"
+            );
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 统计失败（目录不存在）返回 0，不报错。
+    #[test]
+    fn count_files_best_effort_tolerates_missing_dir() {
+        assert_eq!(count_files_best_effort(Path::new("/不存在的/备份目录")), 0);
+    }
+
+    /// 「已存在」错误带固定前缀（前端据此给覆盖按钮）；安全闸拒绝不带。
+    #[test]
+    fn exists_error_carries_marker() {
+        let base = scratch("marker");
+        let out = base.join("报审包");
+        generate_report_package("剧A", &base, None, None, &[], &base_opts(out.clone())).unwrap();
+        let exists =
+            generate_report_package("剧A", &base, None, None, &[], &base_opts(out.clone()))
+                .unwrap_err();
+        assert_eq!(exists.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(
+            exists.to_string().starts_with(PACKAGE_EXISTS_MARK),
+            "{exists}"
+        );
+        let plain = base.join("普通目录");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join("x.txt"), b"x").unwrap();
+        let mut opts = base_opts(plain);
+        opts.overwrite = true;
+        let refused = generate_report_package("剧A", &base, None, None, &[], &opts).unwrap_err();
+        assert!(
+            !refused.to_string().contains(PACKAGE_EXISTS_MARK),
+            "{refused}"
+        );
         std::fs::remove_dir_all(&base).ok();
     }
 
